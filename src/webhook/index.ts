@@ -10,6 +10,7 @@ import { routeEvent } from "../router.js";
 import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
 import { deliverToAgent, DeliveryThrottle } from "../delivery/index.js";
 import { normalizeSessionKey } from "../session-key.js";
+import { getAgent } from "../agents.js";
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/index.js";
 import { type WakeUpConfig } from "../bag/wake-up.js";
@@ -333,10 +334,12 @@ export function createWebhookRouter(
         log.info(`Agent queue: delivering immediately for ${route.agentId} [${ticketId}]`);
       }
 
+      // Deliver to OpenClaw agent via delivery module
+      const agentCfg = getAgent(route.agentId);
       const deliveryConfig = {
         nodeBin: process.execPath,
-        hooksUrl: process.env.OPENCLAW_HOOKS_URL,
-        hooksToken: process.env.OPENCLAW_HOOKS_TOKEN,
+        hooksUrl: agentCfg?.hooksUrl ?? process.env.OPENCLAW_HOOKS_URL,
+        hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
         hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
         hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
       };

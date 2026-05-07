@@ -23,6 +23,10 @@ export interface AgentConfig {
   host?: "ishikawa" | "local";
   /** Path to write LINEAR_OAUTH_TOKEN when tokens refresh */
   secretsPath?: string;
+  /** Per-agent OpenClaw hooks URL override (e.g. for agents in a different fleet/gateway) */
+  hooksUrl?: string;
+  /** Per-agent OpenClaw hooks token override */
+  hooksToken?: string;
 }
 
 interface AgentsFile {
