@@ -9,6 +9,10 @@ export interface DeliveryConfig {
     retryDelayMs?: number;
     maxRetries?: number;
 }
+export interface DeliveryResult {
+    dispatched: boolean;
+    runId?: string;
+}
 /**
  * Deliver a routed event to an OpenClaw agent.
  *
@@ -19,7 +23,7 @@ export interface DeliveryConfig {
  * Both modes include retry with configurable timeout/delay/attempts.
  * Errors are logged, never thrown.
  */
-export declare function deliverToAgent(route: RouteResult, config: DeliveryConfig): Promise<void>;
+export declare function deliverToAgent(route: RouteResult, config: DeliveryConfig): Promise<DeliveryResult>;
 /** Deliver an explicit operator-authored message to an existing OpenClaw session. */
-export declare function deliverMessageToAgent(agentName: string, sessionId: string, message: string, config: DeliveryConfig): Promise<boolean>;
+export declare function deliverMessageToAgent(agentName: string, sessionId: string, message: string, config: DeliveryConfig): Promise<DeliveryResult>;
 //# sourceMappingURL=deliver.d.ts.map

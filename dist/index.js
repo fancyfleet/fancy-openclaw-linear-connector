@@ -10,7 +10,7 @@ import { NudgeStore } from "./store/nudge-store.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
 import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent, deliverMessageToAgent, DeliveryThrottle } from "./delivery/index.js";
-import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "./bag/index.js";
+import { PendingWorkBag, SessionTracker, resignalPendingTickets, replayPendingBag } from "./bag/index.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { createAdminRouter } from "./admin.js";
 import crypto from "crypto";
@@ -223,18 +223,29 @@ export function createApp(options) {
             return;
         }
         log.info(`Session-end callback received for ${agentId}`);
-        const pendingTickets = sessionTracker.endSession(agentId);
-        operationalEventStore.append({ outcome: "session-ended", agent: agentId, deliveryMode: "session-end-callback", detail: { pendingTickets: pendingTickets ?? [] } });
-        if (pendingTickets && pendingTickets.length > 0) {
+        const queuedTickets = sessionTracker.endSession(agentId);
+        // Also drain any dispatched-but-unconfirmed bag entries for this agent.
+        // These were dispatched on HTTP 200 but not confirmed as processed.
+        const bagTickets = bag.getPendingTickets(agentId).map(e => e.ticketId);
+        if (bagTickets.length > 0)
+            bag.clearAgent(agentId);
+        // Normalize queued tickets so dedup works correctly vs already-normalized bag IDs.
+        const queuedNormalized = (queuedTickets ?? []).map(t => normalizeSessionKey(t));
+        const allPending = [...new Set([...queuedNormalized, ...bagTickets])];
+        operationalEventStore.append({
+            outcome: "session-ended", agent: agentId, deliveryMode: "session-end-callback",
+            detail: { queuedTickets: queuedTickets ?? [], bagTickets, allPending }
+        });
+        if (allPending.length > 0) {
             // Re-signal: agent has work waiting. Send one signal per ticket so each
             // issue is delivered into its own canonical per-ticket session key.
             try {
-                await resignalPendingTickets(agentId, pendingTickets, bag, sessionTracker, wakeConfig, { markActive: true });
+                await resignalPendingTickets(agentId, allPending, bag, sessionTracker, wakeConfig, { markActive: true });
             }
             catch (err) {
                 log.error(`Session-end re-signal failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
             }
-            res.json({ ok: true, pendingTickets: pendingTickets.length });
+            res.json({ ok: true, pendingTickets: allPending.length });
         }
         else {
             res.json({ ok: true, pendingTickets: 0 });
@@ -263,7 +274,7 @@ export function createApp(options) {
             activeSessionDetails: activeSessions.map((agentId) => sessionTracker.getActiveSessionInfo(agentId)),
         });
     });
-    return { app, agentQueue, bag, sessionTracker, operationalEventStore };
+    return { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig };
 }
 /**
  * Recover queue backlog left behind by prior process state. For each agent
@@ -314,12 +325,16 @@ if (isEntryPoint) {
     if (agents.length > 0) {
         startTokenRefresh();
     }
-    const { app, agentQueue } = createApp();
+    const { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig } = createApp();
     const server = app.listen(PORT, () => {
         log.info(`fancy-openclaw-linear-connector [${DEPLOYMENT_NAME}] listening on port ${PORT} (pid=${process.pid})`);
-        // Recover any backlog left behind by prior process state.
+        // Recover any backlog left behind by prior process state (v1.0 queue).
         drainBacklog(agentQueue).catch((err) => {
             log.error(`Startup drain failed: ${err instanceof Error ? err.message : String(err)}`);
+        });
+        // Replay persisted pending-bag work left behind by a prior process restart.
+        replayPendingBag(bag, sessionTracker, wakeConfig, operationalEventStore).catch((err) => {
+            log.error(`Startup replay failed: ${err instanceof Error ? err.message : String(err)}`);
         });
     });
     // Graceful shutdown — drain in-flight connections before exit
