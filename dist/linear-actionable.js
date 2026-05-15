@@ -1,9 +1,11 @@
-import { getAccessToken } from "./agents.js";
+import { getAccessToken, getAgent } from "./agents.js";
 import { createLogger, componentLogger } from "./logger.js";
 import { normalizeSessionKey } from "./session-key.js";
 const log = componentLogger(createLogger(), "linear-actionable");
 const TERMINAL_STATE_TYPES = new Set(["completed", "canceled", "cancelled"]);
 const TERMINAL_STATE_NAMES = new Set(["done", "canceled", "cancelled"]);
+const PARKED_STATE_TYPES = new Set(["backlog"]);
+const PARKED_STATE_NAMES = new Set(["backlog"]);
 export function isTerminalIssueState(state) {
     if (!state || typeof state !== "object")
         return false;
@@ -11,6 +13,14 @@ export function isTerminalIssueState(state) {
     const type = typeof record.type === "string" ? record.type.toLowerCase() : "";
     const name = typeof record.name === "string" ? record.name.toLowerCase() : "";
     return TERMINAL_STATE_TYPES.has(type) || TERMINAL_STATE_NAMES.has(name);
+}
+export function isParkedIssueState(state) {
+    if (!state || typeof state !== "object")
+        return false;
+    const record = state;
+    const type = typeof record.type === "string" ? record.type.toLowerCase() : "";
+    const name = typeof record.name === "string" ? record.name.toLowerCase() : "";
+    return PARKED_STATE_TYPES.has(type) || PARKED_STATE_NAMES.has(name);
 }
 export function issueIdentifierFromSessionKey(ticketId) {
     return normalizeSessionKey(ticketId).replace(/^linear-/, "");
@@ -38,6 +48,59 @@ function linearAuthorizationHeader(token) {
  * On auth/network/API uncertainty, keep the ticket actionable so we do not
  * silently drop legitimate work because Linear had a transient failure.
  */
+export async function isLinearIssueStillRoutedToAgent(ticketId, agentId, routingReason) {
+    if (routingReason === "mention" || routingReason === "body-mention")
+        return true;
+    const token = tokenForAgent(agentId);
+    const agent = getAgent(agentId);
+    if (!token || !agent?.linearUserId)
+        return true;
+    const identifier = issueIdentifierFromSessionKey(ticketId);
+    try {
+        const response = await fetch("https://api.linear.app/graphql", {
+            method: "POST",
+            headers: {
+                "content-type": "application/json",
+                authorization: linearAuthorizationHeader(token),
+            },
+            body: JSON.stringify({
+                query: `query IssueRouting($id: String!) { issue(id: $id) { id identifier delegate { id name } assignee { id name } state { name type } } }`,
+                variables: { id: identifier },
+            }),
+        });
+        if (!response.ok) {
+            log.warn(`Linear routing check failed for ${identifier}: HTTP ${response.status}`);
+            return true;
+        }
+        const body = await response.json();
+        if (body.errors?.length) {
+            log.warn(`Linear routing check errored for ${identifier}: ${body.errors.map((e) => e.message).join("; ")}`);
+            return true;
+        }
+        const issue = body.data?.issue;
+        if (!issue)
+            return false;
+        if (isTerminalIssueState(issue.state) || isParkedIssueState(issue.state))
+            return false;
+        if (routingReason === "delegate") {
+            const ok = issue.delegate?.id === agent.linearUserId;
+            if (!ok)
+                log.info(`Dropping stale delegate event for ${identifier}: ${agentId} is no longer delegate`);
+            return ok;
+        }
+        if (routingReason === "assignee") {
+            const ok = issue.assignee?.id === agent.linearUserId;
+            if (!ok)
+                log.info(`Dropping stale assignee event for ${identifier}: ${agentId} is no longer assignee`);
+            return ok;
+        }
+        return true;
+    }
+    catch (err) {
+        log.warn(`Linear routing check failed for ${identifier}: ${err instanceof Error ? err.message : String(err)}`);
+        return true;
+    }
+}
 export async function isLinearIssueActionable(ticketId, agentId) {
     const token = tokenForAgent(agentId);
     if (!token)
@@ -69,11 +132,11 @@ export async function isLinearIssueActionable(ticketId, agentId) {
             log.info(`Dropping pending Linear ticket ${identifier}: issue no longer exists`);
             return false;
         }
-        const terminal = isTerminalIssueState(issue.state);
-        if (terminal) {
-            log.info(`Dropping pending Linear ticket ${identifier}: state is ${issue.state?.name ?? issue.state?.type ?? "terminal"}`);
+        const nonActionable = isTerminalIssueState(issue.state) || isParkedIssueState(issue.state);
+        if (nonActionable) {
+            log.info(`Dropping pending Linear ticket ${identifier}: state is ${issue.state?.name ?? issue.state?.type ?? "non-actionable"}`);
         }
-        return !terminal;
+        return !nonActionable;
     }
     catch (err) {
         log.warn(`Linear actionable check failed for ${identifier}: ${err instanceof Error ? err.message : String(err)}`);

@@ -1,4 +1,4 @@
-export declare const OPERATIONAL_EVENT_OUTCOMES: readonly ["received", "signature-rejected", "duplicate", "normalized", "terminal-pruned", "no-route", "routed", "dedup-suppressed", "bag-added", "delivered", "queued", "delivery-failed", "session-ended", "stale-resignaled"];
+export declare const OPERATIONAL_EVENT_OUTCOMES: readonly ["received", "signature-rejected", "duplicate", "normalized", "terminal-pruned", "no-route", "routed", "dedup-suppressed", "bag-added", "delivered", "dispatch-accepted", "queued", "delivery-failed", "session-ended", "stale-resignaled", "startup-replayed", "startup-pruned"];
 export type OperationalEventOutcome = typeof OPERATIONAL_EVENT_OUTCOMES[number];
 export interface OperationalEventInput {
     outcome: OperationalEventOutcome;
@@ -37,8 +37,12 @@ export interface OperationalSnapshot {
 export declare function redactOperationalDetail(detail: unknown): unknown;
 export declare class OperationalEventStore {
     private db;
+    private writeCount;
+    private readonly maxAgeDays;
+    private readonly maxRows;
     constructor(dbPath?: string);
     private migrate;
+    prune(): number;
     append(input: OperationalEventInput): number;
     query(query?: OperationalEventQuery): OperationalEvent[];
     snapshot(query: {

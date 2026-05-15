@@ -16,5 +16,14 @@ export declare function createApp(options?: CreateAppOptions): {
     bag: PendingWorkBag;
     sessionTracker: SessionTracker;
     operationalEventStore: OperationalEventStore;
+    wakeConfig: {
+        nodeBin: string;
+        hooksUrl: string | undefined;
+        hooksToken: string | undefined;
+        hooksThinking: string | undefined;
+        hooksModel: string | undefined;
+        timeoutMs: number | undefined;
+        maxRetries: number | undefined;
+    };
 };
 //# sourceMappingURL=index.d.ts.map
