@@ -13,7 +13,7 @@ import { deliverToAgent, deliverMessageToAgent, DeliveryThrottle } from "./deliv
 import { PendingWorkBag, SessionTracker, resignalPendingTickets, replayPendingBag } from "./bag/index.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { createAdminRouter } from "./admin.js";
-import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
+import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, STALE_CLASS_NAMES, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
 import { getAccessToken, getAgent } from "./agents.js";
 import type { StaleSessionDetail } from "./bag/session-tracker.js";
 import crypto from "crypto";
@@ -143,6 +143,7 @@ export function createApp(options?: CreateAppOptions) {
     diagnosticsDir: process.env.STALE_SESSION_DIAGNOSTICS_DIR,
     openclawHome: process.env.OPENCLAW_HOME,
     loopThreshold: process.env.STALE_LOOP_THRESHOLD ? parseInt(process.env.STALE_LOOP_THRESHOLD, 10) : undefined,
+    humanAssigneeLinearId: process.env.STALE_HUMAN_ASSIGNEE_LINEAR_ID,
   };
 
   /**
@@ -173,7 +174,7 @@ export function createApp(options?: CreateAppOptions) {
 
     // 5. Log classification
     log.warn(
-      `Stale session classified: ${stale.agentId} [${stale.sessionKey}] → ${snapshot.classification} (${(await import("./bag/stale-session-forensics.js")).STALE_CLASS_NAMES[snapshot.classification]})`
+      `Stale session classified: ${stale.agentId} [${stale.sessionKey}] → ${snapshot.classification} (${STALE_CLASS_NAMES[snapshot.classification]})`
     );
 
     operationalEventStore.append({
@@ -193,7 +194,7 @@ export function createApp(options?: CreateAppOptions) {
     });
 
     // 6. Recover the Linear ticket
-    const recovery = await recoverTicket(snapshot, stale.agentId);
+    const recovery = await recoverTicket(snapshot, stale.agentId, forensicsConfig);
     if (!recovery.success) {
       log.error(`Recovery failed for ${stale.sessionKey}: ${recovery.detail}`);
     }

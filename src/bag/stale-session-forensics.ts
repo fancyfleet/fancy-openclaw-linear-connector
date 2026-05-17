@@ -65,7 +65,6 @@ export interface SessionMetadata {
   lastActivityAt: number;     // ms timestamp
   timeoutMs: number;
   totalDurationMs: number;
-  idleDurationMs: number;
 }
 
 export interface ToolCallEntry {
@@ -124,6 +123,11 @@ export interface ForensicsConfig {
   openclawHome?: string;
   /** Number of tool calls without productive output to classify as C5. Default: 20 */
   loopThreshold?: number;
+  /**
+   * Linear user ID of the human owner (Matt) to assign for needs-human recovery classes
+   * (C1/C3/C5/C6/C-UNK). Falls back to STALE_HUMAN_ASSIGNEE_LINEAR_ID env var.
+   */
+  humanAssigneeLinearId?: string;
 }
 
 const DEFAULT_LOOP_THRESHOLD = 20;
@@ -288,7 +292,6 @@ export function buildSnapshot(
     lastActivityAt: now,
     timeoutMs: stale.timeoutMs,
     totalDurationMs: now - stale.startedAt,
-    idleDurationMs: now - stale.startedAt, // Approximate; last activity unknown from tracker alone
   };
 
   // Linear ticket snapshot (will be populated by fetchLinearTicketState)
@@ -714,9 +717,16 @@ export interface RecoveryResult {
  * Execute a class-specific recovery action on the Linear ticket.
  * Posts a comment and transitions the ticket state.
  */
+/**
+ * Classes that require human review — assignee=Matt, delegate cleared.
+ * C2 and C4 are tool hangs / never-started: return to Todo for re-dispatch.
+ */
+const NEEDS_HUMAN_CLASSES = new Set<StaleClass>(["C1", "C3", "C5", "C6", "C-UNK"]);
+
 export async function recoverTicket(
   snapshot: StaleSnapshot,
   agentId: string,
+  config: ForensicsConfig = {},
 ): Promise<RecoveryResult> {
   const token = getAccessToken(agentId) ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
   if (!token) {
@@ -781,15 +791,40 @@ export async function recoverTicket(
       }
     }
 
+    // Apply needs-human semantics: set assignee + clear delegate.
+    // C1/C3/C5/C6/C-UNK → assign to human owner and clear delegate (human must review).
+    // C2/C4 → clear both (connector will re-dispatch normally).
+    const needsHuman = NEEDS_HUMAN_CLASSES.has(snapshot.classification);
+    const humanId = config.humanAssigneeLinearId ?? process.env.STALE_HUMAN_ASSIGNEE_LINEAR_ID ?? null;
+    const ownershipInput: Record<string, string | null> = {
+      delegateId: null,
+      assigneeId: needsHuman ? (humanId ?? null) : null,
+    };
+    if (needsHuman && !humanId) {
+      log.warn(
+        `Recovery for ${identifier}: class=${snapshot.classification} requires human assignment ` +
+        `but STALE_HUMAN_ASSIGNEE_LINEAR_ID is not set — delegate cleared, assignee not set`,
+      );
+    }
+    await fetch("https://api.linear.app/graphql", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: authHeader },
+      body: JSON.stringify({
+        query: `mutation OwnershipUpdate($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`,
+        variables: { id: identifier, input: ownershipInput },
+      }),
+    });
+
     const className = STALE_CLASS_NAMES[snapshot.classification];
+    const ownershipTag = needsHuman ? (humanId ? "+needs-human(assignee+delegate-cleared)" : "+delegate-cleared") : "+delegate-cleared";
     log.info(
       `Recovery for ${identifier}: class=${snapshot.classification} (${className}), ` +
-      `comment posted, state ${stateTransitioned ? "transitioned to " + targetStateName : "unchanged"}`,
+      `comment posted, state ${stateTransitioned ? "transitioned to " + targetStateName : "unchanged"}, ${ownershipTag}`,
     );
 
     return {
       success: true,
-      action: `classify=${snapshot.classification} comment+${stateTransitioned ? "state(" + targetStateName + ")" : "comment-only"}`,
+      action: `classify=${snapshot.classification} comment+${stateTransitioned ? "state(" + targetStateName + ")" : "comment-only"}${ownershipTag}`,
       detail: `${className} — ${comment.slice(0, 200)}`,
     };
   } catch (err) {
