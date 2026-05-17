@@ -23,8 +23,16 @@ const log = componentLogger(createLogger(), "session-tracker");
 
 const DEFAULT_SESSION_TIMEOUT_MS = 25 * 60 * 1000; // 25 minutes
 
+export interface StaleSessionDetail {
+  agentId: string;
+  sessionKey: string;
+  startedAt: number;
+  timeoutMs: number;
+  pendingTickets: string[];
+}
+
 export type StaleSessionHandler = (
-  staleSessions: { agentId: string; pendingTickets: string[] }[],
+  staleSessions: StaleSessionDetail[],
 ) => void | Promise<void>;
 
 export class SessionTracker {
@@ -211,19 +219,26 @@ export class SessionTracker {
 
   /**
    * Clean up stale sessions that exceeded the timeout.
-   * Returns an array of { agentId, pendingTickets } for agents that lost all
-   * sessions due to staleness and had queued pending signals — the caller can
-   * re-signal them.
+   * Returns an array of StaleSessionDetail for sessions that were stale.
+   * Each entry includes the session key, start time, timeout, and any
+   * pending tickets that were queued for the agent.
    */
-  cleanupStale(): { agentId: string; pendingTickets: string[] }[] {
+  cleanupStale(): StaleSessionDetail[] {
     const now = Date.now();
-    const needsResignal: { agentId: string; pendingTickets: string[] }[] = [];
+    const staleDetails: StaleSessionDetail[] = [];
     for (const [agentId, sessions] of this.activeSessions) {
       for (const [sessionKey, startedAt] of sessions) {
         if (now - startedAt > this.sessionTimeoutMs) {
           log.warn(
             `Stale session detected for ${agentId} [${sessionKey}] (${Math.round(this.sessionTimeoutMs / 60000)}min timeout). Ending.`
           );
+          staleDetails.push({
+            agentId,
+            sessionKey,
+            startedAt,
+            timeoutMs: this.sessionTimeoutMs,
+            pendingTickets: [],
+          });
           sessions.delete(sessionKey);
         }
       }
@@ -232,10 +247,14 @@ export class SessionTracker {
         const pending = this.pendingSignals.get(agentId);
         if (pending && pending.length > 0) {
           this.pendingSignals.delete(agentId);
-          needsResignal.push({ agentId, pendingTickets: pending });
+          // Attach pending tickets to the last stale detail for this agent
+          const agentStale = staleDetails.filter((s) => s.agentId === agentId);
+          if (agentStale.length > 0) {
+            agentStale[agentStale.length - 1].pendingTickets = pending;
+          }
         }
       }
     }
-    return needsResignal;
+    return staleDetails;
   }
 }

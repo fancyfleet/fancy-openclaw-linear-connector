@@ -13,6 +13,9 @@ import { deliverToAgent, deliverMessageToAgent, DeliveryThrottle } from "./deliv
 import { PendingWorkBag, SessionTracker, resignalPendingTickets, replayPendingBag } from "./bag/index.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { createAdminRouter } from "./admin.js";
+import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
+import { getAccessToken, getAgent } from "./agents.js";
+import type { StaleSessionDetail } from "./bag/session-tracker.js";
 import crypto from "crypto";
 
 const log = componentLogger(createLogger(), "server");
@@ -136,11 +139,88 @@ export function createApp(options?: CreateAppOptions) {
     timeoutMs: process.env.NODE_ENV === "test" ? 50 : undefined,
     maxRetries: process.env.NODE_ENV === "test" ? 0 : undefined,
   };
-  const sessionTracker = new SessionTracker(undefined, async (staleSessions) => {
-    for (const stale of staleSessions) {
+  const forensicsConfig: ForensicsConfig = {
+    diagnosticsDir: process.env.STALE_SESSION_DIAGNOSTICS_DIR,
+    openclawHome: process.env.OPENCLAW_HOME,
+    loopThreshold: process.env.STALE_LOOP_THRESHOLD ? parseInt(process.env.STALE_LOOP_THRESHOLD, 10) : undefined,
+  };
+
+  /**
+   * Process a single stale session: capture forensics, classify, recover ticket.
+   */
+  async function processStaleSession(stale: StaleSessionDetail): Promise<void> {
+    log.warn(
+      `Stale session: ${stale.agentId} [${stale.sessionKey}] ` +
+      `(started ${Math.round((Date.now() - stale.startedAt) / 60_000)}min ago, timeout ${Math.round(stale.timeoutMs / 60_000)}min)`
+    );
+
+    // 1. Build forensic snapshot
+    const snapshot = buildSnapshot(stale, forensicsConfig);
+
+    // 2. Fetch current Linear ticket state for comparison
+    const linearState = await fetchLinearTicketState(stale.sessionKey, stale.agentId);
+    if (linearState) {
+      snapshot.linearTicket.stateAtTimeout = linearState.state?.name ?? null;
+      snapshot.linearTicket.commentCountAtTimeout = linearState.comments?.nodes?.length ?? 0;
+    }
+
+    // 3. Write snapshot to disk
+    const diagPath = writeSnapshot(snapshot, forensicsConfig);
+    snapshot.diagnosticPath = diagPath;
+
+    // 4. Append to digest JSONL
+    appendDigestEntry(snapshot, forensicsConfig);
+
+    // 5. Log classification
+    log.warn(
+      `Stale session classified: ${stale.agentId} [${stale.sessionKey}] → ${snapshot.classification} (${(await import("./bag/stale-session-forensics.js")).STALE_CLASS_NAMES[snapshot.classification]})`
+    );
+
+    operationalEventStore.append({
+      outcome: "stale-resignaled",
+      agent: stale.agentId,
+      key: stale.sessionKey,
+      sessionKey: stale.sessionKey,
+      deliveryMode: "stale-session-drain",
+      attemptCount: stale.pendingTickets.length,
+      detail: {
+        classification: snapshot.classification,
+        diagnosticPath: diagPath,
+        toolCallCount: snapshot.toolCallSummary.totalCalls,
+        stopReason: snapshot.lastAssistantMessage?.stopReason,
+        errorCount: snapshot.errors.length,
+      },
+    });
+
+    // 6. Recover the Linear ticket
+    const recovery = await recoverTicket(snapshot, stale.agentId);
+    if (!recovery.success) {
+      log.error(`Recovery failed for ${stale.sessionKey}: ${recovery.detail}`);
+    }
+
+    // 7. Re-signal pending tickets (if any)
+    if (stale.pendingTickets.length > 0) {
       log.info(`Stale session drain: re-signaling ${stale.agentId} for ${stale.pendingTickets.length} ticket(s)`);
       const sent = await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfig, { markActive: true });
-      operationalEventStore.append({ outcome: "stale-resignaled", agent: stale.agentId, key: stale.pendingTickets[0] ?? null, sessionKey: stale.pendingTickets[0] ?? null, deliveryMode: "stale-session-drain", attemptCount: stale.pendingTickets.length, detail: { requested: stale.pendingTickets.length, sent } });
+      operationalEventStore.append({
+        outcome: "stale-resignaled",
+        agent: stale.agentId,
+        key: stale.pendingTickets[0] ?? null,
+        sessionKey: stale.pendingTickets[0] ?? null,
+        deliveryMode: "stale-session-resignal",
+        attemptCount: stale.pendingTickets.length,
+        detail: { requested: stale.pendingTickets.length, sent },
+      });
+    }
+  }
+
+  const sessionTracker = new SessionTracker(undefined, async (staleSessions) => {
+    for (const stale of staleSessions) {
+      try {
+        await processStaleSession(stale);
+      } catch (err) {
+        log.error(`Stale session processing failed for ${stale.agentId} [${stale.sessionKey}]: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
   });
   const throttle = new DeliveryThrottle();

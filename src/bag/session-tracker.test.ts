@@ -121,9 +121,12 @@ describe("SessionTracker", () => {
     // Wait a tick for timeout to elapse
     await new Promise((r) => setTimeout(r, 10));
 
-    const needsResignal = shortTracker.cleanupStale();
-    expect(needsResignal).toHaveLength(1);
-    expect(needsResignal[0]).toEqual({ agentId: "igor", pendingTickets: ["linear-AI-300"] });
+    const staleDetails = shortTracker.cleanupStale();
+    // The stale session is returned with pending tickets attached
+    expect(staleDetails).toHaveLength(1);
+    expect(staleDetails[0].agentId).toBe("igor");
+    expect(staleDetails[0].sessionKey).toBe("linear-AI-200");
+    expect(staleDetails[0].pendingTickets).toEqual(["linear-AI-300"]);
     expect(shortTracker.isActive("igor")).toBe(false);
     shortTracker.close();
   });
@@ -136,9 +139,12 @@ describe("SessionTracker", () => {
 
     await new Promise((r) => setTimeout(r, 10));
 
-    const needsResignal = shortTracker.cleanupStale();
-    // Both sessions expired, no pending signals queued
-    expect(needsResignal).toHaveLength(0);
+    const staleDetails = shortTracker.cleanupStale();
+    // Both sessions expired, no pending signals queued — but both stale sessions are returned
+    expect(staleDetails).toHaveLength(2);
+    expect(staleDetails.map((s) => s.sessionKey).sort()).toEqual(["linear-AI-200", "linear-AI-201"]);
+    expect(staleDetails[0].pendingTickets).toEqual([]);
+    expect(staleDetails[1].pendingTickets).toEqual([]);
     expect(shortTracker.isActive("igor")).toBe(false);
     shortTracker.close();
   });
@@ -157,8 +163,11 @@ describe("SessionTracker", () => {
 
     await new Promise((r) => setTimeout(r, 10));
 
-    const needsResignal = shortTracker.cleanupStale();
-    expect(needsResignal).toHaveLength(0);
+    const staleDetails = shortTracker.cleanupStale();
+    // Stale session returned, but no pending tickets
+    expect(staleDetails).toHaveLength(1);
+    expect(staleDetails[0].agentId).toBe("igor");
+    expect(staleDetails[0].pendingTickets).toEqual([]);
     expect(shortTracker.isActive("igor")).toBe(false);
     shortTracker.close();
   });

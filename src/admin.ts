@@ -7,6 +7,7 @@ import type { SessionTracker } from "./bag/index.js";
 import type { RouteResult } from "./types.js";
 import type { LinearEvent } from "./webhook/schema.js";
 import type { OperationalEventStore, OperationalEventOutcome } from "./store/operational-event-store.js";
+import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forensics.js";
 
 interface AdminDeps {
   agentQueue: AgentQueue;
@@ -472,6 +473,16 @@ export function createAdminRouter(deps: AdminDeps): Router {
   });
   router.get("/api/tasks/:key/events", (req: Request, res: Response) => {
     res.json(deps.operationalEventStore?.snapshot({ key: req.params.key }) ?? { key: req.params.key, lifecycle: [] });
+  });
+  router.get("/api/stale-digest", (_req: Request, res: Response) => {
+    const daysBack = typeof _req.query.days === "string" ? Number.parseInt(_req.query.days, 10) : 7;
+    const summary = aggregateDigest(undefined, daysBack);
+    res.json(summary);
+  });
+  router.get("/api/stale-digest/text", (_req: Request, res: Response) => {
+    const daysBack = typeof _req.query.days === "string" ? Number.parseInt(_req.query.days, 10) : 7;
+    const summary = aggregateDigest(undefined, daysBack);
+    res.type("text/plain").send(formatDigestSummary(summary));
   });
   router.get(["/", "/agents", "/tasks", "/settings"], (req: Request, res: Response) => {
     const segment = req.path.split("/").filter(Boolean)[0];
