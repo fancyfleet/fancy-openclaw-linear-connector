@@ -233,6 +233,17 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
                 timeoutMs: process.env.NODE_ENV === "test" ? 50 : undefined,
                 maxRetries: process.env.NODE_ENV === "test" ? 0 : undefined,
             };
+            // Per-agent override: prefer the agent's own hooksUrl/hooksToken from
+            // agents.json so dispatches reach the right gateway/container instead of
+            // always hitting OPENCLAW_HOOKS_URL (which may belong to a different fleet).
+            const wakeConfigForAgent = (agentIdLookup) => {
+                const cfg = getAgent(agentIdLookup);
+                return {
+                    ...wakeConfig,
+                    hooksUrl: cfg?.hooksUrl ?? wakeConfig.hooksUrl,
+                    hooksToken: cfg?.hooksToken ?? wakeConfig.hooksToken,
+                };
+            };
             // Before honoring in-memory active-session locks, synchronously expire
             // stale sessions. The interval-based cleanup is only a backstop; webhook
             // traffic should not wait up to another minute behind an already-expired
@@ -240,7 +251,7 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
             const staleSessions = sessionTracker.cleanupStale();
             for (const stale of staleSessions) {
                 log.info(`Webhook stale-session drain: re-signaling ${stale.agentId} for ${stale.pendingTickets.length} ticket(s)`);
-                await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfig, { markActive: true, onDispatched });
+                await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfigForAgent(stale.agentId), { markActive: true, onDispatched });
             }
             if (sessionTracker.isActiveForTicket(agentName, normalizedTicketId)) {
                 // Same ticket already has an active session: deliver directly into it.
@@ -252,7 +263,7 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
                         await throttle.wait(route.agentId);
                         throttle.record(route.agentId);
                     }
-                    const sameTicketResult = await deliverToAgent(route, wakeConfig);
+                    const sameTicketResult = await deliverToAgent(route, wakeConfigForAgent(route.agentId));
                     bag.removeTicket(agentName, normalizedTicketId);
                     appendOperationalEvent(operationalEventStore, {
                         outcome: sameTicketResult.runId ? "dispatch-accepted" : "delivered",
@@ -273,7 +284,7 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
             const pending = bag.getPendingTickets(agentName);
             const pendingIds = pending.map((e) => e.ticketId);
             log.info(`Bag: sending wake-up signal(s) to ${agentName} with ${pendingIds.length} ticket(s)`);
-            const dispatchResults = await resignalPendingTickets(agentName, pendingIds, bag, sessionTracker, wakeConfig, { markActive: true, onDispatched });
+            const dispatchResults = await resignalPendingTickets(agentName, pendingIds, bag, sessionTracker, wakeConfigForAgent(agentName), { markActive: true, onDispatched });
             const dispatched = dispatchResults.filter(r => r.dispatched).length;
             const firstRunId = dispatchResults.find(r => r.runId)?.runId ?? null;
             appendOperationalEvent(operationalEventStore, {
