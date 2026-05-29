@@ -1,4 +1,6 @@
-import { classify, type ToolCallSummary, type LastAssistantMessage, STALE_CLASS_NAMES, buildSnapshot, writeSnapshot, aggregateDigest, formatDigestSummary } from "./stale-session-forensics.js";
+import { jest } from "@jest/globals";
+import { classify, buildRecoveryComment, type ToolCallSummary, type LastAssistantMessage, type StaleSnapshot, STALE_CLASS_NAMES, buildSnapshot, writeSnapshot, aggregateDigest, formatDigestSummary, recoverTicket } from "./stale-session-forensics.js";
+import { StaleRedispatchCounter } from "./stale-redispatch-counter.js";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -218,5 +220,277 @@ describe("aggregateDigest", () => {
     expect(text).toContain("C3");
     expect(text).toContain("50%"); // 2/4 = 50%
     expect(text).toContain("igor: 3");
+  });
+});
+
+// ── StaleRedispatchCounter ─────────────────────────────────────────────────
+
+describe("StaleRedispatchCounter", () => {
+  let dbPath: string;
+  let counter: StaleRedispatchCounter;
+
+  beforeEach(() => {
+    dbPath = `/tmp/stale-redispatch-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+    counter = new StaleRedispatchCounter(dbPath);
+  });
+
+  afterEach(() => {
+    counter.close();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+    try { fs.unlinkSync(dbPath + "-wal"); } catch { /* ignore */ }
+    try { fs.unlinkSync(dbPath + "-shm"); } catch { /* ignore */ }
+  });
+
+  test("get returns 0 for unknown ticket", () => {
+    expect(counter.get("linear-AI-9999")).toBe(0);
+  });
+
+  test("incrementAndGet returns 1 on first call", () => {
+    expect(counter.incrementAndGet("linear-AI-1001")).toBe(1);
+  });
+
+  test("incrementAndGet increments on each call", () => {
+    expect(counter.incrementAndGet("linear-AI-1002")).toBe(1);
+    expect(counter.incrementAndGet("linear-AI-1002")).toBe(2);
+    expect(counter.incrementAndGet("linear-AI-1002")).toBe(3);
+  });
+
+  test("get returns current count after increments", () => {
+    counter.incrementAndGet("linear-AI-1003");
+    counter.incrementAndGet("linear-AI-1003");
+    expect(counter.get("linear-AI-1003")).toBe(2);
+  });
+
+  test("reset removes entry, get returns 0 afterwards", () => {
+    counter.incrementAndGet("linear-AI-1004");
+    counter.incrementAndGet("linear-AI-1004");
+    counter.reset("linear-AI-1004");
+    expect(counter.get("linear-AI-1004")).toBe(0);
+  });
+
+  test("tracks separate counts per ticket", () => {
+    counter.incrementAndGet("linear-AI-A");
+    counter.incrementAndGet("linear-AI-A");
+    counter.incrementAndGet("linear-AI-B");
+    expect(counter.get("linear-AI-A")).toBe(2);
+    expect(counter.get("linear-AI-B")).toBe(1);
+  });
+});
+
+// ── buildRecoveryComment — attempt parameter ───────────────────────────────
+
+function makeSnapshot(cls: StaleSnapshot["classification"]): StaleSnapshot {
+  return {
+    capturedAt: new Date().toISOString(),
+    metadata: {
+      agentId: "igor",
+      ticketId: "linear-AI-1044",
+      sessionKey: "agent:igor:linear-AI-1044",
+      sessionFile: null,
+      sessionStartedAt: Date.now() - 30 * 60 * 1000,
+      lastActivityAt: Date.now(),
+      timeoutMs: 25 * 60 * 1000,
+      totalDurationMs: 30 * 60 * 1000,
+    },
+    lastAssistantMessage: null,
+    lastToolCall: { name: "exec", arguments: { command: "npm test" }, result: "no-result", timestamp: new Date().toISOString() },
+    toolCallSummary: { byName: { exec: 1 }, totalCalls: 1, last10: [] },
+    linearTicket: { identifier: "AI-1044", stateAtStart: null, stateAtTimeout: null, lastCommentAtStart: null, lastCommentAtTimeout: null, commentCountAtStart: null, commentCountAtTimeout: null },
+    classification: cls,
+    errors: [],
+    diagnosticPath: "",
+  };
+}
+
+describe("buildRecoveryComment — C2 attempt tracking", () => {
+  test("no attempt param: includes standard re-dispatch text, no attempt line", () => {
+    const comment = buildRecoveryComment(makeSnapshot("C2"));
+    expect(comment).toContain("Ticket returned to Todo for re-dispatch.");
+    expect(comment).not.toContain("Re-dispatch attempt");
+  });
+
+  test("below cap (attempt 1 of 3): appends attempt count", () => {
+    const comment = buildRecoveryComment(makeSnapshot("C2"), 1, 3);
+    expect(comment).toContain("Ticket returned to Todo for re-dispatch.");
+    expect(comment).toContain("Re-dispatch attempt **1 of 3**.");
+  });
+
+  test("below cap (attempt 2 of 3): appends correct count", () => {
+    const comment = buildRecoveryComment(makeSnapshot("C2"), 2, 3);
+    expect(comment).toContain("Re-dispatch attempt **2 of 3**.");
+    expect(comment).not.toContain("Max re-dispatch attempts reached");
+  });
+
+  test("at cap (attempt 3 of 3): shows escalation text, not re-dispatch", () => {
+    const comment = buildRecoveryComment(makeSnapshot("C2"), 3, 3);
+    expect(comment).toContain("Max re-dispatch attempts reached (**3/3**). Escalating to human review.");
+    expect(comment).not.toContain("Ticket returned to Todo for re-dispatch.");
+  });
+});
+
+describe("buildRecoveryComment — C4 attempt tracking", () => {
+  test("below cap: appends attempt count", () => {
+    const comment = buildRecoveryComment(makeSnapshot("C4"), 1, 3);
+    expect(comment).toContain("Ticket returned to Todo for re-dispatch.");
+    expect(comment).toContain("Re-dispatch attempt **1 of 3**.");
+  });
+
+  test("at cap: shows escalation text", () => {
+    const comment = buildRecoveryComment(makeSnapshot("C4"), 3, 3);
+    expect(comment).toContain("Max re-dispatch attempts reached (**3/3**). Escalating to human review.");
+    expect(comment).not.toContain("Ticket returned to Todo for re-dispatch.");
+  });
+});
+
+// ── recoverTicket — redispatch cap integration ─────────────────────────────
+
+function makeFetchMock() {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return jest.fn<(...args: Parameters<typeof fetch>) => Promise<any>>().mockImplementation(async (_url: unknown, opts?: unknown) => {
+    const reqOpts = opts as RequestInit | undefined;
+    const body = reqOpts?.body ? JSON.parse(reqOpts.body as string) : {};
+    const query: string = body.query ?? "";
+
+    if (query.includes("IssueWithTeam")) {
+      return { ok: true, json: async () => ({ data: { issue: { id: "issue-123", team: { id: "team-456" } } } }) };
+    }
+    if (query.includes("TeamStates") || query.includes("workflow")) {
+      return { ok: true, json: async () => ({ data: { team: { workflow: { states: [{ id: "state-todo", name: "Todo", type: "unstarted" }] } } } }) };
+    }
+    if (query.includes("commentCreate")) {
+      return { ok: true, json: async () => ({ data: { commentCreate: { comment: { id: "comment-1" } } } }) };
+    }
+    if (query.includes("issueUpdate")) {
+      return { ok: true, json: async () => ({ data: { issueUpdate: { success: true, issue: { id: "issue-123", state: { name: "Todo" } } } } }) };
+    }
+    if (query.includes("OwnershipUpdate")) {
+      return { ok: true, json: async () => ({ data: { issueUpdate: { success: true } } }) };
+    }
+    return { ok: true, json: async () => ({}) };
+  });
+}
+
+describe("recoverTicket — C2/C4 redispatch cap", () => {
+  let dbPath: string;
+
+  beforeEach(() => {
+    dbPath = `/tmp/stale-redispatch-recover-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+    process.env.LINEAR_API_KEY = "test-key";
+  });
+
+  afterEach(() => {
+    // restore fetch if needed
+    delete process.env.LINEAR_API_KEY;
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+    try { fs.unlinkSync(dbPath + "-wal"); } catch { /* ignore */ }
+    try { fs.unlinkSync(dbPath + "-shm"); } catch { /* ignore */ }
+  });
+
+  test("C2 below cap: re-dispatches normally, increments counter", async () => {
+    global.fetch = makeFetchMock() as unknown as typeof fetch;
+
+    const snapshot = makeSnapshot("C2");
+    const result = await recoverTicket(snapshot, "igor", {
+      redispatchDbPath: dbPath,
+      maxRedispatchAttempts: 3,
+    });
+
+    expect(result.success).toBe(true);
+
+    const counter = new StaleRedispatchCounter(dbPath);
+    expect(counter.get("linear-AI-1044")).toBe(1);
+    counter.close();
+
+    const fetchMock = global.fetch as ReturnType<typeof jest.fn>;
+    const commentCall = (fetchMock.mock.calls as Array<[string, RequestInit]>).find(([, opts]) => {
+      const b = JSON.parse((opts?.body ?? "{}") as string);
+      return b.query?.includes("commentCreate");
+    });
+    expect(commentCall).toBeDefined();
+    const commentBody = JSON.parse((commentCall![1].body ?? "{}") as string);
+    expect(commentBody.variables.body).toContain("Re-dispatch attempt **1 of 3**.");
+    expect(commentBody.variables.body).toContain("Ticket returned to Todo for re-dispatch.");
+  });
+
+  test("C2 at cap: converts to needs-human semantics, correct comment", async () => {
+    const setupCounter = new StaleRedispatchCounter(dbPath);
+    setupCounter.incrementAndGet("linear-AI-1044");
+    setupCounter.incrementAndGet("linear-AI-1044");
+    setupCounter.close();
+
+    global.fetch = makeFetchMock() as unknown as typeof fetch;
+
+    const snapshot = makeSnapshot("C2");
+    const result = await recoverTicket(snapshot, "igor", {
+      redispatchDbPath: dbPath,
+      maxRedispatchAttempts: 3,
+      humanAssigneeLinearId: "human-linear-id",
+    });
+
+    expect(result.success).toBe(true);
+
+    const fetchMock = global.fetch as ReturnType<typeof jest.fn>;
+    const commentCall = (fetchMock.mock.calls as Array<[string, RequestInit]>).find(([, opts]) => {
+      const b = JSON.parse((opts?.body ?? "{}") as string);
+      return b.query?.includes("commentCreate");
+    });
+    expect(commentCall).toBeDefined();
+    const commentBody = JSON.parse((commentCall![1].body ?? "{}") as string);
+    expect(commentBody.variables.body).toContain("Max re-dispatch attempts reached (**3/3**). Escalating to human review.");
+    expect(commentBody.variables.body).not.toContain("Ticket returned to Todo for re-dispatch.");
+
+    const ownershipCall = (fetchMock.mock.calls as Array<[string, RequestInit]>).find(([, opts]) => {
+      const b = JSON.parse((opts?.body ?? "{}") as string);
+      return b.query?.includes("OwnershipUpdate");
+    });
+    expect(ownershipCall).toBeDefined();
+    const ownershipBody = JSON.parse((ownershipCall![1].body ?? "{}") as string);
+    expect(ownershipBody.variables.input.assigneeId).toBe("human-linear-id");
+  });
+
+  test("C4 below cap: re-dispatches normally with attempt count", async () => {
+    global.fetch = makeFetchMock() as unknown as typeof fetch;
+
+    const snapshot = makeSnapshot("C4");
+    const result = await recoverTicket(snapshot, "igor", {
+      redispatchDbPath: dbPath,
+      maxRedispatchAttempts: 3,
+    });
+
+    expect(result.success).toBe(true);
+
+    const fetchMock = global.fetch as ReturnType<typeof jest.fn>;
+    const commentCall = (fetchMock.mock.calls as Array<[string, RequestInit]>).find(([, opts]) => {
+      const b = JSON.parse((opts?.body ?? "{}") as string);
+      return b.query?.includes("commentCreate");
+    });
+    const commentBody = JSON.parse((commentCall![1].body ?? "{}") as string);
+    expect(commentBody.variables.body).toContain("Re-dispatch attempt **1 of 3**.");
+  });
+
+  test("C4 at cap: escalates to human", async () => {
+    const setupCounter = new StaleRedispatchCounter(dbPath);
+    setupCounter.incrementAndGet("linear-AI-1044");
+    setupCounter.incrementAndGet("linear-AI-1044");
+    setupCounter.close();
+
+    global.fetch = makeFetchMock() as unknown as typeof fetch;
+
+    const snapshot = makeSnapshot("C4");
+    const result = await recoverTicket(snapshot, "igor", {
+      redispatchDbPath: dbPath,
+      maxRedispatchAttempts: 3,
+      humanAssigneeLinearId: "human-linear-id",
+    });
+
+    expect(result.success).toBe(true);
+
+    const fetchMock = global.fetch as ReturnType<typeof jest.fn>;
+    const commentCall = (fetchMock.mock.calls as Array<[string, RequestInit]>).find(([, opts]) => {
+      const b = JSON.parse((opts?.body ?? "{}") as string);
+      return b.query?.includes("commentCreate");
+    });
+    const commentBody = JSON.parse((commentCall![1].body ?? "{}") as string);
+    expect(commentBody.variables.body).toContain("Max re-dispatch attempts reached (**3/3**). Escalating to human review.");
   });
 });

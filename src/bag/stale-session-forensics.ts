@@ -18,6 +18,7 @@ import os from "node:os";
 import { createLogger, componentLogger } from "../logger.js";
 import { getAccessToken, getAgent, getOpenclawAgentName } from "../agents.js";
 import { normalizeSessionKey } from "../session-key.js";
+import { StaleRedispatchCounter } from "./stale-redispatch-counter.js";
 
 const log = componentLogger(createLogger(), "stale-forensics");
 
@@ -128,6 +129,10 @@ export interface ForensicsConfig {
    * (C1/C3/C5/C6/C-UNK). Falls back to STALE_HUMAN_ASSIGNEE_LINEAR_ID env var.
    */
   humanAssigneeLinearId?: string;
+  /** Path to SQLite file for tracking C2/C4 re-dispatch attempt counts. Default: data/stale-redispatch-attempts.db */
+  redispatchDbPath?: string;
+  /** Max C2/C4 re-dispatch attempts before escalating to human. Default: 3 (STALE_REDISPATCH_MAX_ATTEMPTS env) */
+  maxRedispatchAttempts?: number;
 }
 
 const DEFAULT_LOOP_THRESHOLD = 20;
@@ -736,8 +741,21 @@ export async function recoverTicket(
   const identifier = snapshot.metadata.ticketId.replace(/^linear-/, "");
   const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
 
+  // For C2/C4: track re-dispatch attempts and cap if necessary
+  let redispatchAttempt: number | undefined;
+  let redispatchMax: number | undefined;
+  let isRedispatchCapped = false;
+
+  if (snapshot.classification === "C2" || snapshot.classification === "C4") {
+    redispatchMax = config.maxRedispatchAttempts ?? parseEnvInt("STALE_REDISPATCH_MAX_ATTEMPTS", 3);
+    const counter = new StaleRedispatchCounter(config.redispatchDbPath);
+    redispatchAttempt = counter.incrementAndGet(snapshot.metadata.ticketId);
+    counter.close();
+    isRedispatchCapped = redispatchAttempt >= redispatchMax;
+  }
+
   // Build comment based on classification
-  const comment = buildRecoveryComment(snapshot);
+  const comment = buildRecoveryComment(snapshot, redispatchAttempt, redispatchMax);
 
   // Determine target state name based on classification
   const targetStateName = getRecoveryTargetStateName(snapshot.classification);
@@ -793,8 +811,8 @@ export async function recoverTicket(
 
     // Apply needs-human semantics: set assignee + clear delegate.
     // C1/C3/C5/C6/C-UNK → assign to human owner and clear delegate (human must review).
-    // C2/C4 → clear both (connector will re-dispatch normally).
-    const needsHuman = NEEDS_HUMAN_CLASSES.has(snapshot.classification);
+    // C2/C4 → clear both (connector will re-dispatch normally), unless cap is breached.
+    const needsHuman = NEEDS_HUMAN_CLASSES.has(snapshot.classification) || isRedispatchCapped;
     const humanId = config.humanAssigneeLinearId ?? process.env.STALE_HUMAN_ASSIGNEE_LINEAR_ID ?? null;
     const ownershipInput: Record<string, string | null> = {
       delegateId: null,
@@ -838,8 +856,9 @@ export async function recoverTicket(
 
 /**
  * Build a human-readable recovery comment for the Linear ticket based on classification.
+ * For C2/C4, pass attempt (1-based current count) and maxAttempts to include retry info.
  */
-function buildRecoveryComment(snapshot: StaleSnapshot): string {
+export function buildRecoveryComment(snapshot: StaleSnapshot, attempt?: number, maxAttempts?: number): string {
   const cls = snapshot.classification;
   const className = STALE_CLASS_NAMES[cls];
   const duration = Math.round(snapshot.metadata.totalDurationMs / 60_000);
@@ -852,12 +871,26 @@ function buildRecoveryComment(snapshot: StaleSnapshot): string {
         `Last assistant message ended with a question:\n> ${(snapshot.lastAssistantMessage?.fullText ?? "").slice(0, 300)}\n\n` +
         `Ticket returned for human review.${diagPath ? `\n\n📝 Diagnostics: \`${diagPath}\`` : ""}`;
 
-    case "C2":
-      return `🔴 **Stale session recovered** — class **${cls}** (${className})\n\n` +
+    case "C2": {
+      const isCapped = attempt !== undefined && maxAttempts !== undefined && attempt >= maxAttempts;
+      const base = `🔴 **Stale session recovered** — class **${cls}** (${className})\n\n` +
         `Session timed out after ${duration} minutes. The agent was waiting for a tool response that never arrived.\n\n` +
         `Last tool call: \`${snapshot.lastToolCall?.name ?? "unknown"}\`` +
         (snapshot.lastToolCall?.arguments ? `\nArguments: ${JSON.stringify(snapshot.lastToolCall.arguments).slice(0, 200)}` : "") +
-        `\n\nTicket returned to Todo for re-dispatch.${diagPath ? `\n\n📝 Diagnostics: \`${diagPath}\`` : ""}`;
+        `\n\n`;
+      if (isCapped) {
+        return base +
+          `Max re-dispatch attempts reached (**${attempt}/${maxAttempts}**). Escalating to human review.` +
+          (diagPath ? `\n\n📝 Diagnostics: \`${diagPath}\`` : "");
+      }
+      const attemptSuffix = attempt !== undefined && maxAttempts !== undefined
+        ? `\n\nRe-dispatch attempt **${attempt} of ${maxAttempts}**.`
+        : "";
+      return base +
+        `Ticket returned to Todo for re-dispatch.` +
+        (diagPath ? `\n\n📝 Diagnostics: \`${diagPath}\`` : "") +
+        attemptSuffix;
+    }
 
     case "C3":
       return `🔴 **Stale session recovered** — class **${cls}** (${className})\n\n` +
@@ -865,10 +898,23 @@ function buildRecoveryComment(snapshot: StaleSnapshot): string {
         `Last assistant message:\n> ${(snapshot.lastAssistantMessage?.fullText ?? "").slice(0, 500)}\n\n` +
         `Please review and confirm completion or re-route.${diagPath ? `\n\n📝 Diagnostics: \`${diagPath}\`` : ""}`;
 
-    case "C4":
-      return `🔴 **Stale session recovered** — class **${cls}** (${className})\n\n` +
-        `Session timed out after ${duration} minutes. The agent session was spawned but produced no output.\n\n` +
-        `Ticket returned to Todo for re-dispatch.${diagPath ? `\n\n📝 Diagnostics: \`${diagPath}\`` : ""}`;
+    case "C4": {
+      const isCapped = attempt !== undefined && maxAttempts !== undefined && attempt >= maxAttempts;
+      const base = `🔴 **Stale session recovered** — class **${cls}** (${className})\n\n` +
+        `Session timed out after ${duration} minutes. The agent session was spawned but produced no output.\n\n`;
+      if (isCapped) {
+        return base +
+          `Max re-dispatch attempts reached (**${attempt}/${maxAttempts}**). Escalating to human review.` +
+          (diagPath ? `\n\n📝 Diagnostics: \`${diagPath}\`` : "");
+      }
+      const attemptSuffix = attempt !== undefined && maxAttempts !== undefined
+        ? `\n\nRe-dispatch attempt **${attempt} of ${maxAttempts}**.`
+        : "";
+      return base +
+        `Ticket returned to Todo for re-dispatch.` +
+        (diagPath ? `\n\n📝 Diagnostics: \`${diagPath}\`` : "") +
+        attemptSuffix;
+    }
 
     case "C5":
       return `🔴 **Stale session recovered** — class **${cls}** (${className})\n\n` +
