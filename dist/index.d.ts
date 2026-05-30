@@ -1,7 +1,8 @@
 import 'dotenv/config';
 import { OperationalEventStore } from "./store/operational-event-store.js";
+import { ManagingStateStore } from "./store/managing-state-store.js";
 import { AgentQueue } from "./queue/index.js";
-import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector } from "./bag/index.js";
+import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, ManagingPoller } from "./bag/index.js";
 export interface CreateAppOptions {
     /** Override PendingWorkBag database path (for testing). */
     bagDbPath?: string;
@@ -9,6 +10,8 @@ export interface CreateAppOptions {
     agentQueueDbPath?: string;
     /** Override OperationalEventStore database path (for testing). */
     operationalEventsDbPath?: string;
+    /** Override ManagingStateStore database path (for testing). */
+    managingStateDbPath?: string;
 }
 export declare function createApp(options?: CreateAppOptions): {
     app: import("express-serve-static-core").Express;
@@ -28,5 +31,7 @@ export declare function createApp(options?: CreateAppOptions): {
     ackTracker: DispatchAckTracker;
     watchdog: DispatchWatchdog;
     noActivityDetector: NoActivityDetector;
+    managingPoller: ManagingPoller;
+    managingStateStore: ManagingStateStore;
 };
 //# sourceMappingURL=index.d.ts.map

@@ -8,3 +8,4 @@ export { replayPendingBag, type StartupReplayOptions, type StartupReplayResult }
 export { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, aggregateDigest, formatDigestSummary, classify, type StaleSnapshot, type ForensicsConfig, type DigestSummary, STALE_CLASS_NAMES } from "./stale-session-forensics.js";
 export { ManagingPoller, parseManagingInterval, isDue, type ManagingPollerConfig, type ManagingPollerDeps, type PollerCycleResult, type LinearManagingIssue } from "./managing-poller.js";
 export { buildManagingWakeMessage, sendManagingWakeSignal, type ManagingWakeTicket } from "./managing-wake.js";
+//# sourceMappingURL=index.d.ts.map
