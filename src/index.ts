@@ -8,9 +8,10 @@ import { handleOAuthCallback } from "./oauth-callback.js";
 import { EventStore } from "./store/event-store.js";
 import { NudgeStore } from "./store/nudge-store.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
+import { ManagingStateStore } from "./store/managing-state-store.js";
 import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent, deliverMessageToAgent, DeliveryThrottle } from "./delivery/index.js";
-import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, resignalPendingTickets, replayPendingBag } from "./bag/index.js";
+import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, resignalPendingTickets, replayPendingBag, ManagingPoller } from "./bag/index.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { createAdminRouter } from "./admin.js";
 import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, STALE_CLASS_NAMES, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
@@ -89,6 +90,8 @@ export interface CreateAppOptions {
   agentQueueDbPath?: string;
   /** Override OperationalEventStore database path (for testing). */
   operationalEventsDbPath?: string;
+  /** Override ManagingStateStore database path (for testing). */
+  managingStateDbPath?: string;
 }
 
 export function createApp(options?: CreateAppOptions) {
@@ -283,6 +286,20 @@ export function createApp(options?: CreateAppOptions) {
   );
   noActivityDetector.start();
 
+  // ── Managing-state stewardship poller ────────────────────────────────
+  // Wakes agents on a cadence to review Managing-state tickets (parent /
+  // externally-blocked work the agent has claimed responsibility for but
+  // can't push forward right now). Per-ticket interval is set via a
+  // `Managing-interval: <duration>` marker in the issue description;
+  // default is 30 minutes.
+  const managingStateStore = new ManagingStateStore(options?.managingStateDbPath);
+  const managingPoller = new ManagingPoller({
+    store: managingStateStore,
+    operationalEventStore,
+    deliveryConfig: wakeConfig,
+  });
+  managingPoller.start();
+
   // Operator nudge endpoint — sends a short instruction into an already-active
   // agent session. Phase 1 is local/Nakazawa only; no cross-gateway routing.
   app.post("/nudge", async (req: express.Request, res: express.Response) => {
@@ -442,7 +459,7 @@ export function createApp(options?: CreateAppOptions) {
     });
   });
 
-  return { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig, ackTracker, watchdog, noActivityDetector };
+  return { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig, ackTracker, watchdog, noActivityDetector, managingPoller, managingStateStore };
 }
 
 /**
