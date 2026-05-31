@@ -15,6 +15,8 @@ describe("buildManagingWakeMessage", () => {
     expect(msg).toContain("You are managing these tickets:");
     expect(msg).toContain("- AI-1: Wire up X (last reviewed: first review)");
     expect(msg).toContain("Check subtask state");
+    expect(msg).toContain("delta-only note");
+    expect(msg).toContain("Do not restate unchanged child status");
     expect(msg).toContain("Move tickets out of Managing");
   });
 
