@@ -12,10 +12,11 @@ import { ManagingStateStore } from "./store/managing-state-store.js";
 import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent, deliverMessageToAgent, DeliveryThrottle } from "./delivery/index.js";
 import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, resignalPendingTickets, replayPendingBag, ManagingPoller } from "./bag/index.js";
+import { sendWakeUpSignal } from "./bag/wake-up.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { createAdminRouter } from "./admin.js";
 import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, STALE_CLASS_NAMES } from "./bag/stale-session-forensics.js";
-import { getAccessToken } from "./agents.js";
+import { getAccessToken, getAgent } from "./agents.js";
 import crypto from "crypto";
 import path from "path";
 const log = componentLogger(createLogger(), "server");
@@ -120,6 +121,17 @@ export function createApp(options) {
         timeoutMs: process.env.NODE_ENV === "test" ? 50 : undefined,
         maxRetries: process.env.NODE_ENV === "test" ? 0 : undefined,
     };
+    const wakeConfigForAgent = (agentIdLookup) => {
+        const cfg = getAgent(agentIdLookup);
+        return {
+            ...wakeConfig,
+            hooksUrl: cfg?.hooksUrl ?? wakeConfig.hooksUrl,
+            hooksToken: cfg?.hooksToken ?? wakeConfig.hooksToken,
+        };
+    };
+    const resignalOptions = {
+        sendWakeUp: (agentId, ticketIds) => sendWakeUpSignal(agentId, ticketIds, wakeConfigForAgent(agentId)),
+    };
     const forensicsConfig = {
         diagnosticsDir: process.env.STALE_SESSION_DIAGNOSTICS_DIR,
         openclawHome: process.env.OPENCLAW_HOME,
@@ -170,7 +182,7 @@ export function createApp(options) {
         // 7. Re-signal pending tickets (if any)
         if (stale.pendingTickets.length > 0) {
             log.info(`Stale session drain: re-signaling ${stale.agentId} for ${stale.pendingTickets.length} ticket(s)`);
-            const sent = await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfig, { markActive: true });
+            const sent = await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfigForAgent(stale.agentId), { markActive: true, ...resignalOptions });
             operationalEventStore.append({
                 outcome: "stale-resignaled",
                 agent: stale.agentId,
@@ -237,9 +249,9 @@ export function createApp(options) {
             return false;
         }
     }
-    const watchdog = new DispatchWatchdog({ bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig });
+    const watchdog = new DispatchWatchdog({ bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig, resignalOptions });
     watchdog.start();
-    const noActivityDetector = new NoActivityDetector({ sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, postLinearComment });
+    const noActivityDetector = new NoActivityDetector({ sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, resignalOptions, postLinearComment });
     noActivityDetector.start();
     // ── Managing-state stewardship poller ────────────────────────────────
     // Wakes agents on a cadence to review Managing-state tickets (parent /
@@ -414,7 +426,7 @@ export function createApp(options) {
             activeSessionDetails: activeSessions.map((agentId) => sessionTracker.getActiveSessionInfo(agentId)),
         });
     });
-    return { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig, ackTracker, watchdog, noActivityDetector, managingPoller, managingStateStore };
+    return { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, managingPoller, managingStateStore };
 }
 /**
  * Recover queue backlog left behind by prior process state. For each agent
@@ -465,7 +477,7 @@ if (isEntryPoint) {
     if (agents.length > 0) {
         startTokenRefresh();
     }
-    const { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig, ackTracker, watchdog, noActivityDetector } = createApp();
+    const { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig, resignalOptions, ackTracker, watchdog, noActivityDetector } = createApp();
     const server = app.listen(PORT, () => {
         log.info(`fancy-openclaw-linear-connector [${DEPLOYMENT_NAME}] listening on port ${PORT} (pid=${process.pid})`);
         // Recover any backlog left behind by prior process state (v1.0 queue).
@@ -474,6 +486,7 @@ if (isEntryPoint) {
         });
         // Replay persisted pending-bag work left behind by a prior process restart.
         replayPendingBag(bag, sessionTracker, wakeConfig, operationalEventStore, {
+            ...resignalOptions,
             onDispatched: (agentId, ticketId) => ackTracker.recordDispatch(agentId, ticketId),
         }).catch((err) => {
             log.error(`Startup replay failed: ${err instanceof Error ? err.message : String(err)}`);

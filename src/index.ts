@@ -12,6 +12,7 @@ import { ManagingStateStore } from "./store/managing-state-store.js";
 import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent, deliverMessageToAgent, DeliveryThrottle } from "./delivery/index.js";
 import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, resignalPendingTickets, replayPendingBag, ManagingPoller } from "./bag/index.js";
+import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { createAdminRouter } from "./admin.js";
 import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, STALE_CLASS_NAMES, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
@@ -143,6 +144,18 @@ export function createApp(options?: CreateAppOptions) {
     timeoutMs: process.env.NODE_ENV === "test" ? 50 : undefined,
     maxRetries: process.env.NODE_ENV === "test" ? 0 : undefined,
   };
+  const wakeConfigForAgent = (agentIdLookup: string): WakeUpConfig => {
+    const cfg = getAgent(agentIdLookup);
+    return {
+      ...wakeConfig,
+      hooksUrl: cfg?.hooksUrl ?? wakeConfig.hooksUrl,
+      hooksToken: cfg?.hooksToken ?? wakeConfig.hooksToken,
+    };
+  };
+  const resignalOptions = {
+    sendWakeUp: (agentId: string, ticketIds: string[]) =>
+      sendWakeUpSignal(agentId, ticketIds, wakeConfigForAgent(agentId)),
+  };
   const forensicsConfig: ForensicsConfig = {
     diagnosticsDir: process.env.STALE_SESSION_DIAGNOSTICS_DIR,
     openclawHome: process.env.OPENCLAW_HOME,
@@ -206,7 +219,7 @@ export function createApp(options?: CreateAppOptions) {
     // 7. Re-signal pending tickets (if any)
     if (stale.pendingTickets.length > 0) {
       log.info(`Stale session drain: re-signaling ${stale.agentId} for ${stale.pendingTickets.length} ticket(s)`);
-      const sent = await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfig, { markActive: true });
+      const sent = await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfigForAgent(stale.agentId), { markActive: true, ...resignalOptions });
       operationalEventStore.append({
         outcome: "stale-resignaled",
         agent: stale.agentId,
@@ -277,12 +290,12 @@ export function createApp(options?: CreateAppOptions) {
   }
 
   const watchdog = new DispatchWatchdog(
-    { bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig },
+    { bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig, resignalOptions },
   );
   watchdog.start();
 
   const noActivityDetector = new NoActivityDetector(
-    { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, postLinearComment },
+    { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, resignalOptions, postLinearComment },
   );
   noActivityDetector.start();
 
@@ -474,7 +487,7 @@ export function createApp(options?: CreateAppOptions) {
     });
   });
 
-  return { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig, ackTracker, watchdog, noActivityDetector, managingPoller, managingStateStore };
+  return { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, managingPoller, managingStateStore };
 }
 
 /**
@@ -529,7 +542,7 @@ if (isEntryPoint) {
     startTokenRefresh();
   }
 
-  const { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig, ackTracker, watchdog, noActivityDetector } = createApp();
+  const { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig, resignalOptions, ackTracker, watchdog, noActivityDetector } = createApp();
   const server = app.listen(PORT, () => {
     log.info(`fancy-openclaw-linear-connector [${DEPLOYMENT_NAME}] listening on port ${PORT} (pid=${process.pid})`);
     // Recover any backlog left behind by prior process state (v1.0 queue).
@@ -538,6 +551,7 @@ if (isEntryPoint) {
     });
     // Replay persisted pending-bag work left behind by a prior process restart.
     replayPendingBag(bag, sessionTracker, wakeConfig, operationalEventStore, {
+      ...resignalOptions,
       onDispatched: (agentId, ticketId) => ackTracker.recordDispatch(agentId, ticketId),
     }).catch((err) => {
       log.error(`Startup replay failed: ${err instanceof Error ? err.message : String(err)}`);

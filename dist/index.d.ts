@@ -3,6 +3,7 @@ import { OperationalEventStore } from "./store/operational-event-store.js";
 import { ManagingStateStore } from "./store/managing-state-store.js";
 import { AgentQueue } from "./queue/index.js";
 import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, ManagingPoller } from "./bag/index.js";
+import { type WakeUpConfig } from "./bag/wake-up.js";
 export interface CreateAppOptions {
     /** Override PendingWorkBag database path (for testing). */
     bagDbPath?: string;
@@ -27,6 +28,12 @@ export declare function createApp(options?: CreateAppOptions): {
         hooksModel: string | undefined;
         timeoutMs: number | undefined;
         maxRetries: number | undefined;
+    };
+    wakeConfigForAgent: (agentIdLookup: string) => WakeUpConfig;
+    resignalOptions: {
+        sendWakeUp: (agentId: string, ticketIds: string[]) => Promise<void | {
+            runId?: string;
+        }>;
     };
     ackTracker: DispatchAckTracker;
     watchdog: DispatchWatchdog;
