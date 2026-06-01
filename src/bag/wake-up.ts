@@ -69,6 +69,9 @@ export async function sendWakeUpSignal(
 
   try {
     const result: DeliveryResult = await deliverMessageToAgent(agentId, sessionKey, message, config);
+    if (!result.dispatched) {
+      throw new Error(result.hookErrorSummary ?? "wake-up delivery was not accepted");
+    }
     return result.runId ? { runId: result.runId } : undefined;
   } catch (err) {
     log.error(

@@ -63,6 +63,9 @@ export async function sendManagingWakeSignal(agentId, tickets, config) {
     log.info(`Managing wake → ${agentId} [${sessionKey}] bundling ${tickets.length} ticket(s): ${tickets.map((t) => t.identifier).join(", ")}`);
     try {
         const result = await deliverMessageToAgent(agentId, sessionKey, message, config);
+        if (!result.dispatched) {
+            throw new Error(result.hookErrorSummary ?? "managing wake delivery was not accepted");
+        }
         return result.runId ? { runId: result.runId } : undefined;
     }
     catch (err) {

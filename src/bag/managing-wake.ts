@@ -80,6 +80,9 @@ export async function sendManagingWakeSignal(
   );
   try {
     const result: DeliveryResult = await deliverMessageToAgent(agentId, sessionKey, message, config);
+    if (!result.dispatched) {
+      throw new Error(result.hookErrorSummary ?? "managing wake delivery was not accepted");
+    }
     return result.runId ? { runId: result.runId } : undefined;
   } catch (err) {
     log.error(
