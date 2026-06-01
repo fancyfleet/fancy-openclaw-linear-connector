@@ -66,6 +66,8 @@ function buildDelegationMessage(reason: string, identifier: string, title: strin
     `- To hand off for review, run \`linear handoff-work ${identifier} [delegate] --comment [note]\` (use an agent delegate like Charles for code, Astrid for product)`,
     `- If the ticket\u2019s acceptance criteria is met and you are NOT the implementer, run \`linear complete ${identifier} --comment [summary]\``,
     "",
+    "\uD83D\uDCDD Comment discipline: post one substantive comment \u2014 your actual findings or result. Do NOT post a comment that only restates what is already on the ticket or narrates that you have handed it back. If a dispatch wakes you and you have no new information to add, do not comment at all \u2014 just transition state (or take no action).",
+    "",
     "\u26A0\uFE0F Important: do NOT hand off to Matt Henry for review, sign-off, or closure. Route reviews to the appropriate agent (Charles for code, Astrid for product, Laren for design). Only use \`needs-human\` for genuine blockers that require human action (credentials, access, approvals you cannot obtain yourself)."
   ].join("\n");
 }
