@@ -19,6 +19,8 @@ export interface StartupReplayResult {
   replayed: number;
   pruned: number;
   skipped: number;
+  /** Tickets left in bag because routing check was uncertain (fail-open). Will be retried on next start. */
+  deferred: number;
 }
 
 /**
@@ -41,13 +43,14 @@ export async function replayPendingBag(
   const agents = bag.agentsWithPendingWork();
   if (agents.length === 0) {
     log.info("Startup replay: no pending work found.");
-    return { agents: 0, replayed: 0, pruned: 0, skipped: 0 };
+    return { agents: 0, replayed: 0, pruned: 0, skipped: 0, deferred: 0 };
   }
 
   log.info(`Startup replay: found ${agents.length} agent(s) with pending work: ${agents.join(", ")}`);
 
   let totalReplayed = 0;
   let totalPruned = 0;
+  let totalDeferred = 0;
   let skipped = 0;
 
   for (let i = 0; i < agents.length; i++) {
@@ -72,13 +75,19 @@ export async function replayPendingBag(
 
     try {
       const dispatchResults = await resignalPendingTickets(agentId, ticketIds, bag, sessionTracker, wakeConfig, {
-        markActive: true,
+        // During startup-replay, defer on fail-open: a transient Linear error should not
+        // resurrect Done tickets. Tickets stay in bag for re-check on next start.
+        // Callers can override by passing failOpenBehavior: "dispatch" in resignalOptions.
+        failOpenBehavior: "defer",
         ...resignalOptions,
+        markActive: true,
       });
       const sent = dispatchResults.filter(r => r.dispatched).length;
       const pruned = dispatchResults.filter(r => r.pruned).length;
+      const deferred = dispatchResults.filter(r => r.deferred).length;
       totalReplayed += sent;
       totalPruned += pruned;
+      totalDeferred += deferred;
 
       if (sent > 0) {
         log.info(`Startup replay: ${agentId} — replayed ${sent} ticket(s)`);
@@ -87,7 +96,7 @@ export async function replayPendingBag(
           agent: agentId,
           deliveryMode: "startup-replay",
           attemptCount: sent,
-          detail: { requested: beforeCount, sent, pruned },
+          detail: { requested: beforeCount, sent, pruned, deferred },
         });
       }
       if (pruned > 0) {
@@ -97,7 +106,17 @@ export async function replayPendingBag(
           agent: agentId,
           deliveryMode: "startup-replay",
           attemptCount: pruned,
-          detail: { requested: beforeCount, sent, pruned },
+          detail: { requested: beforeCount, sent, pruned, deferred },
+        });
+      }
+      if (deferred > 0) {
+        log.info(`Startup replay: ${agentId} — deferred ${deferred} ticket(s) due to uncertain routing check (fail-open)`);
+        operationalEventStore?.append({
+          outcome: "startup-pruned",
+          agent: agentId,
+          deliveryMode: "startup-replay",
+          attemptCount: deferred,
+          detail: { requested: beforeCount, sent, pruned, deferred, reason: "fail-open-deferred" },
         });
       }
     } catch (err) {
@@ -110,6 +129,6 @@ export async function replayPendingBag(
     }
   }
 
-  log.info(`Startup replay complete: ${totalReplayed} replayed, ${totalPruned} pruned, ${skipped} skipped.`);
-  return { agents: agents.length, replayed: totalReplayed, pruned: totalPruned, skipped };
+  log.info(`Startup replay complete: ${totalReplayed} replayed, ${totalPruned} pruned, ${totalDeferred} deferred, ${skipped} skipped.`);
+  return { agents: agents.length, replayed: totalReplayed, pruned: totalPruned, deferred: totalDeferred, skipped };
 }

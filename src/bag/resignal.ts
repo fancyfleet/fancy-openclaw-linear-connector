@@ -3,7 +3,7 @@ import { createLogger, componentLogger } from "../logger.js";
 import { sendWakeUpSignal, MENTION_TICKET_TEMPLATE, type WakeUpConfig } from "./wake-up.js";
 import { PendingWorkBag } from "./pending-work-bag.js";
 import { SessionTracker } from "./session-tracker.js";
-import { isLinearIssueActionable, isLinearIssueStillRoutedToAgent } from "../linear-actionable.js";
+import { isLinearIssueActionable, isLinearIssueStillRoutedToAgent, checkLinearIssueRouting } from "../linear-actionable.js";
 
 const log = componentLogger(createLogger(), "resignal");
 
@@ -12,6 +12,8 @@ export interface DispatchResult {
   dispatched: boolean;
   runId?: string;
   pruned?: boolean;
+  /** True when dispatch was skipped because the routing check returned fail-open and failOpenBehavior is "defer". */
+  deferred?: boolean;
 }
 
 export interface ResignalOptions {
@@ -23,6 +25,15 @@ export interface ResignalOptions {
   sendWakeUp?: (agentId: string, ticketIds: string[], config: WakeUpConfig) => Promise<{ runId?: string } | void>;
   /** Optional callback after successful dispatch — used for ack tracking. */
   onDispatched?: (agentId: string, ticketId: string) => void;
+  /**
+   * How to handle a fail-open result (transient Linear API error) during the default routing check.
+   * - "dispatch" (default): treat as actionable and dispatch — preserves fail-open protection for
+   *   live webhook events where dropping legitimate work would be worse than a spurious wake-up.
+   * - "defer": skip dispatch but leave in bag for retry on the next connector start — safe for
+   *   startup-replay where a transient error should not resurrect Done tickets.
+   * Has no effect when isTicketActionable is provided (custom override bypasses this logic).
+   */
+  failOpenBehavior?: "dispatch" | "defer";
 }
 
 /**
@@ -57,20 +68,36 @@ export async function resignalPendingTickets(
       // For everything else (or unknown/legacy rows) fall back to the delegate check,
       // which preserves the ILL-331 protection: a ticket whose delegate was cleared by
       // needs-human/complete/handoff-work is correctly pruned here.
-      const isTicketActionable =
-        options.isTicketActionable ??
-        ((tId: string, aId: string) => {
-          const storedReason = bag.getTicketRoutingReason(aId, tId);
-          const effectiveReason = (storedReason ?? "delegate") as "delegate" | "assignee" | "mention" | "body-mention";
-          return isLinearIssueStillRoutedToAgent(tId, aId, effectiveReason);
-        });
+      if (options.isTicketActionable) {
+        // Custom override provided: use it as-is (failOpenBehavior does not apply)
+        if (!(await options.isTicketActionable(ticketId, agentId))) {
+          bag.removeTicket(agentId, ticketId);
+          sessionTracker.removePendingTicket(ticketId, agentId);
+          log.info(`Pruned non-actionable pending ticket for ${agentId} [${ticketId}] before wake-up dispatch`);
+          results.push({ ticketId, dispatched: false, pruned: true });
+          continue;
+        }
+      } else {
+        // Default: use checkLinearIssueRouting for rich result so failOpenBehavior can apply
+        const storedReason = bag.getTicketRoutingReason(agentId, ticketId);
+        const effectiveReason = (storedReason ?? "delegate") as "delegate" | "assignee" | "mention" | "body-mention";
+        const routingResult = await checkLinearIssueRouting(ticketId, agentId, effectiveReason);
 
-      if (!(await isTicketActionable(ticketId, agentId))) {
-        bag.removeTicket(agentId, ticketId);
-        sessionTracker.removePendingTicket(ticketId, agentId);
-        log.info(`Pruned non-actionable pending ticket for ${agentId} [${ticketId}] before wake-up dispatch`);
-        results.push({ ticketId, dispatched: false, pruned: true });
-        continue;
+        if (!routingResult.actionable) {
+          bag.removeTicket(agentId, ticketId);
+          sessionTracker.removePendingTicket(ticketId, agentId);
+          log.info(`Pruned non-actionable pending ticket for ${agentId} [${ticketId}] before wake-up dispatch`);
+          results.push({ ticketId, dispatched: false, pruned: true });
+          continue;
+        }
+
+        if (routingResult.failOpen && options.failOpenBehavior === "defer") {
+          // Transient error during routing check: defer dispatch rather than risk waking an agent
+          // for a ticket that may be Done. Ticket stays in bag for re-check on next connector start.
+          log.info(`Deferring fail-open pending ticket for ${agentId} [${ticketId}] — routing check uncertain, will retry on next startup`);
+          results.push({ ticketId, dispatched: false, deferred: true });
+          continue;
+        }
       }
 
       // Use a mention-specific wake message so the agent knows to observe, not own.
