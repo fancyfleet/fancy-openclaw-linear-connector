@@ -1,0 +1,87 @@
+/**
+ * DispatchAckTracker — per-ticket dispatch acknowledgment state for the watchdog.
+ *
+ * Tracks every successful wake-up dispatch (agent, ticket). The watchdog queries
+ * this store to find dispatches that have not been acknowledged within a timeout
+ * window, then re-signals or escalates them.
+ *
+ * Acknowledgment sources:
+ *   - /session-end callback fires → agent ran, work was picked up
+ *   - Watchdog auto-acknowledges a ticket that disappears from the pending bag
+ *     (implies the agent pulled it via linear queue)
+ *
+ * Schema note: UNIQUE(agent_id, ticket_id) means repeated dispatches to the same
+ * agent+ticket update last_signal_at and increment attempt_count rather than
+ * creating a new row. This keeps the table small and preserves the original
+ * dispatched_at for age calculations.
+ */
+export type AckStatus = "pending" | "acknowledged" | "unconfirmed" | "escalated" | "deferred";
+export interface DispatchAckEntry {
+    id: number;
+    agentId: string;
+    ticketId: string;
+    dispatchedAt: string;
+    lastSignalAt: string;
+    ackStatus: AckStatus;
+    attemptCount: number;
+}
+export declare class DispatchAckTracker {
+    private db;
+    private ttlMs;
+    constructor(dbPath?: string, ttlMs?: number);
+    private migrate;
+    /**
+     * Record a successful dispatch for a (agent, ticket) pair.
+     *
+     * If an entry already exists and is still pending/unconfirmed, updates
+     * last_signal_at and increments attempt_count (idempotent re-signal tracking).
+     * If it was previously acknowledged, resets to pending (re-delegation case).
+     */
+    recordDispatch(agentId: string, ticketId: string): void;
+    /**
+     * Acknowledge dispatches for an agent — called when /session-end fires.
+     *
+     * If ticketId is provided, acknowledges only that specific ticket.
+     * If omitted, acknowledges all pending/unconfirmed tickets for the agent
+     * (backward-compat path: session-end without per-ticket detail).
+     *
+     * Returns the number of rows updated.
+     */
+    acknowledge(agentId: string, ticketId?: string): number;
+    /**
+     * Return dispatches that are still pending/unconfirmed and whose last_signal_at
+     * is older than timeoutMs milliseconds. The watchdog calls this each cycle.
+     *
+     * When timeoutMs <= 0, all pending/unconfirmed entries are returned immediately
+     * (useful for testing and for a "check everything now" flush).
+     */
+    getPendingTimedOut(timeoutMs: number): DispatchAckEntry[];
+    /**
+     * Update a dispatch record after a watchdog re-signal attempt.
+     * Sets status to 'unconfirmed', bumps attempt_count, resets last_signal_at.
+     */
+    markResignaled(agentId: string, ticketId: string): void;
+    /**
+     * Mark a dispatch as escalated — max re-signals exhausted, admin action required.
+     */
+    markEscalated(agentId: string, ticketId: string): void;
+    /**
+     * Mark a dispatch as deferred — agent is alive but at capacity.
+     * Does NOT increment attempt_count; this is not a retry, just a hold.
+     * The entry will be rescued when a session-end fires or by the stale-deferred sweep.
+     */
+    markDeferred(agentId: string, ticketId: string): void;
+    /**
+     * Return deferred entries whose last_signal_at is older than staleMs.
+     * Used by the no-activity detector to rescue entries that were never
+     * re-dispatched by a session-end signal.
+     */
+    getDeferredStale(staleMs: number): DispatchAckEntry[];
+    /**
+     * Prune acknowledged and escalated records older than ttlMs.
+     * Called automatically at the end of each watchdog cycle.
+     */
+    cleanup(): number;
+    close(): void;
+}
+//# sourceMappingURL=dispatch-ack-tracker.d.ts.map
