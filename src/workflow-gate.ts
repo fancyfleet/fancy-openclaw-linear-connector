@@ -62,7 +62,8 @@ interface WorkflowDef {
   version?: number;
   archetype?: string;
   entry_state?: string;
-  break_glass?: { command: string };
+  /** §4.4: break_glass.command is the x-openclaw-linear-intent value for escape. */
+  break_glass?: { command: string; to?: string; owner_role?: string };
   states: WorkflowState[];
 }
 
@@ -73,7 +74,11 @@ let _workflowCache: WorkflowDef | null = null;
 async function loadWorkflowDef(): Promise<WorkflowDef> {
   if (_workflowCache) return _workflowCache;
   const raw = await fs.readFile(WORKFLOW_DEF_PATH, "utf8");
-  _workflowCache = yaml.load(raw) as WorkflowDef;
+  const def = yaml.load(raw) as WorkflowDef;
+  if (def.break_glass && !def.break_glass.command) {
+    log.warn(`workflow-gate: break_glass block in ${WORKFLOW_DEF_PATH} has no 'command' field — falling back to hardcoded "escape". Canonicalize the YAML to add command: escape.`);
+  }
+  _workflowCache = def;
   return _workflowCache;
 }
 

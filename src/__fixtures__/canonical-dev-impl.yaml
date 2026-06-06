@@ -1,0 +1,103 @@
+# dev-impl — Archetype A workflow definition
+# design.md §13, §16.1
+# owner: steward (Astrid)
+# version history: bump `version` on any state/edge change; in-flight tickets
+#   use the version stamped at their creation time (design.md §12).
+#
+# Verbatim copy of the canonical vault file at:
+#   ai-systems/projects/fleet-orchestration-redesign/workflows/dev-impl.yaml
+# Used as a test fixture so CI can exercise the canonical schema without
+# depending on the vault being present. Keep in sync with the vault source.
+
+id: dev-impl
+version: 2
+archetype: single-task         # single-task | orchestrator | feature-initiative
+entry_state: intake
+
+break_glass:
+  command: escape               # x-openclaw-linear-intent value that triggers break-glass (§4.4)
+  to: escape
+  owner_role: steward           # implicit escape edge from EVERY state (design.md §4.4)
+
+states:
+
+  - id: intake
+    owner_role: steward
+    kind: normal
+    transitions:
+      - command: accept
+        to: ready-for-impl
+      - command: demote
+        to: __ad_hoc__          # ticket leaves the workflow entirely (design.md §4.5)
+
+  - id: ready-for-impl
+    owner_role: dev
+    kind: normal
+    transitions:
+      - command: begin
+        to: in-progress
+
+  - id: in-progress
+    owner_role: dev
+    kind: normal
+    transitions:
+      - command: submit
+        to: awaiting-review
+
+  - id: awaiting-review
+    owner_role: code-review
+    kind: normal
+    sla: 24h                    # time-in-state; breach → stall escalation (design.md §5.5)
+    transitions:
+      - command: approve
+        to: approved
+      - command: request-changes
+        to: changes-requested
+        feedback:
+          required: true
+          category_enum:
+            - missing-tests
+            - style
+            - scope-creep
+            - correctness
+            - ac-mismatch
+
+  - id: changes-requested
+    owner_role: dev
+    kind: normal
+    transitions:
+      - command: resubmit
+        to: awaiting-review
+
+  - id: approved
+    owner_role: merge-gate
+    kind: normal
+    transitions:
+      - command: merge
+        to: merged
+        requires_capability: repo:merge   # Layer A enforcement (design.md §16.2)
+      - command: reject
+        to: changes-requested
+        feedback:
+          required: true
+          category_enum:
+            - missing-tests
+            - style
+            - scope-creep
+            - correctness
+            - ac-mismatch
+
+  - id: merged
+    owner_role: steward
+    kind: normal
+    transitions:
+      - command: close
+        to: done
+
+  - id: done
+    kind: terminal
+    satisfies_parent_barrier: true   # uniform terminal contract (design.md §5.4)
+
+  - id: escape
+    kind: terminal
+    # break-glass terminal; steward decides if Matt escalation is warranted (design.md §11)

@@ -3,16 +3,24 @@
  *
  * Uses minimal in-memory YAML files injected via WORKFLOW_DEF_PATH and
  * CAPABILITY_POLICY_PATH so tests never depend on vault / project paths.
+ *
+ * Includes a suite that exercises the canonical-schema fixture
+ * (src/__fixtures__/canonical-dev-impl.yaml — verbatim copy of the vault
+ * source) to catch parser / schema drift before it reaches production.
  */
 
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   checkWorkflowRules,
   resetWorkflowCache,
 } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const CANONICAL_FIXTURE = path.resolve(__dirname, "__fixtures__/canonical-dev-impl.yaml");
 
 // ── Minimal test capability policy ────────────────────────────────────────
 // Includes repo:merge so we can test the merge capability gate.
@@ -412,5 +420,87 @@ describe("checkWorkflowRules — error message format", () => {
     const result = await checkWorkflowRules("approve", "issue-uuid", "Bearer tok", "charles");
     expect(result).toContain("submit");
     expect(result).toContain("escape");
+  });
+});
+
+// ── Canonical vault schema fixture ────────────────────────────────────────
+// These tests load the verbatim checked-in copy of the vault YAML
+// (src/__fixtures__/canonical-dev-impl.yaml) to guard against parser/schema
+// drift between the simplified test fixtures above and what actually runs in
+// production. If these fail, the canonical YAML drifted or the parser broke.
+
+describe("checkWorkflowRules — canonical vault schema (src/__fixtures__/canonical-dev-impl.yaml)", () => {
+  let originalFetch: typeof globalThis.fetch;
+  let originalPath: string | undefined;
+
+  beforeAll(() => {
+    originalPath = process.env.WORKFLOW_DEF_PATH;
+    process.env.WORKFLOW_DEF_PATH = CANONICAL_FIXTURE;
+  });
+
+  afterAll(() => {
+    if (originalPath !== undefined) {
+      process.env.WORKFLOW_DEF_PATH = originalPath;
+    } else {
+      delete process.env.WORKFLOW_DEF_PATH;
+    }
+  });
+
+  beforeEach(() => {
+    resetWorkflowCache();
+    resetPolicyCache();
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("parses the canonical YAML without error (passes for a legal command)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:in-progress"]);
+    // 'submit' is legal in in-progress; null means pass-through
+    expect(await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles")).toBeNull();
+  });
+
+  it("canonical: escape is legal from every state (§4.4)", async () => {
+    const allStates = [
+      "intake", "ready-for-impl", "in-progress", "awaiting-review",
+      "changes-requested", "approved", "merged", "done", "escape",
+    ];
+    for (const state of allStates) {
+      resetWorkflowCache();
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", `state:${state}`]);
+      const result = await checkWorkflowRules("escape", "issue-uuid", "Bearer tok", "charles");
+      expect(result).toBeNull(); // state: ${state}
+    }
+  });
+
+  it("canonical: approved state allows merge and reject (not just merge)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:approved"]);
+    // 'reject' exists in canonical but was missing from the simplified fixture
+    const result = await checkWorkflowRules("reject", "issue-uuid", "Bearer tok", "astrid");
+    // 'reject' is legal (no capability required) — should pass through
+    expect(result).toBeNull();
+  });
+
+  it("canonical: approved state blocks 'submit' (illegal), names merge and reject as legal", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:approved"]);
+    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("merge");
+    expect(result).toContain("reject");
+    expect(result).toContain("escape");
+  });
+
+  it("canonical: merge in approved state is blocked for non-merge-gate (charles)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:approved"]);
+    const result = await checkWorkflowRules("merge", "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("repo:merge");
+    expect(result).toContain("merge-gate");
+  });
+
+  it("canonical: merge in approved state is allowed for Hanzo (merge-gate body)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:approved"]);
+    expect(await checkWorkflowRules("merge", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
   });
 });
