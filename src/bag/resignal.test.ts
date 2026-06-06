@@ -131,4 +131,35 @@ describe("resignalPendingTickets", () => {
     expect(results[0].pruned).toBe(true);
     expect(sentTickets).toHaveLength(0);
   });
+
+  test("AI-1340: failOpenBehavior=defer defers ticket without removing from bag", async () => {
+    // The default checkLinearIssueRouting path: no token for unknown agent → fail-open.
+    // With failOpenBehavior=defer the ticket should NOT be dispatched and NOT be removed.
+    bag.add("unknown-agent-x", "AI-501", "Issue", "delegate");
+
+    const sentTickets: string[] = [];
+    const results = await resignalPendingTickets("unknown-agent-x", ["AI-501"], bag, sessionTracker, wakeConfig, {
+      failOpenBehavior: "defer",
+      sendWakeUp: async (_agentId, ticketIds) => { sentTickets.push(...ticketIds); },
+    });
+
+    expect(sentTickets).toHaveLength(0);
+    expect(results).toEqual([{ ticketId: "linear-AI-501", dispatched: false, deferred: true }]);
+    // Ticket must remain in bag for retry on next connector start
+    expect(bag.getPendingTickets("unknown-agent-x")).toHaveLength(1);
+  });
+
+  test("AI-1340: failOpenBehavior=dispatch (original default) dispatches on fail-open", async () => {
+    // Same scenario but failOpenBehavior="dispatch" preserves original behavior
+    bag.add("unknown-agent-y", "AI-502", "Issue", "delegate");
+
+    const sentTickets: string[] = [];
+    const results = await resignalPendingTickets("unknown-agent-y", ["AI-502"], bag, sessionTracker, wakeConfig, {
+      failOpenBehavior: "dispatch",
+      sendWakeUp: async (_agentId, ticketIds) => { sentTickets.push(...ticketIds); },
+    });
+
+    expect(sentTickets).toEqual(["linear-AI-502"]);
+    expect(results[0].dispatched).toBe(true);
+  });
 });

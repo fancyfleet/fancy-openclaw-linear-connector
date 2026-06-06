@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express, { Request, Response, NextFunction } from "express";
 import { createWebhookRouter } from "./webhook/index.js";
+import { handleProxyRequest } from "./proxy.js";
 import { startTokenRefresh } from "./token-refresh.js";
 import { getAgents, watchAgentsFile } from "./agents.js";
 import { createLogger, componentLogger } from "./logger.js";
@@ -110,6 +111,12 @@ export function createApp(options?: CreateAppOptions) {
       next();
     },
   );
+
+  // GraphQL proxy — v0 transparent pass-through (Phase 0B, design.md §4.6).
+  // Intercepts every Linear CLI call from Nakazawa agents; forwards unchanged
+  // for now. Future phases add per-step instruction injection and command
+  // validation. ILL fleet runs the main branch and is unaffected.
+  app.post("/proxy/graphql", handleProxyRequest);
 
   // Health check
   app.get("/health", (_req: Request, res: Response) => {

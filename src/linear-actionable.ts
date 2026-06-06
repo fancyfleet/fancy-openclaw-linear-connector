@@ -105,20 +105,33 @@ function linearAuthorizationHeader(token: string): string {
 }
 
 /**
- * Return false only when Linear confirms the issue is terminal or missing.
- * On auth/network/API uncertainty, keep the ticket actionable so we do not
- * silently drop legitimate work because Linear had a transient failure.
+ * Rich result from a Linear routing check.
+ * - actionable: whether the ticket should be dispatched to the agent
+ * - failOpen: true when actionable=true is due to a transient error (network/auth/API)
+ *   rather than a confirmed routing decision. Callers that want strict-mode
+ *   semantics (e.g. startup-replay) can treat failOpen=true as "defer, don't dispatch."
  */
+export interface RoutingCheckResult {
+  actionable: boolean;
+  /** True when actionable is set by fail-open (transient error) not by confirmed routing. */
+  failOpen: boolean;
+}
 
-export async function isLinearIssueStillRoutedToAgent(
+/**
+ * Core routing check. Returns a rich result distinguishing confirmed routing from fail-open.
+ * Most callers should use isLinearIssueStillRoutedToAgent for the simple boolean interface.
+ */
+export async function checkLinearIssueRouting(
   ticketId: string,
   agentId: string,
   routingReason: "delegate" | "assignee" | "mention" | "body-mention" | undefined,
-): Promise<boolean> {
-  if (routingReason === "mention" || routingReason === "body-mention") return true;
+): Promise<RoutingCheckResult> {
+  if (routingReason === "mention" || routingReason === "body-mention") {
+    return { actionable: true, failOpen: false };
+  }
 
   const token = tokenForAgent(agentId);
-  if (!token) return true;
+  if (!token) return { actionable: true, failOpen: true };
 
   const agent = getAgent(agentId);
   const identifier = issueIdentifierFromSessionKey(ticketId);
@@ -147,7 +160,7 @@ export async function isLinearIssueStillRoutedToAgent(
 
     if (!response.ok) {
       log.warn(`Linear routing check failed for ${identifier}: HTTP ${response.status}`);
-      return true;
+      return { actionable: true, failOpen: true };
     }
 
     const body = await response.json() as {
@@ -157,55 +170,66 @@ export async function isLinearIssueStillRoutedToAgent(
 
     if (body.errors?.length) {
       log.warn(`Linear routing check errored for ${identifier}: ${body.errors.map((e) => e.message).join("; ")}`);
-      return true;
+      return { actionable: true, failOpen: true };
     }
 
     const issue = body.data?.issue;
-    if (!issue) return false;
-    if (isTerminalIssueState(issue.state) || isParkedIssueState(issue.state)) return false;
+    if (!issue) return { actionable: false, failOpen: false };
+    if (isTerminalIssueState(issue.state) || isParkedIssueState(issue.state)) {
+      return { actionable: false, failOpen: false };
+    }
     if (isBlockedByOpenIssue(issue)) {
       log.info(`Dropping pending Linear ticket ${identifier}: blocked by unfinished prerequisite`);
-      return false;
+      return { actionable: false, failOpen: false };
     }
 
     if (routingReason === "delegate") {
-      // No delegate at all — ticket was handed back; drop regardless of whether we know our linearUserId
       if (!issue.delegate) {
         log.info(`Dropping stale delegate event for ${identifier}: ticket has no delegate (handed back)`);
-        return false;
+        return { actionable: false, failOpen: false };
       }
-      // We know our linearUserId — verify exact ownership
       if (agent?.linearUserId) {
         const ok = issue.delegate.id === agent.linearUserId;
         if (!ok) log.info(`Dropping stale delegate event for ${identifier}: ${agentId} is no longer delegate`);
-        return ok;
+        return { actionable: ok, failOpen: false };
       }
-      // linearUserId not configured — issue has a delegate but we can't identify which agent owns it
+      // linearUserId not configured — can't verify; allow through but not fail-open (persistent config gap)
       log.warn(`Agent ${agentId} missing linearUserId — cannot verify delegate ownership for ${identifier}; allowing through`);
-      return true;
+      return { actionable: true, failOpen: false };
     }
 
     if (routingReason === "assignee") {
-      // No assignee at all — ticket was unassigned; drop
       if (!issue.assignee) {
         log.info(`Dropping stale assignee event for ${identifier}: ticket has no assignee`);
-        return false;
+        return { actionable: false, failOpen: false };
       }
-      // We know our linearUserId — verify exact ownership
       if (agent?.linearUserId) {
         const ok = issue.assignee.id === agent.linearUserId;
         if (!ok) log.info(`Dropping stale assignee event for ${identifier}: ${agentId} is no longer assignee`);
-        return ok;
+        return { actionable: ok, failOpen: false };
       }
       log.warn(`Agent ${agentId} missing linearUserId — cannot verify assignee ownership for ${identifier}; allowing through`);
-      return true;
+      return { actionable: true, failOpen: false };
     }
 
-    return true;
+    return { actionable: true, failOpen: false };
   } catch (err) {
     log.warn(`Linear routing check failed for ${identifier}: ${err instanceof Error ? err.message : String(err)}`);
-    return true;
+    return { actionable: true, failOpen: true };
   }
+}
+
+/**
+ * Return false only when Linear confirms the issue is terminal or missing.
+ * On auth/network/API uncertainty, keep the ticket actionable so we do not
+ * silently drop legitimate work because Linear had a transient failure.
+ */
+export async function isLinearIssueStillRoutedToAgent(
+  ticketId: string,
+  agentId: string,
+  routingReason: "delegate" | "assignee" | "mention" | "body-mention" | undefined,
+): Promise<boolean> {
+  return (await checkLinearIssueRouting(ticketId, agentId, routingReason)).actionable;
 }
 
 export async function isLinearIssueActionable(ticketId: string, agentId: string): Promise<boolean> {

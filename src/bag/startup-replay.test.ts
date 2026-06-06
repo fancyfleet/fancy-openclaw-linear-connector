@@ -39,7 +39,7 @@ describe("replayPendingBag", () => {
     });
 
     expect(sentTickets).toHaveLength(0);
-    expect(result).toEqual({ agents: 0, replayed: 0, pruned: 0, skipped: 0 });
+    expect(result).toEqual({ agents: 0, replayed: 0, pruned: 0, skipped: 0, deferred: 0 });
   });
 
   test("regression: queued pending row -> process restart -> startup emits wake-up", async () => {
@@ -98,6 +98,26 @@ describe("replayPendingBag", () => {
     expect(sentTickets).toEqual(["linear-AI-101"]);
     expect(result.replayed).toBe(1);
     expect(result.pruned).toBe(1);
+  });
+
+  test("AI-1340: startup-replay defers fail-open tickets instead of dispatching", async () => {
+    // Unknown agent has no token → checkLinearIssueRouting returns fail-open.
+    // Startup-replay must NOT dispatch (preventing spurious wake-up for Done tickets)
+    // and must leave the ticket in bag for retry on next start.
+    bag.add("unknown-agent-z", "AI-501", "Issue", "delegate");
+
+    const sentTickets: string[] = [];
+    const result = await replayPendingBag(bag, sessionTracker, wakeConfig, undefined, {
+      sendWakeUp: async (_agentId, ticketIds) => { sentTickets.push(...ticketIds); },
+      interAgentDelayMs: 0,
+    });
+
+    expect(sentTickets).toHaveLength(0);
+    expect(result.replayed).toBe(0);
+    expect(result.deferred).toBe(1);
+    expect(result.pruned).toBe(0);
+    // Ticket stays in bag — will be retried on next start
+    expect(bag.getPendingTickets("unknown-agent-z")).toHaveLength(1);
   });
 
   test("replays multiple agents with pending work", async () => {
