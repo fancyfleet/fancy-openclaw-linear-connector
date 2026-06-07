@@ -1,13 +1,16 @@
 /**
  * GraphQL proxy — Phase 0B (transparent pass-through) + Phase 2 slice 1
  * (inbound command enforcement) + Phase 3 B1 (workflow-def-driven validation)
- * + Phase 3 B2 (atomic state-label transition application),
+ * + Phase 3 B2 (atomic state-label transition application)
+ * + Layer 2 raw mutation interception (AI-1387),
  * design.md §4.2, §4.6, §11, §13, §16.
  *
  * Enforcement order (defense in depth):
  *   1. Phase 2 escalation-gate — capability rule table (needs-human steward-only).
  *   2. Phase 3 B1 workflow-gate — full legal-move validation against dev-impl.yaml.
- * Both must pass for the request to be forwarded.
+ *   3. Layer 2 raw mutation interception (AI-1387) — blocks direct status/assignee
+ *      changes on workflow tickets that bypass the intent-header path.
+ * All must pass for the request to be forwarded.
  *
  * After a successful forward, Phase 3 B2 applies the state:* label transition
  * atomically (single issueUpdate mutation). Seam: proxy-side, not CLI-side — the
@@ -18,7 +21,7 @@
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules } from "./escalation-gate.js";
-import { checkWorkflowRules, applyStateTransition, type TransitionFeedback } from "./workflow-gate.js";
+import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, type TransitionFeedback } from "./workflow-gate.js";
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
@@ -121,6 +124,16 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       res.status(200).json({ errors: [{ message: p3rejection }] });
       return;
     }
+  } else {
+    // Layer 2 (AI-1387): intercept raw status/assignee mutations on workflow tickets.
+    // When no intent header is present but the mutation touches stateId or assigneeId,
+    // the agent is bypassing workflow commands — reject with the legal verb set.
+    const rawRejection = await checkRawMutationInterception(body, issueId, authorization);
+    if (rawRejection) {
+      log.warn(`raw-mutation-block agent=${agentId}${ticketCtx}: ${rawRejection}`);
+      res.status(200).json({ errors: [{ message: rawRejection }] });
+      return;
+    }
   }
 
   let upstreamRes: globalThis.Response;
@@ -169,6 +182,35 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log.warn(`state-transition failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
+    }
+
+    // Layer 1 (AI-1387): proactive legal-verb re-injection at completion.
+    // After a successful state transition, generate the legal commands for
+    // the NEW state and include in the response body so the agent sees them
+    // at the decision moment — not just at delegation time.
+    // Injected into the response JSON as `_workflowReminder` since HTTP headers
+    // cannot carry newlines.
+    let workflowReminder: string | null = null;
+    try {
+      workflowReminder = await buildStateTransitionReminder(intent, issueId, authorization);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`reminder-build failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
+    }
+
+    // If we have a reminder, inject it into the response body.
+    if (workflowReminder) {
+      try {
+        const parsedResponse = JSON.parse(responseText);
+        parsedResponse._workflowReminder = workflowReminder;
+        res
+          .status(upstreamRes.status)
+          .set("Content-Type", "application/json")
+          .send(JSON.stringify(parsedResponse));
+        return;
+      } catch {
+        // If response isn't valid JSON, fall through to send as-is.
+      }
     }
   }
 

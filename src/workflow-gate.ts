@@ -1,6 +1,7 @@
 /**
  * Phase 3 / B1 — Workflow-def-driven inbound command validation (AI-1352).
  * Phase 3 / B2 — Atomic state-label transition application (AI-1353).
+ * Layer 2 — Raw status/assignee mutation interception (AI-1387).
  *
  * B1: Generalizes the Phase 2 single-rule escalation-gate (escalation-gate.ts) into
  * a full legal-move validator driven by the workflow definition YAML. The rule
@@ -417,6 +418,179 @@ export async function checkWorkflowRules(
   }
 
   return null;
+}
+
+// ── Layer 2: Raw status/assignee mutation interception (AI-1387) ──────────
+
+/**
+ * Detect raw status/assignee mutations on workflow tickets.
+ *
+ * When an agent sends an `issueUpdate` with `stateId` or `assigneeId` in the
+ * input but WITHOUT the `x-openclaw-linear-intent` header, they're bypassing
+ * the workflow CLI commands. This function intercepts those raw mutations,
+ * resolves the ticket's current state from its labels, and returns a rejection
+ * that includes the legal verb set for that state.
+ *
+ * Returns null to allow the request through (non-workflow ticket, non-mutation,
+ * or no status/assignee fields in input). Returns a rejection string otherwise.
+ * Fail-open on any error — missing issueId, label fetch failure, etc.
+ */
+export async function checkRawMutationInterception(
+  body: { query?: string; variables?: Record<string, unknown>; operationName?: string } | null,
+  issueId: string | null,
+  authToken: string,
+): Promise<string | null> {
+  if (!body || !issueId) return null;
+
+  // Only intercept issueUpdate mutations.
+  const q = body.query ?? "";
+  if (!q.includes("issueUpdate")) return null;
+
+  // Check if the mutation input contains stateId or assigneeId.
+  const vars = body.variables ?? {};
+  const input = (vars as Record<string, unknown>).input;
+  const inputObj = input && typeof input === "object" && input !== null
+    ? input as Record<string, unknown>
+    : null;
+
+  const hasStateChange = inputObj && typeof inputObj.stateId === "string";
+  const hasAssigneeChange = inputObj && ("assigneeId" in (inputObj as object));
+
+  if (!hasStateChange && !hasAssigneeChange) return null;
+
+  // This is a raw status/assignee mutation — check if the ticket is on a workflow.
+  const labels = await fetchTicketLabels(issueId, authToken);
+  const workflowId = getWorkflowId(labels);
+  if (!workflowId) return null; // ad-hoc ticket — pass-through
+
+  let def: WorkflowDef;
+  try {
+    def = await loadWorkflowDef();
+  } catch {
+    return null; // fail-open
+  }
+
+  if (workflowId !== def.id) return null; // unknown workflow — pass-through
+
+  const breakGlassCommand = def.break_glass?.command ?? "escape";
+  const currentState = getCurrentState(labels);
+
+  if (!currentState) {
+    // No state label — can't determine legal moves, but still block with a generic message.
+    const allCommands = new Set<string>();
+    for (const s of def.states) {
+      for (const t of s.transitions ?? []) allCommands.add(t.command);
+    }
+    allCommands.add(breakGlassCommand);
+    return (
+      `[Proxy] Direct status/assignee changes are blocked on this workflow ticket. ` +
+      `Use workflow commands: ${[...allCommands].join(", ")}.`
+    );
+  }
+
+  const stateNode = def.states.find((s) => s.id === currentState);
+  if (!stateNode) return null; // unknown state — fail-open
+
+  const legalMoves = [...(stateNode.transitions ?? []).map((t) => t.command), breakGlassCommand];
+
+  // Build per-command help strings with assignment info.
+  const helpLines = await Promise.all(
+    (stateNode.transitions ?? []).map(async (t) => {
+      const { bodies, mode } = await resolveTransitionTargets(t, def);
+      let cmd = `linear ${t.command} ${issueId}`;
+      if (mode === "required") {
+        cmd += ` <${bodies.join("|")}>`;
+      }
+      return `  - \`${cmd}\` (→ ${t.to})`;
+    }),
+  );
+  helpLines.push(`  - \`linear ${breakGlassCommand} ${issueId}\` (break glass → ${def.break_glass?.to ?? "escape"}, legal from any state)`);
+
+  const changedFields: string[] = [];
+  if (hasStateChange) changedFields.push("status");
+  if (hasAssigneeChange) changedFields.push("assignee");
+
+  return (
+    `[Proxy] Direct ${changedFields.join("/")} changes are blocked on this workflow ticket ` +
+    `(state: **${currentState}**). Use workflow commands instead:\n\n` +
+    helpLines.join("\n")
+  );
+}
+
+// ── Layer 1: Proactive legal-verb re-injection at completion (AI-1387) ────
+
+/**
+ * Generate a legal-verb reminder for the NEW state after a successful transition.
+ *
+ * Layer 1 (AI-1387): re-surfaces the legal command set at the completion/decision
+ * moment, so agents don't need to rely on the stale delegation-time injection.
+ *
+ * Returns null when not applicable (ad-hoc ticket, unknown state, terminal state).
+ * Returns a formatted string with the legal commands for the NEW state.
+ * Fail-open on any error.
+ */
+export async function buildStateTransitionReminder(
+  intent: string,
+  issueId: string | null,
+  authToken: string,
+): Promise<string | null> {
+  if (!issueId) return null;
+
+  let def: WorkflowDef;
+  try {
+    def = await loadWorkflowDef();
+  } catch {
+    return null;
+  }
+
+  const breakGlassCommand = def.break_glass?.command ?? "escape";
+
+  // Determine the destination state from the intent.
+  let destStateName: string;
+  if (intent === breakGlassCommand) {
+    destStateName = def.break_glass?.to ?? "escape";
+  } else {
+    // Find which transition this intent triggers by scanning all states.
+    // We don't know the current state here, so we look for any transition
+    // matching this intent. Since commands are unique per state in dev-impl,
+    // this works. For ambiguous workflows, the label-based approach below
+    // would be needed.
+    let found = false;
+    for (const s of def.states) {
+      const t = (s.transitions ?? []).find((tr) => tr.command === intent);
+      if (t) {
+        destStateName = t.to;
+        found = true;
+        break;
+      }
+    }
+    if (!found) return null;
+  }
+
+  // destStateName is set above in both branches
+  const destState = def.states.find((s) => s.id === (destStateName as string));
+  if (!destState) return null;
+
+  // Terminal states have no transitions — no reminder needed.
+  if (destState.kind === "terminal" || !destState.transitions?.length) return null;
+
+  const transitions = destState.transitions;
+  const helpLines = await Promise.all(
+    transitions.map(async (t) => {
+      const { bodies, mode } = await resolveTransitionTargets(t, def);
+      let cmd = `linear ${t.command} ${issueId}`;
+      if (mode === "required") {
+        cmd += ` <${bodies.join("|")}>`;
+      }
+      return `  - \`${cmd}\` (→ ${t.to})`;
+    }),
+  );
+  helpLines.push(`  - \`linear ${breakGlassCommand} ${issueId}\` (break glass, legal from any state)`);
+
+  return (
+    `[Workflow] You are now in state: **${destState.id}**. Your legal action(s):\n` +
+    helpLines.join("\n")
+  );
 }
 
 // ── B2: Atomic state-label transition application ─────────────────────────

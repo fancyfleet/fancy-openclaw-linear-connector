@@ -730,3 +730,276 @@ describe("proxy enforcement — B2 state-label transition application", () => {
     expect(calls.some((c) => c.query.includes("ApplyStateTransition"))).toBe(true);
   });
 });
+
+// ── Layer 2: Raw mutation interception via proxy (AI-1387) ────────────────
+
+describe("proxy — Layer 2 raw mutation interception (AI-1387)", () => {
+  let dir: string;
+  let appState: ReturnType<typeof createApp>;
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-layer2-test-"));
+    process.env.AGENTS_FILE = writeAgents(dir);
+    process.env.CAPABILITY_POLICY_PATH = writePolicyFile(dir, TEST_POLICY_WITH_MERGE_YAML);
+    writeWorkflowFile(dir);
+    resetPolicyCache();
+    resetWorkflowCache();
+    reloadAgents();
+    appState = createApp({
+      bagDbPath: path.join(dir, "bag.db"),
+      agentQueueDbPath: path.join(dir, "queue.db"),
+      operationalEventsDbPath: path.join(dir, "events.db"),
+    });
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    appState.bag.close();
+    appState.sessionTracker.close();
+    appState.agentQueue.close();
+    appState.operationalEventStore.close();
+    appState.watchdog.stop();
+    appState.noActivityDetector.stop();
+    appState.managingPoller.stop();
+  });
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function makeFetch(labelResponse: object, mainResponse = MOCK_RESPONSE) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return async (url: any, init?: RequestInit) => {
+      if (typeof url !== "string" || !url.includes("api.linear.app")) {
+        return originalFetch(url, init);
+      }
+      const bodyText = typeof init?.body === "string" ? init.body : "";
+      const parsed = bodyText ? JSON.parse(bodyText) as { query?: string } : {};
+      if (parsed.query?.includes("IssueLabels")) {
+        return new Response(JSON.stringify(labelResponse), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify(mainResponse), {
+        status: 200, headers: { "Content-Type": "application/json" },
+      });
+    };
+  }
+
+  it("blocks a raw stateId mutation on a workflow ticket without intent header", async () => {
+    globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      // NO X-Openclaw-Linear-Intent header — raw mutation
+      .send({
+        query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+        variables: { id: "issue-uuid", input: { stateId: "state-done-uuid" } },
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("[Proxy]");
+    expect(res.body.errors[0].message).toContain("Direct status");
+    expect(res.body.errors[0].message).toContain("blocked on this workflow ticket");
+  });
+
+  it("blocks a raw assigneeId mutation on a workflow ticket without intent header", async () => {
+    globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .send({
+        query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+        variables: { id: "issue-uuid", input: { assigneeId: "user-uuid" } },
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("[Proxy]");
+    expect(res.body.errors[0].message).toContain("Direct assignee");
+  });
+
+  it("allows raw mutations on non-workflow tickets (ad-hoc §4.6)", async () => {
+    globalThis.fetch = makeFetch(NON_WORKFLOW_LABEL_RESPONSE);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .send({
+        query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+        variables: { id: "issue-uuid", input: { stateId: "state-done-uuid" } },
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+    expect(res.body.data).toBeDefined();
+  });
+
+  it("allows raw mutations without stateId/assigneeId on workflow tickets", async () => {
+    globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .send({
+        query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+        variables: { id: "issue-uuid", input: { title: "Updated title" } },
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+    expect(res.body.data).toBeDefined();
+  });
+
+  it("allows intent-headed requests through (those use B1 validation, not Layer 2)", async () => {
+    globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "submit")
+      .send({
+        query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }",
+        variables: { id: "issue-uuid" },
+      });
+
+    // submit is legal in implementation — should pass B1 and not hit Layer 2.
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+  });
+});
+
+// ── Layer 1: Workflow reminder header in response (AI-1387) ───────────────
+
+describe("proxy — Layer 1 workflow reminder header (AI-1387)", () => {
+  let dir: string;
+  let appState: ReturnType<typeof createApp>;
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-layer1-test-"));
+    process.env.AGENTS_FILE = writeAgents(dir);
+    process.env.CAPABILITY_POLICY_PATH = writePolicyFile(dir, TEST_POLICY_WITH_MERGE_YAML);
+    writeWorkflowFile(dir);
+    resetPolicyCache();
+    resetWorkflowCache();
+    reloadAgents();
+    appState = createApp({
+      bagDbPath: path.join(dir, "bag.db"),
+      agentQueueDbPath: path.join(dir, "queue.db"),
+      operationalEventsDbPath: path.join(dir, "events.db"),
+    });
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    appState.bag.close();
+    appState.sessionTracker.close();
+    appState.agentQueue.close();
+    appState.operationalEventStore.close();
+    appState.watchdog.stop();
+    appState.noActivityDetector.stop();
+    appState.managingPoller.stop();
+  });
+
+  /**
+   * Full fetch mock for Layer 1 tests. Handles:
+   *   IssueLabels — B1 validation
+   *   IssueWithLabels — B2 transition
+   *   TeamLabels — B2 label lookup
+   *   ApplyStateTransition — B2 issueUpdate
+   *   everything else → MOCK_RESPONSE
+   */
+  function makeFullFetch(opts: {
+    b1LabelResponse: object;
+    b2IssueResponse?: object;
+    b2TeamLabels?: object;
+  }): typeof globalThis.fetch {
+    return async (url, init) => {
+      if (typeof url !== "string" || !url.includes("api.linear.app")) {
+        return originalFetch(url, init);
+      }
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(bodyText) as { query?: string };
+      const q = parsed.query ?? "";
+
+      if (q.includes("IssueLabels") && !q.includes("IssueWithLabels")) {
+        return new Response(JSON.stringify(opts.b1LabelResponse), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (q.includes("IssueWithLabels")) {
+        return new Response(
+          JSON.stringify(opts.b2IssueResponse ?? DEV_IMPL_IMPLEMENTATION_WITH_IDS),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (q.includes("TeamLabels")) {
+        return new Response(
+          JSON.stringify(opts.b2TeamLabels ?? TEAM_LABELS_WITH_CR),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (q.includes("ApplyStateTransition")) {
+        return new Response(
+          JSON.stringify({ data: { issueUpdate: { success: true } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify(MOCK_RESPONSE), {
+        status: 200, headers: { "Content-Type": "application/json" },
+      });
+    };
+  }
+
+  it("includes _workflowReminder in response body after a successful submit", async () => {
+    globalThis.fetch = makeFullFetch({
+      b1LabelResponse: DEV_IMPL_IMPLEMENTATION_RESPONSE,
+    });
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "submit")
+      .send({
+        query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }",
+        variables: { id: "issue-uuid" },
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+    // Layer 1 reminder should be present in the response body
+    expect(res.body._workflowReminder).toBeDefined();
+    expect(res.body._workflowReminder).toContain("code-review");
+    expect(res.body._workflowReminder).toContain("approve");
+    expect(res.body._workflowReminder).toContain("request-changes");
+    expect(res.body._workflowReminder).toContain("escape");
+  });
+
+  it("does NOT include _workflowReminder when no intent header is present", async () => {
+    globalThis.fetch = makeFullFetch({
+      b1LabelResponse: NON_WORKFLOW_LABEL_RESPONSE,
+    });
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .send({
+        query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+        variables: { id: "issue-uuid", input: { title: "Updated title" } },
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body._workflowReminder).toBeUndefined();
+  });
+});

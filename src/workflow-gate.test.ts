@@ -23,6 +23,8 @@ import path from "node:path";
 import {
   checkWorkflowRules,
   applyStateTransition,
+  checkRawMutationInterception,
+  buildStateTransitionReminder,
   resetWorkflowCache,
 } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
@@ -763,5 +765,265 @@ describe("applyStateTransition — __ad_hoc__ demotion", () => {
     globalThis.fetch = mock;
     await applyStateTransition("demote", "issue-uuid", "Bearer tok");
     expect(calls.some((c) => (c.body.query ?? "").includes("ApplyStateTransition"))).toBe(false);
+  });
+});
+
+// ── Layer 2: Raw status/assignee mutation interception (AI-1387) ──────────
+
+describe("checkRawMutationInterception — Layer 2 (AI-1387)", () => {
+  let layer2Dir: string;
+  let layer2OriginalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    layer2Dir = fs.mkdtempSync(path.join(os.tmpdir(), "layer2-test-"));
+    const policyFile = path.join(layer2Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(layer2Dir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    resetPolicyCache();
+    resetWorkflowCache();
+    layer2OriginalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = layer2OriginalFetch;
+  });
+
+  // Minimal label response: workflow ticket in implementation state.
+  const WORKFLOW_IMPL_LABELS = {
+    data: { issue: { labels: { nodes: [
+      { name: "wf:dev-impl" },
+      { name: "state:implementation" },
+    ] } } },
+  };
+
+  // Non-workflow ticket.
+  const AD_HOC_LABELS = {
+    data: { issue: { labels: { nodes: [{ name: "bug" }] } } },
+  };
+
+  function mockLabelFetch(labelResponse: object) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return async (url: any, init?: RequestInit) => {
+      if (typeof url === "string" && url.includes("api.linear.app")) {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("IssueLabels")) {
+          return new Response(JSON.stringify(labelResponse), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+      return layer2OriginalFetch(url, init);
+    };
+  }
+
+  it("blocks a raw stateId mutation on a workflow ticket", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { stateId: "state-done-uuid" } },
+    };
+
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("Direct status");
+    expect(result).toContain("blocked on this workflow ticket");
+    expect(result).toContain("implementation");
+    expect(result).toContain("submit");
+  });
+
+  it("blocks a raw assigneeId mutation on a workflow ticket", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { assigneeId: "user-uuid" } },
+    };
+
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toContain("Direct assignee");
+    expect(result).toContain("blocked on this workflow ticket");
+  });
+
+  it("blocks a raw stateId + assigneeId mutation on a workflow ticket", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { stateId: "state-done-uuid", assigneeId: "user-uuid" } },
+    };
+
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toContain("Direct status/assignee");
+  });
+
+  it("passes through on ad-hoc (non-workflow) tickets", async () => {
+    globalThis.fetch = mockLabelFetch(AD_HOC_LABELS);
+
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { stateId: "state-done-uuid" } },
+    };
+
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
+    expect(result).toBeNull();
+  });
+
+  it("passes through when mutation does not touch stateId or assigneeId", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { title: "Updated title" } },
+    };
+
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
+    expect(result).toBeNull();
+  });
+
+  it("passes through when body is not an issueUpdate mutation", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+
+    const body = {
+      query: "mutation M($input: CommentCreateInput!) { commentCreate(input: $input) { success } }",
+      variables: { input: { issueId: "issue-uuid", body: "comment text" } },
+    };
+
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
+    expect(result).toBeNull();
+  });
+
+  it("passes through when issueId is null", async () => {
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { stateId: "state-done-uuid" } },
+    };
+
+    const result = await checkRawMutationInterception(body, null, "Bearer tok");
+    expect(result).toBeNull();
+  });
+
+  it("passes through when body is null", async () => {
+    const result = await checkRawMutationInterception(null, "issue-uuid", "Bearer tok");
+    expect(result).toBeNull();
+  });
+
+  it("fails open on label fetch error", async () => {
+    globalThis.fetch = async () => { throw new Error("network error"); };
+
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { stateId: "state-done-uuid" } },
+    };
+
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
+    expect(result).toBeNull();
+  });
+
+  it("includes per-command help with assignment targets in the rejection", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { stateId: "state-done-uuid" } },
+    };
+
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    // Should include the submit command (the legal move from implementation)
+    expect(result).toContain("linear submit");
+    // Should include the escape/break-glass command
+    expect(result).toContain("escape");
+    // Should show the transition arrow
+    expect(result).toContain("→ code-review");
+  });
+});
+
+// ── Layer 1: Proactive legal-verb re-injection (AI-1387) ──────────────────
+
+describe("buildStateTransitionReminder — Layer 1 (AI-1387)", () => {
+  let layer1Dir: string;
+  let layer1OriginalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    layer1Dir = fs.mkdtempSync(path.join(os.tmpdir(), "layer1-test-"));
+    const policyFile = path.join(layer1Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(layer1Dir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    resetPolicyCache();
+    resetWorkflowCache();
+    layer1OriginalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = layer1OriginalFetch;
+  });
+
+  it("returns reminder for code-review state after submit from implementation", async () => {
+    // After "submit" (implementation → code-review), the new state is code-review.
+    // Legal moves: approve, request-changes, escape.
+    const result = await buildStateTransitionReminder("submit", "ABC-123", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Workflow]");
+    expect(result).toContain("code-review");
+    expect(result).toContain("approve");
+    expect(result).toContain("request-changes");
+    expect(result).toContain("escape");
+  });
+
+  it("returns reminder for implementation state after accept from intake", async () => {
+    const result = await buildStateTransitionReminder("accept", "ABC-123", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toContain("implementation");
+    expect(result).toContain("submit");
+  });
+
+  it("returns null for terminal state (done)", async () => {
+    // After "deploy" (deployment → done), the destination is terminal.
+    const result = await buildStateTransitionReminder("deploy", "ABC-123", "Bearer tok");
+    expect(result).toBeNull();
+  });
+
+  it("returns null for terminal escape state", async () => {
+    const result = await buildStateTransitionReminder("escape", "ABC-123", "Bearer tok");
+    expect(result).toBeNull();
+  });
+
+  it("returns null for unknown intent", async () => {
+    const result = await buildStateTransitionReminder("unknown-command", "ABC-123", "Bearer tok");
+    expect(result).toBeNull();
+  });
+
+  it("returns null when issueId is null", async () => {
+    const result = await buildStateTransitionReminder("submit", null, "Bearer tok");
+    expect(result).toBeNull();
+  });
+
+  it("returns reminder for deployment state after approve from code-review", async () => {
+    const result = await buildStateTransitionReminder("approve", "ABC-123", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toContain("deployment");
+    expect(result).toContain("deploy");
+    expect(result).toContain("reject");
+  });
+
+  it("returns reminder for implementation state after request-changes from code-review", async () => {
+    const result = await buildStateTransitionReminder("request-changes", "ABC-123", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toContain("implementation");
+    expect(result).toContain("submit");
   });
 });
