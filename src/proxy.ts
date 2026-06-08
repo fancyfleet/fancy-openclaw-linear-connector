@@ -2,7 +2,8 @@
  * GraphQL proxy — Phase 0B (transparent pass-through) + Phase 2 slice 1
  * (inbound command enforcement) + Phase 3 B1 (workflow-def-driven validation)
  * + Phase 3 B2 (atomic state-label transition application)
- * + Layer 2 raw mutation interception (AI-1387),
+ * + Layer 2 raw mutation interception (AI-1387)
+ * + AI-1402 default-deny + needs-human block + unknown-caller fail-closed,
  * design.md §4.2, §4.6, §11, §13, §16.
  *
  * Enforcement order (defense in depth):
@@ -177,7 +178,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
     // Layer 2 (AI-1387): intercept raw status/assignee mutations on workflow tickets.
     // When no intent header is present but the mutation touches stateId or assigneeId,
     // the agent is bypassing workflow commands — reject with the legal verb set.
-    const rawRejection = await checkRawMutationInterception(body, issueId, authorization);
+    const rawRejection = await checkRawMutationInterception(body, issueId, authorization, agentId);
     if (rawRejection) {
       log.warn(`raw-mutation-block agent=${agentId}${ticketCtx}: ${rawRejection}`);
       res.status(200).json({ errors: [{ message: rawRejection }] });
