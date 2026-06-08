@@ -40,6 +40,7 @@ import yaml from "js-yaml";
 import { componentLogger, createLogger } from "./logger.js";
 import { bodyHasCapability, resolveBodiesForRole } from "./escalation-gate.js";
 import { ObservationStore, type ReasonCode } from "./store/observation-store.js";
+import { isBodyKnown } from "./escalation-gate.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-gate");
 
@@ -369,6 +370,17 @@ export async function checkWorkflowRules(
   // Only enforce for the workflow whose def is loaded; others fail open.
   if (workflowId !== def.id) return null;
 
+  // AI-1402: Fail-closed on unknown caller. When the caller's body is not in the
+  // capability policy and the ticket is a governed workflow ticket, block the mutation.
+  // This is consistent with AI-1400 B2: unknown caller + known delegate = block.
+  if (!(await isBodyKnown(bodyId))) {
+    log.warn(`workflow-gate: unknown caller '${bodyId}' on wf:${workflowId} ticket ${issueId} — blocking`);
+    return (
+      `[Proxy] Unknown caller '${bodyId}' blocked on workflow ticket. ` +
+      `Ensure this agent is registered in the capability policy.`
+    );
+  }
+
   const breakGlassCommand = def.break_glass?.command ?? "escape";
 
   // §4.4: break-glass escape is legal from every state — never block it.
@@ -398,6 +410,16 @@ export async function checkWorkflowRules(
 
   const currentState = getCurrentState(labels);
   if (!currentState) {
+    // AI-1402: For needs-human, fail-closed even without a state label.
+    // We cannot determine if there is a forward path, so treat the ticket as actionable.
+    // Agents must use 'escape' (break-glass) to exit the workflow.
+    if (intent === "needs-human") {
+      const legalMoves = `${breakGlassCommand} (break-glass)`;
+      return (
+        `[Proxy] 'needs-human' is blocked on this workflow ticket (state unknown — treated as actionable). ` +
+        `Use '${breakGlassCommand}' to exit the workflow. Legal moves: ${legalMoves}.`
+      );
+    }
     log.warn(`workflow-gate: no state:* label on ${issueId} — failing open`);
     return null;
   }
@@ -466,22 +488,27 @@ export async function checkWorkflowRules(
 // ── Layer 2: Raw status/assignee mutation interception (AI-1387) ──────────
 
 /**
- * Detect raw status/assignee mutations on workflow tickets.
+ * Detect raw mutations on workflow tickets (AI-1387, expanded in AI-1402).
  *
- * When an agent sends an `issueUpdate` with `stateId` or `assigneeId` in the
- * input but WITHOUT the `x-openclaw-linear-intent` header, they're bypassing
+ * When an agent sends an `issueUpdate` with `stateId`, `assigneeId`, or `labelIds`
+ * in the input but WITHOUT the `x-openclaw-linear-intent` header, they're bypassing
  * the workflow CLI commands. This function intercepts those raw mutations,
  * resolves the ticket's current state from its labels, and returns a rejection
  * that includes the legal verb set for that state.
  *
+ * AI-1402 expansion: also blocks `labelIds` mutations (label manipulation is as
+ * capable as state changes for bypassing workflow state) and adds fail-closed
+ * enforcement for unknown callers on workflow tickets.
+ *
  * Returns null to allow the request through (non-workflow ticket, non-mutation,
- * or no status/assignee fields in input). Returns a rejection string otherwise.
+ * or no workflow-affecting fields in input). Returns a rejection string otherwise.
  * Fail-open on any error — missing issueId, label fetch failure, etc.
  */
 export async function checkRawMutationInterception(
   body: { query?: string; variables?: Record<string, unknown>; operationName?: string } | null,
   issueId: string | null,
   authToken: string,
+  bodyId?: string,
 ): Promise<string | null> {
   if (!body || !issueId) return null;
 
@@ -489,7 +516,9 @@ export async function checkRawMutationInterception(
   const q = body.query ?? "";
   if (!q.includes("issueUpdate")) return null;
 
-  // Check if the mutation input contains stateId or assigneeId.
+  // Check if the mutation input contains any workflow-affecting fields.
+  // Blocked: stateId (status), assigneeId (assignee), labelIds (label manipulation).
+  // Allowed: title, description, priority, dueDate, and other non-workflow fields.
   const vars = body.variables ?? {};
   const input = (vars as Record<string, unknown>).input;
   const inputObj = input && typeof input === "object" && input !== null
@@ -498,13 +527,24 @@ export async function checkRawMutationInterception(
 
   const hasStateChange = inputObj && typeof inputObj.stateId === "string";
   const hasAssigneeChange = inputObj && ("assigneeId" in (inputObj as object));
+  const hasLabelChange = inputObj && ("labelIds" in (inputObj as object));
 
-  if (!hasStateChange && !hasAssigneeChange) return null;
+  if (!hasStateChange && !hasAssigneeChange && !hasLabelChange) return null;
 
-  // This is a raw status/assignee mutation — check if the ticket is on a workflow.
+  // This is a raw workflow-affecting mutation — check if the ticket is on a workflow.
   const { labels } = await fetchTicketContext(issueId, authToken);
   const workflowId = getWorkflowId(labels);
   if (!workflowId) return null; // ad-hoc ticket — pass-through
+
+  // AI-1402: Fail-closed on unknown caller on governed workflow tickets.
+  // If the caller body is not registered in the capability policy, block the mutation.
+  if (bodyId && !(await isBodyKnown(bodyId))) {
+    log.warn(`workflow-gate: unknown caller '${bodyId}' raw mutation on wf:${workflowId} ticket ${issueId} — blocking`);
+    return (
+      `[Proxy] Unknown caller '${bodyId}' blocked on workflow ticket. ` +
+      `Ensure this agent is registered in the capability policy.`
+    );
+  }
 
   let def: WorkflowDef;
   try {
@@ -526,15 +566,13 @@ export async function checkRawMutationInterception(
     }
     allCommands.add(breakGlassCommand);
     return (
-      `[Proxy] Direct status/assignee changes are blocked on this workflow ticket. ` +
+      `[Proxy] Direct mutation blocked on this workflow ticket (state unknown). ` +
       `Use workflow commands: ${[...allCommands].join(", ")}.`
     );
   }
 
   const stateNode = def.states.find((s) => s.id === currentState);
   if (!stateNode) return null; // unknown state — fail-open
-
-  const legalMoves = [...(stateNode.transitions ?? []).map((t) => t.command), breakGlassCommand];
 
   // Build per-command help strings with assignment info.
   const helpLines = await Promise.all(
@@ -552,6 +590,7 @@ export async function checkRawMutationInterception(
   const changedFields: string[] = [];
   if (hasStateChange) changedFields.push("status");
   if (hasAssigneeChange) changedFields.push("assignee");
+  if (hasLabelChange) changedFields.push("labels");
 
   return (
     `[Proxy] Direct ${changedFields.join("/")} changes are blocked on this workflow ticket ` +

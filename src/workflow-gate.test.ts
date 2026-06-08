@@ -1027,3 +1027,222 @@ describe("buildStateTransitionReminder — Layer 1 (AI-1387)", () => {
     expect(result).toContain("submit");
   });
 });
+
+// ── AI-1402: Default-deny + needs-human blocking + unknown-caller ─────────
+
+describe("checkWorkflowRules — AI-1402: needs-human blocked when forward path exists", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("blocks needs-human in implementation (forward path: submit)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    const result = await checkWorkflowRules("needs-human", "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("needs-human");
+  });
+
+  it("blocks needs-human in code-review (forward path: approve, request-changes)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
+    const result = await checkWorkflowRules("needs-human", "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("needs-human");
+  });
+
+  it("blocks needs-human in deployment (forward path: deploy, reject)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
+    const result = await checkWorkflowRules("needs-human", "issue-uuid", "Bearer tok", "astrid");
+    expect(result).not.toBeNull();
+    expect(result).toContain("needs-human");
+  });
+
+  it("blocks needs-human when no state label — fail-closed for this intent", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl"]); // no state:* label
+    const result = await checkWorkflowRules("needs-human", "issue-uuid", "Bearer tok", "astrid");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("needs-human");
+    // Should suggest escape as the legal alternative
+    expect(result).toContain("escape");
+  });
+
+  it("break-glass (escape) is still legal from every state (§4.4)", async () => {
+    for (const state of ["intake", "implementation", "code-review", "deployment", "done"]) {
+      resetWorkflowCache();
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", `state:${state}`]);
+      const result = await checkWorkflowRules("escape", "issue-uuid", "Bearer tok", "charles");
+      expect(result).toBeNull(); // state: ${state}
+    }
+  });
+});
+
+describe("checkWorkflowRules — AI-1402: unknown-caller fail-closed", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("blocks unknown caller on wf:dev-impl ticket", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    // "ghost-agent" is not in the test policy (which only has hanzo, charles, astrid)
+    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "ghost-agent");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("ghost-agent");
+    expect(result).toContain("Unknown caller");
+  });
+
+  it("allows known caller (charles) on wf:dev-impl ticket with legal command", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles");
+    expect(result).toBeNull();
+  });
+
+  it("unknown caller on ad-hoc ticket is pass-through (no wf:* label)", async () => {
+    globalThis.fetch = makeLabelFetch(["bug", "priority:high"]);
+    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "ghost-agent");
+    expect(result).toBeNull();
+  });
+
+  it("escape (break-glass) does NOT bypass unknown-caller check — unidentified callers are blocked", async () => {
+    // The unknown-caller block fires before the break-glass check. An agent not in the
+    // capability policy cannot affect a governed ticket, even via break-glass.
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    const result = await checkWorkflowRules("escape", "issue-uuid", "Bearer tok", "ghost-agent");
+    expect(result).not.toBeNull();
+    expect(result).toContain("Unknown caller");
+  });
+});
+
+describe("checkRawMutationInterception — AI-1402: labelIds blocking + unknown-caller", () => {
+  let ai1402Dir: string;
+  let ai1402OriginalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    ai1402Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1402-test-"));
+    const policyFile = path.join(ai1402Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(ai1402Dir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    resetPolicyCache();
+    resetWorkflowCache();
+    ai1402OriginalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = ai1402OriginalFetch;
+  });
+
+  const WORKFLOW_IMPL_LABELS = {
+    data: { issue: { labels: { nodes: [
+      { name: "wf:dev-impl" },
+      { name: "state:implementation" },
+    ] } } },
+  };
+
+  const AD_HOC_LABELS = {
+    data: { issue: { labels: { nodes: [{ name: "bug" }] } } },
+  };
+
+  function mockLabelFetch(labelResponse: object) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return async (url: any, init?: RequestInit) => {
+      if (typeof url === "string" && url.includes("api.linear.app")) {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("IssueLabels")) {
+          return new Response(JSON.stringify(labelResponse), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+      return ai1402OriginalFetch(url, init);
+    };
+  }
+
+  it("blocks a raw labelIds mutation on a workflow ticket", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { labelIds: ["lbl-1", "lbl-2"] } },
+    };
+
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("Direct");
+    expect(result).toContain("labels");
+    expect(result).toContain("blocked on this workflow ticket");
+  });
+
+  it("passes through labelIds mutation on ad-hoc ticket", async () => {
+    globalThis.fetch = mockLabelFetch(AD_HOC_LABELS);
+
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { labelIds: ["lbl-1"] } },
+    };
+
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).toBeNull();
+  });
+
+  it("passes through title-only mutation on workflow ticket (title is not workflow-affecting)", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { title: "Updated title" } },
+    };
+
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).toBeNull();
+  });
+
+  it("blocks unknown caller raw mutation on workflow ticket", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { stateId: "state-done-uuid" } },
+    };
+
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "ghost-agent");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("Unknown caller");
+    expect(result).toContain("ghost-agent");
+  });
+
+  it("passes unknown caller on ad-hoc ticket (no wf:* label)", async () => {
+    globalThis.fetch = mockLabelFetch(AD_HOC_LABELS);
+
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { stateId: "state-done-uuid" } },
+    };
+
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "ghost-agent");
+    expect(result).toBeNull();
+  });
+
+  it("passes when bodyId is undefined (backward-compat: no caller header)", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { stateId: "state-done-uuid" } },
+    };
+
+    // bodyId omitted (undefined) — still blocks the stateId mutation via existing logic
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    // Should still be blocked by the stateId rule, not by the unknown-caller rule
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("Direct status");
+  });
+});
