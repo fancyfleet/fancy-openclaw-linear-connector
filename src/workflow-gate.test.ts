@@ -159,6 +159,21 @@ function makeLabelFetch(labelNames: string[]): typeof globalThis.fetch {
   };
 }
 
+describe("AI-1402 acceptance — needs-human rejected via intent path", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("rejects 'needs-human' as not a legal command and names legal moves", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
+    const result = await checkWorkflowRules("needs-human", "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("not a legal command");
+    expect(result).toContain("approve");
+    expect(result).toContain("escape");
+  });
+});
+
 describe("checkWorkflowRules — mode switch", () => {
   let originalFetch: typeof globalThis.fetch;
   beforeEach(() => { originalFetch = globalThis.fetch; });
@@ -877,7 +892,7 @@ describe("checkRawMutationInterception — Layer 2 (AI-1387)", () => {
     expect(result).toBeNull();
   });
 
-  it("passes through when mutation does not touch stateId or assigneeId", async () => {
+  it("blocks a raw title-only issueUpdate on a workflow ticket (default-deny)", async () => {
     globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
 
     const body = {
@@ -886,7 +901,40 @@ describe("checkRawMutationInterception — Layer 2 (AI-1387)", () => {
     };
 
     const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
-    expect(result).toBeNull();
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("blocked on this workflow ticket");
+    expect(result).toContain("title");
+  });
+
+  it("blocks a raw labelIds-only issueUpdate on a workflow ticket (default-deny)", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { labelIds: ["lbl-1"] } },
+    };
+
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("blocked on this workflow ticket");
+    expect(result).toContain("labels");
+  });
+
+  it("blocks a raw delegateId-only issueUpdate on a workflow ticket (default-deny)", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { delegateId: "user-x" } },
+    };
+
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("blocked on this workflow ticket");
+    expect(result).toContain("delegate");
   });
 
   it("passes through when body is not an issueUpdate mutation", async () => {

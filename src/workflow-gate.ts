@@ -468,14 +468,14 @@ export async function checkWorkflowRules(
 /**
  * Detect raw status/assignee mutations on workflow tickets.
  *
- * When an agent sends an `issueUpdate` with `stateId` or `assigneeId` in the
- * input but WITHOUT the `x-openclaw-linear-intent` header, they're bypassing
- * the workflow CLI commands. This function intercepts those raw mutations,
- * resolves the ticket's current state from its labels, and returns a rejection
- * that includes the legal verb set for that state.
+ * When an agent sends an `issueUpdate` with any non-empty input but WITHOUT the
+ * `x-openclaw-linear-intent` header, they're bypassing the workflow CLI
+ * commands. This function default-denies those raw mutations, resolves the
+ * ticket's current state from its labels, and returns a rejection that includes
+ * the legal verb set for that state.
  *
  * Returns null to allow the request through (non-workflow ticket, non-mutation,
- * or no status/assignee fields in input). Returns a rejection string otherwise.
+ * or empty input). Returns a rejection string otherwise.
  * Fail-open on any error — missing issueId, label fetch failure, etc.
  */
 export async function checkRawMutationInterception(
@@ -496,12 +496,10 @@ export async function checkRawMutationInterception(
     ? input as Record<string, unknown>
     : null;
 
-  const hasStateChange = inputObj && typeof inputObj.stateId === "string";
-  const hasAssigneeChange = inputObj && ("assigneeId" in (inputObj as object));
+  const inputKeys = inputObj ? Object.keys(inputObj) : [];
+  if (inputKeys.length === 0) return null;
 
-  if (!hasStateChange && !hasAssigneeChange) return null;
-
-  // This is a raw status/assignee mutation — check if the ticket is on a workflow.
+  // This is a raw mutation with a non-empty input — check if the ticket is on a workflow.
   const { labels } = await fetchTicketContext(issueId, authToken);
   const workflowId = getWorkflowId(labels);
   if (!workflowId) return null; // ad-hoc ticket — pass-through
@@ -526,7 +524,7 @@ export async function checkRawMutationInterception(
     }
     allCommands.add(breakGlassCommand);
     return (
-      `[Proxy] Direct status/assignee changes are blocked on this workflow ticket. ` +
+      `[Proxy] Direct changes are blocked on this workflow ticket. ` +
       `Use workflow commands: ${[...allCommands].join(", ")}.`
     );
   }
@@ -549,9 +547,17 @@ export async function checkRawMutationInterception(
   );
   helpLines.push(`  - \`linear ${breakGlassCommand} ${issueId}\` (break glass → ${def.break_glass?.to ?? "escape"}, legal from any state)`);
 
-  const changedFields: string[] = [];
-  if (hasStateChange) changedFields.push("status");
-  if (hasAssigneeChange) changedFields.push("assignee");
+  const FIELD_LABELS: Record<string, string> = {
+    stateId: "status",
+    assigneeId: "assignee",
+    labelIds: "labels",
+    delegateId: "delegate",
+    title: "title",
+    description: "description",
+    priority: "priority",
+    parentId: "parent",
+  };
+  const changedFields = inputKeys.map((k) => FIELD_LABELS[k] ?? k);
 
   return (
     `[Proxy] Direct ${changedFields.join("/")} changes are blocked on this workflow ticket ` +

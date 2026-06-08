@@ -990,7 +990,7 @@ describe("proxy — Layer 2 raw mutation interception (AI-1387)", () => {
     expect(res.body.data).toBeDefined();
   });
 
-  it("allows raw mutations without stateId/assigneeId on workflow tickets", async () => {
+  it("blocks raw non-workflow-field mutations (title) on workflow tickets (default-deny, AI-1402)", async () => {
     globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
 
     const res = await request(appState.app)
@@ -1003,8 +1003,10 @@ describe("proxy — Layer 2 raw mutation interception (AI-1387)", () => {
       });
 
     expect(res.status).toBe(200);
-    expect(res.body.errors).toBeUndefined();
-    expect(res.body.data).toBeDefined();
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("[Proxy]");
+    expect(res.body.errors[0].message).toContain("blocked on this workflow ticket");
+    expect(res.body.errors[0].message).toContain("title");
   });
 
   it("allows intent-headed requests through (those use B1 validation, not Layer 2)", async () => {
