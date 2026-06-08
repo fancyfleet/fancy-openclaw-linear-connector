@@ -12,6 +12,8 @@
  * Design: design.md §4.6 (outbound direction), §11 Phase 3.
  */
 
+import fs from "node:fs/promises";
+import path from "node:path";
 import type { RouteResult } from "../types.js";
 import {
   loadWorkflowDef,
@@ -24,6 +26,27 @@ import {
 import { componentLogger, createLogger } from "../logger.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "build-message");
+
+/**
+ * Default root for vault-resident step guidance files (C5 / AI-1381).
+ * Files live at guidance/<workflowId>/<step>.md beside the workflow defs.
+ * Override via WORKFLOW_GUIDANCE_DIR for tests.
+ */
+const DEFAULT_GUIDANCE_DIR =
+  "/home/fancymatt/obsidian-vault/ai-systems/projects/fleet-orchestration-redesign/guidance";
+
+function guidanceDir(): string {
+  return process.env.WORKFLOW_GUIDANCE_DIR ?? DEFAULT_GUIDANCE_DIR;
+}
+
+async function loadStepGuidance(workflowId: string, step: string): Promise<string | null> {
+  const filePath = path.join(guidanceDir(), workflowId, `${step}.md`);
+  try {
+    return await fs.readFile(filePath, "utf8");
+  } catch {
+    return null; // Fail-open: missing file → no guidance section
+  }
+}
 
 /**
  * Build a routing-reason-specific delivery message for an agent.
@@ -141,32 +164,39 @@ async function tryBuildWorkflowMessage(
   const breakGlassCommand = def.break_glass?.command ?? "escape";
   const transitions = stateNode.transitions ?? [];
 
-  const stepLines = await Promise.all(transitions.map(async (t) => {
-    const { bodies, mode } = await resolveTransitionTargets(t, def);
+  const [stepLines, guidance] = await Promise.all([
+    Promise.all(transitions.map(async (t) => {
+      const { bodies, mode } = await resolveTransitionTargets(t, def);
 
-    let cmd = `linear ${t.command} ${identifier}`;
-    if (mode === 'required') {
-      cmd += ` <${bodies.join('|')}>`;
-    }
-    if (t.feedback?.required) {
-      cmd += ` --comment "<feedback>"`;
-    }
-    const arrow = ` (→ ${t.to})`;
+      let cmd = `linear ${t.command} ${identifier}`;
+      if (mode === 'required') {
+        cmd += ` <${bodies.join('|')}>`;
+      }
+      if (t.feedback?.required) {
+        cmd += ` --comment "<feedback>"`;
+      }
+      const arrow = ` (→ ${t.to})`;
 
-    let note = '';
-    if (mode === 'auto' && bodies.length === 1) {
-      note = ` [auto-assigns to ${bodies[0]}]`;
-    } else if (mode === 'required' && t.assign?.constraint === 'not-implementer') {
-      note = ` [reviewer required; must not be you]`;
-    } else if (t.assign?.default === 'prior-implementer') {
-      note = ` [defaults to prior implementer; overridable with --target]`;
-    }
+      let note = '';
+      if (mode === 'auto' && bodies.length === 1) {
+        note = ` [auto-assigns to ${bodies[0]}]`;
+      } else if (mode === 'required' && t.assign?.constraint === 'not-implementer') {
+        note = ` [reviewer required; must not be you]`;
+      } else if (t.assign?.default === 'prior-implementer') {
+        note = ` [defaults to prior implementer; overridable with --target]`;
+      }
 
-    return `- Run \`${cmd}\`${arrow}${note}`;
-  }));
+      return `- Run \`${cmd}\`${arrow}${note}`;
+    })),
+    loadStepGuidance(def.id, currentState),
+  ]);
 
   // Always-available break-glass escape (§4.4)
   stepLines.push(`- Run \`linear ${breakGlassCommand} ${identifier}\` to break glass and hand to steward (→ ${def.break_glass?.to ?? "escape"}, legal from any state)`);
+
+  const guidanceBlock: string[] = guidance
+    ? ["", "---", "**Step guidance (accumulated lessons for this state):**", "", guidance.trim(), "---"]
+    : [];
 
   return [
     `${actionText}: ${title}`,
@@ -177,6 +207,7 @@ async function tryBuildWorkflowMessage(
     ...stepLines,
     "",
     `Run \`linear consider-work ${identifier}\` NOW if you haven't already to review the issue.`,
+    ...guidanceBlock,
     "",
     "📝 Comment discipline: post one substantive comment — your actual findings or result. Do NOT post a comment that only restates what is already on the ticket or narrates that you have handed it back. If you have no new information to add, do not comment at all — just transition state.",
     "",

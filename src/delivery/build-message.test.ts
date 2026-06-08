@@ -118,23 +118,32 @@ function makeLabelFetch(labels: string[]): typeof globalThis.fetch {
 // ── Setup / teardown ──────────────────────────────────────────────────────
 
 let tmpYamlPath: string;
+let tmpGuidanceDir: string;
 let originalFetch: typeof globalThis.fetch;
 
 beforeAll(() => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "build-message-test-"));
   tmpYamlPath = path.join(dir, "dev-impl.yaml");
   fs.writeFileSync(tmpYamlPath, TEST_WORKFLOW_YAML, "utf8");
+  tmpGuidanceDir = path.join(dir, "guidance");
+  fs.mkdirSync(path.join(tmpGuidanceDir, "dev-impl"), { recursive: true });
 });
 
 beforeEach(() => {
   resetWorkflowCache();
   process.env.WORKFLOW_DEF_PATH = tmpYamlPath;
+  process.env.WORKFLOW_GUIDANCE_DIR = tmpGuidanceDir;
   originalFetch = globalThis.fetch;
 });
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
   delete process.env.WORKFLOW_DEF_PATH;
+  delete process.env.WORKFLOW_GUIDANCE_DIR;
+  // Remove any guidance files written by tests
+  for (const f of fs.readdirSync(path.join(tmpGuidanceDir, "dev-impl"))) {
+    fs.rmSync(path.join(tmpGuidanceDir, "dev-impl", f));
+  }
 });
 
 // ── Import under test ─────────────────────────────────────────────────────
@@ -304,6 +313,54 @@ describe("B3 — outbound per-step instruction injection", () => {
       const msg = await buildDeliveryMessage(makeRoute("AI-007", "Fetch error"), "Bearer tok");
 
       expect(msg).toContain("Next Steps:");
+    });
+  });
+
+  describe("C5 — step-scoped guidance injection (AI-1381)", () => {
+    it("approved guidance for current state → injected into message", async () => {
+      fs.writeFileSync(
+        path.join(tmpGuidanceDir, "dev-impl", "implementation.md"),
+        "Always include tests for new parser paths.\n",
+        "utf8",
+      );
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+
+      const buildDeliveryMessage = await getbuildDeliveryMessage();
+      const msg = await buildDeliveryMessage(makeRoute("AI-020", "Guidance test"), "Bearer tok");
+
+      expect(msg).toContain("Step guidance");
+      expect(msg).toContain("Always include tests for new parser paths.");
+      // Legal commands still present
+      expect(msg).toContain("linear submit AI-020");
+    });
+
+    it("no guidance file for current state → message byte-identical to pre-C5 output", async () => {
+      // No file written — guidance dir for this step is empty
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+
+      const buildDeliveryMessage = await getbuildDeliveryMessage();
+      const msg = await buildDeliveryMessage(makeRoute("AI-021", "No guidance"), "Bearer tok");
+
+      expect(msg).not.toContain("Step guidance");
+      // Core content still intact
+      expect(msg).toContain("[dev-impl]");
+      expect(msg).toContain("state: **implementation**");
+      expect(msg).toContain("linear submit AI-021");
+    });
+
+    it("guidance for a different step does NOT appear at current step", async () => {
+      fs.writeFileSync(
+        path.join(tmpGuidanceDir, "dev-impl", "code-review.md"),
+        "Verify edge-case coverage before approving.\n",
+        "utf8",
+      );
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+
+      const buildDeliveryMessage = await getbuildDeliveryMessage();
+      const msg = await buildDeliveryMessage(makeRoute("AI-022", "Wrong step"), "Bearer tok");
+
+      expect(msg).not.toContain("Step guidance");
+      expect(msg).not.toContain("Verify edge-case coverage");
     });
   });
 
