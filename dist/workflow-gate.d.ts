@@ -1,6 +1,7 @@
 /**
  * Phase 3 / B1 — Workflow-def-driven inbound command validation (AI-1352).
  * Phase 3 / B2 — Atomic state-label transition application (AI-1353).
+ * Layer 2 — Raw status/assignee mutation interception (AI-1387).
  *
  * B1: Generalizes the Phase 2 single-rule escalation-gate (escalation-gate.ts) into
  * a full legal-move validator driven by the workflow definition YAML. The rule
@@ -92,8 +93,40 @@ export declare function fetchWorkflowLabels(issueId: string, authToken: string):
  * Returns a rejection message when the command should be blocked, or null to forward.
  * Fails open on missing issueId, missing state label, unknown workflow, or label-fetch
  * failure — enforcement only blocks with affirmative evidence of a violation.
+ *
+ * @param callerLinearUserId - Linear user ID of the requesting agent (from agents.ts);
+ *   used for delegate-only enforcement (AI-1397). Null/undefined → fail-open.
  */
-export declare function checkWorkflowRules(intent: string, issueId: string | null, authToken: string, bodyId: string, target?: string | null): Promise<string | null>;
+export declare function checkWorkflowRules(intent: string, issueId: string | null, authToken: string, bodyId: string, target?: string | null, callerLinearUserId?: string | null): Promise<string | null>;
+/**
+ * Detect raw status/assignee mutations on workflow tickets.
+ *
+ * When an agent sends an `issueUpdate` with any non-empty input but WITHOUT the
+ * `x-openclaw-linear-intent` header, they're bypassing the workflow CLI
+ * commands. This function default-denies those raw mutations, resolves the
+ * ticket's current state from its labels, and returns a rejection that includes
+ * the legal verb set for that state.
+ *
+ * Returns null to allow the request through (non-workflow ticket, non-mutation,
+ * or empty input). Returns a rejection string otherwise.
+ * Fail-open on any error — missing issueId, label fetch failure, etc.
+ */
+export declare function checkRawMutationInterception(body: {
+    query?: string;
+    variables?: Record<string, unknown>;
+    operationName?: string;
+} | null, issueId: string | null, authToken: string): Promise<string | null>;
+/**
+ * Generate a legal-verb reminder for the NEW state after a successful transition.
+ *
+ * Layer 1 (AI-1387): re-surfaces the legal command set at the completion/decision
+ * moment, so agents don't need to rely on the stale delegation-time injection.
+ *
+ * Returns null when not applicable (ad-hoc ticket, unknown state, terminal state).
+ * Returns a formatted string with the legal commands for the NEW state.
+ * Fail-open on any error.
+ */
+export declare function buildStateTransitionReminder(intent: string, issueId: string | null, authToken: string): Promise<string | null>;
 /**
  * Apply the state-label transition triggered by a legal command (AI-1353 / §4.2).
  *

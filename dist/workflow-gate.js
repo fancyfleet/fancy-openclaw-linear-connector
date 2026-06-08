@@ -1,6 +1,7 @@
 /**
  * Phase 3 / B1 — Workflow-def-driven inbound command validation (AI-1352).
  * Phase 3 / B2 — Atomic state-label transition application (AI-1353).
+ * Layer 2 — Raw status/assignee mutation interception (AI-1387).
  *
  * B1: Generalizes the Phase 2 single-rule escalation-gate (escalation-gate.ts) into
  * a full legal-move validator driven by the workflow definition YAML. The rule
@@ -67,13 +68,13 @@ export function resetWorkflowCache() {
     _workflowCache = null;
 }
 /**
- * Fetch label names for a Linear issue using the caller's auth token.
+ * Fetch label names and delegate for a Linear issue using the caller's auth token.
  * Independent of escalation-gate's label fetch — the proxy resolves state
  * from its own query and never trusts agent-supplied values (§11).
- * Returns an empty array on any error — enforcement fails open.
+ * Returns empty labels and null delegate on any error — enforcement fails open.
  */
-async function fetchTicketLabels(issueId, authToken) {
-    const query = `query IssueLabels($id: String!) { issue(id: $id) { labels { nodes { name } } } }`;
+async function fetchTicketContext(issueId, authToken) {
+    const query = `query IssueContext($id: String!) { issue(id: $id) { labels { nodes { name } } delegate { id } } }`;
     try {
         const res = await fetch(LINEAR_API_URL, {
             method: "POST",
@@ -84,12 +85,16 @@ async function fetchTicketLabels(issueId, authToken) {
             body: JSON.stringify({ query, variables: { id: issueId } }),
         });
         const data = (await res.json());
-        return (data.data?.issue?.labels?.nodes ?? []).map((n) => n.name);
+        const issue = data.data?.issue;
+        return {
+            labels: (issue?.labels?.nodes ?? []).map((n) => n.name),
+            delegateId: issue?.delegate?.id ?? null,
+        };
     }
     catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        log.warn(`workflow-gate: label fetch failed for ${issueId}: ${msg} — failing open`);
-        return [];
+        log.warn(`workflow-gate: context fetch failed for ${issueId}: ${msg} — failing open`);
+        return { labels: [], delegateId: null };
     }
 }
 /**
@@ -241,13 +246,16 @@ export async function fetchWorkflowLabels(issueId, authToken) {
  * Returns a rejection message when the command should be blocked, or null to forward.
  * Fails open on missing issueId, missing state label, unknown workflow, or label-fetch
  * failure — enforcement only blocks with affirmative evidence of a violation.
+ *
+ * @param callerLinearUserId - Linear user ID of the requesting agent (from agents.ts);
+ *   used for delegate-only enforcement (AI-1397). Null/undefined → fail-open.
  */
-export async function checkWorkflowRules(intent, issueId, authToken, bodyId, target = null) {
+export async function checkWorkflowRules(intent, issueId, authToken, bodyId, target = null, callerLinearUserId) {
     // TODO(AI-1347): fail-open on missing issueId is a Layer A carry-forward.
     // Harden by deriving issueId from the request body when headers are absent.
     if (!issueId)
         return null;
-    const labels = await fetchTicketLabels(issueId, authToken);
+    const { labels, delegateId } = await fetchTicketContext(issueId, authToken);
     // §4.6 mode switch: ad-hoc tickets (no wf:* label) are full pass-through.
     const workflowId = getWorkflowId(labels);
     if (!workflowId)
@@ -268,6 +276,23 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
     // §4.4: break-glass escape is legal from every state — never block it.
     if (intent === breakGlassCommand)
         return null;
+    // AI-1397: delegate-only enforcement at proxy (CLI-version-agnostic).
+    // If both the caller's Linear user ID and the ticket's delegate ID are known,
+    // block any agent that is not the current delegate. Fails open when either is
+    // unknown (delegate not set, agent config missing linearUserId, fetch error).
+    // AI-1400 B2: additionally fail-closed when the caller identity is unknown
+    // (no linearUserId in agents.json) but the ticket has a known delegate — an
+    // unverifiable caller must not be allowed to mutate a delegated ticket.
+    if (!callerLinearUserId && delegateId) {
+        log.warn(`workflow-gate: unknown-caller block agent=${bodyId} intent=${intent} ticket=${issueId}`);
+        return (`[Proxy] '${intent}' blocked: caller '${bodyId}' cannot be verified and the ticket has a known delegate. ` +
+            `Register the agent in agents.json with a linearUserId to proceed.`);
+    }
+    if (callerLinearUserId && delegateId && callerLinearUserId !== delegateId) {
+        log.warn(`workflow-gate: delegate-only block agent=${bodyId} intent=${intent} ticket=${issueId}`);
+        return (`[Proxy] '${intent}' blocked: ${bodyId} is not the current delegate for ${issueId}. ` +
+            `Only the ticket delegate may mutate its state.`);
+    }
     const currentState = getCurrentState(labels);
     if (!currentState) {
         log.warn(`workflow-gate: no state:* label on ${issueId} — failing open`);
@@ -323,6 +348,157 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
         return `[Proxy] Self-review blocked: reviewer must differ from implementer ('${bodyId}').`;
     }
     return null;
+}
+// ── Layer 2: Raw status/assignee mutation interception (AI-1387) ──────────
+/**
+ * Detect raw status/assignee mutations on workflow tickets.
+ *
+ * When an agent sends an `issueUpdate` with any non-empty input but WITHOUT the
+ * `x-openclaw-linear-intent` header, they're bypassing the workflow CLI
+ * commands. This function default-denies those raw mutations, resolves the
+ * ticket's current state from its labels, and returns a rejection that includes
+ * the legal verb set for that state.
+ *
+ * Returns null to allow the request through (non-workflow ticket, non-mutation,
+ * or empty input). Returns a rejection string otherwise.
+ * Fail-open on any error — missing issueId, label fetch failure, etc.
+ */
+export async function checkRawMutationInterception(body, issueId, authToken) {
+    if (!body || !issueId)
+        return null;
+    // Only intercept issueUpdate mutations.
+    const q = body.query ?? "";
+    if (!q.includes("issueUpdate"))
+        return null;
+    // Check if the mutation input contains stateId or assigneeId.
+    const vars = body.variables ?? {};
+    const input = vars.input;
+    const inputObj = input && typeof input === "object" && input !== null
+        ? input
+        : null;
+    const inputKeys = inputObj ? Object.keys(inputObj) : [];
+    if (inputKeys.length === 0)
+        return null;
+    // This is a raw mutation with a non-empty input — check if the ticket is on a workflow.
+    const { labels } = await fetchTicketContext(issueId, authToken);
+    const workflowId = getWorkflowId(labels);
+    if (!workflowId)
+        return null; // ad-hoc ticket — pass-through
+    let def;
+    try {
+        def = await loadWorkflowDef();
+    }
+    catch {
+        return null; // fail-open
+    }
+    if (workflowId !== def.id)
+        return null; // unknown workflow — pass-through
+    const breakGlassCommand = def.break_glass?.command ?? "escape";
+    const currentState = getCurrentState(labels);
+    if (!currentState) {
+        // No state label — can't determine legal moves, but still block with a generic message.
+        const allCommands = new Set();
+        for (const s of def.states) {
+            for (const t of s.transitions ?? [])
+                allCommands.add(t.command);
+        }
+        allCommands.add(breakGlassCommand);
+        return (`[Proxy] Direct changes are blocked on this workflow ticket. ` +
+            `Use workflow commands: ${[...allCommands].join(", ")}.`);
+    }
+    const stateNode = def.states.find((s) => s.id === currentState);
+    if (!stateNode)
+        return null; // unknown state — fail-open
+    const legalMoves = [...(stateNode.transitions ?? []).map((t) => t.command), breakGlassCommand];
+    // Build per-command help strings with assignment info.
+    const helpLines = await Promise.all((stateNode.transitions ?? []).map(async (t) => {
+        const { bodies, mode } = await resolveTransitionTargets(t, def);
+        let cmd = `linear ${t.command} ${issueId}`;
+        if (mode === "required") {
+            cmd += ` <${bodies.join("|")}>`;
+        }
+        return `  - \`${cmd}\` (→ ${t.to})`;
+    }));
+    helpLines.push(`  - \`linear ${breakGlassCommand} ${issueId}\` (break glass → ${def.break_glass?.to ?? "escape"}, legal from any state)`);
+    const FIELD_LABELS = {
+        stateId: "status",
+        assigneeId: "assignee",
+        labelIds: "labels",
+        delegateId: "delegate",
+        title: "title",
+        description: "description",
+        priority: "priority",
+        parentId: "parent",
+    };
+    const changedFields = inputKeys.map((k) => FIELD_LABELS[k] ?? k);
+    return (`[Proxy] Direct ${changedFields.join("/")} changes are blocked on this workflow ticket ` +
+        `(state: **${currentState}**). Use workflow commands instead:\n\n` +
+        helpLines.join("\n"));
+}
+// ── Layer 1: Proactive legal-verb re-injection at completion (AI-1387) ────
+/**
+ * Generate a legal-verb reminder for the NEW state after a successful transition.
+ *
+ * Layer 1 (AI-1387): re-surfaces the legal command set at the completion/decision
+ * moment, so agents don't need to rely on the stale delegation-time injection.
+ *
+ * Returns null when not applicable (ad-hoc ticket, unknown state, terminal state).
+ * Returns a formatted string with the legal commands for the NEW state.
+ * Fail-open on any error.
+ */
+export async function buildStateTransitionReminder(intent, issueId, authToken) {
+    if (!issueId)
+        return null;
+    let def;
+    try {
+        def = await loadWorkflowDef();
+    }
+    catch {
+        return null;
+    }
+    const breakGlassCommand = def.break_glass?.command ?? "escape";
+    // Determine the destination state from the intent.
+    let destStateName;
+    if (intent === breakGlassCommand) {
+        destStateName = def.break_glass?.to ?? "escape";
+    }
+    else {
+        // Find which transition this intent triggers by scanning all states.
+        // We don't know the current state here, so we look for any transition
+        // matching this intent. Since commands are unique per state in dev-impl,
+        // this works. For ambiguous workflows, the label-based approach below
+        // would be needed.
+        let found = false;
+        for (const s of def.states) {
+            const t = (s.transitions ?? []).find((tr) => tr.command === intent);
+            if (t) {
+                destStateName = t.to;
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            return null;
+    }
+    // destStateName is set above in both branches
+    const destState = def.states.find((s) => s.id === destStateName);
+    if (!destState)
+        return null;
+    // Terminal states have no transitions — no reminder needed.
+    if (destState.kind === "terminal" || !destState.transitions?.length)
+        return null;
+    const transitions = destState.transitions;
+    const helpLines = await Promise.all(transitions.map(async (t) => {
+        const { bodies, mode } = await resolveTransitionTargets(t, def);
+        let cmd = `linear ${t.command} ${issueId}`;
+        if (mode === "required") {
+            cmd += ` <${bodies.join("|")}>`;
+        }
+        return `  - \`${cmd}\` (→ ${t.to})`;
+    }));
+    helpLines.push(`  - \`linear ${breakGlassCommand} ${issueId}\` (break glass, legal from any state)`);
+    return (`[Workflow] You are now in state: **${destState.id}**. Your legal action(s):\n` +
+        helpLines.join("\n"));
 }
 export async function applyStateTransition(intent, issueId, authToken, options) {
     // TODO(AI-1347): no-op on missing issueId carries the same fail-open posture as B1.
