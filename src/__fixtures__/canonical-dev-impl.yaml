@@ -28,6 +28,18 @@ version: 6
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
 
+# Phase 6.5 / H-7 (AI-1482): Stakes-threshold sign-off configuration.
+# When a ticket's stakes level meets or exceeds the threshold, the deploy
+# transition requires a human sign-off (Matt), not an AI agent.
+# Stakes levels: 0 = low (internal only), 1 = medium, 2 = high (external/irreversible).
+# Labels on the ticket: stakes:low, stakes:medium, stakes:high.
+stakes:
+  threshold: 2                # deploy from stakes ≥ this level requires human sign-off
+  levels:                     # label name → numeric level mapping
+    stakes:low: 0
+    stakes:medium: 1
+    stakes:high: 2
+
 break_glass:
   command: escape               # x-openclaw-linear-intent value that triggers break-glass (§4.4)
   to: escape
@@ -43,6 +55,10 @@ states:
       - command: accept
         to: implementation
         assign: { mode: required }
+        # Phase 6.5 / H-7 (AI-1482): capture verbatim AC from the issue description
+        # as the AC of record. Ai may annotate alongside, but sign-off is judged
+        # against the verbatim original.
+        capture_ac: true
       - command: demote
         to: __ad_hoc__          # ticket leaves the workflow entirely (design.md §4.5)
 
@@ -87,6 +103,11 @@ states:
       - command: deploy
         to: done
         requires_capability: deploy:execute   # Layer A enforcement (design.md §16.2)
+        # Phase 6.5 / H-7 (AI-1482): stakes-threshold gate.
+        # If the ticket's stakes level ≥ workflow.stakes.threshold, the deploy
+        # must come from a human sign-off (not an AI agent). Enforced by the
+        # connector proxy at deploy time.
+        requires_human_signoff_above_stakes: true
       - command: reject
         to: implementation
         feedback:
