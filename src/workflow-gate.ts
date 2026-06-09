@@ -361,6 +361,8 @@ interface BranchAndPRStatus {
   hasBranch: boolean;
   /** True when the issue has at least one associated pull request. */
   hasPR: boolean;
+  /** True when the issue has at least one merged pull request. */
+  hasMergedPR: boolean;
 }
 
 /**
@@ -407,9 +409,11 @@ async function fetchBranchAndPRStatus(
     const data = (await res.json()) as PRResp;
     const issue = data.data?.issue;
     if (!issue) return null;
+    const prs = issue.pullRequests?.nodes ?? [];
     return {
       hasBranch: !!issue.branch?.id,
-      hasPR: (issue.pullRequests?.nodes?.length ?? 0) > 0,
+      hasPR: prs.length > 0,
+      hasMergedPR: prs.some((pr) => pr.state === "merged"),
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -630,12 +634,16 @@ export async function checkWorkflowRules(
   // Resolve destination state for subsequent gates.
   const destStateNode = def.states.find((s) => s.id === match.to);
 
-  // AI-1475 Defect 1: Done gate (§5.6) — terminal 'done' requires pushed branch + PR.
+  // AI-1475 Defect 1 + AI-1492: Done gate (§5.6) — terminal 'done' requires evidence of merged PR.
   // A wf:dev-impl ticket must not reach terminal done without evidence that the
-  // implementation was pushed and reviewed. Fail-closed: if we cannot determine
-  // branch/PR status, block the transition.
+  // implementation was pushed, reviewed, and merged. Fail-closed: if we cannot
+  // determine branch/PR status, block the transition.
   // Only applies to the deploy command (dev-impl workflow: deployment → done).
   // Other workflows (ux-audit) have their own gate paths (parent-AC gate).
+  //
+  // AI-1492 fix: A merged PR satisfies the gate even when the source branch was
+  // auto-deleted by GitHub after a squash merge. Previously the gate keyed off
+  // branch existence, which breaks when the branch is deleted post-merge.
   if (intent === 'deploy' && destStateNode?.kind === 'terminal' && match.to === 'done') {
     const branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
     if (!branchStatus) {
@@ -645,17 +653,24 @@ export async function checkWorkflowRules(
         `Ensure the branch has been pushed to origin and a pull request exists.`
       );
     }
-    const missing: string[] = [];
-    if (!branchStatus.hasBranch) missing.push('branch not pushed to origin');
-    if (!branchStatus.hasPR) missing.push('no pull request associated');
-    if (missing.length > 0) {
-      log.warn(`workflow-gate: done gate: ${issueId} blocked — ${missing.join('; ')}`);
-      return (
-        `[Proxy] 'deploy' blocked: cannot reach terminal done. Missing: ${missing.join('; ')}. ` +
-        `Push the branch and open a pull request before deploying.`
-      );
+    // A merged PR is sufficient evidence — the code was reviewed and merged,
+    // regardless of whether the branch was auto-deleted after merge (AI-1492).
+    if (branchStatus.hasMergedPR) {
+      log.info(`workflow-gate: done gate: ${issueId} passed (merged PR confirmed)`);
+    } else {
+      // No merged PR — require both a pushed branch AND an open/existing PR.
+      const missing: string[] = [];
+      if (!branchStatus.hasBranch) missing.push('branch not pushed to origin');
+      if (!branchStatus.hasPR) missing.push('no pull request associated');
+      if (missing.length > 0) {
+        log.warn(`workflow-gate: done gate: ${issueId} blocked — ${missing.join('; ')}`);
+        return (
+          `[Proxy] 'deploy' blocked: cannot reach terminal done. Missing: ${missing.join('; ')}. ` +
+          `Push the branch and open a pull request before deploying.`
+        );
+      }
+      log.info(`workflow-gate: done gate: ${issueId} passed (has branch + PR, not yet merged)`);
     }
-    log.info(`workflow-gate: done gate: ${issueId} passed (has branch + PR)`);
   }
 
   // Assignment target validation (§4.3, §16.1)
@@ -999,14 +1014,19 @@ export async function applyStateTransition(
     return;
   }
 
-  // ── AI-1475 Defect 1: Done gate defense-in-depth (§5.6) ────────────────
+  // ── AI-1475 Defect 1 + AI-1492: Done gate defense-in-depth (§5.6) ────────
   // Block the label swap to done if the branch/PR gate is not satisfied.
   // This is defense-in-depth: checkWorkflowRules is the primary gate, but
   // applyStateTransition also blocks to prevent any bypass path.
   // Only applies when intent is 'deploy' (dev-impl workflow: deployment → done).
+  //
+  // AI-1492: A merged PR satisfies the gate even without a branch (auto-deleted
+  // after squash merge).
   if (intent === 'deploy' && toStateName === 'done') {
     const branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
-    if (!branchStatus || !branchStatus.hasBranch || !branchStatus.hasPR) {
+    const hasMergedPR = branchStatus?.hasMergedPR === true;
+    const hasBranchAndPR = branchStatus?.hasBranch && branchStatus?.hasPR;
+    if (!hasMergedPR && !hasBranchAndPR) {
       const missing: string[] = [];
       if (!branchStatus) missing.push('could not verify branch/PR status');
       else {
