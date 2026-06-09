@@ -264,18 +264,23 @@ beforeEach(() => {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-function makeLabelFetch(labelNames: string[], branchAndPR?: { hasBranch: boolean; hasPR: boolean }): typeof globalThis.fetch {
-  const branch = branchAndPR ?? { hasBranch: true, hasPR: true };
+function makeLabelFetch(labelNames: string[], branchAndPR?: { hasBranch?: boolean; hasPR?: boolean; hasMergedPR?: boolean }): typeof globalThis.fetch {
+  const branch = {
+    hasBranch: branchAndPR?.hasBranch ?? true,
+    hasPR: branchAndPR?.hasPR ?? true,
+    hasMergedPR: branchAndPR?.hasMergedPR ?? false,
+  };
   return async (_url, init) => {
     const bodyText = typeof init?.body === "string" ? init.body : "";
     // Return branch/PR data when the query asks for it (AI-1475 D1 done gate)
     if (bodyText.includes("IssueBranchAndPR")) {
+      const prState = branch.hasMergedPR ? "merged" : "open";
       return new Response(
         JSON.stringify({
           data: {
             issue: {
               branch: branch.hasBranch ? { id: "branch-id", name: "feature-branch", updatedAt: "2026-06-09T00:00:00Z" } : null,
-              pullRequests: branch.hasPR ? { nodes: [{ id: "pr-id", state: "open" }] } : { nodes: [] },
+              pullRequests: branch.hasPR ? { nodes: [{ id: "pr-id", state: prState }] } : { nodes: [] },
             },
           },
         }),
@@ -725,8 +730,8 @@ function makeTransitionFetch(opts: {
   issueError?: boolean;
   /** Override to simulate a fetch error for the issueUpdate call. */
   updateError?: boolean;
-  /** Branch/PR status for done gate (AI-1475 D1). Defaults to has branch + PR (pass gate). */
-  branchStatus?: { hasBranch?: boolean; hasPR?: boolean } | null;
+  /** Branch/PR status for done gate (AI-1475 D1 + AI-1492). Defaults to has branch + PR (pass gate). */
+  branchStatus?: { hasBranch?: boolean; hasPR?: boolean; hasMergedPR?: boolean } | null;
 }): { fetch: typeof globalThis.fetch; calls: FetchCall[] } {
   const calls: FetchCall[] = [];
   const teamId = opts.teamId ?? "team-uuid";
@@ -736,6 +741,7 @@ function makeTransitionFetch(opts: {
   const branch = opts.branchStatus === null ? null : {
     hasBranch: opts.branchStatus?.hasBranch ?? true,
     hasPR: opts.branchStatus?.hasPR ?? true,
+    hasMergedPR: opts.branchStatus?.hasMergedPR ?? false,
   };
 
   const mockFetch: typeof globalThis.fetch = async (url, init) => {
@@ -799,18 +805,19 @@ function makeTransitionFetch(opts: {
       );
     }
 
-    // AI-1475 D1: Branch/PR status for done gate.
+    // AI-1475 D1 + AI-1492: Branch/PR status for done gate.
     if (query.includes("IssueBranchAndPR")) {
       if (branch === null) {
         // Simulate fetch error for branch/PR query
         throw new Error("simulated branch/PR fetch error");
       }
+      const prState = branch.hasMergedPR ? "merged" : "open";
       return new Response(
         JSON.stringify({
           data: {
             issue: {
               branch: branch.hasBranch ? { id: "branch-id", name: "feature-branch", updatedAt: "2026-06-09T00:00:00Z" } : null,
-              pullRequests: branch.hasPR ? { nodes: [{ id: "pr-id", state: "open" }] } : { nodes: [] },
+              pullRequests: branch.hasPR ? { nodes: [{ id: "pr-id", state: prState }] } : { nodes: [] },
             },
           },
         }),
@@ -1379,6 +1386,24 @@ describe("checkWorkflowRules — AI-1475 D1: done gate (branch/PR verification)"
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: false, hasPR: false });
     expect(await checkWorkflowRules("reject", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
   });
+
+  // AI-1492 regression: branch auto-deleted after squash merge — merged PR must still pass.
+  it("allows 'deploy' → done when PR is merged but branch is deleted (AI-1492)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: false, hasPR: true, hasMergedPR: true });
+    expect(await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+  });
+
+  it("allows 'deploy' → done when PR is merged and branch still exists (AI-1492)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: true, hasPR: true, hasMergedPR: true });
+    expect(await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+  });
+
+  it("still blocks 'deploy' → done when PR is open (not merged) and branch is deleted (AI-1492)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: false, hasPR: true, hasMergedPR: false });
+    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("branch not pushed to origin");
+  });
 });
 
 // ── AI-1475 Defect 2: Submit requires reviewer ≠ author ──────────────────────
@@ -1472,6 +1497,37 @@ describe("applyStateTransition — AI-1475 D1: done gate defense-in-depth", () =
     await applyStateTransition("submit", "issue-uuid", "Bearer tok");
     const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
     expect(updateCall).toBeDefined();
+  });
+
+  // AI-1492 regression: merged PR passes B2 defense-in-depth even when branch is deleted.
+  it("allows label swap to done when PR is merged but branch is deleted (AI-1492)", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:deployment" },
+      ],
+      teamLabels: [{ id: "done-lbl", name: "state:done" }],
+      branchStatus: { hasBranch: false, hasPR: true, hasMergedPR: true },
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
+    expect(updateCall).toBeDefined();
+  });
+
+  it("still blocks label swap to done when PR is open (not merged) and branch is deleted (AI-1492)", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:deployment" },
+      ],
+      teamLabels: [{ id: "done-lbl", name: "state:done" }],
+      branchStatus: { hasBranch: false, hasPR: true, hasMergedPR: false },
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
+    // No ApplyStateTransition call — done gate blocked it
+    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyStateTransition"))).toBe(false);
   });
 });
 
