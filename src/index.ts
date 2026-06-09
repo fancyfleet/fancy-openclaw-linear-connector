@@ -304,12 +304,12 @@ export function createApp(options?: CreateAppOptions) {
   }
 
   const watchdog = new DispatchWatchdog(
-    { bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig, resignalOptions },
+    { bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig, wakeConfigForAgent, resignalOptions },
   );
   watchdog.start();
 
   const noActivityDetector = new NoActivityDetector(
-    { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, resignalOptions, postLinearComment },
+    { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, wakeConfigForAgent, resignalOptions, postLinearComment },
   );
   noActivityDetector.start();
 
