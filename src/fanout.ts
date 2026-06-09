@@ -20,6 +20,7 @@
  */
 
 import { componentLogger, createLogger } from "./logger.js";
+import { generateSpawnPreview, checkCaps, formatPreviewComment, formatCapRefusalComment, parseSpawnCaps, type SpawnPreview, type CapCheckResult, type SpawnCaps } from "./spawn-preview.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "fanout");
 
@@ -43,6 +44,12 @@ export interface FanoutResult {
   childIdentifiers: string[];
   /** Errors encountered during creation (non-fatal; partial success allowed). */
   errors: FanoutError[];
+  /** Phase 6.5 / H-2: spawn-preview generated before instantiation. */
+  preview: SpawnPreview | null;
+  /** Phase 6.5 / H-2: whether the fan-out was refused by caps. */
+  refused: boolean;
+  /** Phase 6.5 / H-2: whether steward approval is pending. */
+  pendingApproval: boolean;
 }
 
 export interface FanoutError {
@@ -347,11 +354,15 @@ export async function executeFanout(
   parentIssueId: string,
   authToken: string,
   findingsOverride?: Finding[],
+  options?: { caps?: SpawnCaps; skipPreview?: boolean },
 ): Promise<FanoutResult> {
   const result: FanoutResult = {
     created: 0,
     childIdentifiers: [],
     errors: [],
+    preview: null,
+    refused: false,
+    pendingApproval: false,
   };
 
   // 1. Fetch parent issue context
@@ -374,6 +385,56 @@ export async function executeFanout(
       message: "No findings extracted — fan-out requires at least one finding",
     });
     return result;
+  }
+
+  // ── Phase 6.5 / H-2: Spawn-preview gate + hard recursion caps ──────
+  // Before any child is instantiated, generate a preview and check caps.
+  // AC1: exceeding max_children → REFUSED (not truncated).
+  // AC2: above approval_above → steward approval required.
+  // AC3: preview shows proposed child list before any child ticket exists.
+  if (!options?.skipPreview) {
+    const caps = options?.caps ?? parseSpawnCaps();
+
+    const previewResult = await generateSpawnPreview(
+      parentIssueId,
+      authToken,
+      findings.map((f) => ({ title: f.title, description: f.description })),
+      caps,
+    );
+
+    if (previewResult.error) {
+      result.errors.push({
+        findingIndex: -1,
+        message: `Spawn preview generation failed: ${previewResult.error}`,
+      });
+      return result;
+    }
+
+    result.preview = previewResult.preview;
+
+    if (previewResult.preview) {
+      // Post the preview comment for human visibility (AC3)
+      const previewComment = formatPreviewComment(previewResult.preview);
+      await postPreviewComment(parentCtx.internalId, previewComment, authToken);
+
+      // AC1: hard cap violation → refuse entirely
+      if (!previewResult.preview.capResult.allowed) {
+        result.refused = true;
+        result.errors.push({
+          findingIndex: -1,
+          message: previewResult.preview.capResult.refusalReason ?? "Fan-out refused by hard recursion cap",
+        });
+        log.warn(`fanout: REFUSED — caps blocked spawn for ${parentIssueId}: ${previewResult.preview.capResult.refusalReason}`);
+        return result;
+      }
+
+      // AC2: approval_above threshold → return pending state
+      if (previewResult.preview.requiresApproval) {
+        result.pendingApproval = true;
+        log.info(`fanout: pending steward approval for ${parentIssueId} (${previewResult.preview.childCount} children > approval_above ${caps.approvalAbove})`);
+        return result;
+      }
+    }
   }
 
   // 3. Ensure required labels exist
@@ -433,6 +494,32 @@ export async function executeFanout(
   );
 
   return result;
+}
+
+/**
+ * Post a preview comment on the parent ticket.
+ * Fail-open: errors are logged but don't block the operation.
+ */
+async function postPreviewComment(
+  issueInternalId: string,
+  commentBody: string,
+  authToken: string,
+): Promise<void> {
+  const mutation = `
+    mutation($issueId: ID!, $body: String!) {
+      commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
+    }
+  `;
+  try {
+    await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: mutation, variables: { issueId: issueInternalId, body: commentBody } }),
+    });
+    log.info(`fanout: spawn-preview comment posted on ${issueInternalId}`);
+  } catch (err) {
+    log.warn(`fanout: failed to post spawn-preview comment: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 // (resolveInternalId removed — internal UUID is now returned directly by fetchIssueTeamAndParent.)

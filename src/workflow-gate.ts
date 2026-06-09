@@ -43,6 +43,7 @@ import { ObservationStore, type ReasonCode } from "./store/observation-store.js"
 import { isBodyKnown } from "./escalation-gate.js";
 import { getAgent } from "./agents.js";
 import { executeFanout, shouldTriggerFanout } from "./fanout.js";
+import { formatCapRefusalComment } from "./spawn-preview.js";
 import { onChildTerminal, isTerminalState } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
 import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store.js";
@@ -463,7 +464,7 @@ export async function checkWorkflowRules(
     //   - note is informational-only and never mutates state, so allowing it through
     //     is safe even if we can't verify workflow membership.
     // All other intents are rejected because they would mutate workflow state without
-    //     being able to validate the move.
+    // being able to validate the move.
     const looksLikeWorkflowCommand = intent !== "begin-work" && intent !== "note";
     if (looksLikeWorkflowCommand) {
       log.error(`workflow-gate: FAIL-CLOSED — context fetch failed for ${issueId}, cannot determine if workflow ticket — rejecting '${intent}'`);
@@ -1221,6 +1222,37 @@ export async function applyStateTransition(
     try {
       log.info(`workflow-gate: B-2 fan-out: triggering fan-out for ${issueId} (spawning → managing)`);
       const fanoutResult = await executeFanout(issueId, authToken);
+
+      // Phase 6.5 / H-2: Handle spawn-preview gate results.
+      if (fanoutResult.refused) {
+        // Hard cap violation — fan-out was refused. The preview comment was
+        // already posted by the fan-out module. Revert the state transition
+        // back to spawning so the ticket stays actionable.
+        log.warn(`workflow-gate: B-2 fan-out: REFUSED for ${issueId} — reverting state to spawning`);
+        const spawningLabelId = await findOrCreateLabel(issue.teamId, "state:spawning", authToken);
+        const managingLabelId = issue.labels.find((l) => l.name === `state:${toStateName}`)?.id;
+        if (spawningLabelId && managingLabelId) {
+          const revertedLabelIds = newLabelIds.filter((id) => id !== managingLabelId);
+          revertedLabelIds.push(spawningLabelId);
+          await issueUpdateLabels(issue.internalId, revertedLabelIds, authToken);
+          log.info(`workflow-gate: B-2 fan-out: reverted ${issueId} back to state:spawning after cap refusal`);
+        }
+        // Post refusal comment
+        if (fanoutResult.preview?.capResult) {
+          const refusalBody = formatCapRefusalComment(fanoutResult.preview.capResult, issueId);
+          await postFanoutRefusalComment(issue.internalId, refusalBody, authToken);
+        }
+        return;
+      }
+
+      if (fanoutResult.pendingApproval) {
+        // Steward approval required — don't create children yet.
+        // The preview comment was already posted. The state transition to managing
+        // is kept — a steward approval will trigger a re-spawn.
+        log.info(`workflow-gate: B-2 fan-out: ${issueId} awaiting steward approval — preview posted, no children created`);
+        return;
+      }
+
       if (fanoutResult.created > 0) {
         log.info(
           `workflow-gate: B-2 fan-out: ${fanoutResult.created} child(ren) created for ${issueId}: ${fanoutResult.childIdentifiers.join(", ")}`,
@@ -1295,6 +1327,32 @@ export async function applyStateTransition(
       const msg = err instanceof Error ? err.message : String(err);
       log.warn(`workflow-gate: B-3 barrier check failed for ${issueId}: ${msg}`);
     }
+  }
+}
+
+/**
+ * Post a cap-refusal comment on the parent ticket.
+ * Fail-open: errors are logged but don't block the operation.
+ */
+async function postFanoutRefusalComment(
+  issueInternalId: string,
+  commentBody: string,
+  authToken: string,
+): Promise<void> {
+  const mutation = `
+    mutation($issueId: ID!, $body: String!) {
+      commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
+    }
+  `;
+  try {
+    await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: mutation, variables: { issueId: issueInternalId, body: commentBody } }),
+    });
+    log.info(`workflow-gate: B-2 fan-out: cap-refusal comment posted on ${issueInternalId}`);
+  } catch (err) {
+    log.warn(`workflow-gate: B-2 fan-out: failed to post cap-refusal comment: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
