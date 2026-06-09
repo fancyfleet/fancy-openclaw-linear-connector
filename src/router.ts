@@ -13,6 +13,7 @@ import type { LinearEvent } from "./webhook/schema.js";
 import type { RouteResult } from "./types.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { createLogger, componentLogger } from "./logger.js";
+import { loadRoster, resolveRoute, type DepartmentRoster } from "./department-roster.js";
 
 const log = componentLogger(createLogger(), "router");
 
@@ -131,17 +132,11 @@ export function extractAgentTarget(event: LinearEvent): { name: string; reason: 
     }
   }
 
-  // 5. Self-trigger filtering: skip if the actor IS the target agent.
-  //    Prevents feedback loops where an agent's own write re-dispatches itself.
-  //    Exception: state transitions always dispatch — the agent advanced to a new
-  //    step and needs to be notified even if it is the same agent in the new step.
-  if (isActorOurAgent && !isStateTransition) {
-    if (!target || agentMap[actorId!] === target) {
-      log.info(`Skipping self-triggered event from ${actorId}`);
-      return null;
-    }
-    log.info(`Agent-to-agent delegation: ${agentMap[actorId!]} → ${target}`);
-  }
+  // 5. Self-trigger filtering is handled downstream by routeEvent() after
+  //    consulting the department-roster functionary (AI-1479). Returning the
+  //    mechanical target even for self-triggered events lets department-prefix
+  //    routing override self-trigger suppression when the resolved target
+  //    differs from the actor.
 
   return target ? { name: target, reason } : null;
 }
@@ -310,12 +305,30 @@ export function unresolvedRoutingCandidates(event: LinearEvent): string[] {
   return [...candidates].filter((id) => !agentMap[id]);
 }
 
+const VALID_ROUTING_REASONS = new Set<string>([
+  "delegate",
+  "assignee",
+  "mention",
+  "body-mention",
+  "department-prefix",
+  "department-override",
+  "steward-escalation",
+]);
+
+function toRoutingReason(reason: string): RouteResult["routingReason"] {
+  return VALID_ROUTING_REASONS.has(reason) ? (reason as RouteResult["routingReason"]) : undefined;
+}
+
+/**
+ * Build a RouteResult from the functionary's routing decision.
+ */
 function buildRouteResult(
-  target: { name: string; reason: "delegate" | "assignee" | "mention" | "body-mention" },
   event: LinearEvent,
+  targetName: string,
+  identifier: string | null,
+  reason: string,
 ): RouteResult {
-  const openclawName = getOpenclawAgentName(target.name);
-  const identifier = extractIssueIdentifier(event);
+  const openclawName = getOpenclawAgentName(targetName);
   const rawKey = identifier
     ? `linear-${identifier}`
     : `linear-${event.type}-${Date.now()}`;
@@ -331,7 +344,7 @@ function buildRouteResult(
       ` data=${dataStr}`
     );
   } else {
-    log.info(`routeEvent: type=${event.type} identifier=${identifier} reason=${target.reason}`);
+    log.info(`routeEvent: type=${event.type} identifier=${identifier} reason=${reason} target=${targetName}`);
   }
 
   return {
@@ -339,33 +352,112 @@ function buildRouteResult(
     sessionKey,
     priority: 0,
     event,
-    routingReason: target.reason,
+    routingReason: toRoutingReason(reason),
   };
 }
 
 /**
  * Route a Linear event to an OpenClaw agent.
- * Returns a RouteResult if routing succeeded, null if no agent found.
+ *
+ * AI-1479 (Phase 6.5, §16.5): integrates the department-roster functionary.
+ * - When a roster is loaded and the issue has a team prefix matching a
+ *   department, that department's defaultTarget is used directly.
+ * - Otherwise the mechanical resolution (delegate/assignee/mention) is used.
+ * - When neither matches, the steward (Astrid) receives the event as an
+ *   escalation — the functionary never returns null.
+ *
+ * Self-trigger suppression (moved here from extractAgentTarget): an agent's own
+ * write is suppressed to prevent feedback loops, EXCEPT (a) genuine workflow
+ * state transitions, which always dispatch so the agent is woken for its new
+ * step, and (b) when the functionary redirects to a different department target.
+ *
+ * Returns a RouteResult if routing succeeded, null only when the event is a
+ * self-trigger that should be suppressed.
  */
-export function routeEvent(event: LinearEvent): RouteResult | null {
-  const result = extractAgentTarget(event);
-  if (!result) return null;
-  return buildRouteResult(result, event);
+export async function routeEvent(event: LinearEvent): Promise<RouteResult | null> {
+  const identifier = extractIssueIdentifier(event);
+  const mechanicalTarget = extractAgentTarget(event);
+
+  // Load department roster (cached in-process; null when unavailable).
+  let roster: DepartmentRoster | null = null;
+  try {
+    roster = await loadRoster();
+  } catch {
+    // Fail-open: roster unavailable → skip department routing.
+  }
+
+  const actorId = event.actor?.id;
+  const agentMap = buildAgentMap();
+  const isActorOurAgent = actorId ? !!agentMap[actorId] : false;
+
+  // Genuine workflow state transitions always dispatch, even self-triggered —
+  // the agent advanced its own ticket to a new step and must be woken. Mirrors
+  // the pre-functionary self-trigger exception that lived in extractAgentTarget.
+  const isStateTransition =
+    event.type === "Issue" &&
+    event.action === "update" &&
+    (() => {
+      const upd = (event as { updatedFrom?: Record<string, unknown> }).updatedFrom;
+      return upd !== undefined && "stateId" in upd;
+    })();
+
+  if (
+    isActorOurAgent &&
+    !isStateTransition &&
+    mechanicalTarget &&
+    agentMap[actorId!] === mechanicalTarget.name
+  ) {
+    // The mechanical target IS the actor — suppress, unless the functionary
+    // redirects to a department target (which is NOT the actor).
+    const functionaryResult = resolveRoute(identifier, event.type, roster, null);
+    if (
+      functionaryResult.reason === "department-prefix" ||
+      functionaryResult.reason === "department-override"
+    ) {
+      return buildRouteResult(event, functionaryResult.target, identifier, functionaryResult.reason);
+    }
+    log.info(`Skipping self-triggered event from ${actorId}`);
+    return null;
+  }
+
+  // Actor is an agent with no mechanical target: consult the roster before
+  // suppressing. Dispatch only if the functionary routes to a department target
+  // that isn't the actor; otherwise suppress (a steward escalation to self loops).
+  if (isActorOurAgent && !mechanicalTarget) {
+    const functionaryResult = resolveRoute(identifier, event.type, roster, null);
+    const actorName = agentMap[actorId!];
+    if (
+      (functionaryResult.reason === "department-prefix" ||
+        functionaryResult.reason === "department-override") &&
+      functionaryResult.target !== actorName
+    ) {
+      return buildRouteResult(event, functionaryResult.target, identifier, functionaryResult.reason);
+    }
+    log.info(`Skipping self-triggered event from ${actorId} (no mechanical target, no department match to other target)`);
+    return null;
+  }
+
+  // Run the routing functionary.
+  const functionaryResult = resolveRoute(identifier, event.type, roster, mechanicalTarget);
+  return buildRouteResult(event, functionaryResult.target, identifier, functionaryResult.reason);
 }
 
 /**
- * Route a Linear event to ALL its targets: the primary route (delegate →
- * assignee → first mention, exactly as routeEvent) plus one mention route per
- * additional registered agent mentioned in the event (audit #3 — previously
- * only the first mentioned agent was ever woken).
+ * Route a Linear event to ALL its targets: the primary route (through the
+ * department-roster functionary, including self-trigger suppression and steward
+ * escalation) plus one mention route per additional registered agent mentioned
+ * in the event (audit #3 — previously only the first mentioned agent was woken).
  */
-export function routeEventAll(event: LinearEvent): RouteResult[] {
-  const primary = extractAgentTarget(event);
+export async function routeEventAll(event: LinearEvent): Promise<RouteResult[]> {
+  const primary = await routeEvent(event);
   if (!primary) return [];
-  const routes = [buildRouteResult(primary, event)];
-  for (const name of extractAdditionalMentionTargets(event, primary.name)) {
-    log.info(`Fan-out mention route: ${name} (primary: ${primary.name})`);
-    routes.push(buildRouteResult({ name, reason: "mention" }, event));
+  const routes = [primary];
+  // Exclude the mechanical primary and the acting agent from the fan-out.
+  const mechanicalPrimary = extractAgentTarget(event);
+  const identifier = extractIssueIdentifier(event);
+  for (const name of extractAdditionalMentionTargets(event, mechanicalPrimary?.name ?? null)) {
+    log.info(`Fan-out mention route: ${name} (primary: ${mechanicalPrimary?.name ?? "none"})`);
+    routes.push(buildRouteResult(event, name, identifier, "mention"));
   }
   return routes;
 }
