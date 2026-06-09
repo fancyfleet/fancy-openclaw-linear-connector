@@ -44,6 +44,7 @@ import { isBodyKnown } from "./escalation-gate.js";
 import { getAgent } from "./agents.js";
 import { executeFanout, shouldTriggerFanout } from "./fanout.js";
 import { onChildTerminal, isTerminalState } from "./barrier.js";
+import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-gate");
 
@@ -808,6 +809,51 @@ export async function applyStateTransition(
       `workflow-gate: B2 apply: ${issueId} already in state '${toStateName}' — no-op`,
     );
     return;
+  }
+
+  // ── Phase 5 / B-4: Parent-AC gate for review → done (F2b, §5.6) ─────
+  // Before the atomic label swap, check if this is a review → done transition
+  // on a ux-audit ticket. If so, the parent-AC gate must pass (§5.6): the
+  // parent's own AC is verified, not the sum of children.
+  // Fail-closed: if the AC gate cannot be evaluated (description fetch error),
+  // block the transition to prevent premature done.
+  const disposition = resolveDisposition(workflowId, currentStateName, intent);
+  if (disposition === "done") {
+    try {
+      log.info(`workflow-gate: B-4 review: evaluating parent-AC gate for ${issueId} (review → done)`);
+      const acResult = await dispositionToDone(issueId, authToken);
+      if (!acResult.applied) {
+        log.warn(`workflow-gate: B-4 review: → done blocked for ${issueId}: ${acResult.error ?? "unknown"}`);
+        return; // Block the transition — AC gate failed
+      }
+      // AC gate passed and dispositionToDone already applied the label swap + comment.
+      // Skip the normal atomic swap below — dispositionToDone handled it.
+      log.info(`workflow-gate: B-4 review: ${issueId} review → done (parent AC satisfied)`);
+      return;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`workflow-gate: B-4 review: parent-AC gate failed for ${issueId}: ${msg} — blocking transition`);
+      return;
+    }
+  }
+
+  if (disposition === "spawning") {
+    try {
+      log.info(`workflow-gate: B-4 review: disposition → spawning for ${issueId} (follow-up gaps)`);
+      const spawnResult = await dispositionToSpawning(issueId, authToken);
+      if (!spawnResult.applied) {
+        log.warn(`workflow-gate: B-4 review: → spawning failed for ${issueId}: ${spawnResult.error ?? "unknown"}`);
+        // Fall through to normal transition — it'll go to spawning via the standard path
+      } else {
+        // dispositionToSpawning applied the label swap + comment.
+        log.info(`workflow-gate: B-4 review: ${issueId} review → spawning (follow-up)`);
+        return;
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`workflow-gate: B-4 review: → spawning failed for ${issueId}: ${msg}`);
+      // Fall through to normal transition
+    }
   }
 
   // ── Atomic label swap ──────────────────────────────────────────────────

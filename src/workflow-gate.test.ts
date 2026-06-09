@@ -1478,19 +1478,19 @@ describe("checkWorkflowRules — canonical ux-audit schema (src/__fixtures__/can
     expect(blocked).toContain("complete");
   });
 
-  it("review state allows approve and request-revision", async () => {
+  it("review state allows approve and request-rework", async () => {
     globalThis.fetch = makeLabelFetch(["wf:ux-audit", "state:review"]);
     expect(await checkWorkflowRules("approve", "issue-uuid", "Bearer tok", "maya")).toBeNull();
     resetWorkflowCache();
     globalThis.fetch = makeLabelFetch(["wf:ux-audit", "state:review"]);
-    expect(await checkWorkflowRules("request-revision", "issue-uuid", "Bearer tok", "maya")).toBeNull();
+    expect(await checkWorkflowRules("request-rework", "issue-uuid", "Bearer tok", "maya")).toBeNull();
     // complete is illegal in review
     resetWorkflowCache();
     globalThis.fetch = makeLabelFetch(["wf:ux-audit", "state:review"]);
     const blocked = await checkWorkflowRules("complete", "issue-uuid", "Bearer tok", "maya");
     expect(blocked).not.toBeNull();
     expect(blocked).toContain("approve");
-    expect(blocked).toContain("request-revision");
+    expect(blocked).toContain("request-rework");
   });
 
   // §16.0 invariant: all transition targets resolve to valid states
