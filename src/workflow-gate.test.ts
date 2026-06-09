@@ -20,16 +20,19 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import {
   checkWorkflowRules,
   applyStateTransition,
   checkRawMutationInterception,
   buildStateTransitionReminder,
   resetWorkflowCache,
+  resolveStakesLevel,
 } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { reloadAgents } from "./agents.js";
 import { clearArtifactStore, getBoundArtifact, hasBoundArtifact } from "./artifact-store.js";
+import { clearAcRecordStore } from "./ac-record-store.js";
 
 // Resolved from the project root (jest cwd) so it works under both the
 // ESM tsc build and the CommonJS ts-jest transpile.
@@ -255,6 +258,20 @@ beforeAll(() => {
   const workflowFile = path.join(dir, "dev-impl.yaml");
   fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
   process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+  // Agents file with linearUserId for all test bodies (H-1 fail-closed requires
+  // linearUserId on singleton auto-delegate targets).
+  const agentsFile = path.join(dir, "agents.json");
+  fs.writeFileSync(agentsFile, JSON.stringify({
+    agents: [
+      { name: "reviewer", linearUserId: "reviewer-linear-uuid", clientId: "r-client", clientSecret: "r-secret", accessToken: "r-token", refreshToken: "r-refresh" },
+      { name: "hanzo", linearUserId: "hanzo-linear-uuid", clientId: "h-client", clientSecret: "h-secret", accessToken: "h-token", refreshToken: "h-refresh" },
+      { name: "charles", linearUserId: "charles-linear-uuid", clientId: "c-client", clientSecret: "c-secret", accessToken: "c-token", refreshToken: "c-refresh" },
+      { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-client", clientSecret: "a-secret", accessToken: "a-token", refreshToken: "a-refresh" },
+    ],
+  }, null, 2), "utf8");
+  process.env.AGENTS_FILE = agentsFile;
+  reloadAgents();
 });
 
 beforeEach(() => {
@@ -707,7 +724,7 @@ describe("checkWorkflowRules — canonical vault schema (src/__fixtures__/canoni
   });
 
   it("canonical: deploy in deployment state is allowed for Hanzo (deployment body)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment", "stakes:low"]);
     expect(await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
   });
 });
@@ -789,7 +806,7 @@ function makeTransitionFetch(opts: {
       );
     }
 
-    if (query.includes("ApplyStateTransition")) {
+    if (query.includes("ApplyAtomicTransition")) {
       if (opts.updateError) throw new Error("simulated update error");
       return new Response(
         JSON.stringify({ data: { issueUpdate: { success: issueUpdateSuccess } } }),
@@ -851,7 +868,7 @@ describe("applyStateTransition — no-ops (fail-open / mode switch)", () => {
     await applyStateTransition("submit", "issue-uuid", "Bearer tok");
     // Only the IssueWithLabels fetch should fire; no issueUpdate.
     expect(calls.some((c) => (c.body.query ?? "").includes("IssueWithLabels"))).toBe(true);
-    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyStateTransition"))).toBe(false);
+    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"))).toBe(false);
   });
 
   it("is a no-op when issue fetch fails", async () => {
@@ -862,7 +879,7 @@ describe("applyStateTransition — no-ops (fail-open / mode switch)", () => {
     globalThis.fetch = mock;
     // Should not throw even on fetch failure.
     await expect(applyStateTransition("submit", "issue-uuid", "Bearer tok")).resolves.toBeUndefined();
-    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyStateTransition"))).toBe(false);
+    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"))).toBe(false);
   });
 
   it("is a no-op when already in target state (idempotent re-apply)", async () => {
@@ -878,7 +895,7 @@ describe("applyStateTransition — no-ops (fail-open / mode switch)", () => {
     // The transition lookup finds 'submit' only in implementation, not code-review.
     // So this logs a warn (no transition for submit in code-review) and returns.
     await applyStateTransition("submit", "issue-uuid", "Bearer tok");
-    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyStateTransition"))).toBe(false);
+    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"))).toBe(false);
   });
 
   it("idempotent: no issueUpdate when current state already past the command's source", async () => {
@@ -893,7 +910,7 @@ describe("applyStateTransition — no-ops (fail-open / mode switch)", () => {
     });
     globalThis.fetch = mock;
     await applyStateTransition("accept", "issue-uuid", "Bearer tok");
-    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyStateTransition"))).toBe(false);
+    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"))).toBe(false);
   });
 });
 
@@ -916,7 +933,7 @@ describe("applyStateTransition — normal state advance", () => {
     globalThis.fetch = mock;
     await applyStateTransition("submit", "issue-uuid", "Bearer tok");
 
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
     const vars = updateCall!.body.variables as { issueId: string; labelIds: string[] };
     expect(vars.issueId).toBe("internal-uuid");
@@ -939,7 +956,7 @@ describe("applyStateTransition — normal state advance", () => {
     await applyStateTransition("submit", "issue-uuid", "Bearer tok");
 
     expect(calls.some((c) => (c.body.query ?? "").includes("issueLabelCreate"))).toBe(true);
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
     const vars = updateCall!.body.variables as { labelIds: string[] };
     expect(vars.labelIds).toContain("new-label-id");
@@ -957,7 +974,7 @@ describe("applyStateTransition — normal state advance", () => {
     globalThis.fetch = mock;
     await applyStateTransition("accept", "issue-uuid", "Bearer tok");
 
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
     const vars = updateCall!.body.variables as { labelIds: string[] };
     const stateLabelCount = vars.labelIds.filter((id) =>
@@ -1014,7 +1031,7 @@ describe("applyStateTransition — break-glass escape", () => {
     globalThis.fetch = mock;
     await applyStateTransition("escape", "issue-uuid", "Bearer tok");
 
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
     const vars = updateCall!.body.variables as { labelIds: string[] };
     expect(vars.labelIds).toContain("escape-lbl");
@@ -1038,7 +1055,7 @@ describe("applyStateTransition — __ad_hoc__ demotion", () => {
     globalThis.fetch = mock;
     await applyStateTransition("demote", "issue-uuid", "Bearer tok");
 
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
     const vars = updateCall!.body.variables as { labelIds: string[] };
     // wf:* and state:* labels gone; non-workflow labels kept.
@@ -1056,7 +1073,7 @@ describe("applyStateTransition — __ad_hoc__ demotion", () => {
     });
     globalThis.fetch = mock;
     await applyStateTransition("demote", "issue-uuid", "Bearer tok");
-    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyStateTransition"))).toBe(false);
+    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"))).toBe(false);
   });
 });
 
@@ -1451,8 +1468,8 @@ describe("applyStateTransition — AI-1475 D1: done gate defense-in-depth", () =
     });
     globalThis.fetch = mock;
     await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
-    // No ApplyStateTransition call — done gate blocked it
-    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyStateTransition"))).toBe(false);
+    // No ApplyAtomicTransition call — done gate blocked it
+    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"))).toBe(false);
   });
 
   it("blocks label swap to done when no PR exists (defense-in-depth)", async () => {
@@ -1466,7 +1483,7 @@ describe("applyStateTransition — AI-1475 D1: done gate defense-in-depth", () =
     });
     globalThis.fetch = mock;
     await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
-    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyStateTransition"))).toBe(false);
+    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"))).toBe(false);
   });
 
   it("allows label swap to done when branch + PR exist", async () => {
@@ -1480,7 +1497,7 @@ describe("applyStateTransition — AI-1475 D1: done gate defense-in-depth", () =
     });
     globalThis.fetch = mock;
     await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
   });
 
@@ -1495,7 +1512,7 @@ describe("applyStateTransition — AI-1475 D1: done gate defense-in-depth", () =
     });
     globalThis.fetch = mock;
     await applyStateTransition("submit", "issue-uuid", "Bearer tok");
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
   });
 
@@ -1511,7 +1528,7 @@ describe("applyStateTransition — AI-1475 D1: done gate defense-in-depth", () =
     });
     globalThis.fetch = mock;
     await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
   });
 
@@ -1526,8 +1543,8 @@ describe("applyStateTransition — AI-1475 D1: done gate defense-in-depth", () =
     });
     globalThis.fetch = mock;
     await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
-    // No ApplyStateTransition call — done gate blocked it
-    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyStateTransition"))).toBe(false);
+    // No ApplyAtomicTransition call — done gate blocked it
+    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"))).toBe(false);
   });
 });
 
@@ -1990,7 +2007,7 @@ describe("applyStateTransition — auto-delegate assignment (AI-1463)", () => {
     await applyStateTransition("approve", "issue-uuid", "Bearer tok");
 
     // Verify the label swap happened
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
 
     // Verify the delegate update mutation was issued
@@ -2017,7 +2034,7 @@ describe("applyStateTransition — auto-delegate assignment (AI-1463)", () => {
     await applyStateTransition("submit", "issue-uuid", "Bearer tok");
 
     // Label swap should happen
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
 
     // But no delegate update (code-review role has no bodies in test policy)
@@ -2037,7 +2054,7 @@ describe("applyStateTransition — auto-delegate assignment (AI-1463)", () => {
 
     await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
 
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
 
     // Terminal state — no auto-delegate
@@ -2074,7 +2091,7 @@ describe("applyStateTransition — auto-delegate assignment (AI-1463)", () => {
     await applyStateTransition("approve", "issue-uuid", "Bearer tok");
 
     // Label swap should still have happened despite missing hanzo agent
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
 
     // No delegate update (hanzo not in agents)
@@ -2211,7 +2228,7 @@ bodies:
       }
 
       // State transition: issueUpdate
-      if (q.includes("ApplyStateTransition")) {
+      if (q.includes("ApplyAtomicTransition")) {
         return new Response(
           JSON.stringify({ data: { issueUpdate: { success: true } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
@@ -2324,7 +2341,7 @@ bodies:
     process.env.WORKFLOW_DEF_PATH = CANONICAL_UX_AUDIT_FIXTURE;
 
     // Should have done state transition
-    const stateTransition = calls.find((c) => c.query.includes("ApplyStateTransition"));
+    const stateTransition = calls.find((c) => c.query.includes("ApplyAtomicTransition"));
     expect(stateTransition).toBeDefined();
 
     // Should have triggered barrier check (fetching parent)
@@ -2362,7 +2379,7 @@ bodies:
     process.env.WORKFLOW_DEF_PATH = CANONICAL_UX_AUDIT_FIXTURE;
 
     // Should have done state transition
-    const stateTransition = calls.find((c) => c.query.includes("ApplyStateTransition"));
+    const stateTransition = calls.find((c) => c.query.includes("ApplyAtomicTransition"));
     expect(stateTransition).toBeDefined();
 
     // Should NOT have triggered barrier check (code-review is not terminal)
@@ -2388,7 +2405,7 @@ bodies:
     process.env.WORKFLOW_DEF_PATH = CANONICAL_UX_AUDIT_FIXTURE;
 
     // State transition should happen
-    const stateTransition = calls.find((c) => c.query.includes("ApplyStateTransition"));
+    const stateTransition = calls.find((c) => c.query.includes("ApplyAtomicTransition"));
     expect(stateTransition).toBeDefined();
 
     // Barrier check should return early (no parent)
@@ -3451,7 +3468,7 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
       process.env.CAPABILITY_POLICY_PATH = devImplPolicyFile;
       resetPolicyCache();
 
-      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: true, hasPR: true });
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment", "stakes:low"], { hasBranch: true, hasPR: true });
       expect(await checkWorkflowRules("deploy", "AI-3001", "Bearer tok", "hanzo")).toBeNull();
 
       process.env.WORKFLOW_DEF_PATH = CANONICAL_SPRINT_FIXTURE;
@@ -3460,6 +3477,7 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
     });
 
     it("sprint workflow has no deploy command at all", async () => {
+      resetWorkflowCache(); // Ensure we load the sprint fixture, not the cached dev-impl
       const { loadWorkflowDef } = await import("./workflow-gate.js");
       const def = await loadWorkflowDef();
       const deployTransitions: string[] = [];
@@ -3481,7 +3499,7 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
       process.env.CAPABILITY_POLICY_PATH = devImplPolicyFile;
       resetPolicyCache();
 
-      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: false, hasPR: false });
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment", "stakes:low"], { hasBranch: false, hasPR: false });
       const result = await checkWorkflowRules("deploy", "AI-3001", "Bearer tok", "hanzo");
       expect(result).not.toBeNull();
       expect(result).toContain("branch not pushed");
@@ -3538,6 +3556,187 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
       const block3 = await checkWorkflowRules("approve", "SPRINT-SHORTCUT", "Bearer tok", "soren");
       expect(block3).not.toBeNull();
       expect(block3).toContain("complete"); // should suggest 'complete', not 'approve'
+    });
+  });
+});
+
+// ── Phase 6.5 / H-7 (AI-1482): Verbatim AC + Stakes-threshold tests ────
+
+const STAKES_WORKFLOW_YAML = `
+id: dev-impl
+version: 6
+archetype: single-task
+entry_state: intake
+
+stakes:
+  threshold: 2
+  levels:
+    stakes:low: 0
+    stakes:medium: 1
+    stakes:high: 2
+
+break_glass:
+  command: escape
+
+states:
+  - id: intake
+    owner_role: steward
+    kind: normal
+    transitions:
+      - command: accept
+        to: implementation
+        capture_ac: true
+      - command: demote
+        to: __ad_hoc__
+
+  - id: implementation
+    owner_role: dev
+    kind: normal
+    transitions:
+      - command: submit
+        to: code-review
+        assign:
+          mode: required
+          constraint: not-implementer
+
+  - id: code-review
+    owner_role: code-review
+    kind: normal
+    transitions:
+      - command: approve
+        to: deployment
+      - command: request-changes
+        to: implementation
+
+  - id: deployment
+    owner_role: deployment
+    kind: normal
+    transitions:
+      - command: deploy
+        to: done
+        requires_capability: deploy:execute
+        requires_human_signoff_above_stakes: true
+      - command: reject
+        to: implementation
+
+  - id: done
+    kind: terminal
+    transitions: []
+`;
+
+describe("AI-1482: Verbatim AC + Stakes-threshold sign-off", () => {
+  let originalFetch: typeof globalThis.fetch;
+  let origWorkflowPath: string | undefined;
+
+  beforeAll(() => {
+    origWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    const workflowFile = path.join(dir, "dev-impl-stakes.yaml");
+    fs.writeFileSync(workflowFile, STAKES_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+    // Ensure the capability policy is still set (may have been cleared by prior suites)
+    const policyFile = path.join(dir, "capability-policy.yaml");
+    if (!fs.existsSync(policyFile)) {
+      fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    }
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+  });
+
+  afterAll(() => {
+    process.env.WORKFLOW_DEF_PATH = origWorkflowPath;
+  });
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    resetWorkflowCache();
+    resetPolicyCache();
+    clearArtifactStore();
+    // Clear AC record store
+    clearAcRecordStore();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  // ── Stakes-threshold gate ──────────────────────────────────────────
+
+  describe("stakes-threshold gate", () => {
+    it("allows deploy from AI agent when stakes are below threshold", async () => {
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment", "stakes:low"]);
+      const result = await checkWorkflowRules("deploy", "AI-STAKES-LOW", "Bearer tok", "hanzo");
+      expect(result).toBeNull();
+    });
+
+    it("allows deploy from AI agent when stakes:medium (below threshold 2)", async () => {
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment", "stakes:medium"]);
+      const result = await checkWorkflowRules("deploy", "AI-STAKES-MED", "Bearer tok", "hanzo");
+      expect(result).toBeNull();
+    });
+
+    it("blocks deploy from AI agent when stakes:high (at threshold)", async () => {
+      // hanzo is a registered agent body
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment", "stakes:high"]);
+      const result = await checkWorkflowRules("deploy", "AI-STAKES-HIGH", "Bearer tok", "hanzo");
+      expect(result).not.toBeNull();
+      expect(result).toContain("elevated stakes");
+      expect(result).toContain("human sign-off");
+    });
+
+    it("blocks deploy from any registered AI body on high-stakes ticket", async () => {
+      // hanzo is the deployment body (has deploy:execute) and is an AI agent
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment", "stakes:high"]);
+      const result = await checkWorkflowRules("deploy", "AI-STAKES-HIGH2", "Bearer tok", "hanzo");
+      expect(result).not.toBeNull();
+      expect(result).toContain("elevated stakes");
+    });
+
+    it("allows other transitions on high-stakes ticket (only deploy is gated)", async () => {
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review", "stakes:high"]);
+      const result = await checkWorkflowRules("approve", "AI-STAKES-REVIEW", "Bearer tok", "reviewer");
+      expect(result).toBeNull();
+    });
+
+    it("allows deploy on high-stakes ticket when no stakes threshold configured", async () => {
+      // Reset to the standard test YAML (no stakes config)
+      const origPath = process.env.WORKFLOW_DEF_PATH;
+      const workflowFile = path.join(dir, "dev-impl.yaml");
+      process.env.WORKFLOW_DEF_PATH = workflowFile;
+      resetWorkflowCache();
+
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment", "stakes:high"]);
+      const result = await checkWorkflowRules("deploy", "AI-NO-STAKES", "Bearer tok", "hanzo");
+      expect(result).toBeNull();
+
+      process.env.WORKFLOW_DEF_PATH = origPath;
+      resetWorkflowCache();
+    });
+
+    it("blocks deploy from AI agent when no stakes label present (fail closed)", async () => {
+      // No stakes: label → defaults to threshold level (fail closed), which blocks AI deploy
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
+      const result = await checkWorkflowRules("deploy", "AI-NO-LABEL", "Bearer tok", "hanzo");
+      expect(result).not.toBeNull();
+      expect(result).toContain("elevated stakes");
+    });
+  });
+
+  // ── resolveStakesLevel unit tests ──────────────────────────────────
+
+  describe("resolveStakesLevel", () => {
+    const stakesConfig = { threshold: 2, levels: { "stakes:low": 0, "stakes:medium": 1, "stakes:high": 2 } };
+
+    it("returns threshold when no stakes label present (fail closed)", () => {
+      expect(resolveStakesLevel(["wf:dev-impl", "state:deployment"], stakesConfig)).toBe(2);
+    });
+
+    it("returns mapped level for known stakes label", () => {
+      expect(resolveStakesLevel(["stakes:low"], stakesConfig)).toBe(0);
+      expect(resolveStakesLevel(["stakes:medium"], stakesConfig)).toBe(1);
+      expect(resolveStakesLevel(["stakes:high"], stakesConfig)).toBe(2);
+    });
+
+    it("returns threshold for unknown stakes label (fail closed)", () => {
+      expect(resolveStakesLevel(["stakes:unknown"], stakesConfig)).toBe(2);
     });
   });
 });
