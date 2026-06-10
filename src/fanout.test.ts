@@ -371,11 +371,13 @@ describe("executeFanout — mocked Linear API", () => {
 
     globalThis.fetch = makeFanoutFetch({});
 
-    const result = await executeFanout("AI-1439", "Bearer tok", findings);
+    const result = await executeFanout("AI-1439", "Bearer tok", findings, { skipPreview: true });
 
     expect(result.created).toBe(3);
     expect(result.childIdentifiers).toEqual(["AI-2001", "AI-2002", "AI-2003"]);
     expect(result.errors).toHaveLength(0);
+    expect(result.refused).toBe(false);
+    expect(result.pendingApproval).toBe(false);
 
     // Verify child issue creation calls
     const createCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
@@ -401,7 +403,7 @@ describe("executeFanout — mocked Linear API", () => {
       },
     });
 
-    const result = await executeFanout("AI-1439", "Bearer tok");
+    const result = await executeFanout("AI-1439", "Bearer tok", undefined, { skipPreview: true });
 
     expect(result.created).toBe(2);
     expect(result.childIdentifiers).toHaveLength(2);
@@ -417,7 +419,7 @@ describe("executeFanout — mocked Linear API", () => {
       },
     });
 
-    const result = await executeFanout("AI-1439", "Bearer tok");
+    const result = await executeFanout("AI-1439", "Bearer tok", undefined, { skipPreview: true });
 
     // Fallback: 1 child with the parent title
     expect(result.created).toBe(1);
@@ -433,7 +435,7 @@ describe("executeFanout — mocked Linear API", () => {
       ],
     });
 
-    const result = await executeFanout("AI-1439", "Bearer tok", findings);
+    const result = await executeFanout("AI-1439", "Bearer tok", findings, { skipPreview: true });
 
     expect(result.created).toBe(1);
     // Should NOT have created new labels (teamLabels already has them)
@@ -450,7 +452,7 @@ describe("executeFanout — mocked Linear API", () => {
   it("returns errors when parent context fetch fails", async () => {
     globalThis.fetch = async () => { throw new Error("network error"); };
 
-    const result = await executeFanout("AI-1439", "Bearer tok", [{ title: "Test" }]);
+    const result = await executeFanout("AI-1439", "Bearer tok", [{ title: "Test" }], { skipPreview: true });
 
     expect(result.created).toBe(0);
     expect(result.childIdentifiers).toHaveLength(0);
@@ -469,7 +471,7 @@ describe("executeFanout — mocked Linear API", () => {
       );
     };
 
-    const result = await executeFanout("AI-1439", "Bearer tok", findings);
+    const result = await executeFanout("AI-1439", "Bearer tok", findings, { skipPreview: true });
 
     expect(result.created).toBe(0);
     expect(result.errors.length).toBeGreaterThan(0);
@@ -485,7 +487,7 @@ describe("executeFanout — mocked Linear API", () => {
     // Only first child succeeds
     globalThis.fetch = makeFanoutFetch({ successCount: 1 });
 
-    const result = await executeFanout("AI-1439", "Bearer tok", findings);
+    const result = await executeFanout("AI-1439", "Bearer tok", findings, { skipPreview: true });
 
     expect(result.created).toBe(1);
     expect(result.childIdentifiers).toEqual(["AI-2001"]);
@@ -503,7 +505,7 @@ describe("executeFanout — mocked Linear API", () => {
 
     globalThis.fetch = makeFanoutFetch({});
 
-    const result = await executeFanout("AI-1439", "Bearer tok", findings);
+    const result = await executeFanout("AI-1439", "Bearer tok", findings, { skipPreview: true });
 
     expect(result.created).toBe(2);
     const createCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
@@ -523,7 +525,7 @@ describe("executeFanout — mocked Linear API", () => {
 
     globalThis.fetch = makeFanoutFetch({});
 
-    const result = await executeFanout("AI-1439", "Bearer tok", findings);
+    const result = await executeFanout("AI-1439", "Bearer tok", findings, { skipPreview: true });
 
     expect(result.created).toBe(2);
     const createCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
@@ -545,7 +547,7 @@ describe("executeFanout — mocked Linear API", () => {
 
     globalThis.fetch = makeFanoutFetch({ parentInternalId: "parent-uuid-123" });
 
-    const result = await executeFanout("AI-1439", "Bearer tok", findings);
+    const result = await executeFanout("AI-1439", "Bearer tok", findings, { skipPreview: true });
 
     expect(result.created).toBe(2);
     const createCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
@@ -553,6 +555,114 @@ describe("executeFanout — mocked Linear API", () => {
       const input = ((call.body.variables as Record<string, unknown>).input as Record<string, unknown>);
       expect(input.parentId).toBe("parent-uuid-123");
     }
+  });
+
+  // ── Phase 6.5 / H-2: Spawn-preview gate integration ─────────────────────
+
+  it("H-2 AC1: refuses fan-out when max_children exceeded (not truncated)", async () => {
+    // Create more findings than default max_children (20)
+    const findings: Finding[] = Array.from({ length: 25 }, (_, i) => ({
+      title: `Finding ${i + 1}`,
+    }));
+
+    // Mock: parent has no parent (depth 0)
+    const baseFetch = makeFanoutFetch({});
+    globalThis.fetch = async (url, init) => {
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      // Handle depth walk
+      if (bodyText.includes("IssueParent")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { parent: null } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      // For commentCreate (preview comment)
+      if (bodyText.includes("commentCreate") && !bodyText.includes("issueCreate")) {
+        return new Response(
+          JSON.stringify({ data: { commentCreate: { success: true, comment: { id: "comment-id" } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return baseFetch(url, init);
+    };
+
+    const result = await executeFanout("AI-1439", "Bearer tok", findings);
+
+    expect(result.refused).toBe(true);
+    expect(result.created).toBe(0);
+    expect(result.childIdentifiers).toHaveLength(0);
+    expect(result.preview).not.toBeNull();
+    expect(result.preview!.capResult.allowed).toBe(false);
+    expect(result.errors[0].message).toContain("Child count cap exceeded");
+  });
+
+  it("H-2: sets pendingApproval when child count > approval_above", async () => {
+    // 15 findings > default approval_above (10)
+    const findings: Finding[] = Array.from({ length: 15 }, (_, i) => ({
+      title: `Finding ${i + 1}`,
+    }));
+
+    const baseFetch = makeFanoutFetch({});
+    globalThis.fetch = async (url, init) => {
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      if (bodyText.includes("IssueParent")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { parent: null } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (bodyText.includes("commentCreate") && !bodyText.includes("issueCreate")) {
+        return new Response(
+          JSON.stringify({ data: { commentCreate: { success: true, comment: { id: "comment-id" } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return baseFetch(url, init);
+    };
+
+    const result = await executeFanout("AI-1439", "Bearer tok", findings);
+
+    expect(result.pendingApproval).toBe(true);
+    expect(result.created).toBe(0); // No children created until approval
+    expect(result.preview).not.toBeNull();
+    expect(result.preview!.requiresApproval).toBe(true);
+  });
+
+  it("H-2 AC3: generates preview showing proposed children before instantiation", async () => {
+    const findings: Finding[] = [
+      { title: "Finding A", description: "Desc A" },
+      { title: "Finding B" },
+    ];
+
+    const baseFetch = makeFanoutFetch({});
+    globalThis.fetch = async (url, init) => {
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      if (bodyText.includes("IssueParent")) {
+        // Don't record — just handle the depth walk
+        return new Response(
+          JSON.stringify({ data: { issue: { parent: null } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      // Delegate everything else (including commentCreate) to the base mock
+      // which records into fetchCalls
+      return baseFetch(url, init);
+    };
+
+    const result = await executeFanout("AI-1439", "Bearer tok", findings);
+
+    // Should have created children (within caps, no approval needed)
+    expect(result.created).toBe(2);
+    expect(result.preview).not.toBeNull();
+    expect(result.preview!.childCount).toBe(2);
+    expect(result.preview!.children[0].title).toBe("Finding A");
+    expect(result.preview!.children[0].seedAc).toBe("Finding A: Desc A");
+    expect(result.preview!.children[1].title).toBe("Finding B");
+    expect(result.preview!.children[1].seedAc).toBe("Finding B");
+
+    // Preview comment was posted
+    const commentCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("commentCreate"));
+    expect(commentCalls.length).toBeGreaterThanOrEqual(1);
   });
 });
 
@@ -673,6 +783,15 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
       if (query.includes("ApplyStateTransition")) {
         return new Response(
           JSON.stringify({ data: { issueUpdate: { success: true } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Spawn-preview: depth resolution (IssueParent from spawn-preview.ts)
+      // The parent in integration tests is always a root issue (no parent)
+      if (query.includes("IssueParent") && !query.includes("IssueTeamParent")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { parent: null } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
