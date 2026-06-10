@@ -949,7 +949,13 @@ export async function applyStateTransition(intent, issueId, authToken, options) 
     }
     if (workflowId !== def.id)
         return; // unknown workflow — no-op
-    const currentStateName = getCurrentState(labelNames);
+    // AI-1498 fix: prefer the captured pre-forward state. The CLI advances the
+    // state:* label inside its own forwarded mutation, so by now `labelNames`
+    // already reflects the destination; using it as the transition source makes
+    // the intent lookup miss and skips the native write. The proxy captures the
+    // true source before forwarding and passes it as sourceStateOverride.
+    const actualStateName = getCurrentState(labelNames);
+    const currentStateName = options?.sourceStateOverride ?? actualStateName;
     if (!currentStateName) {
         log.warn(`workflow-gate: B2 apply: no state:* label on ${issueId} — skipping`);
         return;
@@ -1165,18 +1171,18 @@ export async function applyStateTransition(intent, issueId, authToken, options) 
     // Before any mutation, resolve ALL facets: {label swap, delegate}.
     // If any facet cannot be resolved for deterministic transitions, fail CLOSED.
     // Step 1: Resolve label IDs for the state swap.
-    const oldLabel = issue.labels.find((l) => l.name === `state:${currentStateName}`);
-    if (!oldLabel) {
-        log.error(`workflow-gate: B2 apply: FAIL-CLOSED — could not find label id for state:${currentStateName} on ${issueId}. Transition aborted.`);
-        return;
-    }
     const newLabelId = await findOrCreateLabel(issue.teamId, `state:${toStateName}`, authToken);
     if (!newLabelId) {
         log.error(`workflow-gate: B2 apply: FAIL-CLOSED — could not resolve label id for state:${toStateName}. Transition aborted.`);
         return;
     }
+    // AI-1498 fix: compute the target label set robustly — strip ALL state:* labels
+    // and add exactly the destination. The CLI may have already advanced (or partially
+    // advanced) the state:* label inside its forwarded mutation, so we must not depend
+    // on the source label still being present. This guarantees the ticket ends with a
+    // single state:* label matching the destination, regardless of the CLI's pre-write.
     const newLabelIds = [
-        ...issue.labels.filter((l) => l.id !== oldLabel.id).map((l) => l.id),
+        ...issue.labels.filter((l) => !l.name.startsWith("state:")).map((l) => l.id),
         newLabelId,
     ];
     // Step 2: Resolve the next delegate.

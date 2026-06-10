@@ -29,7 +29,7 @@
  */
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules } from "./escalation-gate.js";
-import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder } from "./workflow-gate.js";
+import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, getCurrentState } from "./workflow-gate.js";
 import { getAgent } from "./agents.js";
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
@@ -134,6 +134,11 @@ export async function handleProxyRequest(req, res, deps) {
     // AI-1397: resolve caller's Linear user ID from agent config for delegate enforcement.
     const callerLinearUserId = getAgent(agentId)?.linearUserId ?? null;
     log.info(`forward agent=${agentId} op=${opName}${ticketCtx}${intent ? ` intent=${intent}` : ""}${cliVersion ? ` cli=${cliVersion}` : ""}`);
+    // AI-1498: capture the ticket's workflow state BEFORE forwarding. The CLI
+    // advances the state:* label inside its own forwarded mutation, so the
+    // post-forward applyStateTransition would otherwise read the destination
+    // state and skip the native-stateId write. We snapshot the true source here.
+    let sourceStateOverride;
     // Phase 2 / slice 1 + Phase 3 B1: evaluate enforcement rules before forwarding.
     if (intent) {
         // AI-1397: version floor — reject workflow mutations from stale CLIs.
@@ -162,6 +167,19 @@ export async function handleProxyRequest(req, res, deps) {
             log.warn(`workflow-block agent=${agentId} intent=${intent}${ticketCtx}: ${p3rejection}`);
             res.status(200).json({ errors: [{ message: p3rejection }] });
             return;
+        }
+        // AI-1498: snapshot the pre-forward workflow state for applyStateTransition.
+        // Fail-open: on any fetch error leave it undefined and let applyStateTransition
+        // fall back to the ticket's current state:* label (legacy behavior).
+        if (issueId) {
+            try {
+                const preLabels = await fetchWorkflowLabels(issueId, authorization);
+                sourceStateOverride = getCurrentState(preLabels) ?? undefined;
+            }
+            catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                log.warn(`source-state snapshot failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
+            }
         }
     }
     else {
@@ -217,6 +235,7 @@ export async function handleProxyRequest(req, res, deps) {
                 observationStore: deps?.observationStore,
                 feedback,
                 artifactRef: artifactRefHeader,
+                sourceStateOverride,
             });
         }
         catch (err) {

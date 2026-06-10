@@ -1087,6 +1087,51 @@ describe("applyStateTransition — normal state advance", () => {
     expect(vars.labelIds).not.toContain("state-lbl");
   });
 
+  // AI-1498 regression: the CLI pre-moves the state:* label before the proxy's
+  // post-forward applyStateTransition runs. Without sourceStateOverride the gate
+  // reads the already-moved label, the intent lookup fails in the destination
+  // state, and the native stateId never gets written (label/native desync).
+  // With sourceStateOverride the gate resolves the transition from the TRUE
+  // source state and writes all three facets (label + native here).
+  it("writes native stateId when CLI already moved the label (sourceStateOverride)", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      // CLI has already swapped the label to the destination state.
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "impl-lbl", name: "state:implementation" },
+      ],
+      teamLabels: [{ id: "impl-lbl", name: "state:implementation" }],
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("accept", "issue-uuid", "Bearer tok", {
+      sourceStateOverride: "intake",
+    });
+
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+    const vars = updateCall!.body.variables as { labelIds: string[]; stateId?: string };
+    // implementation → native_state: doing → state-doing-uuid
+    expect(vars.stateId).toBe("state-doing-uuid");
+    // exactly the destination state label, no source label lingering
+    expect(vars.labelIds).toContain("impl-lbl");
+    expect(vars.labelIds).toContain("wf-lbl");
+  });
+
+  it("skips the transition when label already moved and NO override (reproduces the bug)", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "impl-lbl", name: "state:implementation" },
+      ],
+      teamLabels: [{ id: "impl-lbl", name: "state:implementation" }],
+    });
+    globalThis.fetch = mock;
+    // No override: gate reads state:implementation, looks up 'accept' there,
+    // finds no such transition, and skips — no atomic write at all.
+    await applyStateTransition("accept", "issue-uuid", "Bearer tok");
+    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"))).toBe(false);
+  });
+
   it("fail-open when issueUpdate returns non-success (no throw)", async () => {
     const { fetch: mock } = makeTransitionFetch({
       issueLabels: [

@@ -216,6 +216,17 @@ export interface ApplyStateTransitionOptions {
     feedback?: TransitionFeedback;
     /** §5.7 item 1 / C-2: artifact ref to bind at intake.accept (sprint-plan doc path). */
     artifactRef?: string | null;
+    /**
+     * AI-1498 fix: the workflow state the ticket was in BEFORE the CLI's forwarded
+     * mutation ran. Because the CLI advances the `state:*` label inside its own
+     * forwarded `issueUpdate`, by the time this post-forward pass reads the ticket
+     * the label is already at the destination — making an intent-based transition
+     * lookup from the (post-move) current state miss and skip the native write.
+     * Passing the captured pre-forward state lets the proxy compute the transition
+     * from the true source so the atomic label+delegate+native write still fires.
+     * Falls back to the ticket's current state:* label when undefined.
+     */
+    sourceStateOverride?: string;
 }
 export declare function applyStateTransition(intent: string, issueId: string | null, authToken: string, options?: ApplyStateTransitionOptions): Promise<void>;
 //# sourceMappingURL=workflow-gate.d.ts.map
