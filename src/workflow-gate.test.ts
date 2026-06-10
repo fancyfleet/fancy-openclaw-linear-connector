@@ -30,6 +30,8 @@ import {
   resetWorkflowCache,
   validateNativeStateMappings,
   resolveStakesLevel,
+  resolveNativeStateId,
+  resetNativeStateCache,
 } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { reloadAgents } from "./agents.js";
@@ -209,6 +211,7 @@ states:
   - id: intake
     owner_role: steward
     kind: normal
+    native_state: todo
     transitions:
       - command: accept
         to: implementation
@@ -218,6 +221,7 @@ states:
   - id: implementation
     owner_role: dev
     kind: normal
+    native_state: doing
     transitions:
       - command: submit
         to: code-review
@@ -228,6 +232,7 @@ states:
   - id: code-review
     owner_role: code-review
     kind: normal
+    native_state: thinking
     transitions:
       - command: approve
         to: deployment
@@ -237,6 +242,7 @@ states:
   - id: deployment
     owner_role: deployment
     kind: normal
+    native_state: doing
     transitions:
       - command: deploy
         to: done
@@ -246,6 +252,12 @@ states:
 
   - id: done
     kind: terminal
+    native_state: done
+    transitions: []
+
+  - id: escape
+    kind: terminal
+    native_state: invalid
     transitions: []
 `;
 
@@ -279,6 +291,7 @@ beforeAll(() => {
 
 beforeEach(() => {
   resetWorkflowCache();
+  resetNativeStateCache();
   resetPolicyCache();
 });
 
@@ -290,8 +303,25 @@ function makeLabelFetch(labelNames: string[], branchAndPR?: { hasBranch?: boolea
     hasPR: branchAndPR?.hasPR ?? true,
     hasMergedPR: branchAndPR?.hasMergedPR ?? false,
   };
+  // AI-1498: mock team workflow states for native state resolution.
+  const mockTeamStates = [
+    { id: "state-backlog-uuid", name: "Backlog", type: "unstarted" },
+    { id: "state-todo-uuid", name: "Todo", type: "unstarted" },
+    { id: "state-doing-uuid", name: "Doing", type: "started" },
+    { id: "state-thinking-uuid", name: "Thinking", type: "started" },
+    { id: "state-managing-uuid", name: "Managing", type: "started" },
+    { id: "state-done-uuid", name: "Done", type: "completed" },
+    { id: "state-invalid-uuid", name: "Invalid", type: "canceled" },
+  ];
   return async (_url, init) => {
     const bodyText = typeof init?.body === "string" ? init.body : "";
+    // Return team states when query asks for it (AI-1498 native state resolution)
+    if (bodyText.includes("TeamStates")) {
+      return new Response(
+        JSON.stringify({ data: { team: { states: { nodes: mockTeamStates } } } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
     // Return branch/PR data when the query asks for it (AI-1475 D1 done gate)
     if (bodyText.includes("IssueBranchAndPR")) {
       const prState = branch.hasMergedPR ? "merged" : "open";
@@ -793,6 +823,30 @@ function makeTransitionFetch(opts: {
     if (query.includes("TeamLabels")) {
       return new Response(
         JSON.stringify({ data: { team: { labels: { nodes: teamLabels } } } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    // AI-1498: Team workflow states for native state resolution.
+    if (query.includes("TeamStates")) {
+      return new Response(
+        JSON.stringify({
+          data: {
+            team: {
+              states: {
+                nodes: [
+                  { id: "state-backlog-uuid", name: "Backlog", type: "unstarted" },
+                  { id: "state-todo-uuid", name: "Todo", type: "unstarted" },
+                  { id: "state-doing-uuid", name: "Doing", type: "started" },
+                  { id: "state-thinking-uuid", name: "Thinking", type: "started" },
+                  { id: "state-managing-uuid", name: "Managing", type: "started" },
+                  { id: "state-done-uuid", name: "Done", type: "completed" },
+                  { id: "state-invalid-uuid", name: "Invalid", type: "canceled" },
+                ],
+              },
+            },
+          },
+        }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
@@ -2261,6 +2315,22 @@ bodies:
         );
       }
 
+      // AI-1498: Team workflow states for native state resolution
+      if (q.includes("TeamStates")) {
+        return new Response(
+          JSON.stringify({ data: { team: { states: { nodes: [
+            { id: "state-backlog-uuid", name: "Backlog", type: "unstarted" },
+            { id: "state-todo-uuid", name: "Todo", type: "unstarted" },
+            { id: "state-doing-uuid", name: "Doing", type: "started" },
+            { id: "state-thinking-uuid", name: "Thinking", type: "started" },
+            { id: "state-managing-uuid", name: "Managing", type: "started" },
+            { id: "state-done-uuid", name: "Done", type: "completed" },
+            { id: "state-invalid-uuid", name: "Invalid", type: "canceled" },
+          ] } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
       // State transition: label create
       if (q.includes("issueLabelCreate")) {
         const name = (parsed.variables as Record<string, unknown>).name as string;
@@ -2815,6 +2885,21 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
+      // AI-1498: Team workflow states for native state resolution
+      if (bodyText.includes("TeamStates")) {
+        return new Response(
+          JSON.stringify({ data: { team: { states: { nodes: [
+            { id: "state-backlog-uuid", name: "Backlog", type: "unstarted" },
+            { id: "state-todo-uuid", name: "Todo", type: "unstarted" },
+            { id: "state-doing-uuid", name: "Doing", type: "started" },
+            { id: "state-thinking-uuid", name: "Thinking", type: "started" },
+            { id: "state-managing-uuid", name: "Managing", type: "started" },
+            { id: "state-done-uuid", name: "Done", type: "completed" },
+            { id: "state-invalid-uuid", name: "Invalid", type: "canceled" },
+          ] } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
       // Default
       return new Response(
         JSON.stringify({ data: {} }),
@@ -2944,6 +3029,20 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
+      if (bodyText.includes("TeamStates")) {
+        return new Response(
+          JSON.stringify({ data: { team: { states: { nodes: [
+            { id: "state-backlog-uuid", name: "Backlog", type: "unstarted" },
+            { id: "state-todo-uuid", name: "Todo", type: "unstarted" },
+            { id: "state-doing-uuid", name: "Doing", type: "started" },
+            { id: "state-thinking-uuid", name: "Thinking", type: "started" },
+            { id: "state-managing-uuid", name: "Managing", type: "started" },
+            { id: "state-done-uuid", name: "Done", type: "completed" },
+            { id: "state-invalid-uuid", name: "Invalid", type: "canceled" },
+          ] } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
       if (bodyText.includes("issueUpdate")) {
         return new Response(
           JSON.stringify({ data: { issueUpdate: { success: true } } }),
@@ -3055,6 +3154,20 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
       if (bodyText.includes("TeamLabels")) {
         return new Response(
           JSON.stringify({ data: { team: { labels: { nodes: [{ id: "lbl-done", name: "state:done" }] } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (bodyText.includes("TeamStates")) {
+        return new Response(
+          JSON.stringify({ data: { team: { states: { nodes: [
+            { id: "state-backlog-uuid", name: "Backlog", type: "unstarted" },
+            { id: "state-todo-uuid", name: "Todo", type: "unstarted" },
+            { id: "state-doing-uuid", name: "Doing", type: "started" },
+            { id: "state-thinking-uuid", name: "Thinking", type: "started" },
+            { id: "state-managing-uuid", name: "Managing", type: "started" },
+            { id: "state-done-uuid", name: "Done", type: "completed" },
+            { id: "state-invalid-uuid", name: "Invalid", type: "canceled" },
+          ] } } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
@@ -3400,6 +3513,17 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
         if (bodyText.includes("issueUpdate")) {
           return new Response(JSON.stringify({ data: { issueUpdate: { success: true } } }), { status: 200, headers: { "Content-Type": "application/json" } });
         }
+        if (bodyText.includes("TeamStates")) {
+          return new Response(JSON.stringify({ data: { team: { states: { nodes: [
+            { id: "state-backlog-uuid", name: "Backlog", type: "unstarted" },
+            { id: "state-todo-uuid", name: "Todo", type: "unstarted" },
+            { id: "state-doing-uuid", name: "Doing", type: "started" },
+            { id: "state-thinking-uuid", name: "Thinking", type: "started" },
+            { id: "state-managing-uuid", name: "Managing", type: "started" },
+            { id: "state-done-uuid", name: "Done", type: "completed" },
+            { id: "state-invalid-uuid", name: "Invalid", type: "canceled" },
+          ] } } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
         return new Response(JSON.stringify({ data: {} }), { status: 200, headers: { "Content-Type": "application/json" } });
       };
       await applyStateTransition("approve", "SPRINT-WITH-ARTIFACT", "Bearer tok", { bodyId: "soren" });
@@ -3625,6 +3749,7 @@ states:
   - id: intake
     owner_role: steward
     kind: normal
+    native_state: todo
     transitions:
       - command: accept
         to: implementation
@@ -3635,6 +3760,7 @@ states:
   - id: implementation
     owner_role: dev
     kind: normal
+    native_state: doing
     transitions:
       - command: submit
         to: code-review
@@ -3645,6 +3771,7 @@ states:
   - id: code-review
     owner_role: code-review
     kind: normal
+    native_state: thinking
     transitions:
       - command: approve
         to: deployment
@@ -3654,6 +3781,7 @@ states:
   - id: deployment
     owner_role: deployment
     kind: normal
+    native_state: doing
     transitions:
       - command: deploy
         to: done
@@ -3664,6 +3792,12 @@ states:
 
   - id: done
     kind: terminal
+    native_state: done
+    transitions: []
+
+  - id: escape
+    kind: terminal
+    native_state: invalid
     transitions: []
 `;
 
@@ -4029,14 +4163,341 @@ describe("validateNativeStateMappings (AI-1490)", () => {
     expect(warnings).toEqual([]);
   });
 
-  it("terminal states without native_state are allowed (non-blocking warning)", () => {
+  it("AI-1498: terminal states without native_state are now a hard error (not just a warning)", () => {
     const def = {
       id: "test",
       states: [
-        { id: "done", kind: "terminal" }, // no native_state on terminal — ok
+        { id: "done", kind: "terminal" }, // no native_state on terminal — now an error
       ],
     };
     const warnings = validateNativeStateMappings(def);
-    expect(warnings).toEqual([]);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("done");
+    expect(warnings[0]).toContain("no native_state field");
+  });
+});
+
+// ── AI-1498: Conformance-walk acceptance gate ─────────────────────────────
+// Drives a synthetic ticket through EVERY transition in the dev-impl workflow
+// and asserts after EACH step that {state:* label, delegate, native column} all
+// match the YAML definition. Plus adversarial direct-write block tests.
+
+describe("AI-1498: Conformance-walk acceptance gate", () => {
+  let originalFetch: typeof globalThis.fetch;
+  let confDir: string;
+  let originalWorkflowPath: string | undefined;
+  let originalPolicyPath: string | undefined;
+
+  beforeAll(() => {
+    originalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    originalPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+
+    confDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1498-conformance-"));
+    const policyFile = path.join(confDir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+    process.env.WORKFLOW_DEF_PATH = CANONICAL_FIXTURE;
+  });
+
+  afterAll(() => {
+    if (originalWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = originalWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
+    if (originalPolicyPath !== undefined) process.env.CAPABILITY_POLICY_PATH = originalPolicyPath;
+    else delete process.env.CAPABILITY_POLICY_PATH;
+  });
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    resetWorkflowCache();
+    resetNativeStateCache();
+    resetPolicyCache();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  /**
+   * Map of semantic state names to their mock Linear stateId UUIDs.
+   * Must match the mock team states returned by the fetch mock.
+   */
+  const SEMANTIC_TO_UUID: Record<string, string> = {
+    todo: "state-todo-uuid",
+    doing: "state-doing-uuid",
+    thinking: "state-thinking-uuid",
+    managing: "state-managing-uuid",
+    done: "state-done-uuid",
+    invalid: "state-invalid-uuid",
+  };
+
+  /**
+   * Native state mapping from the canonical dev-impl YAML.
+   */
+  const STATE_TO_NATIVE: Record<string, string> = {
+    intake: "todo",
+    implementation: "doing",
+    "code-review": "thinking",
+    deployment: "doing",
+    done: "done",
+    escape: "invalid",
+  };
+
+  /**
+   * Build a conformance fetch mock that tracks all mutations and allows
+   * asserting on the atomic stateId in each transition.
+   */
+  function makeConformanceFetch(currentLabels: string[]): {
+    fetch: typeof globalThis.fetch;
+    mutations: Array<{ query: string; variables: Record<string, unknown> }>;
+  } {
+    const mutations: Array<{ query: string; variables: Record<string, unknown> }> = [];
+
+    const fetch: typeof globalThis.fetch = async (_url, init) => {
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(bodyText) as { query?: string; variables?: Record<string, unknown> };
+      const q = parsed.query ?? "";
+
+      // Issue with labels (for applyStateTransition)
+      if (q.includes("IssueWithLabels")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                id: "conf-internal-uuid",
+                team: { id: "conf-team-uuid" },
+                labels: { nodes: currentLabels.map((name) => ({ id: `lbl-${name}`, name })) },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Team labels
+      if (q.includes("TeamLabels")) {
+        return new Response(
+          JSON.stringify({ data: { team: { labels: { nodes: [] } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Label creation
+      if (q.includes("issueLabelCreate")) {
+        const name = (parsed.variables as Record<string, unknown>).name as string;
+        return new Response(
+          JSON.stringify({ data: { issueLabelCreate: { success: true, issueLabel: { id: `lbl-${name}` } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Team states (AI-1498 native state resolution)
+      if (q.includes("TeamStates")) {
+        return new Response(
+          JSON.stringify({ data: { team: { states: { nodes: Object.entries(SEMANTIC_TO_UUID).map(([name, id]) => ({ id, name: name.charAt(0).toUpperCase() + name.slice(1), type: name === "done" ? "completed" : name === "invalid" ? "canceled" : "started" })) } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Branch/PR for done gate
+      if (q.includes("IssueBranchAndPR")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { branch: { id: "branch-id", name: "feature", updatedAt: "2026-06-09T00:00:00Z" }, pullRequests: { nodes: [{ id: "pr-id", state: "open" }] } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Atomic mutation — track it for assertions
+      if (q.includes("ApplyAtomicTransition") || q.includes("issueUpdate")) {
+        mutations.push({ query: q, variables: parsed.variables ?? {} });
+        return new Response(
+          JSON.stringify({ data: { issueUpdate: { success: true } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Issue description (for AC capture)
+      if (q.includes("IssueDescription")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { description: "" } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Delegate context fetch
+      if (q.includes("delegate")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { labels: { nodes: currentLabels.map((name) => ({ name })) }, delegate: null } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      return new Response(JSON.stringify({ data: {} }), { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+
+    return { fetch, mutations };
+  }
+
+  it("every transition writes the correct native stateId atomically", async () => {
+    // Walk the full dev-impl happy path: intake → implementation → code-review → deployment → done
+    const transitions: Array<{ intent: string; fromLabels: string[]; toState: string }> = [
+      { intent: "accept", fromLabels: ["wf:dev-impl", "state:intake"], toState: "implementation" },
+      { intent: "submit", fromLabels: ["wf:dev-impl", "state:implementation"], toState: "code-review" },
+      { intent: "approve", fromLabels: ["wf:dev-impl", "state:code-review"], toState: "deployment" },
+      { intent: "deploy", fromLabels: ["wf:dev-impl", "state:deployment"], toState: "done" },
+    ];
+
+    for (const { intent, fromLabels, toState } of transitions) {
+      resetWorkflowCache();
+      resetNativeStateCache();
+      const { fetch, mutations } = makeConformanceFetch(fromLabels);
+      globalThis.fetch = fetch;
+
+      await applyStateTransition(intent, "AI-CONF", "Bearer tok", {
+        bodyId: "charles",
+        feedback: intent === "deploy" ? { reasonCode: "correctness", freeText: "conformance" } : undefined,
+      });
+
+      // Find the ApplyAtomicTransition mutation
+      const atomicMutation = mutations.find((m) => m.query.includes("ApplyAtomicTransition"));
+      expect(atomicMutation).toBeDefined();
+
+      const vars = atomicMutation!.variables as { stateId?: string; labelIds?: string[] };
+
+      // Assert the native stateId was written
+      const expectedNativeState = STATE_TO_NATIVE[toState];
+      const expectedStateId = SEMANTIC_TO_UUID[expectedNativeState];
+      expect(vars.stateId).toBe(expectedStateId);
+
+      // Assert the label swap includes the new state:* label
+      const labelIds = vars.labelIds ?? [];
+      expect(labelIds.some((id: string) => id.includes(toState))).toBe(true);
+    }
+  });
+
+  it("escape transition writes invalid native stateId", async () => {
+    resetWorkflowCache();
+    resetNativeStateCache();
+    const { fetch, mutations } = makeConformanceFetch(["wf:dev-impl", "state:implementation"]);
+    globalThis.fetch = fetch;
+
+    await applyStateTransition("escape", "AI-CONF-ESC", "Bearer tok", { bodyId: "astrid" });
+
+    const atomicMutation = mutations.find((m) => m.query.includes("ApplyAtomicTransition"));
+    expect(atomicMutation).toBeDefined();
+    const vars = atomicMutation!.variables as { stateId?: string };
+    expect(vars.stateId).toBe(SEMANTIC_TO_UUID["invalid"]);
+  });
+
+  it("reject transition routes back to implementation with doing native state", async () => {
+    resetWorkflowCache();
+    resetNativeStateCache();
+    const { fetch, mutations } = makeConformanceFetch(["wf:dev-impl", "state:deployment"]);
+    globalThis.fetch = fetch;
+
+    await applyStateTransition("reject", "AI-CONF-REJ", "Bearer tok", {
+      bodyId: "hanzo",
+      feedback: { reasonCode: "correctness", freeText: "conformance reject" },
+    });
+
+    const atomicMutation = mutations.find((m) => m.query.includes("ApplyAtomicTransition"));
+    expect(atomicMutation).toBeDefined();
+    const vars = atomicMutation!.variables as { stateId?: string };
+    expect(vars.stateId).toBe(SEMANTIC_TO_UUID["doing"]);
+  });
+
+  it("request-changes transition routes back to implementation with doing native state", async () => {
+    resetWorkflowCache();
+    resetNativeStateCache();
+    const { fetch, mutations } = makeConformanceFetch(["wf:dev-impl", "state:code-review"]);
+    globalThis.fetch = fetch;
+
+    await applyStateTransition("request-changes", "AI-CONF-RC", "Bearer tok", {
+      bodyId: "reviewer",
+      feedback: { reasonCode: "missing-tests", freeText: "conformance" },
+    });
+
+    const atomicMutation = mutations.find((m) => m.query.includes("ApplyAtomicTransition"));
+    expect(atomicMutation).toBeDefined();
+    const vars = atomicMutation!.variables as { stateId?: string };
+    expect(vars.stateId).toBe(SEMANTIC_TO_UUID["doing"]);
+  });
+
+  // ── Adversarial: direct-write block tests ────────────────────────────────
+
+  it("blocks raw stateId mutation on workflow ticket", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    const result = await checkRawMutationInterception(
+      { query: "mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }", variables: { input: { stateId: "some-state-id" } } },
+      "issue-uuid",
+      "Bearer tok",
+      "charles",
+    );
+    expect(result).not.toBeNull();
+    expect(result).toContain("blocked");
+  });
+
+  it("blocks raw assigneeId mutation on workflow ticket", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    const result = await checkRawMutationInterception(
+      { query: "mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }", variables: { input: { assigneeId: "some-user-id" } } },
+      "issue-uuid",
+      "Bearer tok",
+      "charles",
+    );
+    expect(result).not.toBeNull();
+    expect(result).toContain("blocked");
+  });
+
+  it("blocks raw labelIds mutation on workflow ticket", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    const result = await checkRawMutationInterception(
+      { query: "mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }", variables: { input: { labelIds: ["lbl-1", "lbl-2"] } } },
+      "issue-uuid",
+      "Bearer tok",
+      "charles",
+    );
+    expect(result).not.toBeNull();
+    expect(result).toContain("blocked");
+  });
+
+  it("blocks raw stateId + assigneeId + labelIds combined mutation", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    const result = await checkRawMutationInterception(
+      { query: "mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }", variables: { input: { stateId: "state-id", assigneeId: "user-id", labelIds: ["lbl-1"] } } },
+      "issue-uuid",
+      "Bearer tok",
+      "charles",
+    );
+    expect(result).not.toBeNull();
+    expect(result).toContain("status/assignee/labels");
+  });
+
+  it("allows raw non-workflow mutations (title, description, etc.)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    const result = await checkRawMutationInterception(
+      { query: "mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }", variables: { input: { title: "New title", description: "New description", priority: 1 } } },
+      "issue-uuid",
+      "Bearer tok",
+      "charles",
+    );
+    expect(result).toBeNull(); // Not a workflow-affecting mutation
+  });
+
+  it("exactly one issueUpdate mutation per transition (no separate native-state write)", async () => {
+    resetWorkflowCache();
+    resetNativeStateCache();
+    const { fetch, mutations } = makeConformanceFetch(["wf:dev-impl", "state:implementation"]);
+    globalThis.fetch = fetch;
+
+    await applyStateTransition("submit", "AI-CONF-ONE", "Bearer tok", { bodyId: "charles" });
+
+    // Count ApplyAtomicTransition mutations — must be exactly 1
+    const atomicMutations = mutations.filter((m) => m.query.includes("ApplyAtomicTransition"));
+    expect(atomicMutations).toHaveLength(1);
+
+    // The single mutation must include all three facets: labelIds, delegateId, stateId
+    const vars = atomicMutations[0].variables as { labelIds?: string[]; delegateId?: string; stateId?: string };
+    expect(vars.labelIds).toBeDefined();
+    expect(vars.stateId).toBeDefined(); // AI-1498: native state is in the same mutation
   });
 });

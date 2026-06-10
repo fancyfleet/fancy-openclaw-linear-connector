@@ -27,6 +27,7 @@ states:
   - id: intake
     owner_role: steward
     kind: normal
+    native_state: todo
     transitions:
       - command: accept
         to: ux-shaping
@@ -38,6 +39,7 @@ states:
   - id: ux-shaping
     owner_role: ux-researcher   # person — not an engine role
     kind: normal
+    native_state: doing
     transitions:
       - command: submit
         to: spawning
@@ -45,6 +47,7 @@ states:
   - id: spawning
     owner_role: engine
     kind: normal
+    native_state: doing
     transitions:
       - command: spawn
         to: managing
@@ -52,6 +55,7 @@ states:
   - id: managing
     owner_role: sprint-owner    # co-owned with engine (engine fills engine role)
     kind: normal
+    native_state: managing
     transitions:
       - command: complete
         to: validating          # barrier auto-advances to validating, not done
@@ -59,6 +63,7 @@ states:
   - id: validating
     owner_role: sprint-owner    # handoff → Matt for final approval
     kind: normal
+    native_state: thinking
     transitions:
       - command: approve
         to: done
@@ -67,8 +72,10 @@ states:
 
   - id: done
     kind: terminal
+    native_state: done
     satisfies_parent_barrier: true   # uniform terminal contract (design.md §5.4)
 
   - id: escape
     kind: terminal
+    native_state: invalid
     # break-glass terminal; steward decides if Matt escalation is warranted (design.md §11)

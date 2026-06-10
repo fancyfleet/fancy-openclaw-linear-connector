@@ -27,6 +27,7 @@ states:
   - id: intake
     owner_role: steward
     kind: normal
+    native_state: todo
     transitions:
       - command: accept
         to: auditing
@@ -37,6 +38,7 @@ states:
   - id: auditing
     owner_role: ux-researcher
     kind: normal
+    native_state: doing
     transitions:
       - command: complete-audit
         to: spawning
@@ -44,6 +46,7 @@ states:
   - id: spawning
     owner_role: engine
     kind: normal
+    native_state: doing
     transitions:
       - command: spawn
         to: managing
@@ -51,6 +54,7 @@ states:
   - id: managing
     owner_role: ux-researcher   # co-owned with engine (engine fills engine role)
     kind: normal
+    native_state: managing
     transitions:
       - command: complete
         to: review              # barrier auto-advances to review (B-3), not done
@@ -62,6 +66,7 @@ states:
   - id: review
     owner_role: ux-researcher
     kind: normal
+    native_state: thinking
     transitions:
       - command: approve
         to: done                # gated by parent-AC check (§5.6 F2b) — engine enforces
@@ -70,8 +75,10 @@ states:
 
   - id: done
     kind: terminal
+    native_state: done
     satisfies_parent_barrier: true   # uniform terminal contract (design.md §5.4)
 
   - id: escape
     kind: terminal
+    native_state: invalid
     # break-glass terminal; steward decides if Matt escalation is warranted (design.md §11)

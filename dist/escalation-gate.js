@@ -18,6 +18,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import yaml from "js-yaml";
 import { componentLogger, createLogger } from "./logger.js";
+import { recordSuccess, recordFailure } from "./config-health.js";
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "escalation-gate");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 /**
@@ -44,9 +45,17 @@ let _policyCache = null;
 async function loadPolicy() {
     if (_policyCache)
         return _policyCache;
-    const raw = await fs.readFile(policyPath(), "utf8");
-    _policyCache = yaml.load(raw);
-    return _policyCache;
+    try {
+        const raw = await fs.readFile(policyPath(), "utf8");
+        _policyCache = yaml.load(raw);
+        recordSuccess("capability-policy");
+        return _policyCache;
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        recordFailure("capability-policy", msg);
+        throw err;
+    }
 }
 /** Invalidate the in-process policy cache (used in tests). */
 export function resetPolicyCache() {

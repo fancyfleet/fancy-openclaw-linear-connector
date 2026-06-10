@@ -5,6 +5,7 @@
  * + Layer 2 raw mutation interception (AI-1387)
  * + AI-1402 default-deny + needs-human block + unknown-caller fail-closed,
  * design.md §4.2, §4.6, §11, §13, §16.
+ * + Phase 6.5 / H-1 fail-closed + break-glass + config-health (AI-1476).
  *
  * Enforcement order (defense in depth):
  *   1. Phase 2 escalation-gate — capability rule table (needs-human steward-only).
@@ -12,7 +13,11 @@
  *      including delegate-only enforcement (AI-1397).
  *   3. Layer 2 raw mutation interception (AI-1387) — blocks direct status/assignee
  *      changes on workflow tickets that bypass the intent-header path.
+ *   4. Phase 6.5 config-health — rejects wf:* commands when config is degraded (§16.0).
  * All must pass for the request to be forwarded.
+ *
+ * Break-glass (§4.4 lifted): X-Openclaw-Break-Glass header allows a steward to
+ * bypass enforcement when config is degraded, preventing permanent queue wedging.
  *
  * After a successful forward, Phase 3 B2 applies the state:* label transition
  * atomically (single issueUpdate mutation). Seam: proxy-side, not CLI-side — the
