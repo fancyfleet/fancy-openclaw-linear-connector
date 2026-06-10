@@ -49,12 +49,29 @@ export interface WorkflowTransition {
         constraint?: string;
         default?: string;
     };
+    /** Phase 6.5 / H-7 (AI-1482): if true, capture verbatim AC from issue description at accept time. */
+    capture_ac?: boolean;
+    /** Phase 6.5 / H-7 (AI-1482): if true, requires human sign-off when stakes >= threshold. */
+    requires_human_signoff_above_stakes?: boolean;
 }
 export interface WorkflowState {
     id: string;
     owner_role?: string;
     kind?: string;
+    /** AI-1490: semantic native Linear state this workflow state projects to.
+     *  Must be a key in the CLI's SEMANTIC_STATE_MAP (doing, thinking, done, invalid, etc.)
+     *  or a literal Linear state name. Validated at connector startup. */
+    native_state?: string;
+    /** Per-state time-in-state SLA (ms). Parsed from YAML duration strings like "24h", "30m".
+     *  When a child breaches this SLA, the engine emits a stall event (§5.5 / §16.1). */
+    sla?: number;
     transitions?: WorkflowTransition[];
+}
+export interface StakesLevel {
+    /** Map of stakes:* label names to numeric levels (e.g. stakes:low → 0, stakes:high → 2). */
+    levels: Record<string, number>;
+    /** Tickets at or above this level require human sign-off. */
+    threshold: number;
 }
 export interface WorkflowDef {
     id: string;
@@ -67,11 +84,22 @@ export interface WorkflowDef {
         to?: string;
         owner_role?: string;
     };
+    /** Phase 6.5 / H-7 (AI-1482): stakes-threshold configuration for human sign-off gate. */
+    stakes?: StakesLevel;
     states: WorkflowState[];
 }
+/** Parse an SLA duration string (e.g. "24h", "30m", "2d", "90s") to milliseconds. */
+export declare function parseSlaDuration(value: string | number | undefined): number | undefined;
 export declare function loadWorkflowDef(): Promise<WorkflowDef>;
 /** Invalidate the in-process workflow def cache (used in tests). */
 export declare function resetWorkflowCache(): void;
+/**
+ * AI-1490: Validate that every workflow state with a native_state field
+ * references a valid semantic state name. Returns an array of diagnostic
+ * warnings (empty if all valid). Does not throw — used for startup checks
+ * and config-health reporting.
+ */
+export declare function validateNativeStateMappings(def: WorkflowDef): string[];
 /**
  * Derive legal assignment targets for a transition based on destination state's owner_role.
  * Returns mode=none for terminal states or roles with no bodies.
@@ -90,6 +118,18 @@ export declare function getCurrentState(labels: string[]): string | null;
  */
 export declare function fetchWorkflowLabels(issueId: string, authToken: string): Promise<string[]>;
 /**
+ * Resolve a ticket's numeric stakes level from its labels.
+ * Checks for stakes:* labels (e.g. stakes:low, stakes:medium, stakes:high)
+ * and maps them to numeric values via the workflow's stakes configuration.
+ *
+ * Fails closed: when no stakes label is present, returns the threshold
+ * value itself — unlabeled tickets are treated as high-stakes to prevent
+ * a missing label from silently bypassing the human sign-off gate.
+ * When the label is present but maps to an unknown level, also returns
+ * the threshold (fail-closed on unknown metadata).
+ */
+export declare function resolveStakesLevel(labels: string[], stakesConfig: StakesLevel): number;
+/**
  * Evaluate full workflow-def-driven command validation for an inbound proxied request.
  *
  * Returns a rejection message when the command should be blocked, or null to forward.
@@ -99,7 +139,7 @@ export declare function fetchWorkflowLabels(issueId: string, authToken: string):
  * @param callerLinearUserId - Linear user ID of the requesting agent (from agents.ts);
  *   used for delegate-only enforcement (AI-1397). Null/undefined → fail-open.
  */
-export declare function checkWorkflowRules(intent: string, issueId: string | null, authToken: string, bodyId: string, target?: string | null, callerLinearUserId?: string | null, artifactRef?: string | null): Promise<string | null>;
+export declare function checkWorkflowRules(intent: string, issueId: string | null, authToken: string, bodyId: string, target?: string | null, callerLinearUserId?: string | null, artifactRef?: string | null, breakGlassOverride?: boolean): Promise<string | null>;
 /**
  * Detect raw mutations on workflow tickets (AI-1387, expanded in AI-1402).
  *

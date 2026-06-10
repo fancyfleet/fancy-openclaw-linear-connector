@@ -131,10 +131,17 @@ export async function loadWorkflowDef(): Promise<WorkflowDef> {
     }
     _workflowCache = def;
     recordSuccess("workflow-def");
-    // AI-1490: validate native_state mappings on load.
+    // AI-1490 / AI-1498: validate native_state mappings on load — hard-fail if any state
+    // lacks a valid native_state (the proxy must be able to write native stateId for every
+    // transition; a missing mapping is what made deployment fall through to native Invalid).
     const warnings = validateNativeStateMappings(def);
     for (const w of warnings) {
-      log.warn(`workflow-gate: native_state validation: ${w}`);
+      log.error(`workflow-gate: native_state validation FAILURE: ${w}`);
+    }
+    if (warnings.length > 0) {
+      const msg = `Workflow definition has ${warnings.length} invalid native_state mapping(s): ${warnings.join("; ")}`;
+      recordFailure("workflow-def", msg);
+      throw new Error(msg);
     }
     return _workflowCache;
   } catch (err) {
@@ -150,33 +157,48 @@ export function resetWorkflowCache(): void {
 }
 
 /**
+ * AI-1498: Semantic-to-native mapping — mirrors the CLI's SEMANTIC_STATE_MAP
+ * so the proxy can resolve native Linear stateId UUIDs without depending on the CLI.
+ * Each semantic state maps to an ordered list of candidate Linear workflow state names;
+ * the first match found in the team's actual states wins.
+ * Keep in sync with the CLI's SEMANTIC_STATE_MAP when new semantic names are added.
+ */
+const SEMANTIC_STATE_MAP: Record<string, string[]> = {
+  backlog: ["Backlog"],
+  todo: ["Todo", "To Do", "To Develop"],
+  thinking: ["Thinking", "In Progress"],
+  doing: ["Doing", "In Progress", "Developing"],
+  managing: ["Managing"],
+  done: ["Done"],
+  invalid: ["Invalid", "Canceled", "Cancelled"],
+};
+
+/**
  * Valid semantic state names that the CLI's SEMANTIC_STATE_MAP recognizes.
  * AI-1490: used to validate that every workflow state's native_state field
  * maps to a real CLI semantic state (which in turn resolves to an actual
  * Linear workflow state per team).
  */
-const VALID_SEMANTIC_STATES = new Set([
-  "backlog", "todo", "thinking", "doing", "managing", "done", "invalid",
-]);
+const VALID_SEMANTIC_STATES = new Set(Object.keys(SEMANTIC_STATE_MAP));
 
 /**
- * AI-1490: Validate that every workflow state with a native_state field
- * references a valid semantic state name. Returns an array of diagnostic
- * warnings (empty if all valid). Does not throw — used for startup checks
- * and config-health reporting.
+ * AI-1490 / AI-1498: Validate that every workflow state has a valid native_state field.
+ * AI-1498 hardens this from warn → hard-fail for non-terminal states: a missing or
+ * invalid native_state means the proxy cannot compute the native Linear stateId,
+ * making desync structurally impossible. Returns an array of diagnostic errors.
+ * The caller should throw when errors is non-empty for governed workflows.
  */
 export function validateNativeStateMappings(def: WorkflowDef): string[] {
   const warnings: string[] = [];
   for (const state of def.states) {
     if (!state.native_state) {
-      // Missing native_state is a problem for non-terminal states
-      // (terminals like done/escape should have them for completeness).
-      if (state.kind !== "terminal") {
-        warnings.push(
-          `Workflow state '${state.id}' has no native_state field — its native Linear state projection is undefined. ` +
-          `Add a native_state field (e.g. 'doing', 'thinking', 'todo', 'done', 'invalid').`,
-        );
-      }
+      // AI-1498: hard-fail for ALL states (terminal and non-terminal).
+      // A terminal state without native_state means done/escape tickets land
+      // in an undefined native column — exactly the projection bugs this ticket fixes.
+      warnings.push(
+        `Workflow state '${state.id}' has no native_state field — its native Linear state projection is undefined. ` +
+        `Add a native_state field (e.g. 'doing', 'thinking', 'todo', 'done', 'invalid').`,
+      );
       continue;
     }
     if (!VALID_SEMANTIC_STATES.has(state.native_state)) {
@@ -187,6 +209,88 @@ export function validateNativeStateMappings(def: WorkflowDef): string[] {
     }
   }
   return warnings;
+}
+
+// ── AI-1498: Native state resolution cache ────────────────────────────────
+// Maps (teamId, semanticName) → Linear workflow state UUID.
+// Resolved once per team, cached indefinitely. Invalidated on cache reset.
+
+/** Cache: teamId → array of team workflow states from Linear API. */
+let _teamStateCache: Map<string, Array<{ id: string; name: string; type: string }>> = new Map();
+
+/** Reset the native-state cache (used in tests). */
+export function resetNativeStateCache(): void {
+  _teamStateCache.clear();
+}
+
+/**
+ * Fetch a team's workflow states from Linear (with caching).
+ * Returns the raw state nodes for the team.
+ */
+async function fetchTeamWorkflowStates(
+  teamId: string,
+  authToken: string,
+): Promise<Array<{ id: string; name: string; type: string }>> {
+  const cached = _teamStateCache.get(teamId);
+  if (cached) return cached;
+
+  const query = `
+    query TeamStates($teamId: String!) {
+      team(id: $teamId) {
+        states {
+          nodes {
+            id
+            name
+            type
+          }
+        }
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { teamId } }),
+    });
+    type Resp = { data?: { team?: { states?: { nodes: Array<{ id: string; name: string; type: string }> } } } };
+    const data = (await res.json()) as Resp;
+    const nodes = data.data?.team?.states?.nodes ?? [];
+    _teamStateCache.set(teamId, nodes);
+    return nodes;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: team state fetch failed for team=${teamId}: ${msg}`);
+    return [];
+  }
+}
+
+/**
+ * AI-1498: Resolve a semantic native_state name (e.g. "doing", "done") to the actual
+ * Linear workflow state UUID for the given team. Uses the same SEMANTIC_STATE_MAP
+ * candidate-order resolution as the CLI so the proxy and CLI always agree.
+ * Returns null if the state cannot be resolved.
+ */
+export async function resolveNativeStateId(
+  teamId: string,
+  semanticName: string,
+  authToken: string,
+): Promise<string | null> {
+  const candidates = SEMANTIC_STATE_MAP[semanticName.toLowerCase()];
+  if (!candidates) {
+    log.warn(`workflow-gate: resolveNativeStateId: unknown semantic name '${semanticName}'`);
+    return null;
+  }
+  const states = await fetchTeamWorkflowStates(teamId, authToken);
+  const normalize = (s: string) => s.toLowerCase().replace(/\s+/g, "");
+  for (const candidate of candidates) {
+    const match = states.find((s) => normalize(s.name) === normalize(candidate));
+    if (match) return match.id;
+  }
+  log.warn(
+    `workflow-gate: resolveNativeStateId: no match for '${semanticName}' (tried: ${candidates.join(", ")}) in team ${teamId}`,
+  );
+  return null;
 }
 
 // ── Label fetch ────────────────────────────────────────────────────────────
@@ -1449,18 +1553,48 @@ export async function applyStateTransition(
     }
   }
 
-  // Step 4: Apply the FULL transition atomically (labels + delegate in one mutation).
+  // Step 4 (AI-1498): Resolve native stateId from YAML native_state field.
+  // The proxy is now the SOLE writer of all three facets: label, delegate, AND native state.
+  // Fail-closed: if the destination state has a native_state field but we can't resolve
+  // the Linear stateId, abort the transition (this is the structural guarantee that
+  // prevents desync).
+  let resolvedNativeStateId: string | null | undefined = undefined;
+  const destNativeState = destStateNode?.native_state;
+  if (destNativeState) {
+    const stateId = await resolveNativeStateId(issue.teamId, destNativeState, authToken);
+    if (!stateId) {
+      log.error(
+        `workflow-gate: B2 apply: FAIL-CLOSED — could not resolve native stateId for '${destNativeState}' on team ${issue.teamId}. Transition aborted.`,
+      );
+      return;
+    }
+    resolvedNativeStateId = stateId;
+    log.info(
+      `workflow-gate: B2 apply: resolved native_state '${destNativeState}' → stateId=${stateId} for ${issueId}`,
+    );
+  } else if (destStateNode) {
+    // State exists but has no native_state — this should have been caught at load-time
+    // validation (AI-1498 hard-fail). If we somehow reach here, fail-closed.
+    log.error(
+      `workflow-gate: B2 apply: FAIL-CLOSED — destination state '${toStateName}' has no native_state field. Transition aborted.`,
+    );
+    return;
+  }
+
+  // Step 5: Apply the FULL transition atomically (labels + delegate + native state in one mutation).
   const applied = await issueUpdateAtomic(
     issue.internalId,
     newLabelIds,
     authToken,
     resolvedDelegateId,
+    resolvedNativeStateId,
   );
 
   if (applied) {
     log.info(
       `workflow-gate: B2 apply: ${issueId} state:${currentStateName} → state:${toStateName}` +
-      (resolvedDelegateId != null ? ` delegate=${resolvedDelegateId}` : resolvedDelegateId === null ? ` delegate=cleared` : ``),
+      (resolvedDelegateId != null ? ` delegate=${resolvedDelegateId}` : resolvedDelegateId === null ? ` delegate=cleared` : ``) +
+      (resolvedNativeStateId ? ` native=${destNativeState}(${resolvedNativeStateId})` : ``),
     );
   } else {
     log.error(
@@ -1629,22 +1763,29 @@ async function issueUpdateAtomic(
   labelIds: string[],
   authToken: string,
   delegateId?: string | null,
+  nativeStateId?: string | null,
 ): Promise<boolean> {
   // Build the mutation input: include delegateId when explicitly set (string or null to clear).
   // undefined means "don't touch delegate". null means "clear delegate".
+  // AI-1498: include nativeStateId when explicitly set — the proxy writes ALL three facets
+  // (label, delegate, native state) in a single mutation.
   const hasDelegate = delegateId !== undefined;
-  const inputFields = hasDelegate
-    ? "labelIds: $labelIds, delegateId: $delegateId"
-    : "labelIds: $labelIds";
+  const hasStateId = nativeStateId !== undefined;
+
+  const inputParts: string[] = ["labelIds: $labelIds"];
+  if (hasDelegate) inputParts.push("delegateId: $delegateId");
+  if (hasStateId) inputParts.push("stateId: $stateId");
+
   const mutation = `
-    mutation ApplyAtomicTransition($issueId: String!, $labelIds: [String!]!${hasDelegate ? ", $delegateId: String" : ""}) {
-      issueUpdate(id: $issueId, input: { ${inputFields} }) {
+    mutation ApplyAtomicTransition($issueId: String!, $labelIds: [String!]!${hasDelegate ? ", $delegateId: String" : ""}${hasStateId ? ", $stateId: String" : ""}) {
+      issueUpdate(id: $issueId, input: { ${inputParts.join(", ")} }) {
         success
       }
     }
   `;
   const variables: Record<string, unknown> = { issueId: internalId, labelIds };
   if (hasDelegate) variables.delegateId = delegateId;
+  if (hasStateId) variables.stateId = nativeStateId;
   try {
     const res = await fetch(LINEAR_API_URL, {
       method: "POST",

@@ -13,7 +13,8 @@
  */
 import fs from "node:fs/promises";
 import path from "node:path";
-import { loadWorkflowDef, fetchWorkflowLabels, getWorkflowId, getCurrentState, resolveTransitionTargets, } from "../workflow-gate.js";
+import { loadWorkflowDef, fetchWorkflowLabels, getWorkflowId, getCurrentState, resolveTransitionTargets, resolveStakesLevel, } from "../workflow-gate.js";
+import { getAcRecord } from "../ac-record-store.js";
 import { componentLogger, createLogger } from "../logger.js";
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "build-message");
 /**
@@ -150,16 +151,32 @@ async function tryBuildWorkflowMessage(actionText, identifier, title, authToken)
     const guidanceBlock = guidance
         ? ["", "---", "**Step guidance (accumulated lessons for this state):**", "", guidance.trim(), "---"]
         : [];
+    // Phase 6.5 / H-7 (AI-1482): Include verbatim AC record if captured.
+    const acRecordBlock = [];
+    const acRecord = await getAcRecord(identifier);
+    if (acRecord) {
+        acRecordBlock.push("", "---", "**Verbatim Acceptance Criteria (AC of record):**", "", acRecord.verbatimAc, "", `_(Captured at intake by ${acRecord.capturedBy} on ${acRecord.capturedAt}. Sign-off is judged against this verbatim AC, not any restatement.)_`, "---");
+    }
+    // Phase 6.5 / H-7 (AI-1482): Include stakes level if configured.
+    const stakesBlock = [];
+    if (def.stakes) {
+        const ticketStakesLevel = resolveStakesLevel(labels, def.stakes);
+        if (ticketStakesLevel >= def.stakes.threshold) {
+            stakesBlock.push("", `⚠️ **Elevated stakes (level ${ticketStakesLevel}):** This ticket requires human (Matt) sign-off at deploy. AI agents cannot self-sign-off.`);
+        }
+    }
     return [
         `${actionText}: ${title}`,
         "",
         `This is a [${def.id}] workflow ticket in state: **${currentState}**`,
+        ...stakesBlock,
         "",
         "Your legal action(s) for this state:",
         ...stepLines,
         "",
         `Run \`linear consider-work ${identifier}\` NOW if you haven't already to review the issue.`,
         ...guidanceBlock,
+        ...acRecordBlock,
         "",
         "📝 Comment discipline: post one substantive comment — your actual findings or result. Do NOT post a comment that only restates what is already on the ticket or narrates that you have handed it back. If you have no new information to add, do not comment at all — just transition state.",
         "",
