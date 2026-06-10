@@ -991,26 +991,58 @@ export async function checkRawMutationInterception(
   authToken: string,
   bodyId?: string,
 ): Promise<string | null> {
-  if (!body || !issueId) return null;
+  if (!body) return null;
 
   // Only intercept issueUpdate mutations.
   const q = body.query ?? "";
   if (!q.includes("issueUpdate")) return null;
 
-  // Check if the mutation input contains any workflow-affecting fields.
+  // Check if the mutation touches any workflow-affecting field.
   // Blocked: stateId (status), assigneeId (assignee), labelIds (label manipulation).
   // Allowed: title, description, priority, dueDate, and other non-workflow fields.
+  //
+  // AI-1402 follow-up: a field can reach issueUpdate three ways and the old
+  // detector only saw the first, so inlining the input literally in the query
+  // string (or routing the value through a differently-named scalar variable)
+  // bypassed the gate entirely:
+  //   (a) variables.input.<field>        — CLI shape; field key lives in variables
+  //   (b) input:{<field>:$var} inline    — field key in query text, value in vars
+  //   (c) input:{<field>:"literal"}      — field key and value both in query text
+  // GraphQL input-object keys cannot be aliased, so for (b)/(c) the literal field
+  // identifier must appear in the query text. Detect across all encodings by
+  // (1) scanning the query string for the field identifier and (2) deep-scanning
+  // the variables for the field key at any depth.
   const vars = body.variables ?? {};
-  const input = (vars as Record<string, unknown>).input;
-  const inputObj = input && typeof input === "object" && input !== null
-    ? input as Record<string, unknown>
-    : null;
+  const queryHasField = (field: string) => new RegExp(`\\b${field}\\b`).test(q);
+  const varsHaveKey = (obj: unknown, key: string): boolean => {
+    if (!obj || typeof obj !== "object") return false;
+    if (Array.isArray(obj)) return obj.some((v) => varsHaveKey(v, key));
+    const rec = obj as Record<string, unknown>;
+    if (key in rec) return true;
+    return Object.values(rec).some((v) => varsHaveKey(v, key));
+  };
+  const touches = (field: string) => queryHasField(field) || varsHaveKey(vars, field);
 
-  const hasStateChange = inputObj && typeof inputObj.stateId === "string";
-  const hasAssigneeChange = inputObj && ("assigneeId" in (inputObj as object));
-  const hasLabelChange = inputObj && ("labelIds" in (inputObj as object));
+  const hasStateChange = touches("stateId");
+  const hasAssigneeChange = touches("assigneeId");
+  const hasLabelChange = touches("labelIds");
 
   if (!hasStateChange && !hasAssigneeChange && !hasLabelChange) return null;
+
+  // AI-1347: this is a raw workflow-affecting mutation but the caller did not
+  // expose the ticket id in a place the proxy could resolve (no id variable, no
+  // inline id in the query). We cannot fetch labels to confirm whether the ticket
+  // is governed, so we cannot prove it is safe. Fail CLOSED: a raw stateId /
+  // assigneeId / labelIds change with no resolvable ticket and no intent header
+  // is exactly the bypass shape this gate exists to stop.
+  if (!issueId) {
+    log.warn(`workflow-gate: raw workflow-field mutation with unresolvable issueId — blocking (fail-closed)`);
+    return (
+      `[Proxy] Direct status/assignee/label changes on workflow tickets must go through ` +
+      `workflow commands, and the ticket id could not be resolved from this request. ` +
+      `Re-issue using the linear CLI workflow commands (or pass the ticket id as a variable).`
+    );
+  }
 
   // This is a raw workflow-affecting mutation — check if the ticket is on a workflow.
   const { labels } = await fetchTicketContext(issueId, authToken);

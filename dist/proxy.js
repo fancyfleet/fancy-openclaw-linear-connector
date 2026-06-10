@@ -81,13 +81,28 @@ function parseBody(req) {
  * Returns the first non-empty string found in common ID variable names, or null.
  */
 function extractIssueId(body) {
-    if (!body?.variables)
+    if (!body)
         return null;
-    const vars = body.variables;
+    const vars = body.variables ?? {};
     for (const key of ["id", "issueId", "identifier"]) {
         const v = vars[key];
         if (typeof v === "string" && v.length > 0)
             return v;
+    }
+    // AI-1347: the id may be inlined in the query text rather than passed as a
+    // variable (e.g. `issueUpdate(id:"<uuid>", ...)` or `issueUpdate(id:$foo,...)`
+    // with a non-standard variable name). Without this, a raw mutation that
+    // inlines its id slips past the workflow gate because issueId resolves null.
+    const q = body.query ?? "";
+    const m = q.match(/issueUpdate\s*\(\s*id\s*:\s*(?:"([^"]+)"|\$(\w+))/);
+    if (m) {
+        if (m[1])
+            return m[1]; // inline literal
+        if (m[2]) {
+            const v = vars[m[2]];
+            if (typeof v === "string" && v.length > 0)
+                return v; // aliased variable
+        }
     }
     return null;
 }
