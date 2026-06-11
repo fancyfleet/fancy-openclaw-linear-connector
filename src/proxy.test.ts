@@ -77,18 +77,21 @@ states:
   - id: intake
     owner_role: steward
     kind: normal
+    native_state: todo
     transitions:
       - command: accept
         to: implementation
   - id: implementation
     owner_role: dev
     kind: normal
+    native_state: todo
     transitions:
       - command: submit
         to: code-review
   - id: code-review
     owner_role: code-review
     kind: normal
+    native_state: todo
     transitions:
       - command: approve
         to: deployment
@@ -97,6 +100,7 @@ states:
   - id: deployment
     owner_role: deployment
     kind: normal
+    native_state: todo
     transitions:
       - command: deploy
         to: done
@@ -105,6 +109,7 @@ states:
         to: implementation
   - id: done
     kind: terminal
+    native_state: done
     transitions: []
 `;
 
@@ -896,7 +901,7 @@ describe("proxy enforcement — B2 state-label transition application", () => {
    *   IssueLabels   — B1 validation fetch (returns label names)
    *   IssueWithLabels — B2 transition fetch (returns label IDs + team)
    *   TeamLabels    — B2 label lookup
-   *   ApplyStateTransition — B2 issueUpdate mutation
+   *   ApplyAtomicTransition — B2 issueUpdate mutation
    *   everything else → MOCK_RESPONSE (the agent's main mutation)
    * Records every call so tests can assert transition behavior.
    */
@@ -935,7 +940,28 @@ describe("proxy enforcement — B2 state-label transition application", () => {
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
-      if (q.includes("ApplyStateTransition")) {
+      if (q.includes("TeamStates")) {
+        // AI-1498: native state resolution for the atomic writer.
+        return new Response(
+          JSON.stringify({
+            data: {
+              team: {
+                states: {
+                  nodes: [
+                    { id: "state-todo-uuid", name: "Todo", type: "unstarted" },
+                    { id: "state-doing-uuid", name: "Doing", type: "started" },
+                    { id: "state-thinking-uuid", name: "Thinking", type: "started" },
+                    { id: "state-done-uuid", name: "Done", type: "completed" },
+                    { id: "state-invalid-uuid", name: "Invalid", type: "canceled" },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (q.includes("ApplyAtomicTransition")) {
         const success = opts.updateSuccess ?? true;
         return new Response(
           JSON.stringify({ data: { issueUpdate: { success } } }),
@@ -967,9 +993,9 @@ describe("proxy enforcement — B2 state-label transition application", () => {
     expect(res.status).toBe(200);
     expect(res.body.errors).toBeUndefined();
     // B2 transition call should have fired.
-    expect(calls.some((c) => c.query.includes("ApplyStateTransition"))).toBe(true);
+    expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(true);
     // The issueUpdate should use internal UUID and contain the new label.
-    const b2call = calls.find((c) => c.query.includes("ApplyStateTransition"));
+    const b2call = calls.find((c) => c.query.includes("ApplyAtomicTransition"));
     expect(b2call).toBeDefined();
     const vars = b2call!.variables as { issueId: string; labelIds: string[] };
     expect(vars.issueId).toBe("internal-uuid");
@@ -992,7 +1018,7 @@ describe("proxy enforcement — B2 state-label transition application", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.errors).toBeDefined();
-    expect(calls.some((c) => c.query.includes("ApplyStateTransition"))).toBe(false);
+    expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(false);
   });
 
   it("does NOT apply transition when no intent header (pure pass-through)", async () => {
@@ -1010,7 +1036,7 @@ describe("proxy enforcement — B2 state-label transition application", () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual(MOCK_RESPONSE);
-    expect(calls.some((c) => c.query.includes("ApplyStateTransition"))).toBe(false);
+    expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(false);
   });
 
   it("returns the upstream response even when the B2 transition fails", async () => {
@@ -1030,7 +1056,7 @@ describe("proxy enforcement — B2 state-label transition application", () => {
     // Agent response is still 200 even though label update returned non-success.
     expect(res.status).toBe(200);
     expect(res.body.errors).toBeUndefined();
-    expect(calls.some((c) => c.query.includes("ApplyStateTransition"))).toBe(true);
+    expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(true);
   });
 });
 
@@ -1218,7 +1244,7 @@ describe("proxy — Layer 1 workflow reminder header (AI-1387)", () => {
    *   IssueLabels — B1 validation
    *   IssueWithLabels — B2 transition
    *   TeamLabels — B2 label lookup
-   *   ApplyStateTransition — B2 issueUpdate
+   *   ApplyAtomicTransition — B2 issueUpdate
    *   everything else → MOCK_RESPONSE
    */
   function makeFullFetch(opts: {
@@ -1251,7 +1277,28 @@ describe("proxy — Layer 1 workflow reminder header (AI-1387)", () => {
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
-      if (q.includes("ApplyStateTransition")) {
+      if (q.includes("TeamStates")) {
+        // AI-1498: native state resolution for the atomic writer.
+        return new Response(
+          JSON.stringify({
+            data: {
+              team: {
+                states: {
+                  nodes: [
+                    { id: "state-todo-uuid", name: "Todo", type: "unstarted" },
+                    { id: "state-doing-uuid", name: "Doing", type: "started" },
+                    { id: "state-thinking-uuid", name: "Thinking", type: "started" },
+                    { id: "state-done-uuid", name: "Done", type: "completed" },
+                    { id: "state-invalid-uuid", name: "Invalid", type: "canceled" },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (q.includes("ApplyAtomicTransition")) {
         return new Response(
           JSON.stringify({ data: { issueUpdate: { success: true } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },

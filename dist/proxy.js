@@ -254,7 +254,7 @@ export async function handleProxyRequest(req, res, deps) {
         try {
             // Build feedback context for observation recording.
             let feedback;
-            if (feedbackCategoryHeader && (intent === "request-changes" || intent === "reject")) {
+            if (feedbackCategoryHeader && (intent === "request-changes" || intent === "reject" || intent === "ac-fail")) {
                 const fromBodyHeader = req.headers["x-openclaw-from-body"] ?? null;
                 feedback = {
                     fromBody: fromBodyHeader,

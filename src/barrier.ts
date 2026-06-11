@@ -50,6 +50,24 @@ import {
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "barrier");
 
+/**
+ * Parse a per-state SLA duration string into milliseconds.
+ * Accepts `<n>h`, `<n>m`, `<n>s`, or a bare millisecond number (e.g. "24h",
+ * "90m", "3600000"). Returns null when the value can't be parsed.
+ */
+function parseSlaToMs(sla: string): number | null {
+  const m = /^\s*(\d+(?:\.\d+)?)\s*(h|m|s|ms)?\s*$/i.exec(sla);
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  if (!Number.isFinite(n)) return null;
+  switch ((m[2] ?? "ms").toLowerCase()) {
+    case "h": return n * 60 * 60 * 1000;
+    case "m": return n * 60 * 1000;
+    case "s": return n * 1000;
+    default: return n; // bare number = ms
+  }
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────
 
 /** Terminal states that satisfy the parent barrier. */
@@ -812,12 +830,12 @@ export async function detectStalledChildren(
     const stateEnteredAt = await fetchChildStateEnteredAt(child.identifier, authToken);
     const timeInStateMs = stateEnteredAt !== null ? now - stateEnteredAt : idleDurationMs;
 
-    // Look up per-state SLA from workflow def
+    // Look up per-state SLA from workflow def (duration string → ms)
     let stateSlaMs: number | null = null;
     if (def && child.workflowState) {
       const stateDef = def.states.find((s) => s.id === child.workflowState);
       if (stateDef?.sla) {
-        stateSlaMs = stateDef.sla;
+        stateSlaMs = parseSlaToMs(stateDef.sla);
       }
     }
 

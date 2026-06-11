@@ -21,7 +21,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import yaml from "js-yaml";
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "@jest/globals";
 import {
   checkWorkflowRules,
   applyStateTransition,
@@ -1354,14 +1354,17 @@ describe("checkRawMutationInterception — Layer 2 (AI-1387)", () => {
     expect(result).toBeNull();
   });
 
-  it("passes through when issueId is null", async () => {
+  it("fails closed on a raw stateId mutation when issueId is unresolvable (AI-1347)", async () => {
+    // A raw stateId change with no resolvable ticket id is exactly the bypass
+    // shape the gate exists to stop — block it rather than pass through.
     const body = {
       query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
       variables: { id: "issue-uuid", input: { stateId: "state-done-uuid" } },
     };
 
     const result = await checkRawMutationInterception(body, null, "Bearer tok");
-    expect(result).toBeNull();
+    expect(result).not.toBeNull();
+    expect(result).toContain("could not be resolved");
   });
 
   it("passes through when body is null", async () => {
@@ -2520,12 +2523,12 @@ bodies:
     globalThis.fetch = makeBarrierIntegrationFetch({
       childLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
-        { id: "state-lbl", name: "state:deployment" },
+        { id: "state-lbl", name: "state:ac-validate" },
       ],
     });
 
-    // deploy from deployment → done (terminal)
-    await applyStateTransition("deploy", "AI-2001", "Bearer tok");
+    // v8: validated from ac-validate → done (terminal)
+    await applyStateTransition("validated", "AI-2001", "Bearer tok");
 
     // Restore ux-audit workflow def
     process.env.WORKFLOW_DEF_PATH = CANONICAL_UX_AUDIT_FIXTURE;
@@ -4310,12 +4313,19 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
 
   /**
    * Native state mapping from the canonical dev-impl YAML.
+   * v7 (AI-1510): native status is a pure engagement overlay, so every active
+   * work-phase RESTS at `todo`; a transition writes that resting value and the
+   * connector then cycles thinking/doing off the delegate's session lifecycle.
+   * Terminal states keep their semantic value.
    */
   const STATE_TO_NATIVE: Record<string, string> = {
     intake: "todo",
-    implementation: "doing",
-    "code-review": "thinking",
-    deployment: "doing",
+    "write-tests": "todo",
+    implementation: "todo",
+    "code-review": "todo",
+    deployment: "todo",
+    "host-deploy": "todo",
+    "ac-validate": "todo",
     done: "done",
     escape: "invalid",
   };
@@ -4416,12 +4426,15 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
   }
 
   it("every transition writes the correct native stateId atomically", async () => {
-    // Walk the full dev-impl happy path: intake → implementation → code-review → deployment → done
+    // Walk the full dev-impl v8 happy path:
+    //   intake → write-tests → implementation → code-review → deployment → ac-validate → done
     const transitions: Array<{ intent: string; fromLabels: string[]; toState: string }> = [
-      { intent: "accept", fromLabels: ["wf:dev-impl", "state:intake"], toState: "implementation" },
+      { intent: "accept", fromLabels: ["wf:dev-impl", "state:intake"], toState: "write-tests" },
+      { intent: "tests-ready", fromLabels: ["wf:dev-impl", "state:write-tests"], toState: "implementation" },
       { intent: "submit", fromLabels: ["wf:dev-impl", "state:implementation"], toState: "code-review" },
       { intent: "approve", fromLabels: ["wf:dev-impl", "state:code-review"], toState: "deployment" },
-      { intent: "deploy", fromLabels: ["wf:dev-impl", "state:deployment"], toState: "done" },
+      { intent: "deploy", fromLabels: ["wf:dev-impl", "state:deployment"], toState: "ac-validate" },
+      { intent: "validated", fromLabels: ["wf:dev-impl", "state:ac-validate"], toState: "done" },
     ];
 
     for (const { intent, fromLabels, toState } of transitions) {
@@ -4432,7 +4445,6 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
 
       await applyStateTransition(intent, "AI-CONF", "Bearer tok", {
         bodyId: "charles",
-        feedback: intent === "deploy" ? { reasonCode: "correctness", freeText: "conformance" } : undefined,
       });
 
       // Find the ApplyAtomicTransition mutation
@@ -4466,7 +4478,7 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     expect(vars.stateId).toBe(SEMANTIC_TO_UUID["invalid"]);
   });
 
-  it("reject transition routes back to implementation with doing native state", async () => {
+  it("reject transition routes back to implementation with todo resting native state", async () => {
     resetWorkflowCache();
     resetNativeStateCache();
     const { fetch, mutations } = makeConformanceFetch(["wf:dev-impl", "state:deployment"]);
@@ -4480,10 +4492,10 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     const atomicMutation = mutations.find((m) => m.query.includes("ApplyAtomicTransition"));
     expect(atomicMutation).toBeDefined();
     const vars = atomicMutation!.variables as { stateId?: string };
-    expect(vars.stateId).toBe(SEMANTIC_TO_UUID["doing"]);
+    expect(vars.stateId).toBe(SEMANTIC_TO_UUID["todo"]);
   });
 
-  it("request-changes transition routes back to implementation with doing native state", async () => {
+  it("request-changes transition routes back to implementation with todo resting native state", async () => {
     resetWorkflowCache();
     resetNativeStateCache();
     const { fetch, mutations } = makeConformanceFetch(["wf:dev-impl", "state:code-review"]);
@@ -4497,7 +4509,7 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     const atomicMutation = mutations.find((m) => m.query.includes("ApplyAtomicTransition"));
     expect(atomicMutation).toBeDefined();
     const vars = atomicMutation!.variables as { stateId?: string };
-    expect(vars.stateId).toBe(SEMANTIC_TO_UUID["doing"]);
+    expect(vars.stateId).toBe(SEMANTIC_TO_UUID["todo"]);
   });
 
   // ── Adversarial: direct-write block tests ────────────────────────────────

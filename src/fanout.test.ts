@@ -779,8 +779,31 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
         );
       }
 
-      // B2: state transition issueUpdate
-      if (query.includes("ApplyStateTransition")) {
+      // AI-1498: native state resolution (resolveNativeStateId → TeamStates)
+      if (query.includes("TeamStates")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              team: {
+                states: {
+                  nodes: [
+                    { id: "state-todo-uuid", name: "Todo", type: "unstarted" },
+                    { id: "state-doing-uuid", name: "Doing", type: "started" },
+                    { id: "state-thinking-uuid", name: "Thinking", type: "started" },
+                    { id: "state-managing-uuid", name: "Managing", type: "started" },
+                    { id: "state-done-uuid", name: "Done", type: "completed" },
+                    { id: "state-invalid-uuid", name: "Invalid", type: "canceled" },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // B2: state transition — single atomic writer (AI-1498)
+      if (query.includes("ApplyAtomicTransition")) {
         return new Response(
           JSON.stringify({ data: { issueUpdate: { success: true } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
@@ -858,7 +881,7 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     await applyStateTransition("spawn", "AI-1439", "Bearer tok");
 
     // Should have made state transition (spawning → managing)
-    const stateUpdateCall = fetchCalls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
+    const stateUpdateCall = fetchCalls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(stateUpdateCall).toBeDefined();
 
     // Should have triggered fan-out (child issue creation)
@@ -891,7 +914,7 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     process.env.WORKFLOW_DEF_PATH = CANONICAL_UX_AUDIT_FIXTURE;
 
     // Should have state transition but NO fan-out
-    const stateUpdateCall = fetchCalls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
+    const stateUpdateCall = fetchCalls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(stateUpdateCall).toBeDefined();
 
     const childCreateCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));

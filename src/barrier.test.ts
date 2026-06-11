@@ -595,15 +595,25 @@ describe("buildShepherdingMessage", () => {
       { identifier: "AI-2001", labels: ["wf:dev-impl", "state:implementation"], isTerminal: false, workflowState: "implementation" },
     ];
     const stalled: StalledChild[] = [
-      { identifier: "AI-2001", parentIdentifier: "AI-1439", currentState: "implementation", lastActivityAt: 1000000, idleDurationMs: 45 * 60 * 1000 },
+      {
+        identifier: "AI-2001",
+        parentIdentifier: "AI-1439",
+        currentState: "implementation",
+        lastActivityAt: 1000000,
+        idleDurationMs: 45 * 60 * 1000,
+        stateEnteredAt: null,
+        stateSlaMs: 30 * 60 * 1000,
+        timeInStateMs: 45 * 60 * 1000,
+        knownDeferralMs: 0,
+        isDeferredAtCapacity: false,
+      },
     ];
 
     const msg = buildShepherdingMessage("AI-1439", children, stalled);
 
-    expect(msg).toContain("Stalled children");
+    expect(msg).toContain("Stall event(s)");
     expect(msg).toContain("AI-2001");
     expect(msg).toContain("45m");
-    expect(msg).toContain("tripwire");
     expect(msg).toContain("nudge");
   });
 
@@ -809,9 +819,9 @@ describe("surfaceStalledChildren — §5.5 tripwire", () => {
       throw new Error(`unexpected query: ${(parsed.query ?? "").slice(0, 80)}`);
     };
 
-    const count = await surfaceStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
+    const result = await surfaceStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
 
-    expect(count).toBe(1);
+    expect(result.surfaced).toBe(1);
     expect(commentPosted).toBe(true);
   });
 
@@ -850,8 +860,8 @@ describe("surfaceStalledChildren — §5.5 tripwire", () => {
       throw new Error("unexpected query");
     };
 
-    const count = await surfaceStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
-    expect(count).toBe(0);
+    const result = await surfaceStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
+    expect(result.surfaced).toBe(0);
   });
 });
 

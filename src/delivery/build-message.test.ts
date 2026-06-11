@@ -32,6 +32,7 @@ states:
   - id: intake
     owner_role: steward
     kind: normal
+    native_state: todo
     transitions:
       - command: accept
         to: implementation
@@ -41,6 +42,7 @@ states:
   - id: implementation
     owner_role: dev
     kind: normal
+    native_state: todo
     transitions:
       - command: submit
         to: code-review
@@ -48,6 +50,7 @@ states:
   - id: code-review
     owner_role: code-review
     kind: normal
+    native_state: todo
     sla: 24h
     transitions:
       - command: approve
@@ -61,6 +64,7 @@ states:
   - id: deployment
     owner_role: deployment
     kind: normal
+    native_state: todo
     transitions:
       - command: deploy
         to: done
@@ -73,9 +77,11 @@ states:
 
   - id: done
     kind: terminal
+    native_state: done
 
   - id: escape
     kind: terminal
+    native_state: invalid
 `;
 
 // ── Helper to build a minimal RouteResult ─────────────────────────────────

@@ -2,13 +2,16 @@
  * Unit tests for DELEGATE_UNAVAILABLE escalation module (AI-1428).
  */
 
-import { emitDelegateUnavailable } from "./escalation.js";
+import { jest, describe, it, expect, afterEach } from "@jest/globals";
 
-// Mock getAccessToken so we don't transitively import agents.ts
-// which depends on the missing fancy-openclaw-linear-skill-cli module.
-jest.mock("./agents.js", () => ({
-  getAccessToken: jest.fn().mockReturnValue(null),
+// ESM-compatible mock (must be declared before the dynamic import below).
+// Pin getAccessToken to undefined so the "no auth token" path is deterministic.
+const mockGetAccessToken = jest.fn<() => string | undefined>().mockReturnValue(undefined);
+jest.unstable_mockModule("./agents.js", () => ({
+  getAccessToken: mockGetAccessToken,
 }));
+
+const { emitDelegateUnavailable } = await import("./escalation.js");
 
 const originalFetch = globalThis.fetch;
 

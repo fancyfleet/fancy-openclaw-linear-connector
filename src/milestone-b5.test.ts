@@ -615,7 +615,7 @@ describe("AC3: §5.5 tripwire — child stall exercised in live run", () => {
 
     // Surface the tripwire — this re-fetches children and re-detects stalls
     const surfaced = await surfaceStalledChildren("PARENT-1", "Bearer tok", 30 * 60 * 1000, now);
-    expect(surfaced).toBe(1);
+    expect(surfaced.surfaced).toBe(1);
 
     // Verify the mock was called correctly
     expect(parentChildrenCalls).toBeGreaterThanOrEqual(2); // detect + surface
@@ -660,7 +660,7 @@ describe("AC3: §5.5 tripwire — child stall exercised in live run", () => {
     ]);
 
     const surfaced = await surfaceStalledChildren("PARENT-1", "Bearer tok", 30 * 60 * 1000, now);
-    expect(surfaced).toBe(0);
+    expect(surfaced.surfaced).toBe(0);
     expect(commentPosted).toBe(false);
   });
 

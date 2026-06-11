@@ -104,6 +104,22 @@ describe("SessionTracker", () => {
     expect(tracker.isActiveForTicket("igor", "linear-AI-101")).toBe(true);
   });
 
+  test("isTicketActiveForAnyAgent detects a successor holding the ticket (handoff guard)", () => {
+    tracker.startSession("igor", "linear-AI-100");
+
+    // Same ticket, ignoring the holder → no other agent holds it.
+    expect(tracker.isTicketActiveForAnyAgent("linear-AI-100", "igor")).toBe(false);
+    // Without an exception, the holder counts.
+    expect(tracker.isTicketActiveForAnyAgent("linear-AI-100")).toBe(true);
+    // A ticket no one holds.
+    expect(tracker.isTicketActiveForAnyAgent("linear-AI-999")).toBe(false);
+
+    // Successor picks up the same ticket (post-handoff). Now, ignoring the
+    // releasing agent, another agent still holds it → must NOT reset to To Do.
+    tracker.startSession("sage", "linear-AI-100");
+    expect(tracker.isTicketActiveForAnyAgent("linear-AI-100", "igor")).toBe(true);
+  });
+
   test("queueSignal accumulates and dedupes ticket IDs", () => {
     tracker.startSession("igor", "linear-AI-100");
     tracker.queueSignal("igor", ["linear-AI-200", "linear-AI-201"]);

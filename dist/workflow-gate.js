@@ -681,10 +681,13 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
     }
     // Resolve destination state for subsequent gates.
     const destStateNode = def.states.find((s) => s.id === match.to);
-    // AI-1475 Defect 1 + AI-1492 + AI-1497: Done gate (§5.6) — terminal 'done' requires
-    // evidence of merged PR. A wf:dev-impl ticket must not reach terminal done without
+    // AI-1475 Defect 1 + AI-1492 + AI-1497: Merged-PR release gate (§5.6) — a
+    // wf:dev-impl ticket must not leave the deployment state forward without
     // evidence that the implementation was pushed, reviewed, and merged.
-    // Only applies to the deploy command (dev-impl workflow: deployment → done).
+    // v8: deployment now has two forward exits — `deploy` (→ ac-validate, CI
+    // auto-deploys) and `handoff-host-deploy` (→ host-deploy, bare-metal action).
+    // The PR merge happens in `deployment` before either, so the gate fires on
+    // both. (`done` is now reached later via `validated`, after ac-validate.)
     // Other workflows (ux-audit) have their own gate paths (parent-AC gate).
     //
     // AI-1492 fix: A merged PR satisfies the gate even when the source branch was
@@ -696,7 +699,7 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
     // code-review approval), fail-open rather than stranding the ticket. Only block
     // when partial evidence exists (has branch but no PR = pushed but never reviewed).
     // Also fail-open on null (transient API failure) after one retry.
-    if (intent === 'deploy' && destStateNode?.kind === 'terminal' && match.to === 'done') {
+    if (intent === 'deploy' || intent === 'handoff-host-deploy') {
         let branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
         // AI-1497: retry once on null — transient Linear API failure during
         // Hanzo merge+deploy quick succession.
@@ -727,8 +730,8 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
             if (!branchStatus.hasPR)
                 missing.push('no pull request associated');
             if (missing.length > 0) {
-                log.warn(`workflow-gate: done gate: ${issueId} blocked — ${missing.join('; ')}`);
-                return (`[Proxy] 'deploy' blocked: cannot reach terminal done. Missing: ${missing.join('; ')}. ` +
+                log.warn(`workflow-gate: release gate: ${issueId} blocked — ${missing.join('; ')}`);
+                return (`[Proxy] '${intent}' blocked: cannot release unmerged work. Missing: ${missing.join('; ')}. ` +
                     `Push the branch and open a pull request before deploying.`);
             }
             log.info(`workflow-gate: done gate: ${issueId} passed (has branch + PR, not yet merged)`);
@@ -1048,18 +1051,19 @@ export async function applyStateTransition(intent, issueId, authToken, options) 
         }
         return;
     }
-    // ── AI-1475 Defect 1 + AI-1492 + AI-1497: Done gate defense-in-depth (§5.6) ─
-    // Block the label swap to done if the branch/PR gate is not satisfied.
-    // This is defense-in-depth: checkWorkflowRules is the primary gate, but
+    // ── AI-1475 Defect 1 + AI-1492 + AI-1497: Merged-PR release gate defense-in-depth (§5.6) ─
+    // Block the forward label swap out of deployment if the branch/PR gate is not
+    // satisfied. Defense-in-depth: checkWorkflowRules is the primary gate, but
     // applyStateTransition also blocks to prevent any bypass path.
-    // Only applies when intent is 'deploy' (dev-impl workflow: deployment → done).
+    // v8: fires on both forward exits from deployment — `deploy` and
+    // `handoff-host-deploy` (the merge precedes either).
     //
     // AI-1492: A merged PR satisfies the gate even without a branch (auto-deleted
     // after squash merge).
     //
     // AI-1497: Fail-open on null (after retry) and on complete absence of evidence
     // (no branch + no PR). Only block on partial evidence (branch exists but no PR).
-    if (intent === 'deploy' && toStateName === 'done') {
+    if (intent === 'deploy' || intent === 'handoff-host-deploy') {
         let branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
         if (!branchStatus) {
             await new Promise((r) => setTimeout(r, 1000));
@@ -1227,8 +1231,8 @@ export async function applyStateTransition(intent, issueId, authToken, options) 
         resolvedDelegateId = null;
     }
     else {
-        // Deterministic routing for reject / request-changes (back to implementation).
-        if ((intent === 'reject' || intent === 'request-changes') && toStateName === 'implementation') {
+        // Deterministic routing for reject / request-changes / ac-fail (back to implementation).
+        if ((intent === 'reject' || intent === 'request-changes' || intent === 'ac-fail') && toStateName === 'implementation') {
             const priorImplementer = await getImplementer(issueId);
             if (priorImplementer) {
                 const agent = getAgent(priorImplementer);
@@ -1262,7 +1266,7 @@ export async function applyStateTransition(intent, issueId, authToken, options) 
                     // AI-1493 review fix: fail-closed for reject/request-changes when no prior implementer.
                     // Multi-body roles on these intents MUST have a resolved delegate — silently
                     // skipping leaves the ticket owner-less, which violates AC.
-                    if (intent === 'reject' || intent === 'request-changes') {
+                    if (intent === 'reject' || intent === 'request-changes' || intent === 'ac-fail') {
                         log.error(`workflow-gate: B2 apply: FAIL-CLOSED — multi-body role '${destOwnerRole}' on '${intent}' with no prior implementer. Cannot auto-resolve delegate for ${issueId}. Use --target.`);
                         return;
                     }

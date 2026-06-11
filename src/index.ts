@@ -16,6 +16,7 @@ import { deliverToAgent, deliverMessageToAgent, DeliveryThrottle } from "./deliv
 import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, resignalPendingTickets, replayPendingBag, ManagingPoller } from "./bag/index.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 import { normalizeSessionKey } from "./session-key.js";
+import { applyEngagementStatus } from "./engagement-status.js";
 import { createAdminRouter } from "./admin.js";
 import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, STALE_CLASS_NAMES, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
 import { registerDistillationCron } from "./cron/p4-metrics-distillation.js";
@@ -303,6 +304,16 @@ export function createApp(options?: CreateAppOptions) {
     }
   }
 
+  /**
+   * AI-1510: drive the non-authoritative engagement-status overlay (To Do →
+   * Thinking → Doing) using the delegate agent's vaulted token. Fire-and-forget;
+   * fail-open inside the helper so a status flip never blocks dispatch/session-end.
+   */
+  function flipEngagementStatus(agentId: string, ticketId: string, semantic: "thinking" | "doing" | "todo"): void {
+    const token = getAccessToken(agentId) ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+    void applyEngagementStatus(ticketId, semantic, token);
+  }
+
   const watchdog = new DispatchWatchdog(
     { bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig, wakeConfigForAgent, resignalOptions },
   );
@@ -399,12 +410,18 @@ export function createApp(options?: CreateAppOptions) {
     sessionTracker,
     throttle,
     operationalEventStore,
-    (agentId, ticketId) => ackTracker.recordDispatch(agentId, ticketId),
+    (agentId, ticketId) => {
+      ackTracker.recordDispatch(agentId, ticketId);
+      // AI-1510: agent has read the ticket via the connector → Thinking.
+      flipEngagementStatus(agentId, ticketId, "thinking");
+    },
     (agentId, ticketId) => {
       const acknowledged = ackTracker.acknowledge(agentId, ticketId);
       if (acknowledged > 0) {
         noActivityDetector.clearWarned(agentId, ticketId);
       }
+      // AI-1510: agent authored Linear activity → actively working → Doing.
+      flipEngagementStatus(agentId, ticketId, "doing");
     },
   ));
 
@@ -447,7 +464,19 @@ export function createApp(options?: CreateAppOptions) {
       return;
     }
     log.info(`Session-end callback received for ${agentId}`);
+    // AI-1510: capture the agent's active ticket keys BEFORE endSession clears
+    // them, so we can reset native status → To Do for each ticket the agent is
+    // releasing. (This handler ends ALL of the agent's sessions.)
+    const endedKeys = sessionTracker.getActiveSessionKeys(agentId);
     const queuedTickets = sessionTracker.endSession(agentId);
+    // Reset engagement status to To Do for each released ticket — but only if no
+    // successor (post-handoff delegate) already holds it. Handoff dispatches the
+    // successor's startSession synchronously, so this guard is reliable.
+    for (const key of endedKeys) {
+      if (!sessionTracker.isTicketActiveForAnyAgent(key, agentId)) {
+        flipEngagementStatus(agentId, key, "todo");
+      }
+    }
     // Re-arm any tickets that were deferred because the agent was at capacity.
     noActivityDetector.checkDeferredOnSessionEnd(agentId).catch((err) => {
       log.error(`checkDeferredOnSessionEnd failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);

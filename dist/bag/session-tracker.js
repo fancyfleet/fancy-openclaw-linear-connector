@@ -118,6 +118,21 @@ export class SessionTracker {
         return this.activeSessions.get(agentId)?.has(sessionKey) ?? false;
     }
     /**
+     * Check whether any agent currently has an active session for a ticket key,
+     * optionally ignoring one agent. Used by the engagement-status overlay to
+     * decide, at session-end, whether a successor (post-handoff delegate) already
+     * holds the ticket — in which case the ending agent must NOT reset it to To Do.
+     */
+    isTicketActiveForAnyAgent(sessionKey, exceptAgentId) {
+        for (const [agentId, sessions] of this.activeSessions) {
+            if (exceptAgentId && agentId === exceptAgentId)
+                continue;
+            if (sessions.has(sessionKey))
+                return true;
+        }
+        return false;
+    }
+    /**
      * Queue a retry signal for a ticket whose delivery failed.
      * Will be returned from endSession() when all the agent's sessions complete.
      */

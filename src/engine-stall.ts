@@ -45,8 +45,8 @@ export interface StallEvent {
   parentIdentifier: string;
   /** The child's current state. */
   currentState: string | null;
-  /** Epoch ms of the child's last activity. */
-  lastActivityAt: number;
+  /** Epoch ms of the child's last activity, or null if never active. */
+  lastActivityAt: number | null;
   /** How long (ms) the child has been idle. */
   idleDurationMs: number;
   /** Whether the child is at-capacity/deferred (known deferral). */

@@ -62,6 +62,9 @@ export interface WorkflowState {
      *  Must be a key in the CLI's SEMANTIC_STATE_MAP (doing, thinking, done, invalid, etc.)
      *  or a literal Linear state name. Validated at connector startup. */
     native_state?: string;
+    /** §5.5: per-state SLA as a duration string (e.g. "24h", "90m", "3600000").
+     *  Time-in-state beyond this trips stall escalation (parsed to ms by barrier). */
+    sla?: string;
     transitions?: WorkflowTransition[];
 }
 export interface StakesLevel {

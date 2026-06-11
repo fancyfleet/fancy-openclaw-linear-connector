@@ -53,6 +53,7 @@ export interface RoleGuardResult {
  */
 export const REVIEW_ONLY_AGENTS = new Set([
   "charles",
+  "tdd",
   "ai",
   "astrid",
   "finn",
