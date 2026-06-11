@@ -667,7 +667,7 @@ describe("detectStalledChildren — mocked Linear API", () => {
       throw new Error(`unexpected query: ${(parsed.query ?? "").slice(0, 80)}`);
     };
 
-    const stalled = await detectStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
+    const { stalled } = await detectStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
 
     expect(stalled).toHaveLength(1);
     expect(stalled[0].identifier).toBe("AI-2001");
@@ -709,7 +709,7 @@ describe("detectStalledChildren — mocked Linear API", () => {
       throw new Error("unexpected query");
     };
 
-    const stalled = await detectStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
+    const { stalled } = await detectStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
     expect(stalled).toHaveLength(0);
   });
 
@@ -738,7 +738,7 @@ describe("detectStalledChildren — mocked Linear API", () => {
       throw new Error("unexpected query — should not check activity for terminal child");
     };
 
-    const stalled = await detectStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000);
+    const { stalled } = await detectStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000);
     expect(stalled).toHaveLength(0);
   });
 });
@@ -1004,7 +1004,7 @@ describe("AI-1478 AC1: deliberately stalled leaf produces stall event to parent"
       throw new Error(`unexpected query: ${(parsed.query ?? "").slice(0, 80)}`);
     };
 
-    const stalled = await detectStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
+    const { stalled } = await detectStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
 
     // AC1: The stalled leaf produces a result
     expect(stalled).toHaveLength(1);
@@ -1089,7 +1089,7 @@ describe("AI-1478 AC2: at-capacity-but-healthy subtree does NOT trip stall escal
       throw new Error(`unexpected query: ${(parsed.query ?? "").slice(0, 80)}`);
     };
 
-    const stalled = await detectStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
+    const { stalled } = await detectStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
 
     // AC2: At-capacity child should be skipped — NOT in the stalled list
     expect(stalled).toHaveLength(0);
@@ -1137,7 +1137,7 @@ describe("AI-1478 AC2: at-capacity-but-healthy subtree does NOT trip stall escal
       throw new Error(`unexpected query: ${(parsed.query ?? "").slice(0, 80)}`);
     };
 
-    const stalled = await detectStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
+    const { stalled } = await detectStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
 
     // Only AI-2002 should be stalled — AI-2001 is at-capacity and skipped
     expect(stalled).toHaveLength(1);

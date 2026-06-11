@@ -83,7 +83,7 @@ export async function triggerStallDetection(
 ): Promise<StallDetectionResult> {
   log.info(`engine-stall: checking for stalled children on ${parentIdentifier}`);
 
-  const { surfaced, events } = await surfaceStalledChildren(parentIdentifier, authToken);
+  const { surfaced, events, atCapacitySkipped } = await surfaceStalledChildren(parentIdentifier, authToken);
 
   if (events.length > 0 && operationalEventStore) {
     for (const event of events) {
@@ -107,14 +107,10 @@ export async function triggerStallDetection(
     }
   }
 
-  // Count at-capacity children that were accounted for but not escalated
-  const acct = deferralAccountant;
-  const atCapacityCount = events.filter((e) => e.knownDeferralMs > 0).length;
-
   return {
     eventsEmitted: surfaced,
     events,
-    atCapacitySkipped: atCapacityCount,
+    atCapacitySkipped,
   };
 }
 
