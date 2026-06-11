@@ -1742,7 +1742,7 @@ export async function applyStateTransition(
   //
   // §14b: For sprint (Archetype C), increment the oscillation cycle counter
   // when the transition goes validating → spawning (rework loop).
-  if (applied && toStateName === 'spawning' && workflowId === 'sprint') {
+  if (applied && toStateName === 'spawning' && currentStateName === 'validating' && workflowId === 'sprint') {
     try {
       const newCycleCount = await incrementCycle(issueId, workflowId);
       log.info(

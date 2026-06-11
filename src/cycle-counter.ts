@@ -41,16 +41,21 @@ export interface CycleCounterRecord {
 /** In-memory store: ticket identifier → CycleCounterRecord. */
 const _store = new Map<string, CycleCounterRecord>();
 
-/** Whether the initial load from disk has been attempted. */
-let _loaded = false;
+/** In-flight load promise to prevent race conditions during startup. */
+let _loadingPromise: Promise<void> | null = null;
 
 /**
  * Load persisted cycle counter records from disk. Idempotent — only loads once.
  * Fail-open: if the file doesn't exist or is corrupt, start with empty store.
  */
 async function ensureLoaded(): Promise<void> {
-  if (_loaded) return;
-  _loaded = true;
+  if (_loadingPromise) return _loadingPromise;
+  _loadingPromise = _doLoad();
+  return _loadingPromise;
+}
+
+/** Internal async load implementation. */
+async function _doLoad(): Promise<void> {
   try {
     const raw = await fs.readFile(cycleCounterPath(), "utf8");
     const data = JSON.parse(raw) as Record<string, CycleCounterRecord>;
@@ -161,5 +166,5 @@ export async function removeCycleRecord(ticketId: string): Promise<boolean> {
  */
 export function clearCycleCounterStore(): void {
   _store.clear();
-  _loaded = false;
+  _loadingPromise = null;
 }
