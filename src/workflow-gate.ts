@@ -1131,6 +1131,7 @@ export async function checkRawMutationInterception(
   issueId: string | null,
   authToken: string,
   bodyId?: string,
+  callerLinearUserId?: string | null,
 ): Promise<string | null> {
   if (!body) return null;
 
@@ -1167,8 +1168,13 @@ export async function checkRawMutationInterception(
   const hasStateChange = touches("stateId");
   const hasAssigneeChange = touches("assigneeId");
   const hasLabelChange = touches("labelIds");
+  // AI-1535: delegate is a distinct field from assignee. App-user delegates are
+  // written via `delegateId` (assigneeId is omitted for them, AI-1395), so a raw
+  // delegate write was invisible to this detector and bypassed the delegate-only
+  // guard entirely — a non-delegate could yank the delegate off the rightful owner.
+  const hasDelegateChange = touches("delegateId");
 
-  if (!hasStateChange && !hasAssigneeChange && !hasLabelChange) return null;
+  if (!hasStateChange && !hasAssigneeChange && !hasLabelChange && !hasDelegateChange) return null;
 
   // AI-1347: this is a raw workflow-affecting mutation but the caller did not
   // expose the ticket id in a place the proxy could resolve (no id variable, no
@@ -1186,7 +1192,7 @@ export async function checkRawMutationInterception(
   }
 
   // This is a raw workflow-affecting mutation — check if the ticket is on a workflow.
-  const { labels } = await fetchTicketContext(issueId, authToken);
+  const { labels, delegateId } = await fetchTicketContext(issueId, authToken);
   const workflowId = getWorkflowId(labels);
   if (!workflowId) return null; // ad-hoc ticket — pass-through
 
@@ -1209,6 +1215,40 @@ export async function checkRawMutationInterception(
   }
 
   if (!def) return null; // unknown workflow — pass-through (AI-1530)
+
+  // AI-1535: a *delegate-only* raw change (delegateId changed, no state/assignee/
+  // label) gets delegate-only semantics rather than the blanket block below. The
+  // delegate-routing meta-commands (handoff-work, undelegate) write delegateId
+  // with no intent header, and they are LEGITIMATE for the current delegate —
+  // blanket-blocking them would break re-routing. But a non-delegate (e.g. a prior
+  // owner's lingering session, as in the AI-1531 dogfood) must not be able to yank
+  // the delegate. Mirror the intent-path delegate-only rule (lines ~912-925):
+  //   - caller IS the current delegate            → allow (legitimate re-route)
+  //   - caller is a known non-delegate            → block
+  //   - caller unverifiable + ticket has delegate → block (AI-1400 B2 parity)
+  //   - no current delegate / no caller+delegate  → fail-open (establishing first delegate)
+  const delegateOnlyChange =
+    hasDelegateChange && !hasStateChange && !hasAssigneeChange && !hasLabelChange;
+  if (delegateOnlyChange) {
+    if (callerLinearUserId && delegateId && callerLinearUserId === delegateId) {
+      return null; // current delegate may re-route
+    }
+    if (!callerLinearUserId && delegateId) {
+      log.warn(`workflow-gate: raw delegate unknown-caller block agent=${bodyId} ticket=${issueId}`);
+      return (
+        `[Proxy] Direct delegate change blocked: caller '${bodyId}' cannot be verified and ${issueId} has a known delegate. ` +
+        `Register the agent in agents.json with a linearUserId, or re-route via a workflow command.`
+      );
+    }
+    if (callerLinearUserId && delegateId && callerLinearUserId !== delegateId) {
+      log.warn(`workflow-gate: raw delegate-only block agent=${bodyId} ticket=${issueId} (not current delegate)`);
+      return (
+        `[Proxy] Direct delegate change blocked: ${bodyId} is not the current delegate for ${issueId}. ` +
+        `Only the ticket delegate may re-route it (use handoff-work as the delegate, or advance via a workflow transition verb).`
+      );
+    }
+    return null; // no current delegate to protect — fail-open
+  }
 
   const breakGlassCommand = def.break_glass?.command ?? "escape";
   const currentState = getCurrentState(labels);
@@ -1246,6 +1286,7 @@ export async function checkRawMutationInterception(
   if (hasStateChange) changedFields.push("status");
   if (hasAssigneeChange) changedFields.push("assignee");
   if (hasLabelChange) changedFields.push("labels");
+  if (hasDelegateChange) changedFields.push("delegate");
 
   return (
     `[Proxy] Direct ${changedFields.join("/")} changes are blocked on this workflow ticket ` +

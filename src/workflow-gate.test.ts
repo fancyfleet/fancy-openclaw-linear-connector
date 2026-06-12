@@ -1952,6 +1952,154 @@ describe("checkRawMutationInterception — AI-1402: labelIds blocking + unknown-
 });
 
 
+// ── AI-1535: raw delegateId mutations get delegate-only semantics ───────────
+// A delegate-routing meta-command (handoff-work, undelegate) writes `delegateId`
+// with NO intent header, so it lands in checkRawMutationInterception, not the
+// intent-path delegate-only guard. App-user delegates omit assigneeId (AI-1395),
+// so the old detector (stateId/assigneeId/labelIds only) missed delegate writes
+// entirely — letting a non-delegate yank the delegate (the AI-1531 dogfood bug).
+describe("checkRawMutationInterception — AI-1535: delegate-only raw mutations", () => {
+  let ai1535Dir: string;
+  let ai1535OriginalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    ai1535Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1535-test-"));
+    const policyFile = path.join(ai1535Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(ai1535Dir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    resetPolicyCache();
+    resetWorkflowCache();
+    ai1535OriginalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = ai1535OriginalFetch;
+  });
+
+  const DELEGATE_USER_ID = "delegate-user-uuid";
+
+  // Workflow ticket whose current delegate is DELEGATE_USER_ID.
+  const WORKFLOW_IMPL_WITH_DELEGATE = {
+    data: { issue: {
+      labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] },
+      delegate: { id: DELEGATE_USER_ID },
+    } },
+  };
+
+  // Workflow ticket with NO delegate set.
+  const WORKFLOW_IMPL_NO_DELEGATE = {
+    data: { issue: {
+      labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] },
+      delegate: null,
+    } },
+  };
+
+  const AD_HOC_LABELS = {
+    data: { issue: { labels: { nodes: [{ name: "bug" }] }, delegate: { id: DELEGATE_USER_ID } } },
+  };
+
+  function mockLabelFetch(labelResponse: object) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return async (url: any, init?: RequestInit) => {
+      if (typeof url === "string" && url.includes("api.linear.app")) {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("IssueContext") || bodyText.includes("IssueLabels")) {
+          return new Response(JSON.stringify(labelResponse), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+      return ai1535OriginalFetch(url, init);
+    };
+  }
+
+  // The three encodings a delegateId can reach issueUpdate (mirrors AI-1402).
+  const delegateBodies = {
+    "variables.input shape": {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { delegateId: "new-user-uuid" } },
+    },
+    "inline $var shape": {
+      query: "mutation M($id: String!, $delegateId: String) { issueUpdate(id: $id, input: { delegateId: $delegateId }) { success } }",
+      variables: { id: "issue-uuid", delegateId: "new-user-uuid" },
+    },
+    "inline literal shape": {
+      query: 'mutation M($id: String!) { issueUpdate(id: $id, input: { delegateId: "new-user-uuid" }) { success } }',
+      variables: { id: "issue-uuid" },
+    },
+  };
+
+  for (const [name, body] of Object.entries(delegateBodies)) {
+    it(`blocks a raw delegate write by a NON-delegate (${name})`, async () => {
+      globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_WITH_DELEGATE);
+      // caller "charles" is a known body but NOT the current delegate
+      const result = await checkRawMutationInterception(
+        body, "issue-uuid", "Bearer tok", "charles", "some-other-user-uuid",
+      );
+      expect(result).not.toBeNull();
+      expect(result).toContain("[Proxy]");
+      expect(result).toContain("Direct delegate change blocked");
+      expect(result).toContain("not the current delegate");
+    });
+  }
+
+  it("ALLOWS a raw delegate write by the CURRENT delegate (legitimate handoff-work)", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_WITH_DELEGATE);
+    const result = await checkRawMutationInterception(
+      delegateBodies["variables.input shape"], "issue-uuid", "Bearer tok", "charles", DELEGATE_USER_ID,
+    );
+    expect(result).toBeNull();
+  });
+
+  it("blocks a raw delegate write by an unverifiable caller when a delegate exists (AI-1400 B2 parity)", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_WITH_DELEGATE);
+    // callerLinearUserId omitted (null) but bodyId is a known body
+    const result = await checkRawMutationInterception(
+      delegateBodies["variables.input shape"], "issue-uuid", "Bearer tok", "charles", null,
+    );
+    expect(result).not.toBeNull();
+    expect(result).toContain("cannot be verified");
+  });
+
+  it("fails open (allows) a raw delegate write when the ticket has NO current delegate", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_NO_DELEGATE);
+    const result = await checkRawMutationInterception(
+      delegateBodies["variables.input shape"], "issue-uuid", "Bearer tok", "charles", "some-other-user-uuid",
+    );
+    expect(result).toBeNull();
+  });
+
+  it("passes through a delegate write on an ad-hoc (non-workflow) ticket", async () => {
+    globalThis.fetch = mockLabelFetch(AD_HOC_LABELS);
+    const result = await checkRawMutationInterception(
+      delegateBodies["variables.input shape"], "issue-uuid", "Bearer tok", "charles", "some-other-user-uuid",
+    );
+    expect(result).toBeNull();
+  });
+
+  it("blocks a mixed delegate + stateId mutation via the blanket guard (delegate listed)", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_WITH_DELEGATE);
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      // even the CURRENT delegate cannot raw-write stateId — must use a verb
+      variables: { id: "issue-uuid", input: { delegateId: "new-user-uuid", stateId: "state-done-uuid" } },
+    };
+    const result = await checkRawMutationInterception(
+      body, "issue-uuid", "Bearer tok", "charles", DELEGATE_USER_ID,
+    );
+    expect(result).not.toBeNull();
+    expect(result).toContain("blocked on this workflow ticket");
+    expect(result).toContain("status");
+    expect(result).toContain("delegate");
+  });
+});
+
+
 // ── Phase 5 / B-1: ux-audit workflow definition validation (AI-1438) ────────
 // Validates the canonical ux-audit YAML fixture parses correctly and
 // enforces workflow rules per design.md §14 + §16.0.
