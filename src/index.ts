@@ -626,12 +626,13 @@ export function createApp(options?: CreateAppOptions) {
     });
     // Update hold-retry state for all ended sessions.
     for (const key of endedKeys) {
-      if (holdRetryTracker.hasTransition(agentId, key)) {
+      const normalizedKey = normalizeSessionKey(key);
+      if (holdRetryTracker.hasTransition(agentId, normalizedKey)) {
         // Healthy run: transition was seen — reset attempt count for the next dispatch.
-        holdRetryTracker.clearTicket(agentId, key);
+        holdRetryTracker.clearTicket(agentId, normalizedKey);
       } else {
         // Hold or no-dispatch: clear only the transition flag; preserve attempt count.
-        holdRetryTracker.clearTransition(agentId, key);
+        holdRetryTracker.clearTransition(agentId, normalizedKey);
       }
     }
 

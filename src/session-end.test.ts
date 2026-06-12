@@ -218,4 +218,23 @@ describe("POST /session-end — hold-retry (AI-1533)", () => {
     expect(dispatched).toHaveLength(1);
     expect(appCtx.holdRetryTracker.getHoldAttempts("igor", "linear-AI-1531")).toBe(1);
   });
+
+  test("normalization-mismatch: healthy run clears state even when session key is unnormalized", async () => {
+    // sessionTracker may store an unnormalized key (e.g. "AI-1531") while
+    // recordTransition is called with the normalized form ("linear-AI-1531").
+    // Without normalizeSessionKey in the state-update loop, hasTransition returns
+    // false → a healthy run looks like a hold and triggers a spurious retry.
+    appCtx.sessionTracker.startSession("igor", "AI-1531");
+    appCtx.ackTracker.recordDispatch("igor", "linear-AI-1531");
+    // Transition recorded with normalized key (the form onAgentActivity uses).
+    appCtx.holdRetryTracker.recordTransition("igor", "linear-AI-1531");
+
+    const res = await sessionEnd("igor");
+    expect(res.status).toBe(200);
+    // Healthy run — no re-dispatch.
+    expect(res.body.pendingTickets).toBe(0);
+    expect(dispatched).toHaveLength(0);
+    // Attempt count must be 0 (cleared, not preserved).
+    expect(appCtx.holdRetryTracker.getHoldAttempts("igor", "linear-AI-1531")).toBe(0);
+  });
 });
