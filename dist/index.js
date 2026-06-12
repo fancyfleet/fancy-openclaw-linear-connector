@@ -354,7 +354,10 @@ export function createApp(options) {
         }
         // AI-1510: agent authored Linear activity → actively working → Doing.
         flipEngagementStatus(agentId, ticketId, "doing");
-    }));
+    }, 
+    // AI-1538: register a pending dispatch expectation at delivery-commit so a
+    // swallowed delivery self-heals via the watchdog.
+    (agentId, ticketId) => ackTracker.ensurePending(agentId, ticketId)));
     // ── v1.1: Session-end callback endpoint ──────────────────────────────
     // The gateway (via plugin) calls this when an agent's session ends.
     // The connector then checks the bag and sends another wake-up if needed.

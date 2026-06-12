@@ -118,6 +118,34 @@ describe("DispatchAckTracker", () => {
     const entries = tracker.getPendingTimedOut(0);
     expect(entries).toHaveLength(0);
   });
+
+  // AI-1538: ensurePending registers a delivery-commit expectation BEFORE the
+  // actual send. A swallowed delivery (e.g. nudge-dedup coalesce) then leaves a
+  // pending entry the watchdog re-signals, instead of stalling indefinitely.
+  test("ensurePending creates a pending entry with attempt_count 0", () => {
+    tracker.ensurePending("hanzo", "linear-AI-1531");
+    const timedOut = tracker.getPendingTimedOut(0);
+    expect(timedOut).toHaveLength(1);
+    expect(timedOut[0].agentId).toBe("hanzo");
+    expect(timedOut[0].ackStatus).toBe("pending");
+    expect(timedOut[0].attemptCount).toBe(0);
+  });
+
+  test("a real recordDispatch bumps an ensurePending placeholder 0 → 1 (happy-path attempt_count unchanged)", () => {
+    tracker.ensurePending("hanzo", "linear-AI-1531");
+    tracker.recordDispatch("hanzo", "linear-AI-1531");
+    const timedOut = tracker.getPendingTimedOut(0);
+    expect(timedOut).toHaveLength(1);
+    expect(timedOut[0].attemptCount).toBe(1);
+  });
+
+  test("ensurePending is a no-op when an entry already exists (no bump, no resurrection)", () => {
+    tracker.recordDispatch("hanzo", "linear-AI-1531"); // attempt=1
+    tracker.acknowledge("hanzo", "linear-AI-1531");
+    tracker.ensurePending("hanzo", "linear-AI-1531");
+    // Acknowledged entry must NOT be resurrected to pending by ensurePending.
+    expect(tracker.getPendingTimedOut(0)).toHaveLength(0);
+  });
 });
 
 describe("DispatchWatchdog — CT-52 failure mode", () => {
@@ -166,6 +194,43 @@ describe("DispatchWatchdog — CT-52 failure mode", () => {
 
     // Watchdog must have re-signaled the agent
     expect(dispatchedTickets).toContain("linear-CT-52");
+
+    watchdog.stop();
+    bag.close();
+    sessionTracker.close();
+    ackTracker.close();
+    operationalEventStore.close();
+  });
+
+  // AI-1538 AC4: a delivery that was committed (ensurePending) but swallowed
+  // before any send (no recordDispatch) must be treated as an unacknowledged
+  // dispatch and re-signaled — the run self-heals rather than stalling.
+  test("AI-1538: committed-but-swallowed delivery (ensurePending only) is re-signaled", async () => {
+    const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
+    const dispatchedTickets: string[] = [];
+
+    // Delegate committed → ensurePending registered an expectation, but the
+    // wake-up was swallowed (no recordDispatch ever fired). The ticket sits in
+    // the bag with delegate set but no successful delivery on record.
+    bag.add("hanzo", "linear-AI-1531", "Issue");
+    ackTracker.ensurePending("hanzo", "linear-AI-1531");
+
+    const watchdog = new DispatchWatchdog(
+      {
+        bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig,
+        resignalOptions: {
+          isTicketActionable: () => true,
+          sendWakeUp: async (_agentId, ticketIds) => { dispatchedTickets.push(...ticketIds); },
+        },
+      },
+      { ackTimeoutMs: 0, maxResignals: 3, cycleIntervalMs: 60_000 },
+    );
+
+    const result = await watchdog.runCycle();
+
+    expect(result.unconfirmed).toBe(1);
+    expect(result.resignaled).toBe(1);
+    expect(dispatchedTickets).toContain("linear-AI-1531");
 
     watchdog.stop();
     bag.close();

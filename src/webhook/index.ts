@@ -95,6 +95,7 @@ export function createWebhookRouter(
   operationalEventStore?: OperationalEventStore,
   onDispatched?: (agentId: string, ticketId: string) => void,
   onAgentActivity?: (agentId: string, ticketId: string) => void,
+  onDeliveryCommitted?: (agentId: string, ticketId: string) => void,
 ): Router {
   const router = Router();
 
@@ -329,6 +330,9 @@ export function createWebhookRouter(
           route.agentId,
           `${liveness.reason}: ${liveness.detail ?? "unknown"}`,
         );
+        // No delivery was sent — roll back the dedup priming so a later genuine
+        // dispatch to this agent+ticket inside the window is not swallowed (AI-1538).
+        nudgeStore?.clearNudge(route.agentId, ticketId);
         // Do NOT deliver — return immediately.
         return;
       }
@@ -372,12 +376,25 @@ export function createWebhookRouter(
               attemptCount: 1,
               errorSummary: `routing-guard blocked: ${guardResult.reason ?? "role mismatch"}`,
             });
+            // No delivery was sent — roll back the dedup priming so the genuine
+            // dispatch to the agent that legitimately becomes the delegate is not
+            // swallowed as a "duplicate" of this blocked attempt (AI-1538).
+            nudgeStore?.clearNudge(route.agentId, ticketId);
             return;
           }
         } catch (err) {
           log.warn(`Role-guard check failed for ${issueIdentifier}: ${err instanceof Error ? err.message : String(err)} — continuing`);
         }
       }
+
+      // Delivery is now committed: the event routed to a delegate that passed
+      // the stale-route, liveness, and role-guard checks. Register a pending
+      // dispatch expectation BEFORE the actual send so that if the delivery is
+      // later swallowed (nudge-dedup) or sent through a path that records no
+      // ack, the watchdog still sees an unacknowledged dispatch and re-signals
+      // it (AI-1538). ensurePending uses attempt_count=0 + ON CONFLICT DO
+      // NOTHING, so the happy path's counter is unchanged.
+      onDeliveryCommitted?.(agentName, ticketId);
 
       // ── 10. Create agent session + emit thought ───────────────────────────
       const data = event.data as Record<string, unknown> | null;
