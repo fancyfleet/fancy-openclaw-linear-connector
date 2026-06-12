@@ -13,9 +13,9 @@ import { ObservationStore } from "./store/observation-store.js";
 import { ManagingStateStore } from "./store/managing-state-store.js";
 import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent, deliverMessageToAgent, DeliveryThrottle } from "./delivery/index.js";
-import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, resignalPendingTickets, replayPendingBag, ManagingPoller } from "./bag/index.js";
+import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, resignalPendingTickets, replayPendingBag, ManagingPoller, HeldRunRetrier } from "./bag/index.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
-import { normalizeSessionKey } from "./session-key.js";
+import { normalizeSessionKey, tryNormalizeSessionKey } from "./session-key.js";
 import { applyEngagementStatus } from "./engagement-status.js";
 import { createAdminRouter } from "./admin.js";
 import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, STALE_CLASS_NAMES, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
@@ -324,6 +324,14 @@ export function createApp(options?: CreateAppOptions) {
   );
   noActivityDetector.start();
 
+  const heldRunRetrier = new HeldRunRetrier(
+    { bag, sessionTracker, operationalEventStore, wakeConfig, resignalOptions },
+    {
+      dispatchRetryGraceMs: parseInt(process.env.HELD_RUN_RETRY_GRACE_MS ?? "30000", 10),
+      maxAttempts: parseInt(process.env.HELD_RUN_MAX_ATTEMPTS ?? "2", 10),
+    },
+  );
+
   // ── Managing-state stewardship poller ────────────────────────────────
   // Wakes agents on a cadence to review Managing-state tickets (parent /
   // externally-blocked work the agent has claimed responsibility for but
@@ -412,6 +420,7 @@ export function createApp(options?: CreateAppOptions) {
     operationalEventStore,
     (agentId, ticketId) => {
       ackTracker.recordDispatch(agentId, ticketId);
+      heldRunRetrier.trackDispatch(agentId, ticketId);
       // AI-1510: agent has read the ticket via the connector → Thinking.
       flipEngagementStatus(agentId, ticketId, "thinking");
     },
@@ -420,6 +429,8 @@ export function createApp(options?: CreateAppOptions) {
       if (acknowledged > 0) {
         noActivityDetector.clearWarned(agentId, ticketId);
       }
+      // State-advancing activity observed — clear held-run retry state for this ticket.
+      heldRunRetrier.recordTransition(agentId, ticketId);
       // AI-1510: agent authored Linear activity → actively working → Doing.
       flipEngagementStatus(agentId, ticketId, "doing");
     },
@@ -497,6 +508,17 @@ export function createApp(options?: CreateAppOptions) {
       outcome: "session-ended", agent: agentId, deliveryMode: "session-end-callback",
       detail: { queuedTickets: queuedTickets ?? [], bagTickets, allPending }
     });
+    // Retry held runs: for each ended session with no observed state-advancing transition,
+    // re-dispatch so transient holds self-heal without waiting for the no-activity timeout.
+    // Keys are normalized before lookup so raw/prefixed keys correctly match tracked state.
+    // Non-Linear keys (e.g. internal session keys) are skipped gracefully.
+    for (const key of endedKeys) {
+      const normalizedKey = tryNormalizeSessionKey(key);
+      if (!normalizedKey) continue;
+      await heldRunRetrier.onSessionEnd(agentId, normalizedKey).catch((err) => {
+        log.error(`heldRunRetrier.onSessionEnd failed for ${agentId} [${normalizedKey}]: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }
     if (allPending.length > 0) {
       // Re-signal: agent has work waiting. Send one signal per ticket so each
       // issue is delivered into its own canonical per-ticket session key.

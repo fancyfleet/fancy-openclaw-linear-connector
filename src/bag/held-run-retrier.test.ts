@@ -386,4 +386,48 @@ describe("HeldRunRetrier", () => {
     sessionTracker.close();
     operationalEventStore.close();
   });
+
+  // Normalization: keys are normalized internally so raw/prefixed keys match normalized state
+  test("normalizes session keys — trackDispatch with raw key matches onSessionEnd with prefixed key", async () => {
+    const { bag, sessionTracker, operationalEventStore } = setupDeps(dir);
+    const dispatched: string[] = [];
+
+    bag.add("astrid", "linear-AI-1531", "Issue");
+    sessionTracker.startSession("astrid", "linear-AI-1531");
+
+    const retrier = new HeldRunRetrier(
+      {
+        bag,
+        sessionTracker,
+        operationalEventStore,
+        wakeConfig,
+        resignalOptions: {
+          isTicketActionable: () => true,
+          sendWakeUp: async (_agentId, ticketIds) => { dispatched.push(...ticketIds); },
+        },
+      },
+      { dispatchRetryGraceMs: 120_000, maxAttempts: 2 },
+    );
+
+    // trackDispatch called with raw (unnormalized) key — no "linear-" prefix
+    retrier.trackDispatch("astrid", "AI-1531");
+
+    // recordTransition called with a legacy-prefix form of the same key
+    retrier.recordTransition("astrid", "wake-linear-AI-1531");
+
+    // onSessionEnd receives the normalized form — should detect the transition and NOT retry
+    const retried = await retrier.onSessionEnd("astrid", "linear-AI-1531");
+
+    // All three key forms normalize to "linear-AI-1531" — state is shared correctly
+    expect(retried).toBe(false);
+    expect(dispatched).toHaveLength(0);
+
+    // No held-run-retry event — transition cleared state before retry
+    const events = operationalEventStore.query({ outcome: "held-run-retry" });
+    expect(events).toHaveLength(0);
+
+    bag.close();
+    sessionTracker.close();
+    operationalEventStore.close();
+  });
 });
