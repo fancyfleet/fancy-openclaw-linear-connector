@@ -39,6 +39,7 @@ import { clearArtifactStore, getBoundArtifact, hasBoundArtifact } from "./artifa
 import { runTransitionWalk } from "./canary.js";
 import { clearAcRecordStore } from "./ac-record-store.js";
 import { resetConfigHealth } from "./config-health.js";
+import { clearImplementerStore } from "./implementer-store.js";
 
 // Resolved from the project root (jest cwd) so it works under both the
 // ESM tsc build and the CommonJS ts-jest transpile.
@@ -4011,12 +4012,19 @@ describe("applyStateTransition — AI-1493 atomic transitions", () => {
   let ai1493Dir: string;
   let ai1493OriginalFetch: typeof globalThis.fetch;
   let ai1493OriginalAgentsFile: string | undefined;
+  let ai1493OriginalImplementerStorePath: string | undefined;
 
   beforeEach(() => {
     ai1493Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1493-test-"));
     const policyFile = path.join(ai1493Dir, "capability-policy.yaml");
     fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
     process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    // AI-1531: isolate the implementer store to this suite's tmpdir so a stale
+    // /tmp/implementer-store.json can never poison reject/request-changes.
+    ai1493OriginalImplementerStorePath = process.env.IMPLEMENTER_STORE_PATH;
+    process.env.IMPLEMENTER_STORE_PATH = path.join(ai1493Dir, "implementer-store.json");
+    clearImplementerStore();
 
     const workflowFile = path.join(ai1493Dir, "dev-impl.yaml");
     fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
@@ -4057,13 +4065,17 @@ describe("applyStateTransition — AI-1493 atomic transitions", () => {
       delete process.env.AGENTS_FILE;
     }
     reloadAgents();
-    fs.rmSync(ai1493Dir, { recursive: true, force: true });
 
-    const { removeImplementer: doRemove } = await import("./implementer-store.js");
-    doRemove("issue-reject-ai1493");
-    doRemove("issue-rc-ai1493");
-    doRemove("issue-atomic-ai1493");
-    doRemove("issue-done-ai1493");
+    // AI-1531: clear the in-memory store and restore the env override before
+    // removing the tmpdir, so no record leaks across suites.
+    clearImplementerStore();
+    if (ai1493OriginalImplementerStorePath !== undefined) {
+      process.env.IMPLEMENTER_STORE_PATH = ai1493OriginalImplementerStorePath;
+    } else {
+      delete process.env.IMPLEMENTER_STORE_PATH;
+    }
+
+    fs.rmSync(ai1493Dir, { recursive: true, force: true });
   });
 
   it("routes reject back to prior implementer from implementer store", async () => {
@@ -4147,6 +4159,73 @@ describe("applyStateTransition — AI-1493 atomic transitions", () => {
     expect(updateCall).toBeDefined();
     const vars = updateCall!.body.variables as { delegateId?: string };
     expect(vars.delegateId).toBeNull();
+  });
+
+  // ── AI-1531: IMPLEMENTER_STORE_PATH must be isolated per-suite ─────────────
+  // These two tests verify AC1: a stale /tmp/implementer-store.json must never
+  // short-circuit reject or request-changes. They FAIL before the fix (no
+  // IMPLEMENTER_STORE_PATH isolation in beforeEach) and PASS after (isolation
+  // redirects reads to a per-suite tmpfile that contains no ghost-body entry).
+  //
+  // Unique issue IDs are used so the suite's afterEach cleanup never races
+  // with these tests' file writes.
+
+  it("AI-1531/AC1: reject fires ApplyAtomicTransition even when /tmp/implementer-store.json has a ghost-body entry for this issue", async () => {
+    const issueId = "issue-reject-ai1531-isolation";
+    const poisonContent = JSON.stringify({
+      [issueId]: { bodyId: "ghost-body-ai1531", workflowId: "dev-impl", recordedAt: "2026-01-01T00:00:00Z" },
+    });
+    // Seed the default store path (not the per-suite isolated path, which doesn't exist yet).
+    fs.writeFileSync("/tmp/implementer-store.json", poisonContent, "utf8");
+    // Force the in-memory store to reload from disk on next access.
+    clearImplementerStore();
+
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:deployment" },
+      ],
+      teamLabels: [{ id: "impl-lbl", name: "state:implementation" }],
+    });
+    globalThis.fetch = mock;
+
+    try {
+      await applyStateTransition("reject", issueId, "Bearer tok");
+      // With IMPLEMENTER_STORE_PATH isolated to a per-suite tmpdir, the ghost-body entry
+      // in /tmp/implementer-store.json is never loaded and the transition completes.
+      const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+      expect(updateCall).toBeDefined(); // AC1: must not be short-circuited by ghost-body
+    } finally {
+      clearImplementerStore();
+      try { fs.rmSync("/tmp/implementer-store.json"); } catch { /* absent is fine */ }
+    }
+  });
+
+  it("AI-1531/AC1: request-changes fires ApplyAtomicTransition even when /tmp/implementer-store.json has a ghost-body entry for this issue", async () => {
+    const issueId = "issue-rc-ai1531-isolation";
+    const poisonContent = JSON.stringify({
+      [issueId]: { bodyId: "ghost-body-ai1531", workflowId: "dev-impl", recordedAt: "2026-01-01T00:00:00Z" },
+    });
+    fs.writeFileSync("/tmp/implementer-store.json", poisonContent, "utf8");
+    clearImplementerStore();
+
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:code-review" },
+      ],
+      teamLabels: [{ id: "impl-lbl", name: "state:implementation" }],
+    });
+    globalThis.fetch = mock;
+
+    try {
+      await applyStateTransition("request-changes", issueId, "Bearer tok");
+      const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+      expect(updateCall).toBeDefined(); // AC1: must not be short-circuited by ghost-body
+    } finally {
+      clearImplementerStore();
+      try { fs.rmSync("/tmp/implementer-store.json"); } catch { /* absent is fine */ }
+    }
   });
 });
 
@@ -4275,6 +4354,7 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
   let confDir: string;
   let originalWorkflowPath: string | undefined;
   let originalPolicyPath: string | undefined;
+  let originalImplementerStorePath: string | undefined;
 
   beforeAll(() => {
     originalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
@@ -4285,6 +4365,11 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
     process.env.CAPABILITY_POLICY_PATH = policyFile;
     process.env.WORKFLOW_DEF_PATH = CANONICAL_FIXTURE;
+
+    // AI-1531: isolate the implementer store to this suite's tmpdir so a stale
+    // /tmp/implementer-store.json can never poison reject/request-changes.
+    originalImplementerStorePath = process.env.IMPLEMENTER_STORE_PATH;
+    process.env.IMPLEMENTER_STORE_PATH = path.join(confDir, "implementer-store.json");
   });
 
   afterAll(() => {
@@ -4292,6 +4377,8 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     else delete process.env.WORKFLOW_DEF_PATH;
     if (originalPolicyPath !== undefined) process.env.CAPABILITY_POLICY_PATH = originalPolicyPath;
     else delete process.env.CAPABILITY_POLICY_PATH;
+    if (originalImplementerStorePath !== undefined) process.env.IMPLEMENTER_STORE_PATH = originalImplementerStorePath;
+    else delete process.env.IMPLEMENTER_STORE_PATH;
   });
 
   beforeEach(() => {
@@ -4299,10 +4386,12 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     resetWorkflowCache();
     resetNativeStateCache();
     resetPolicyCache();
+    clearImplementerStore();
   });
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    clearImplementerStore();
   });
 
   /**
@@ -4596,6 +4685,81 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     const vars = atomicMutations[0].variables as { labelIds?: string[]; delegateId?: string; stateId?: string };
     expect(vars.labelIds).toBeDefined();
     expect(vars.stateId).toBeDefined(); // AI-1498: native state is in the same mutation
+  });
+
+  // ── AI-1531: IMPLEMENTER_STORE_PATH must be isolated per-suite ─────────────
+  // These tests verify AC1 and AC2 for the conformance suite. They FAIL before
+  // the fix (no IMPLEMENTER_STORE_PATH isolation in beforeAll) and PASS after.
+  //
+  // Unique issue IDs are used to avoid conflicts with existing conformance tests;
+  // the canonical workflow maps implementation to native_state: todo, so the
+  // expected stateId is SEMANTIC_TO_UUID["todo"] (not "doing").
+
+  it("AI-1531/AC1: reject completes even when /tmp/implementer-store.json is pre-seeded with a ghost-body for the conformance issue", async () => {
+    const issueId = "AI-CONF-REJ-1531";
+    const poisonContent = JSON.stringify({
+      [issueId]: { bodyId: "ghost-body-ai1531", workflowId: "dev-impl", recordedAt: "2026-01-01T00:00:00Z" },
+    });
+    // Seed the default store with a ghost-body that has no linearUserId.
+    fs.writeFileSync("/tmp/implementer-store.json", poisonContent, "utf8");
+    clearImplementerStore();
+
+    resetWorkflowCache();
+    resetNativeStateCache();
+    const { fetch, mutations } = makeConformanceFetch(["wf:dev-impl", "state:deployment"]);
+    globalThis.fetch = fetch;
+
+    try {
+      await applyStateTransition("reject", issueId, "Bearer tok", {
+        bodyId: "hanzo",
+        feedback: { reasonCode: "correctness", freeText: "ai1531 conformance reject" },
+      });
+      // AC1: ApplyAtomicTransition must fire regardless of /tmp store contents.
+      // (Canonical workflow: implementation has native_state: todo.)
+      const atomicMutation = mutations.find((m) => m.query.includes("ApplyAtomicTransition"));
+      expect(atomicMutation).toBeDefined();
+      const vars = atomicMutation!.variables as { stateId?: string };
+      expect(vars.stateId).toBe(SEMANTIC_TO_UUID["todo"]);
+    } finally {
+      clearImplementerStore();
+      try { fs.rmSync("/tmp/implementer-store.json"); } catch { /* absent is fine */ }
+    }
+  });
+
+  it("AI-1531/AC1: request-changes completes even when /tmp/implementer-store.json is pre-seeded with a ghost-body for the conformance issue", async () => {
+    const issueId = "AI-CONF-RC-1531";
+    const poisonContent = JSON.stringify({
+      [issueId]: { bodyId: "ghost-body-ai1531", workflowId: "dev-impl", recordedAt: "2026-01-01T00:00:00Z" },
+    });
+    fs.writeFileSync("/tmp/implementer-store.json", poisonContent, "utf8");
+    clearImplementerStore();
+
+    resetWorkflowCache();
+    resetNativeStateCache();
+    const { fetch, mutations } = makeConformanceFetch(["wf:dev-impl", "state:code-review"]);
+    globalThis.fetch = fetch;
+
+    try {
+      await applyStateTransition("request-changes", issueId, "Bearer tok", {
+        bodyId: "reviewer",
+        feedback: { reasonCode: "missing-tests", freeText: "ai1531 conformance rc" },
+      });
+      const atomicMutation = mutations.find((m) => m.query.includes("ApplyAtomicTransition"));
+      expect(atomicMutation).toBeDefined();
+      const vars = atomicMutation!.variables as { stateId?: string };
+      expect(vars.stateId).toBe(SEMANTIC_TO_UUID["todo"]);
+    } finally {
+      clearImplementerStore();
+      try { fs.rmSync("/tmp/implementer-store.json"); } catch { /* absent is fine */ }
+    }
+  });
+
+  it("AI-1531/AC2: IMPLEMENTER_STORE_PATH is set to a per-suite-isolated path (not the global default)", () => {
+    // After the fix, beforeAll sets IMPLEMENTER_STORE_PATH to a per-suite tmpdir.
+    // Before the fix, it is unset — so persist() would write to /tmp/implementer-store.json.
+    const storePath = process.env.IMPLEMENTER_STORE_PATH;
+    expect(storePath).toBeDefined(); // FAILS before fix (undefined), PASSES after
+    expect(storePath).not.toBe("/tmp/implementer-store.json");
   });
 });
 
