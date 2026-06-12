@@ -60,6 +60,60 @@ describe("NudgeStore", () => {
     cleanup();
   });
 
+  // AI-1538: a blocked/aborted dispatch primes the dedup window via recordNudge
+  // but sends no delivery. clearNudge rolls that priming back so the next genuine
+  // dispatch to the same agent+ticket inside the window is not swallowed.
+  it("clearNudge removes suppression so a subsequent dispatch is not coalesced (AC1)", () => {
+    const { dbPath, cleanup } = makeTempDb();
+    const store = new NudgeStore(dbPath);
+    // 1. routing-guard-blocked dispatch primes the window for hanzo…
+    store.recordNudge("hanzo", "linear-AI-1531");
+    expect(store.isSuppressed("hanzo", "linear-AI-1531", 120000)).toBe(true);
+    // 2. …but no delivery was sent, so the block rolls it back.
+    store.clearNudge("hanzo", "linear-AI-1531");
+    // 3. the legitimate deployment dispatch is now NOT suppressed.
+    expect(store.isSuppressed("hanzo", "linear-AI-1531", 120000)).toBe(false);
+    store.close();
+    cleanup();
+  });
+
+  it("a fresh recordNudge after clearNudge delivers exactly once (AC3)", () => {
+    const { dbPath, cleanup } = makeTempDb();
+    const store = new NudgeStore(dbPath);
+    store.recordNudge("hanzo", "linear-AI-1531"); // blocked attempt
+    store.clearNudge("hanzo", "linear-AI-1531");  // rolled back
+    // delegate newly assigned to hanzo → genuine dispatch primes the window.
+    expect(store.isSuppressed("hanzo", "linear-AI-1531", 120000)).toBe(false);
+    store.recordNudge("hanzo", "linear-AI-1531");
+    // and a true duplicate of THAT delivery is still coalesced.
+    expect(store.isSuppressed("hanzo", "linear-AI-1531", 120000)).toBe(true);
+    store.close();
+    cleanup();
+  });
+
+  it("clearNudge only clears the targeted agent+ticket", () => {
+    const { dbPath, cleanup } = makeTempDb();
+    const store = new NudgeStore(dbPath);
+    store.recordNudge("hanzo", "linear-AI-1531");
+    store.recordNudge("hanzo", "linear-AI-1600");
+    store.recordNudge("charles", "linear-AI-1531");
+    store.clearNudge("hanzo", "linear-AI-1531");
+    expect(store.isSuppressed("hanzo", "linear-AI-1531", 120000)).toBe(false);
+    expect(store.isSuppressed("hanzo", "linear-AI-1600", 120000)).toBe(true);
+    expect(store.isSuppressed("charles", "linear-AI-1531", 120000)).toBe(true);
+    store.close();
+    cleanup();
+  });
+
+  it("clearNudge on an unknown agent+ticket is a no-op", () => {
+    const { dbPath, cleanup } = makeTempDb();
+    const store = new NudgeStore(dbPath);
+    expect(() => store.clearNudge("nobody", "linear-AI-9999")).not.toThrow();
+    expect(store.isSuppressed("nobody", "linear-AI-9999", 120000)).toBe(false);
+    store.close();
+    cleanup();
+  });
+
   it("resets suppression after resetSuppression()", () => {
     const { dbPath, cleanup } = makeTempDb();
     const store = new NudgeStore(dbPath);

@@ -39,6 +39,22 @@ export declare class DispatchAckTracker {
      */
     recordDispatch(agentId: string, ticketId: string): void;
     /**
+     * Register a pending dispatch expectation for a (agent, ticket) pair when the
+     * connector commits to delivering to a newly-assigned delegate, BEFORE the
+     * wake-up is actually sent.
+     *
+     * If a real dispatch follows, recordDispatch bumps this row (0 → 1) so the
+     * happy-path attempt_count is unchanged. If the delivery is instead swallowed
+     * (e.g. by nudge-dedup coalescing) or delivered through a path that records no
+     * ack, this placeholder remains 'pending' and the watchdog re-signals it —
+     * so a swallowed delivery self-heals instead of stalling indefinitely (AI-1538).
+     *
+     * Inserted with attempt_count=0 and ON CONFLICT DO NOTHING: it never bumps the
+     * counter, never resets last_signal_at, and never resurrects an acknowledged
+     * entry.
+     */
+    ensurePending(agentId: string, ticketId: string): void;
+    /**
      * Acknowledge dispatches for an agent — called when /session-end fires.
      *
      * If ticketId is provided, acknowledges only that specific ticket.

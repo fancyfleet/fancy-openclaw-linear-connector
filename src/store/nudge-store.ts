@@ -118,6 +118,20 @@ export class NudgeStore {
   }
 
   /**
+   * Clear the dedup entry for a single agent+ticket pair.
+   *
+   * Called when a dispatch is aborted before any delivery is sent (e.g. the
+   * routing-guard blocks it or the agent is unreachable). A blocked attempt
+   * must not "reserve" the dedup window, otherwise the next genuine dispatch to
+   * the same agent+ticket inside the window is wrongly swallowed (AI-1538).
+   */
+  clearNudge(agentId: string, ticketId: string): void {
+    this.db
+      .prepare("DELETE FROM nudge_log WHERE agent_id = ? AND ticket_id = ?")
+      .run(agentId, ticketId);
+  }
+
+  /**
    * Reset suppression for an agent (e.g., after they pull their queue).
    */
   resetSuppression(agentId: string): void {
