@@ -77,7 +77,10 @@ describe("agent-authored activity acknowledgments", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  test("acknowledges a dispatch when the target agent changes the issue", async () => {
+  // AI-1564: Issue state/label updates by agents are connector facet writes and
+  // must NOT trigger the Doing-flip (they were echoing back as activity signals,
+  // clobbering the handoff To Do separator).
+  test("does NOT acknowledge an Issue update by a known agent (prevents self-loop)", async () => {
     const acknowledgments: Array<{ agentId: string; ticketId: string }> = [];
     const app = createTestApp((agentId, ticketId) => {
       acknowledgments.push({ agentId, ticketId });
@@ -86,13 +89,13 @@ describe("agent-authored activity acknowledgments", () => {
     const body = JSON.stringify({
       type: "Issue",
       action: "update",
-      createdAt: "2026-05-31T19:38:51.252Z",
+      createdAt: "2026-06-12T16:00:00.000Z",
       actor: { id: ASTRID_ID, name: "Astrid (CPO)" },
       data: {
         id: "issue-1",
         identifier: "AI-1276",
         title: "Launch Gen CDN performance sprint",
-        state: { id: "state-thinking", name: "Thinking", type: "started" },
+        state: { id: "state-todo", name: "To Do", type: "unstarted" },
         priority: 0,
         priorityLabel: "No priority",
         teamId: "team-ai",
@@ -100,8 +103,8 @@ describe("agent-authored activity acknowledgments", () => {
         delegate: { id: ASTRID_ID, name: "Astrid (CPO)" },
         labelIds: [],
         url: "https://linear.app/fancymatt/issue/AI-1276",
-        createdAt: "2026-05-31T19:26:42.940Z",
-        updatedAt: "2026-05-31T19:38:51.252Z",
+        createdAt: "2026-06-12T15:00:00.000Z",
+        updatedAt: "2026-06-12T16:00:00.000Z",
       },
     });
 
@@ -109,7 +112,43 @@ describe("agent-authored activity acknowledgments", () => {
       .post("/")
       .set("Content-Type", "application/json")
       .set("x-linear-signature", sign(body))
-      .set("x-linear-delivery", "agent-activity-1")
+      .set("x-linear-delivery", "agent-activity-issue-update")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(acknowledgments).toEqual([]);
+  });
+
+  // AI-1564: Comment-create by a known agent is genuine authored content and
+  // MUST still trigger the Doing-flip (this is the legitimate signal we preserve).
+  test("acknowledges a Comment-create by a known agent actor", async () => {
+    const acknowledgments: Array<{ agentId: string; ticketId: string }> = [];
+    const app = createTestApp((agentId, ticketId) => {
+      acknowledgments.push({ agentId, ticketId });
+    });
+
+    const body = JSON.stringify({
+      type: "Comment",
+      action: "create",
+      createdAt: "2026-06-12T16:01:00.000Z",
+      actor: { id: ASTRID_ID, name: "Astrid (CPO)" },
+      data: {
+        id: "comment-1",
+        body: "Reviewing the CDN performance sprint scope now.",
+        issue: {
+          id: "issue-1",
+          identifier: "AI-1276",
+        },
+        createdAt: "2026-06-12T16:01:00.000Z",
+        updatedAt: "2026-06-12T16:01:00.000Z",
+      },
+    });
+
+    const res = await request(app)
+      .post("/")
+      .set("Content-Type", "application/json")
+      .set("x-linear-signature", sign(body))
+      .set("x-linear-delivery", "agent-activity-comment-create")
       .send(body);
 
     expect(res.status).toBe(200);

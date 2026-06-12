@@ -56,6 +56,10 @@ function acknowledgeAgentAuthoredActivity(
   onAgentActivity?: (agentId: string, ticketId: string) => void,
 ): void {
   if (!onAgentActivity) return;
+  // Only genuine human-visible authored content (comments, agent session events)
+  // triggers the Doing-flip. Issue state/label updates are connector facet writes
+  // that must not echo back as activity signals (AI-1564).
+  if (event.type !== "Comment" && event.type !== "AgentSessionEvent") return;
   const actorId = event.actor?.id;
   if (!actorId) return;
 
