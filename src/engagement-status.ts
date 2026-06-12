@@ -35,6 +35,15 @@ export type EngagementSemantic = "thinking" | "doing" | "todo";
 /** Linear state names that mean "agent is actively working" — the monotonic floor. */
 const DOING_NAMES = new Set(["doing", "developing"]);
 
+/**
+ * Terminal workflow-state labels. A ticket carrying one of these has been driven
+ * to a resting end-state by the workflow gate (its native write is authoritative);
+ * the engagement overlay must never move it — otherwise a delegate's final
+ * agent-authored activity re-drives native back to "doing", un-completing a Done
+ * ticket (AI-1540).
+ */
+const TERMINAL_LABELS = new Set(["state:done", "state:escape"]);
+
 function normalizeName(s: string): string {
   return s.toLowerCase().replace(/\s+/g, "");
 }
@@ -111,6 +120,11 @@ export async function applyEngagementStatus(
     // Overlay applies only to workflow tickets. Ad-hoc tickets keep their status.
     const isWorkflow = issue.labels.some((l) => /^wf:/i.test(l));
     if (!isWorkflow) return;
+
+    // Terminal-state immunity: never overlay a ticket the workflow has driven to a
+    // resting end-state (state:done / state:escape). The gate's native write wins;
+    // a late agent-authored-activity webhook must not re-drive it to "doing" (AI-1540).
+    if (issue.labels.some((l) => TERMINAL_LABELS.has(l.toLowerCase()))) return;
 
     // Monotonic floor: never downgrade an actively-working ticket back to Thinking.
     if (semantic === "thinking" && DOING_NAMES.has(normalizeName(issue.stateName))) {

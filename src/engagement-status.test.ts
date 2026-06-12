@@ -212,6 +212,36 @@ describe("applyEngagementStatus (AI-1510)", () => {
     expect(updates).toHaveLength(0);
   });
 
+  it("AI-1540: never overlays a terminal state:done ticket (no Done→Doing un-complete)", async () => {
+    const { fetch, updates } = makeEngagementFetch({
+      id: "issue-uuid",
+      teamId: "team-uuid",
+      stateName: "Done",
+      stateId: SEMANTIC_TO_UUID["To Do"],
+      labels: ["wf:dev-impl", "state:done"],
+    });
+    globalThis.fetch = fetch;
+
+    await applyEngagementStatus("AI-1", "doing", "tok");
+
+    expect(updates).toHaveLength(0);
+  });
+
+  it("AI-1540: never overlays a terminal state:escape ticket", async () => {
+    const { fetch, updates } = makeEngagementFetch({
+      id: "issue-uuid",
+      teamId: "team-uuid",
+      stateName: "Doing",
+      stateId: SEMANTIC_TO_UUID["Doing"],
+      labels: ["wf:dev-impl", "state:escape"],
+    });
+    globalThis.fetch = fetch;
+
+    await applyEngagementStatus("AI-1", "todo", "tok");
+
+    expect(updates).toHaveLength(0);
+  });
+
   it("no-op without a token (never touches the network)", async () => {
     let called = false;
     globalThis.fetch = (async () => {
