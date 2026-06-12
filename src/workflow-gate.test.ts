@@ -3977,12 +3977,11 @@ describe("AI-1482: Verbatim AC + Stakes-threshold sign-off", () => {
       resetWorkflowCache();
     });
 
-    it("blocks deploy from AI agent when no stakes label present (fail closed)", async () => {
-      // No stakes: label → defaults to threshold level (fail closed), which blocks AI deploy
+    it("allows deploy from AI agent when no stakes label present (fail OPEN — AI-1539 Matt directive)", async () => {
+      // A missing tag must NOT hold a task up for human review: fail open to level 0.
       globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
       const result = await checkWorkflowRules("deploy", "AI-NO-LABEL", "Bearer tok", "hanzo");
-      expect(result).not.toBeNull();
-      expect(result).toContain("elevated stakes");
+      expect(result).toBeNull();
     });
   });
 
@@ -3991,8 +3990,8 @@ describe("AI-1482: Verbatim AC + Stakes-threshold sign-off", () => {
   describe("resolveStakesLevel", () => {
     const stakesConfig = { threshold: 2, levels: { "stakes:low": 0, "stakes:medium": 1, "stakes:high": 2 } };
 
-    it("returns threshold when no stakes label present (fail closed)", () => {
-      expect(resolveStakesLevel(["wf:dev-impl", "state:deployment"], stakesConfig)).toBe(2);
+    it("returns 0 when no stakes label present (fail OPEN — AI-1539)", () => {
+      expect(resolveStakesLevel(["wf:dev-impl", "state:deployment"], stakesConfig)).toBe(0);
     });
 
     it("returns mapped level for known stakes label", () => {
@@ -4001,8 +4000,8 @@ describe("AI-1482: Verbatim AC + Stakes-threshold sign-off", () => {
       expect(resolveStakesLevel(["stakes:high"], stakesConfig)).toBe(2);
     });
 
-    it("returns threshold for unknown stakes label (fail closed)", () => {
-      expect(resolveStakesLevel(["stakes:unknown"], stakesConfig)).toBe(2);
+    it("returns 0 for unknown/unmapped stakes label (fail OPEN — AI-1539)", () => {
+      expect(resolveStakesLevel(["stakes:unknown"], stakesConfig)).toBe(0);
     });
 
     // ── AI-1539: namespace-agnostic resolution (def keys on risk:*) ──────
@@ -4020,15 +4019,16 @@ describe("AI-1482: Verbatim AC + Stakes-threshold sign-off", () => {
         expect(resolveStakesLevel(["risk:high"], riskConfig)).toBe(2);
       });
 
-      it("fails closed to threshold when the ticket carries no configured level label", () => {
-        expect(resolveStakesLevel(["wf:dev-impl", "state:deployment"], riskConfig)).toBe(2);
+      it("fails OPEN to level 0 when the ticket carries no configured level label (AI-1539 Matt directive)", () => {
+        expect(resolveStakesLevel(["wf:dev-impl", "state:deployment"], riskConfig)).toBe(0);
       });
 
-      it("ignores non-level labels in a different namespace (e.g. a stray stakes:low when def keys on risk:*)", () => {
+      it("only counts labels in the configured namespace; an explicit risk:high still gates", () => {
         // A label from the wrong namespace must NOT be treated as the stakes label;
-        // only keys present in stakesConfig.levels count.
+        // only keys present in stakesConfig.levels count. An explicit risk:high gates;
+        // a stray stakes:low (not in the risk:* map) is ignored → fail open to 0.
         expect(resolveStakesLevel(["stakes:low", "risk:high"], riskConfig)).toBe(2);
-        expect(resolveStakesLevel(["stakes:low"], riskConfig)).toBe(2); // no risk:* present → fail closed
+        expect(resolveStakesLevel(["stakes:low"], riskConfig)).toBe(0); // no risk:* present → fail open
       });
     });
   });

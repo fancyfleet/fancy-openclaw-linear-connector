@@ -767,18 +767,20 @@ async function fetchIssueDescription(issueId: string, authToken: string): Promis
  * of bug where a hardcoded prefix (`/^stakes:/`) silently fails to match the
  * configured namespace and forces every ticket to fail closed.
  *
- * Fails closed: when the ticket carries none of the configured level labels,
- * returns the threshold value itself — unlabeled tickets are treated as
- * high-stakes to prevent a missing label from silently bypassing the human
- * sign-off gate.
+ * Fails OPEN (AI-1539, Matt directive 2026-06-11): when the ticket carries none
+ * of the configured level labels, returns 0 (lowest stakes) — a *missing* tag
+ * must not hold a task up for human review. Only an EXPLICIT high-stakes label
+ * (e.g. risk:high mapping to >= threshold) trips the human sign-off gate.
+ * Tradeoff accepted by the owner: a genuinely high-stakes task left untagged
+ * will deploy without sign-off; tag it risk:high to gate it.
  */
 export function resolveStakesLevel(labels: string[], stakesConfig: StakesLevel): number {
   const stakesLabel = labels.find((l) =>
     Object.prototype.hasOwnProperty.call(stakesConfig.levels, l),
   );
   if (!stakesLabel) {
-    log.warn(`workflow-gate: resolveStakesLevel: no configured stakes label found (levels: ${Object.keys(stakesConfig.levels).join(", ")}) — failing closed (defaulting to threshold ${stakesConfig.threshold})`);
-    return stakesConfig.threshold; // fail closed: unlabeled = high stakes
+    log.warn(`workflow-gate: resolveStakesLevel: no configured stakes label found (levels: ${Object.keys(stakesConfig.levels).join(", ")}) — failing open (level 0, no human sign-off required)`);
+    return 0; // fail open (Matt directive): a missing tag must not force human review
   }
   return stakesConfig.levels[stakesLabel];
 }
