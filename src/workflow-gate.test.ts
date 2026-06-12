@@ -4004,6 +4004,33 @@ describe("AI-1482: Verbatim AC + Stakes-threshold sign-off", () => {
     it("returns threshold for unknown stakes label (fail closed)", () => {
       expect(resolveStakesLevel(["stakes:unknown"], stakesConfig)).toBe(2);
     });
+
+    // ── AI-1539: namespace-agnostic resolution (def keys on risk:*) ──────
+    describe("AI-1539: risk:* namespace (matches the live v8 dev-impl def)", () => {
+      const riskConfig = { threshold: 2, levels: { "risk:low": 0, "risk:medium": 1, "risk:high": 2 } };
+
+      it("resolves risk:low to level 0 (below threshold) — the AI-1531 regression", () => {
+        // Before AI-1539, the hardcoded /^stakes:/ matcher missed risk:low and
+        // fail-closed every dev-impl ticket to the threshold (forced human sign-off).
+        expect(resolveStakesLevel(["wf:dev-impl", "state:deployment", "risk:low"], riskConfig)).toBe(0);
+      });
+
+      it("resolves risk:medium → 1 and risk:high → 2", () => {
+        expect(resolveStakesLevel(["risk:medium"], riskConfig)).toBe(1);
+        expect(resolveStakesLevel(["risk:high"], riskConfig)).toBe(2);
+      });
+
+      it("fails closed to threshold when the ticket carries no configured level label", () => {
+        expect(resolveStakesLevel(["wf:dev-impl", "state:deployment"], riskConfig)).toBe(2);
+      });
+
+      it("ignores non-level labels in a different namespace (e.g. a stray stakes:low when def keys on risk:*)", () => {
+        // A label from the wrong namespace must NOT be treated as the stakes label;
+        // only keys present in stakesConfig.levels count.
+        expect(resolveStakesLevel(["stakes:low", "risk:high"], riskConfig)).toBe(2);
+        expect(resolveStakesLevel(["stakes:low"], riskConfig)).toBe(2); // no risk:* present → fail closed
+      });
+    });
   });
 
 // ── AI-1493: Atomic transitions + deterministic owner-routing ──────────────
