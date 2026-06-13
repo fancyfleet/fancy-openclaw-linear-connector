@@ -881,18 +881,32 @@ export async function checkWorkflowRules(
   // AC3 (B-3): Children cannot address the parent — enforced by the absence of
   // any upward-directed command in the dev-impl state machine.
 
+  const breakGlassCommand = def.break_glass?.command ?? "escape";
+
   // AI-1402: Fail-closed on unknown caller. When the caller's body is not in the
   // capability policy and the ticket is a governed workflow ticket, block the mutation.
-  // This is consistent with AI-1400 B2: unknown caller + known delegate = block.
-  if (!(await isBodyKnown(bodyId))) {
-    log.warn(`workflow-gate: unknown caller '${bodyId}' on wf:${workflowId} ticket ${issueId} — blocking`);
-    return (
-      `[Proxy] Unknown caller '${bodyId}' blocked on workflow ticket. ` +
-      `Ensure this agent is registered in the capability policy.`
+  // Exception: an actual human (unknown to the AI capability policy) must be able to
+  // sign off on stakes-gated high-stakes transitions — see stakes check below.
+  const isCallerKnown = await isBodyKnown(bodyId);
+  if (!isCallerKnown) {
+    // Allow unknown callers through ONLY for the human sign-off path.
+    const preState = getCurrentState(labels);
+    const preNode = preState ? def.states.find((s) => s.id === preState) : undefined;
+    const preTx = preNode?.transitions?.find((t) => t.command === intent);
+    const isHumanSignoffPath = !!(
+      preTx?.requires_human_signoff_above_stakes &&
+      def.stakes &&
+      resolveStakesLevel(labels, def.stakes) >= def.stakes.threshold
     );
+    if (!isHumanSignoffPath) {
+      log.warn(`workflow-gate: unknown caller '${bodyId}' on wf:${workflowId} ticket ${issueId} — blocking`);
+      return (
+        `[Proxy] Unknown caller '${bodyId}' blocked on workflow ticket. ` +
+        `Ensure this agent is registered in the capability policy.`
+      );
+    }
+    log.info(`workflow-gate: unknown caller '${bodyId}' on wf:${workflowId} — human sign-off path, allowing through`);
   }
-
-  const breakGlassCommand = def.break_glass?.command ?? "escape";
 
   // §4.4: break-glass escape is legal from every state — never block it.
   if (intent === breakGlassCommand) return null;
@@ -972,7 +986,8 @@ export async function checkWorkflowRules(
   }
 
   // Capability gate — e.g. deploy:execute is Hanzo-only (§16.2).
-  if (match.requires_capability) {
+  // Unknown callers (humans on the sign-off path) bypass capability checks.
+  if (match.requires_capability && isCallerKnown) {
     const allowed = await bodyHasCapability(bodyId, match.requires_capability);
     if (!allowed) {
       return (
@@ -1088,10 +1103,7 @@ export async function checkWorkflowRules(
     }
 
     if (legalBodies.length > 1) {
-      if (!target) {
-        return `[Proxy] '${intent}' requires an assignment target. Legal targets for role '${ownerRole}': ${legalBodies.join(', ')}.`;
-      }
-      if (!legalBodies.includes(target)) {
+      if (target && !legalBodies.includes(target)) {
         return `[Proxy] '${target}' is not a legal assignment target for '${intent}'. Legal targets for role '${ownerRole}': ${legalBodies.join(', ')}.`;
       }
     } else if (legalBodies.length === 1) {
