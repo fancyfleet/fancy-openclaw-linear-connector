@@ -135,6 +135,17 @@ export interface WorkflowDef {
   entry_state?: string;
   /** §4.4: break_glass.command is the x-openclaw-linear-intent value for escape. */
   break_glass?: { command: string; to?: string; owner_role?: string };
+  /**
+   * AI-1579: recovery actor(s) — body id(s) (e.g. `ai`) permitted to re-establish
+   * a delegate on a governed ticket whose delegate is currently EMPTY (orphaned),
+   * at ANY state, even one whose owner_role they do not fill. This is the
+   * authorization counterpart to the stale-session recovery machinery: when a
+   * delegate's session dies without advancing the ticket, recovery clears the
+   * delegate and must re-dispatch by writing a new delegateId — a raw write from
+   * `ai`, which the role-based first-delegate check would otherwise block. Scoped
+   * to the empty-delegate path only, so it can never steal a live delegate.
+   */
+  recovery_actor?: string | string[];
   /** Phase 6.5 / H-7 (AI-1482): stakes-threshold configuration for human sign-off gate. */
   stakes?: StakesLevel;
   states: WorkflowState[];
@@ -897,6 +908,24 @@ export async function checkWorkflowRules(
   // §4.4: break-glass escape is legal from every state — never block it.
   if (intent === breakGlassCommand) return null;
 
+  // AI-1576 AC3: demote guard — block demote when the ticket has in-flight or merged work
+  // (pushed branch or any PR). Fail-open if the branch/PR fetch fails — we cannot confirm
+  // in-flight work, so stranding the ticket is worse than a false negative.
+  if (intent === "demote" && !breakGlassOverride) {
+    const branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+    if (branchStatus && (branchStatus.hasBranch || branchStatus.hasPR)) {
+      const evidence = [
+        branchStatus.hasPR ? (branchStatus.hasMergedPR ? "merged PR" : "open PR") : null,
+        branchStatus.hasBranch && !branchStatus.hasPR ? "pushed branch (no PR)" : null,
+      ].filter(Boolean).join(", ");
+      return (
+        `[Proxy] 'demote' blocked: this ticket has in-flight or merged implementation work (${evidence}). ` +
+        `Demoting would strip the deployment gate from undeployed code. ` +
+        `Use 'escape' (break-glass) with an explicit override if you intend to demote despite this.`
+      );
+    }
+  }
+
   // AI-1460/AI-1574: refuse-work is caller-gated. Only the current delegate or
   // the workflow steward (break_glass.owner_role) may refuse on a governed
   // ticket. A non-delegate, non-steward caller is blocked to prevent third-party
@@ -1280,6 +1309,35 @@ export async function checkRawMutationInterception(
     // entry state, so it stays blocked by the role check below. Only applies with a
     // known caller (unknown bodies were already rejected above, AI-1402).
     if (bodyId && def.entry_state && stateId === def.entry_state) return null;
+    // AI-1579: recovery-actor carve-out. A configured recovery identity (e.g.
+    // `ai`) may re-establish a delegate on a governed ticket whose delegate is
+    // currently EMPTY (orphaned) at ANY state, including a mid-workflow state
+    // whose owner_role the actor does not fill. This is the authorization
+    // counterpart to the stale-session recovery machinery (StaleSessionForensics
+    // .recoverTicket / NoActivityDetector): when a delegate's session dies without
+    // advancing the ticket, recovery clears the delegate and must re-dispatch by
+    // writing a new delegateId — a raw write from `ai`, which the role check below
+    // would reject (the orchestrator fills no workflow role). Scope:
+    //   - only reachable when the current delegate is empty (every active-delegate
+    //     case returned above) — so this can NEVER steal a live delegate;
+    //   - only the configured recovery actor(s); every other out-of-role caller is
+    //     still blocked by the role check below (the AI-1560 Igor incident at
+    //     `deployment` stays blocked);
+    //   - the routing-guard still corrects the dispatch target to the legal state
+    //     owner on the webhook side, so the worst case is a dispatch to the
+    //     rightful owner.
+    const recoveryActors = Array.isArray(def.recovery_actor)
+      ? def.recovery_actor
+      : def.recovery_actor
+        ? [def.recovery_actor]
+        : [];
+    if (bodyId && recoveryActors.includes(bodyId)) {
+      const ownerRoleForLog = def.states.find((s) => s.id === stateId)?.owner_role ?? "(ownerless)";
+      log.warn(
+        `workflow-gate: recovery-actor first-delegate ALLOW actor=${bodyId} ticket=${issueId} state=${stateId} resolved_owner_role=${ownerRoleForLog} (delegate was empty — orphaned-ticket recovery)`,
+      );
+      return null;
+    }
     const stateNode = def.states.find((s) => s.id === stateId);
     const ownerRole = stateNode?.owner_role;
     if (!ownerRole) return null; // ownerless/terminal state — fail-open
