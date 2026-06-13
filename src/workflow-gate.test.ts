@@ -476,25 +476,60 @@ describe("checkWorkflowRules — AI-1460: refuse-work meta-command", () => {
     expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles")).toBeNull();
   });
 
-  it("refuse-work bypasses delegate-only check (non-delegate can refuse)", async () => {
-    // Simulate a ticket where charles is NOT the delegate (someone else is)
-    // by providing callerLinearUserId that differs from delegateId.
-    // refuse-work should still pass because it bypasses delegate-only.
-    globalThis.fetch = async (_url, _init) => {
-      const body = {
-        data: {
-          issue: {
-            labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:code-review" }] },
-            delegate: { id: "other-user-id" },
-          },
-        },
-      };
-      return new Response(JSON.stringify(body), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
-    };
-    // charles (callerLinearUserId=charles-uid) is not the delegate (other-user-id)
+});
+
+// ── AI-1574: refuse-work caller-gating hardening ──────────────────────────
+// The line-905 exemption must become conditional:
+//   - delegate (callerLinearUserId === delegateId) → allowed
+//   - steward (bodyId fills the workflow's break_glass.owner_role) → allowed
+//   - all others → blocked
+//
+// Without the fix, line 905 is unconditional and any known caller can refuse
+// work on someone else's governed ticket (third-party reroute hole).
+
+describe("checkWorkflowRules — AI-1574: refuse-work caller-gating", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  function makeDelegateFetch(labelNames: string[], delegateId: string): typeof globalThis.fetch {
+    return async (_url, _init) => new Response(JSON.stringify({
+      data: { issue: { labels: { nodes: labelNames.map((n) => ({ name: n })) }, delegate: { id: delegateId } } },
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }
+
+  // AC1: the current delegate can always refuse their own work.
+  it("AC1: refuse-work by the current delegate (callerLinearUserId === delegateId) passes through", async () => {
+    globalThis.fetch = makeDelegateFetch(["wf:dev-impl", "state:write-tests"], "delegate-uid");
+    expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles", null, "delegate-uid")).toBeNull();
+  });
+
+  it("AC1: delegate can refuse from every governed state", async () => {
+    for (const state of ["intake", "write-tests", "implementation", "code-review", "deployment", "done"]) {
+      globalThis.fetch = makeDelegateFetch(["wf:dev-impl", `state:${state}`], "delegate-uid");
+      expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles", null, "delegate-uid")).toBeNull();
+    }
+  });
+
+  // AC2: a non-delegate, non-steward caller must be blocked.
+  it("AC2: refuse-work by a non-delegate, non-steward caller is blocked", async () => {
+    globalThis.fetch = makeDelegateFetch(["wf:dev-impl", "state:implementation"], "real-delegate-uid");
+    // charles (dev role, not steward) provides a different callerLinearUserId
+    const result = await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles", null, "charles-uid");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+  });
+
+  // Steward exemption: the workflow steward (break_glass.owner_role) may always refuse.
+  it("refuse-work by the workflow steward passes through even when not the delegate", async () => {
+    globalThis.fetch = makeDelegateFetch(["wf:dev-impl", "state:implementation"], "real-delegate-uid");
+    // astrid fills the steward role in TEST_POLICY_YAML
+    expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "astrid", null, "astrid-uid")).toBeNull();
+  });
+
+  // AC3 regression: ad-hoc (ungoverned) tickets must continue to pass through.
+  it("AC3: refuse-work on an ungoverned ticket (no wf:* label) always passes through", async () => {
+    globalThis.fetch = makeDelegateFetch(["bug", "priority:high"], "real-delegate-uid");
     expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles", null, "charles-uid")).toBeNull();
   });
 });
