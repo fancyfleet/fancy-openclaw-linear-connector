@@ -137,6 +137,12 @@ export async function applyEngagementStatus(
     // signal even if Linear already shows To Do (prior flip may have been skipped).
     if (semantic !== "todo" && targetStateId === issue.stateId) return;
 
+    // AC2/AI-1548: pre-write re-check. B2 may have written state:done between the
+    // initial fetch (above) and this issueUpdate. Re-read to ensure the overlay
+    // does not overwrite the authoritative terminal native write.
+    const freshIssue = await fetchIssue(identifier, authHeader);
+    if (!freshIssue || freshIssue.labels.some((l) => TERMINAL_LABELS.has(l.toLowerCase()))) return;
+
     const res = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: authHeader },
