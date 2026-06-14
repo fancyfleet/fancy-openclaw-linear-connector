@@ -33,6 +33,7 @@ import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules } from "./escalation-gate.js";
 import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, getCurrentState, type TransitionFeedback } from "./workflow-gate.js";
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
+import { sharedStateTracker } from "./state-regression.js";
 import { getAgent, getAgentByProxyToken } from "./agents.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
@@ -322,6 +323,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         feedback,
         artifactRef: artifactRefHeader,
         sourceStateOverride,
+        onStateAdvanced: (id, state) => sharedStateTracker.advance(id, state),
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

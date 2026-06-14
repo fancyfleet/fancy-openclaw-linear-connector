@@ -408,7 +408,7 @@ export function createWebhookRouter(
                   if (def) {
                     const regression = detectStateRegression(issueIdentifier, guardLabels, lastKnown, def);
                     if (regression.isRegression) {
-                      log.warn(regression.warning);
+                      log.warn(regression.warning ?? "state regression detected");
                       // Skip role-guard — stale snapshot must not trigger backwards delegate correction.
                       return;
                     }

@@ -277,6 +277,9 @@ export interface ApplyStateTransitionOptions {
      * Falls back to the ticket's current state:* label when undefined.
      */
     sourceStateOverride?: string;
+    /** AI-1594: called after a successful atomic transition so callers can advance
+     *  the state high-water mark tracker with the confirmed new state. */
+    onStateAdvanced?: (issueId: string, newState: string) => void;
 }
 export declare function applyStateTransition(intent: string, issueId: string | null, authToken: string, options?: ApplyStateTransitionOptions): Promise<void>;
 /**

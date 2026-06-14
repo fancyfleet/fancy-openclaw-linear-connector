@@ -10,7 +10,8 @@ import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgent
 import { checkAgentLiveness } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
 import { checkRoleGuardAndBlock } from "../routing-guard.js";
-import { fetchWorkflowLabels, enrollIfMissing } from "../workflow-gate.js";
+import { fetchWorkflowLabels, enrollIfMissing, loadWorkflowRegistry, getWorkflowId } from "../workflow-gate.js";
+import { sharedStateTracker, detectStateRegression } from "../state-regression.js";
 import { resignalPendingTickets } from "../bag/index.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { isLinearIssueStillRoutedToAgent, isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
@@ -335,6 +336,33 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
         if (roleGuardToken) {
             try {
                 const guardLabels = await fetchWorkflowLabels(issueIdentifier, roleGuardToken);
+                // AI-1594 (AC3): check for stale-label regression before role-guard
+                // delegate correction. If the webhook carries an older state:* than
+                // the tracker's high-water mark, skip correction — the ticket has
+                // already advanced beyond what this snapshot reflects.
+                {
+                    const lastKnown = sharedStateTracker.getLastKnownState(issueIdentifier);
+                    if (lastKnown !== null) {
+                        const wfId = getWorkflowId(guardLabels);
+                        if (wfId) {
+                            try {
+                                const registry = await loadWorkflowRegistry();
+                                const def = registry.get(wfId);
+                                if (def) {
+                                    const regression = detectStateRegression(issueIdentifier, guardLabels, lastKnown, def);
+                                    if (regression.isRegression) {
+                                        log.warn(regression.warning ?? "state regression detected");
+                                        // Skip role-guard — stale snapshot must not trigger backwards delegate correction.
+                                        return;
+                                    }
+                                }
+                            }
+                            catch {
+                                // fail open
+                            }
+                        }
+                    }
+                }
                 // Provide a resolver so the guard can auto-correct the delegate
                 // without needing to import agents.ts directly (avoids the test
                 // compile-time dependency on fancy-openclaw-linear-skill-cli).
