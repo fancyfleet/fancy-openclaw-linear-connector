@@ -268,12 +268,16 @@ describe("workflow-gate: uncovered enforcement branches (G-21)", () => {
     expect(result).toBeNull();
   });
 
-  // ── AC2-WG-2: multi-body role — target required (lines 1090-1091) ─────
+  // ── AC2-WG-2: multi-body role — illegal-target guard (lines ~1128-1131) ─
   // When a transition's destination state has an owner_role filled by N>1 bodies,
-  // the intent must carry a target. A mutant changing `> 1` to `>= 1` (or the
-  // inner `!target` to `target`) would pass these tests only when both hold.
+  // an explicit target MUST be one of the legal bodies. A *missing* target is
+  // legal-by-design (the conformance matrix asserts accept@intake / submit@
+  // implementation with no target are allowed; the CLI carries the delegate via
+  // its forwarded mutation, or the apply path routes by prior-implementer for
+  // reject/request-changes/ac-fail). So the only enforcement here is the
+  // illegal-target rejection, plus confirming no-target is NOT spuriously blocked.
 
-  it("rejects submit when multi-body dev role has no target provided", async () => {
+  it("allows a forward transition to a multi-body dev role with no target (legal-by-design)", async () => {
     const policyFile = writeTmpYaml(dir, "policy.yaml", POLICY_MULTI_DEV);
     const wfFile = writeTmpYaml(dir, "wf.yaml", WORKFLOW_DEV_IMPL);
     process.env.CAPABILITY_POLICY_PATH = policyFile;
@@ -291,17 +295,16 @@ describe("workflow-gate: uncovered enforcement branches (G-21)", () => {
     });
 
     const result = await checkWorkflowRules(
-      "accept", // intake→implementation, but dev role is multi-body
+      "accept", // intake→implementation, multi-body dev role
       "TICKET-1",
       "tok",
       "astrid",
-      null,              // no target
+      null,              // no target — allowed by design
       "user-astrid",     // caller is the delegate
     );
 
-    // accept goes to implementation (multi-body dev role), no target → must reject
-    expect(result).toMatch(/requires an assignment target/i);
-    expect(result).toMatch(/igor|felix/i); // shows legal targets
+    // No-target forward transition is legal (matches conformance-matrix AC2 legal cells).
+    expect(result).toBeNull();
   });
 
   it("rejects submit with an illegal target for multi-body dev role", async () => {
