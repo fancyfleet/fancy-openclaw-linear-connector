@@ -6013,6 +6013,19 @@ describe("AI-1488: default-deny — unknown command rejected (allowlist proof, n
     expect(result).toContain("[Proxy]");
   });
 
+  it("rejects handoff-work on a workflow ticket (not on any allowlist)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
+
+    const result = await checkWorkflowRules(
+      "handoff-work",
+      "issue-uuid",
+      "Bearer tok",
+      "charles",
+    );
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+  });
+
   it("ad-hoc ticket: handoff-work passes through (no wf: label → not governed)", async () => {
     // No wf: label → checkWorkflowRules returns null immediately (not a wf: ticket).
     globalThis.fetch = makeLabelFetch(["bug", "priority:high"]);
