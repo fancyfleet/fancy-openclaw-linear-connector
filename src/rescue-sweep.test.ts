@@ -128,9 +128,10 @@ function makeLinearMock(opts: {
   updateLabels?: { success: boolean };
   commentPost?: { success: boolean };
   onFetch?: (query: string, variables: unknown) => void;
-}): { fetch: typeof globalThis.fetch; delegateUpdateCalls: string[]; labelUpdateCalls: string[] } {
+}): { fetch: typeof globalThis.fetch; delegateUpdateCalls: string[]; labelUpdateCalls: string[]; capturedLabelIds: Map<string, string[]> } {
   const delegateUpdateCalls: string[] = [];
   const labelUpdateCalls: string[] = [];
+  const capturedLabelIds = new Map<string, string[]>(); // ticketId → labelIds passed
 
   const mockFetch: typeof globalThis.fetch = async (_url, init) => {
     const bodyText = typeof init?.body === "string" ? init.body : "{}";
@@ -149,6 +150,7 @@ function makeLinearMock(opts: {
         delegate: iss.delegateId
           ? { id: iss.delegateId, name: iss.delegateName ?? iss.delegateId }
           : null,
+        team: { id: "team-test" },
       }));
       return new Response(
         JSON.stringify({ data: { issues: { nodes } } }),
@@ -158,9 +160,13 @@ function makeLinearMock(opts: {
 
     // Delegate update
     if (query.includes("UpdateDelegate") || query.includes("issueUpdate")) {
-      const issId = (parsed.variables as Record<string, unknown>)?.["id"] as string ?? "";
+      const vars = parsed.variables as Record<string, unknown> ?? {};
+      const issId = vars["id"] as string ?? "";
       if (query.includes("delegateId")) delegateUpdateCalls.push(issId);
-      if (query.includes("labelIds")) labelUpdateCalls.push(issId);
+      if (query.includes("labelIds")) {
+        labelUpdateCalls.push(issId);
+        capturedLabelIds.set(issId, (vars["labelIds"] as string[]) ?? []);
+      }
       return new Response(
         JSON.stringify({ data: { issueUpdate: { success: opts.updateDelegate?.success ?? true } } }),
         { status: 200, headers: { "Content-Type": "application/json" } },
@@ -175,10 +181,30 @@ function makeLinearMock(opts: {
       );
     }
 
-    // Label lookup / team labels
+    // Label lookup / team labels — return all standard wf:* and state:* labels with stable UUIDs
     if (query.includes("TeamLabels")) {
       return new Response(
-        JSON.stringify({ data: { team: { labels: { nodes: [] } } } }),
+        JSON.stringify({
+          data: {
+            team: {
+              labels: {
+                nodes: [
+                  { id: "uuid-lbl-wf-dev-impl",        name: "wf:dev-impl" },
+                  { id: "uuid-lbl-state-intake",        name: "state:intake" },
+                  { id: "uuid-lbl-state-write-tests",   name: "state:write-tests" },
+                  { id: "uuid-lbl-state-implementation",name: "state:implementation" },
+                  { id: "uuid-lbl-state-code-review",   name: "state:code-review" },
+                  { id: "uuid-lbl-state-deployment",    name: "state:deployment" },
+                  { id: "uuid-lbl-state-host-deploy",   name: "state:host-deploy" },
+                  { id: "uuid-lbl-state-ac-validate",   name: "state:ac-validate" },
+                  { id: "uuid-lbl-state-done",          name: "state:done" },
+                  { id: "uuid-lbl-state-escape",        name: "state:escape" },
+                  { id: "uuid-lbl-risk-low",            name: "risk:low" },
+                ],
+              },
+            },
+          },
+        }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
@@ -186,7 +212,7 @@ function makeLinearMock(opts: {
     throw new Error(`rescue-sweep-test: unexpected Linear query: ${query.slice(0, 120)}`);
   };
 
-  return { fetch: mockFetch, delegateUpdateCalls, labelUpdateCalls };
+  return { fetch: mockFetch, delegateUpdateCalls, labelUpdateCalls, capturedLabelIds };
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -497,7 +523,7 @@ describe("AC7 — scenario: malformed ticket gets bootstrapped (entry state + de
   afterEach(() => { globalThis.fetch = originalFetch; });
 
   it("malformed ticket receives entry state label (state:intake) atomically", async () => {
-    const { fetch: mock, labelUpdateCalls, delegateUpdateCalls } = makeLinearMock({
+    const { fetch: mock, labelUpdateCalls, delegateUpdateCalls, capturedLabelIds } = makeLinearMock({
       issues: [
         { id: "uuid-mal", identifier: "AI-500", labels: ["wf:dev-impl"], delegateId: null },
       ],
@@ -517,6 +543,10 @@ describe("AC7 — scenario: malformed ticket gets bootstrapped (entry state + de
     expect(delegateUpdateCalls).toContain("uuid-mal");
     expect(result.rescues[0]?.classification).toBe("malformed");
     expect(result.rescues[0]?.outcome).toBe("rescued");
+    // All label IDs passed to Linear must be UUIDs, not name strings like "state:intake"
+    const passedIds = capturedLabelIds.get("uuid-mal") ?? [];
+    expect(passedIds.length).toBeGreaterThan(0);
+    expect(passedIds.every((id) => !id.startsWith("state:") && !id.startsWith("wf:"))).toBe(true);
   });
 
   it("malformed ticket rescue action mentions bootstrapping / entry state", async () => {

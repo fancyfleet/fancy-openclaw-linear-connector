@@ -20,6 +20,7 @@ import { applyEngagementStatus } from "./engagement-status.js";
 import { createAdminRouter } from "./admin.js";
 import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, STALE_CLASS_NAMES, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
 import { registerDistillationCron } from "./cron/p4-metrics-distillation.js";
+import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { getAccessToken, getAgent } from "./agents.js";
 import type { StaleSessionDetail } from "./bag/session-tracker.js";
 import crypto from "crypto";
@@ -665,6 +666,8 @@ if (isEntryPoint) {
 
   // P4-3: periodic distillation of reject metrics into skill-workshop proposals
   registerDistillationCron(observationStore);
+  // AI-1566: periodic rescue sweep for dormant/malformed wf:* tickets
+  registerRescueSweepCron();
 
   const server = app.listen(PORT, () => {
     log.info(`fancy-openclaw-linear-connector [${DEPLOYMENT_NAME}] listening on port ${PORT} (pid=${process.pid})`);

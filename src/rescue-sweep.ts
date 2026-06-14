@@ -81,6 +81,12 @@ export interface RescueSweepOptions {
   operationalEventStore?: { record(event: { outcome: string; type?: string; detail?: unknown }): unknown };
   /** Report issue identifier (e.g. "AI-1234") to post summary comment to */
   reportIssueIdentifier?: string;
+  /**
+   * Resolver: given a label name (e.g. "state:intake"), returns the Linear UUID for that
+   * label, or null if not found. When omitted, the sweep fetches team labels at startup
+   * to build this mapping automatically. Inject in tests for isolation.
+   */
+  labelNameToId?: (name: string) => string | null;
 }
 
 // ── Internal types ─────────────────────────────────────────────────────────
@@ -102,6 +108,7 @@ interface CapabilityPolicy {
 
 interface FetchedTicket extends SweepTicket {
   labelNodes: Array<{ id: string; name: string }>;
+  teamId: string;
 }
 
 // ── Classification ─────────────────────────────────────────────────────────
@@ -172,6 +179,7 @@ async function fetchWfTickets(authToken: string): Promise<FetchedTicket[]> {
           state { name }
           labels { nodes { id name } }
           delegate { id name }
+          team { id }
         }
       }
     }
@@ -187,6 +195,7 @@ async function fetchWfTickets(authToken: string): Promise<FetchedTicket[]> {
       identifier: string;
       labels: { nodes: Array<{ id: string; name: string }> };
       delegate: { id: string; name: string } | null;
+      team: { id: string } | null;
     };
     type Resp = { data?: { issues?: { nodes: IssueNode[] } } };
     const data = (await res.json()) as Resp;
@@ -197,10 +206,37 @@ async function fetchWfTickets(authToken: string): Promise<FetchedTicket[]> {
       labelNodes: n.labels.nodes,
       delegateId: n.delegate?.id ?? null,
       delegateName: n.delegate?.name ?? null,
+      teamId: n.team?.id ?? "",
     }));
   } catch (err) {
     log.error(`fetchWfTickets failed: ${err instanceof Error ? err.message : String(err)}`);
     return [];
+  }
+}
+
+async function fetchTeamLabelMap(teamId: string, authToken: string): Promise<Map<string, string>> {
+  const query = `
+    query TeamLabels($teamId: String!) {
+      team(id: $teamId) {
+        labels { nodes { id name } }
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { teamId } }),
+    });
+    type Resp = { data?: { team?: { labels: { nodes: Array<{ id: string; name: string }> } } } };
+    const data = (await res.json()) as Resp;
+    const nodes = data.data?.team?.labels?.nodes ?? [];
+    const map = new Map<string, string>();
+    for (const n of nodes) map.set(n.name, n.id);
+    return map;
+  } catch (err) {
+    log.error(`fetchTeamLabelMap failed for team ${teamId}: ${err instanceof Error ? err.message : String(err)}`);
+    return new Map();
   }
 }
 
@@ -262,6 +298,7 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
     workflowRegistry = new Map<string, WorkflowDef>(),
     capabilityPolicyPath,
     operationalEventStore,
+    labelNameToId: injectedLabelNameToId,
   } = options;
 
   const errors: string[] = [];
@@ -300,6 +337,21 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
     }
   }
 
+  // Build label name → UUID resolver. Use injected resolver if provided (tests); otherwise
+  // fetch team labels once per unique team so rescueMalformed can pass real UUIDs to labelIds.
+  let labelNameToId: (name: string) => string | null;
+  if (injectedLabelNameToId) {
+    labelNameToId = injectedLabelNameToId;
+  } else {
+    const labelMap = new Map<string, string>();
+    const teamIds = [...new Set(tickets.map((t) => t.teamId).filter(Boolean))];
+    for (const teamId of teamIds) {
+      const teamMap = await fetchTeamLabelMap(teamId, authToken);
+      for (const [name, id] of teamMap) labelMap.set(name, id);
+    }
+    labelNameToId = (name: string) => labelMap.get(name) ?? null;
+  }
+
   for (const ticket of tickets) {
     // Resolve workflow def from the wf:* label
     const wfLabel = ticket.labels.find((l) => l.startsWith("wf:"));
@@ -325,7 +377,7 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
     let rescueAction: RescueAction;
 
     if (classification === "malformed") {
-      rescueAction = await rescueMalformed(ticket, wfDef, roleBodiesForRole, authToken);
+      rescueAction = await rescueMalformed(ticket, wfDef, roleBodiesForRole, labelNameToId, authToken);
     } else if (classification === "dormant") {
       rescueAction = await rescueDormant(ticket, wfDef, roleBodiesForRole, authToken);
     } else {
@@ -339,8 +391,8 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
       rescuedIds.add(ticket.id);
     }
 
-    // Emit operational event for any rescue attempt (rescued or ambiguous)
-    if (rescueAction.outcome === "rescued") {
+    // Emit operational event for rescued and ambiguous outcomes (ambiguous needs visibility too)
+    if (rescueAction.outcome === "rescued" || rescueAction.outcome === "ambiguous") {
       operationalEventStore?.record({
         outcome: `rescue:${rescueAction.outcome}`,
         type: "rescue",
@@ -369,6 +421,7 @@ async function rescueMalformed(
   ticket: FetchedTicket,
   wfDef: WorkflowDef,
   roleBodiesForRole: (roleId: string) => string[],
+  labelNameToId: (name: string) => string | null,
   authToken: string,
 ): Promise<RescueAction> {
   const entryState = wfDef.entry_state ?? wfDef.states[0]?.id ?? "intake";
@@ -376,10 +429,22 @@ async function rescueMalformed(
   const ownerRole = entryStateDef?.owner_role;
   const candidates = ownerRole ? roleBodiesForRole(ownerRole) : [];
 
-  // Apply the entry state label — use label name as ID fallback if UUID unknown
+  // Resolve the state label to its Linear UUID (required — labelIds must be UUIDs, not names)
+  const stateLabelName = `state:${entryState}`;
+  const stateLabelUuid = labelNameToId(stateLabelName);
+  if (!stateLabelUuid) {
+    log.error(`rescueMalformed: could not resolve UUID for label ${stateLabelName} on ticket ${ticket.identifier}`);
+    return {
+      ticketId: ticket.id,
+      identifier: ticket.identifier,
+      classification: "malformed",
+      action: `bootstrap: could not resolve UUID for label ${stateLabelName}`,
+      outcome: "failed",
+    };
+  }
+
   const existingIds = ticket.labelNodes.map((n) => n.id);
-  const stateLabelId = `state:${entryState}`;
-  const labelOk = await applyLabelIds(ticket.id, [...existingIds, stateLabelId], authToken);
+  const labelOk = await applyLabelIds(ticket.id, [...existingIds, stateLabelUuid], authToken);
 
   let outcome: "rescued" | "failed" | "ambiguous";
   let actionDesc: string;
@@ -466,7 +531,7 @@ async function rescueDrifted(
       action: `re-delegated to ${candidates[0]} (fills ${ownerRole}); was ${ticket.delegateId}`,
       outcome: ok ? "rescued" : "failed",
     };
-  } else {
+  } else if (candidates.length > 1) {
     // Multiple candidates → ambiguous, do not auto-assign
     return {
       ticketId: ticket.id,
@@ -474,6 +539,15 @@ async function rescueDrifted(
       classification: "drifted",
       action: `ambiguous: ${candidates.length} bodies fill ${ownerRole ?? "(unknown role)"}; manual review required`,
       outcome: "ambiguous",
+    };
+  } else {
+    // No candidates → cannot resolve delegate
+    return {
+      ticketId: ticket.id,
+      identifier: ticket.identifier,
+      classification: "drifted",
+      action: `no delegate candidates found for role ${ownerRole ?? "(unknown)"}`,
+      outcome: "failed",
     };
   }
 }
