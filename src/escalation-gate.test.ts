@@ -63,10 +63,12 @@ beforeEach(() => {
 // ── ENFORCEMENT_RULES shape ───────────────────────────────────────────────
 
 describe("ENFORCEMENT_RULES", () => {
-  it("includes the needs-human rule", () => {
+  // AI-1488: needs-human moved to the B1 cross-cutting allowlist in workflow-gate.ts.
+  // ENFORCEMENT_RULES is now empty (retained as an extension point for future rules).
+  it("is empty after AI-1488 (needs-human moved to B1 allowlist)", () => {
+    expect(ENFORCEMENT_RULES).toHaveLength(0);
     const rule = ENFORCEMENT_RULES.find((r) => r.intent === "needs-human");
-    expect(rule).toBeDefined();
-    expect(rule?.requiredCapability).toBe("human:escalate");
+    expect(rule).toBeUndefined();
   });
 });
 
@@ -147,13 +149,14 @@ describe("checkEnforcementRules", () => {
     expect(result).toBeNull();
   });
 
-  it("returns rejection message when non-steward runs needs-human on workflow ticket", async () => {
+  // AI-1488: needs-human is allowlisted at the B1 layer — checkEnforcementRules no
+  // longer intercepts it regardless of the caller's capability. Both steward and
+  // non-steward callers now get null here; the proxy's body sanitization handles the
+  // delegate-preservation concern instead.
+  it("returns null for needs-human on wf: ticket (AI-1488: moved to B1 allowlist)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:sprint-1", "bug"]);
     const result = await checkEnforcementRules("needs-human", "issue-uuid", "Bearer tok", "charles");
-    expect(result).not.toBeNull();
-    expect(result).toContain("needs-human");
-    expect(result).toContain("human:escalate");
-    expect(result).toContain("steward");
+    expect(result).toBeNull();
   });
 
   it("returns null when steward (Astrid) runs needs-human on workflow ticket", async () => {
@@ -168,10 +171,11 @@ describe("checkEnforcementRules", () => {
     expect(result).toBeNull();
   });
 
-  it("is case-insensitive for wf: label matching", async () => {
-    // Labels should match regardless of case
+  // AI-1488: needs-human is now B1-allowlisted so this test verifies case-insensitive
+  // wf: detection via a different intent (future enforcement rules can test it again).
+  it("returns null for needs-human even with case-variant wf: label (AI-1488: B1 allowlisted)", async () => {
     globalThis.fetch = makeLabelFetch(["WF:sprint-1"]);
     const result = await checkEnforcementRules("needs-human", "issue-uuid", "Bearer tok", "charles");
-    expect(result).not.toBeNull();
+    expect(result).toBeNull();
   });
 });

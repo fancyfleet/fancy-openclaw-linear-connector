@@ -595,7 +595,9 @@ states:
     expect(result).toMatch(/no.*state.*workflow label/i);
   });
 
-  it("blocks needs-human when the state label is absent (no free escalation path)", async () => {
+  // AI-1488: needs-human is allowlisted for all wf: states — even when state label is absent.
+  // Previously this returned a block message; after AI-1488 it always returns null (pass).
+  it("passes needs-human when the state label is absent (AI-1488: allowlisted before state check)", async () => {
     const policyFile = writeTmpYaml(dir, "policy.yaml", POLICY_SINGLE_DEV);
     const wfFile = writeTmpYaml(dir, "wf.yaml", WORKFLOW_DEV_IMPL);
     process.env.CAPABILITY_POLICY_PATH = policyFile;
@@ -621,7 +623,7 @@ states:
       "user-charles",
     );
 
-    expect(result).toMatch(/needs-human.*blocked/i);
+    expect(result).toBeNull();
   });
 
   // ── AC2-WG-7: break-glass always legal (line ~898) ────────────────────
@@ -899,8 +901,21 @@ describe("workflow-gate: checkRawMutationInterception — uncovered branches", (
     expect(result).toMatch(/ticket id could not be resolved/i);
   });
 
-  // AC2-WG-16: raw mutation not touching workflow fields → pass-through (line 1179)
-  it("passes through issueUpdate that only changes title/description (no workflow fields)", async () => {
+  // AC2-WG-16: title mutation on an ad-hoc (non-wf:) ticket → pass-through.
+  // On wf: tickets title is blocked (AI-1488), but ad-hoc tickets are unaffected.
+  it("passes through title mutation on an ad-hoc (non-wf:) ticket", async () => {
+    // Return no wf:* label — this is an ad-hoc ticket.
+    globalThis.fetch = makeFetch({
+      "X": {
+        data: {
+          issue: {
+            labels: { nodes: [{ name: "priority:high" }] }, // no wf:* label
+            delegate: null,
+          },
+        },
+      },
+    });
+
     const result = await checkRawMutationInterception(
       { query: "mutation { issueUpdate(id: \"X\", input: { title: \"new\" }) { success } }", variables: { id: "X" } },
       "X",

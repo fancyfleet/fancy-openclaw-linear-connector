@@ -915,6 +915,27 @@ export async function checkWorkflowRules(
   // §4.4: break-glass escape is legal from every state — never block it.
   if (intent === breakGlassCommand) return null;
 
+  // AI-1488: cross-cutting commands allowed from any state — state-preserving, never
+  // advance the workflow state machine.
+  //
+  // needs-human: escalates to a human while retaining the delegate
+  // (blocked-but-keep-owner). The proxy strips delegateId from the forwarded
+  // mutation via applyWorkflowBodySanitization so the owner is preserved server-side.
+  //
+  // ping / activity-ping: last-active observability signal. Never changes state,
+  // delegate, assignee, or any workflow field.
+  //
+  // begin-work: signals work start without advancing state (ad-hoc carryover).
+  //
+  // block: records a dependency via `block --blocked-by <id>`, retaining the delegate.
+  if (
+    intent === "needs-human" ||
+    intent === "ping" ||
+    intent === "activity-ping" ||
+    intent === "begin-work" ||
+    intent === "block"
+  ) return null;
+
   // AI-1460/AI-1574: refuse-work is caller-gated. Only the current delegate or
   // the workflow steward (break_glass.owner_role) may refuse on a governed
   // ticket. A non-delegate, non-steward caller is blocked to prevent third-party
@@ -958,16 +979,6 @@ export async function checkWorkflowRules(
 
   const currentState = getCurrentState(labels);
   if (!currentState) {
-    // AI-1402: For needs-human, fail-closed even without a state label.
-    // We cannot determine if there is a forward path, so treat the ticket as actionable.
-    // Agents must use 'escape' (break-glass) to exit the workflow.
-    if (intent === "needs-human") {
-      const legalMoves = `${breakGlassCommand} (break-glass)`;
-      return (
-        `[Proxy] 'needs-human' is blocked on this workflow ticket (state unknown — treated as actionable). ` +
-        `Use '${breakGlassCommand}' to exit the workflow. Legal moves: ${legalMoves}.`
-      );
-    }
     // A governed wf:dev-impl ticket enters at entry_state with a state:* label applied
     // atomically; a missing label means the projection was corrupted (e.g. a label-stripping
     // CLI verb ran). Previously this failed OPEN — allowing ANY intent, including a deploy
@@ -995,6 +1006,15 @@ export async function checkWorkflowRules(
 
   if (!match) {
     const legalMoves = [...transitions.map((t) => t.command), breakGlassCommand].join(", ");
+    // AI-1488: `undelegate` is a common mistake — surface the safe alternatives.
+    if (intent === "undelegate") {
+      return (
+        `[Proxy] 'undelegate' is not a legal workflow command. ` +
+        `To annotate a blocker while retaining the delegate, use 'block --blocked-by <id>'. ` +
+        `To escalate to a human, use 'needs-human <assignee>'. ` +
+        `Legal moves: ${legalMoves}.`
+      );
+    }
     return (
       `[Proxy] '${intent}' is not a legal command in state '${currentState}'. ` +
       `Legal moves: ${legalMoves}.`
@@ -1140,7 +1160,31 @@ export async function checkWorkflowRules(
 // ── Layer 2: Raw status/assignee mutation interception (AI-1387) ──────────
 
 /**
- * Detect raw mutations on workflow tickets (AI-1387, expanded in AI-1402).
+ * Look up the Linear issue that a given comment belongs to.
+ * Used by the AI-1488 commentDelete interceptor to determine whether a comment
+ * deletion targets a governed workflow ticket.
+ * Returns the issue UUID, or null on any error (caller fails open).
+ */
+async function fetchCommentIssueId(commentId: string, authToken: string): Promise<string | null> {
+  const query = `query CommentIssue($id: String!) { comment(id: $id) { issue { id } } }`;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: commentId } }),
+    });
+    type Resp = { data?: { comment?: { issue?: { id: string } | null } | null } };
+    const data = (await res.json()) as Resp;
+    return data.data?.comment?.issue?.id ?? null;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: fetchCommentIssueId failed for comment ${commentId}: ${msg} — failing open`);
+    return null;
+  }
+}
+
+/**
+ * Detect raw mutations on workflow tickets (AI-1387, expanded in AI-1402, AI-1488).
  *
  * When an agent sends an `issueUpdate` with `stateId`, `assigneeId`, or `labelIds`
  * in the input but WITHOUT the `x-openclaw-linear-intent` header, they're bypassing
@@ -1151,6 +1195,15 @@ export async function checkWorkflowRules(
  * AI-1402 expansion: also blocks `labelIds` mutations (label manipulation is as
  * capable as state changes for bypassing workflow state) and adds fail-closed
  * enforcement for unknown callers on workflow tickets.
+ *
+ * AI-1488 (default-deny): extended to also intercept:
+ *   - `issueDelete` and `commentDelete` mutations on governed tickets (destroy protection).
+ *   - `issueUpdate` touching `title`, `description`, `priority`, `parentId`, `teamId`
+ *     (spec/AC rewrite and move-out-of-jurisdiction protection).
+ *   - Raw delegate changes by the CURRENT DELEGATE on wf: tickets are now blocked.
+ *     Previously the current delegate could re-route without a workflow command.
+ *     Now the delegate only changes as a side-effect of legal workflow transitions.
+ *     Rejection names `block --blocked-by` and `needs-human` as legal alternatives.
  *
  * Returns null to allow the request through (non-workflow ticket, non-mutation,
  * or no workflow-affecting fields in input). Returns a rejection string otherwise.
@@ -1165,18 +1218,50 @@ export async function checkRawMutationInterception(
 ): Promise<string | null> {
   if (!body) return null;
 
-  // Only intercept issueUpdate mutations.
   const q = body.query ?? "";
+
+  // AI-1488: intercept issueDelete and commentDelete (destroy protection).
+  // These are separate from issueUpdate and handled before the field-detection path.
+  const isIssueDelete = q.includes("issueDelete");
+  const isCommentDelete = q.includes("commentDelete");
+  if (isIssueDelete || isCommentDelete) {
+    let resolvedIssueId: string | null;
+    if (isIssueDelete) {
+      // variables.id is the issue UUID (same as the issueId extracted by the proxy).
+      resolvedIssueId = issueId;
+    } else {
+      // commentDelete: variables.id is a comment UUID, not an issue UUID.
+      // Look up the comment to find its issue.
+      const commentId = typeof (body.variables as Record<string, unknown> | undefined)?.id === "string"
+        ? String((body.variables as Record<string, unknown>).id)
+        : null;
+      if (!commentId) return null; // can't resolve comment → fail-open
+      resolvedIssueId = await fetchCommentIssueId(commentId, authToken);
+    }
+    if (!resolvedIssueId) return null; // unresolvable → fail-open
+    const { labels: delLabels, fetchFailed: delFetchFailed } = await fetchTicketContext(resolvedIssueId, authToken);
+    if (delFetchFailed) return null; // context fetch error → fail-open
+    const delWfId = getWorkflowId(delLabels);
+    if (!delWfId) return null; // ad-hoc ticket — pass-through
+    const opLabel = isIssueDelete ? "Deleting a governed ticket" : "Deleting a comment on a governed ticket";
+    log.warn(`workflow-gate: raw ${isIssueDelete ? "issueDelete" : "commentDelete"} blocked on wf:${delWfId} ticket ${resolvedIssueId} agent=${bodyId}`);
+    return (
+      `[Proxy] ${opLabel} (wf:${delWfId}) is blocked. ` +
+      `Governed tickets are protected from destructive mutations. ` +
+      `Use the workflow break-glass command to exit the workflow before taking destructive action.`
+    );
+  }
+
+  // Only intercept issueUpdate mutations (below).
   if (!q.includes("issueUpdate")) return null;
 
-  // Check if the mutation touches any workflow-affecting field.
-  // Blocked: stateId (status), assigneeId (assignee), labelIds (label manipulation).
-  // Allowed: title, description, priority, dueDate, and other non-workflow fields.
+  // Check if the mutation touches any intercepted field.
   //
-  // AI-1402 follow-up: a field can reach issueUpdate three ways and the old
-  // detector only saw the first, so inlining the input literally in the query
-  // string (or routing the value through a differently-named scalar variable)
-  // bypassed the gate entirely:
+  // Legacy fields (status, assignee, labels, delegate): always intercepted on wf: tickets.
+  // AI-1488 edit fields (title, description, priority, parent, team): also intercepted on
+  // wf: tickets — these are spec/AC rewrite and move-out-of-jurisdiction vectors.
+  //
+  // A field can reach issueUpdate three ways (AI-1402 follow-up):
   //   (a) variables.input.<field>        — CLI shape; field key lives in variables
   //   (b) input:{<field>:$var} inline    — field key in query text, value in vars
   //   (c) input:{<field>:"literal"}      — field key and value both in query text
@@ -1203,8 +1288,15 @@ export async function checkRawMutationInterception(
   // delegate write was invisible to this detector and bypassed the delegate-only
   // guard entirely — a non-delegate could yank the delegate off the rightful owner.
   const hasDelegateChange = touches("delegateId");
+  // AI-1488: also block spec/AC rewrite and move-out-of-jurisdiction vectors.
+  const hasTitleChange = touches("title");
+  const hasDescriptionChange = touches("description");
+  const hasPriorityChange = touches("priority");
+  const hasParentChange = touches("parentId");
+  const hasTeamChange = touches("teamId");
+  const hasAnyEditField = hasTitleChange || hasDescriptionChange || hasPriorityChange || hasParentChange || hasTeamChange;
 
-  if (!hasStateChange && !hasAssigneeChange && !hasLabelChange && !hasDelegateChange) return null;
+  if (!hasStateChange && !hasAssigneeChange && !hasLabelChange && !hasDelegateChange && !hasAnyEditField) return null;
 
   // AI-1347: this is a raw workflow-affecting mutation but the caller did not
   // expose the ticket id in a place the proxy could resolve (no id variable, no
@@ -1224,7 +1316,9 @@ export async function checkRawMutationInterception(
   // This is a raw workflow-affecting mutation — check if the ticket is on a workflow.
   const { labels, delegateId } = await fetchTicketContext(issueId, authToken);
   const workflowId = getWorkflowId(labels);
-  if (!workflowId) return null; // ad-hoc ticket — pass-through
+  // Ad-hoc ticket: full pass-through (§4.5 mode switch). AI-1488 edit-field blocking
+  // only applies to wf: tickets — title/description/priority/etc. are allowed on ad-hoc.
+  if (!workflowId) return null;
 
   // AI-1402: Fail-closed on unknown caller on governed workflow tickets.
   // If the caller body is not registered in the capability policy, block the mutation.
@@ -1247,21 +1341,34 @@ export async function checkRawMutationInterception(
   if (!def) return null; // unknown workflow — pass-through (AI-1530)
 
   // AI-1535: a *delegate-only* raw change (delegateId changed, no state/assignee/
-  // label) gets delegate-only semantics rather than the blanket block below. The
-  // delegate-routing meta-commands (handoff-work, undelegate) write delegateId
-  // with no intent header, and they are LEGITIMATE for the current delegate —
-  // blanket-blocking them would break re-routing. But a non-delegate (e.g. a prior
-  // owner's lingering session, as in the AI-1531 dogfood) must not be able to yank
-  // the delegate. Mirror the intent-path delegate-only rule (lines ~912-925):
-  //   - caller IS the current delegate            → allow (legitimate re-route)
+  // label/edit-field) gets delegate-only semantics rather than the blanket block below.
+  //
+  // AI-1488 (default-deny): on governed wf: tickets, the current-delegate re-route
+  // carve-out is removed. The delegate changes ONLY as a side-effect of a legal
+  // workflow verb. Raw delegate mutations (handoff-work, undelegate) are blocked even
+  // when the caller is the current delegate. The rejection names `block --blocked-by`
+  // and `needs-human` as legal alternatives that annotate a blocked condition while
+  // retaining the delegate. The entry-state first-delegate and recovery-actor carve-outs
+  // (empty-delegate path below) are unchanged — they are legitimate orchestration writes.
+  //
+  // Updated semantics on wf: tickets:
+  //   - caller IS the current delegate            → block (AI-1488: delegate locked surface)
   //   - caller is a known non-delegate            → block
   //   - caller unverifiable + ticket has delegate → block (AI-1400 B2 parity)
-  //   - no current delegate / no caller+delegate  → fail-open (establishing first delegate)
+  //   - no current delegate                       → first-delegate path (entry/recovery carve-outs)
   const delegateOnlyChange =
-    hasDelegateChange && !hasStateChange && !hasAssigneeChange && !hasLabelChange;
+    hasDelegateChange && !hasStateChange && !hasAssigneeChange && !hasLabelChange && !hasAnyEditField;
   if (delegateOnlyChange) {
     if (callerLinearUserId && delegateId && callerLinearUserId === delegateId) {
-      return null; // current delegate may re-route
+      // AI-1488: block even the current delegate from raw re-routing on wf: tickets.
+      // The delegate is locked — it only changes via legal workflow transitions.
+      log.warn(`workflow-gate: raw delegate-reroute blocked on wf:${workflowId} agent=${bodyId} ticket=${issueId} (AI-1488: delegate-locked surface)`);
+      return (
+        `[Proxy] Direct delegate change blocked on workflow ticket ${issueId} (wf:${workflowId}). ` +
+        `On governed tickets the delegate changes only as a side-effect of legal workflow transitions. ` +
+        `To annotate a dependency block (retains delegate): \`linear block ${issueId} --blocked-by <dependency-id>\`. ` +
+        `To escalate to a human (retains delegate): \`linear needs-human ${issueId} <assignee>\`.`
+      );
     }
     if (!callerLinearUserId && delegateId) {
       log.warn(`workflow-gate: raw delegate unknown-caller block agent=${bodyId} ticket=${issueId}`);
@@ -1384,12 +1491,69 @@ export async function checkRawMutationInterception(
   if (hasAssigneeChange) changedFields.push("assignee");
   if (hasLabelChange) changedFields.push("labels");
   if (hasDelegateChange) changedFields.push("delegate");
+  // AI-1488: also report edit fields in the rejection
+  if (hasTitleChange) changedFields.push("title");
+  if (hasDescriptionChange) changedFields.push("description");
+  if (hasPriorityChange) changedFields.push("priority");
+  if (hasParentChange) changedFields.push("parent");
+  if (hasTeamChange) changedFields.push("team");
 
-  return (
+  let blockMsg =
     `[Proxy] Direct ${changedFields.join("/")} changes are blocked on this workflow ticket ` +
     `(state: **${currentState}**). Use workflow commands instead:\n\n` +
-    helpLines.join("\n")
-  );
+    helpLines.join("\n");
+
+  // AI-1488: when a delegate-clear attempt is blocked, name the safe alternatives.
+  if (hasDelegateChange) {
+    blockMsg +=
+      `\n\nTo signal a blocked state while retaining the delegate (owner):\n` +
+      `  - \`linear block ${issueId} --blocked-by <dependency-id>\` (records dependency, retains delegate)\n` +
+      `  - \`linear needs-human ${issueId} <assignee>\` (escalates to human, retains delegate)`;
+  }
+
+  return blockMsg;
+}
+
+// ── AI-1488: Request-body sanitization for certain intents on wf: tickets ────
+
+/**
+ * Sanitize the forwarded GraphQL request body for specific intents on governed tickets.
+ *
+ * Currently: for `needs-human` on wf: tickets, strip `delegateId` from the mutation
+ * so that the delegate is preserved server-side (blocked-but-keep-owner semantics).
+ * `needs-human` signals "I need a human to act, but I am still the resumption owner."
+ * Stripping `delegateId: null` prevents Linear from clearing the delegate even though
+ * the CLI's `needsHuman` implementation sends `clearDelegate: true`.
+ *
+ * Called by proxy.ts after enforcement passes but before the upstream forward.
+ * Returns the original body unchanged for all other cases.
+ * Fail-open on any error.
+ */
+export async function applyWorkflowBodySanitization(
+  intent: string,
+  issueId: string | null,
+  authToken: string,
+  body: { query?: string; variables?: Record<string, unknown>; operationName?: string } | null,
+): Promise<{ query?: string; variables?: Record<string, unknown>; operationName?: string } | null> {
+  if (!body || !issueId) return body;
+  if (intent !== "needs-human") return body;
+
+  try {
+    const { labels } = await fetchTicketContext(issueId, authToken);
+    if (!getWorkflowId(labels)) return body; // ad-hoc ticket — no sanitization needed
+  } catch {
+    return body; // fetch error → fail-open (don't block the request)
+  }
+
+  // Strip delegateId from the mutation so Linear does not clear the delegate.
+  if (!body.variables) return body;
+  const vars = JSON.parse(JSON.stringify(body.variables)) as Record<string, unknown>;
+  if (vars.input && typeof vars.input === "object" && vars.input !== null) {
+    delete (vars.input as Record<string, unknown>).delegateId;
+  }
+  delete vars.delegateId;
+  log.info(`workflow-gate: sanitized needs-human body for wf: ticket ${issueId} — stripped delegateId to preserve owner`);
+  return { ...body, variables: vars };
 }
 
 // ── Layer 1: Proactive legal-verb re-injection at completion (AI-1387) ────

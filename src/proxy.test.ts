@@ -449,7 +449,10 @@ describe("proxy enforcement — needs-human (Phase 2 slice 1)", () => {
     };
   }
 
-  it("blocks needs-human from non-steward on a workflow ticket", async () => {
+  // AI-1488: needs-human is allowlisted for all wf: states — no steward restriction.
+  // Any registered agent may use needs-human to annotate a blocked condition while
+  // retaining the delegate (blocked-but-keep-owner).
+  it("allows needs-human from any known agent on a workflow ticket (AI-1488: allowlisted)", async () => {
     globalThis.fetch = makeFetch(WORKFLOW_LABEL_RESPONSE);
 
     const res = await request(appState.app)
@@ -460,9 +463,8 @@ describe("proxy enforcement — needs-human (Phase 2 slice 1)", () => {
       .send({ query: "mutation NeedsHuman($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
 
     expect(res.status).toBe(200);
-    expect(res.body.errors).toBeDefined();
-    expect(res.body.errors[0].message).toContain("[Proxy]");
-    expect(res.body.errors[0].message).toContain("steward");
+    expect(res.body.errors).toBeUndefined();
+    expect(res.body.data).toBeDefined();
   });
 
   it("allows needs-human from steward (Astrid) on a workflow ticket", async () => {
@@ -1214,7 +1216,9 @@ describe("proxy — Layer 2 raw mutation interception (AI-1387)", () => {
     expect(res.body.data).toBeDefined();
   });
 
-  it("allows raw mutations without stateId/assigneeId on workflow tickets", async () => {
+  // AI-1488: title (and other edit fields) are now blocked on wf: tickets.
+  // Previously this test asserted pass-through; after AI-1488 it must block.
+  it("blocks title mutation on workflow tickets (AI-1488: edit-field locked surface)", async () => {
     globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
 
     const res = await request(appState.app)
@@ -1227,8 +1231,9 @@ describe("proxy — Layer 2 raw mutation interception (AI-1387)", () => {
       });
 
     expect(res.status).toBe(200);
-    expect(res.body.errors).toBeUndefined();
-    expect(res.body.data).toBeDefined();
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("[Proxy]");
+    expect(res.body.errors[0].message).toMatch(/Direct title.*blocked.*workflow ticket/i);
   });
 
   it("allows intent-headed requests through (those use B1 validation, not Layer 2)", async () => {

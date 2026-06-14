@@ -31,7 +31,7 @@
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules } from "./escalation-gate.js";
-import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, getCurrentState, type TransitionFeedback } from "./workflow-gate.js";
+import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, getCurrentState, applyWorkflowBodySanitization, type TransitionFeedback } from "./workflow-gate.js";
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
 import { getAgent, getAgentByProxyToken } from "./agents.js";
 
@@ -293,12 +293,17 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         }
       }
 
+      // AI-1488: sanitize the forwarded body for certain intents on wf: tickets.
+      // Currently: strip delegateId from needs-human to preserve the delegate owner
+      // (blocked-but-keep-owner — the steward retains resumption ownership).
+      const forwardBody = await applyWorkflowBodySanitization(intent, issueId, authorization, body);
+
       let upstreamRes: globalThis.Response;
       try {
         upstreamRes = await fetch(LINEAR_API_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: authorization },
-          body: JSON.stringify(body),
+          body: JSON.stringify(forwardBody),
         });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

@@ -1372,7 +1372,20 @@ describe("checkRawMutationInterception — Layer 2 (AI-1387)", () => {
     expect(result).toBeNull();
   });
 
-  it("passes through when mutation does not touch stateId or assigneeId", async () => {
+  it("passes through when mutation does not touch any intercepted field (dueDate only)", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { dueDate: "2026-12-31" } },
+    };
+
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
+    expect(result).toBeNull();
+  });
+
+  // AI-1488: title mutations are now blocked on wf: tickets (spec/AC rewrite protection).
+  it("blocks title mutation on workflow ticket (AI-1488: edit-field protection)", async () => {
     globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
 
     const body = {
@@ -1381,7 +1394,9 @@ describe("checkRawMutationInterception — Layer 2 (AI-1387)", () => {
     };
 
     const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
-    expect(result).toBeNull();
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("title");
   });
 
   it("passes through when body is not an issueUpdate mutation", async () => {
@@ -1769,43 +1784,40 @@ describe("applyStateTransition — AI-1475 D1: done gate defense-in-depth", () =
   });
 });
 
-// ── AI-1402: Default-deny + needs-human blocking + unknown-caller ─────────
+// ── AI-1488: needs-human is allowlist — passes in every wf: state ─────────
+//
+// AI-1402 previously blocked needs-human when a forward path existed (agents should
+// submit/approve/deploy rather than escalate). AI-1488 reverses this: needs-human is
+// explicitly on the allowlist for all wf: states as the "blocked-but-keep-owner" verb.
+// It annotates a blocked condition while retaining the delegate, which is always safe.
 
-describe("checkWorkflowRules — AI-1402: needs-human blocked when forward path exists", () => {
+describe("checkWorkflowRules — AI-1488: needs-human is allowlisted for all wf: states", () => {
   let originalFetch: typeof globalThis.fetch;
   beforeEach(() => { originalFetch = globalThis.fetch; });
   afterEach(() => { globalThis.fetch = originalFetch; });
 
-  it("blocks needs-human in implementation (forward path: submit)", async () => {
+  it("passes needs-human in implementation (AI-1488: always-legal blocked-but-keep-owner)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
     const result = await checkWorkflowRules("needs-human", "issue-uuid", "Bearer tok", "charles");
-    expect(result).not.toBeNull();
-    expect(result).toContain("[Proxy]");
-    expect(result).toContain("needs-human");
+    expect(result).toBeNull();
   });
 
-  it("blocks needs-human in code-review (forward path: approve, request-changes)", async () => {
+  it("passes needs-human in code-review (AI-1488: always-legal)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
     const result = await checkWorkflowRules("needs-human", "issue-uuid", "Bearer tok", "charles");
-    expect(result).not.toBeNull();
-    expect(result).toContain("needs-human");
+    expect(result).toBeNull();
   });
 
-  it("blocks needs-human in deployment (forward path: deploy, reject)", async () => {
+  it("passes needs-human in deployment (AI-1488: always-legal)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
     const result = await checkWorkflowRules("needs-human", "issue-uuid", "Bearer tok", "astrid");
-    expect(result).not.toBeNull();
-    expect(result).toContain("needs-human");
+    expect(result).toBeNull();
   });
 
-  it("blocks needs-human when no state label — fail-closed for this intent", async () => {
+  it("passes needs-human even when state label is missing (early-pass before state check)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl"]); // no state:* label
     const result = await checkWorkflowRules("needs-human", "issue-uuid", "Bearer tok", "astrid");
-    expect(result).not.toBeNull();
-    expect(result).toContain("[Proxy]");
-    expect(result).toContain("needs-human");
-    // Should suggest escape as the legal alternative
-    expect(result).toContain("escape");
+    expect(result).toBeNull();
   });
 
   it("break-glass (escape) is still legal from every state (§4.4)", async () => {
@@ -1932,7 +1944,8 @@ describe("checkRawMutationInterception — AI-1402: labelIds blocking + unknown-
     expect(result).toBeNull();
   });
 
-  it("passes through title-only mutation on workflow ticket (title is not workflow-affecting)", async () => {
+  // AI-1488: title mutation is now blocked on wf: tickets (spec/AC rewrite protection).
+  it("blocks title mutation on workflow ticket (AI-1488: edit-field locked surface)", async () => {
     globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
 
     const body = {
@@ -1941,7 +1954,9 @@ describe("checkRawMutationInterception — AI-1402: labelIds blocking + unknown-
     };
 
     const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
-    expect(result).toBeNull();
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("title");
   });
 
   it("blocks unknown caller raw mutation on workflow ticket", async () => {
@@ -2085,12 +2100,19 @@ describe("checkRawMutationInterception — AI-1535: delegate-only raw mutations"
     });
   }
 
-  it("ALLOWS a raw delegate write by the CURRENT delegate (legitimate handoff-work)", async () => {
+  // AI-1488: current delegate can no longer raw-reroute on wf: tickets.
+  // The delegate is locked — it only changes as a side-effect of legal workflow transitions.
+  it("BLOCKS a raw delegate write by the CURRENT delegate on wf: ticket (AI-1488: delegate-locked surface)", async () => {
     globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_WITH_DELEGATE);
     const result = await checkRawMutationInterception(
       delegateBodies["variables.input shape"], "issue-uuid", "Bearer tok", "charles", DELEGATE_USER_ID,
     );
-    expect(result).toBeNull();
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("Direct delegate change blocked");
+    // Must name the legal alternatives that retain the delegate
+    expect(result).toContain("block");
+    expect(result).toContain("needs-human");
   });
 
   it("blocks a raw delegate write by an unverifiable caller when a delegate exists (AI-1400 B2 parity)", async () => {
@@ -2196,6 +2218,318 @@ describe("checkRawMutationInterception — AI-1535: delegate-only raw mutations"
     expect(result).toContain("blocked on this workflow ticket");
     expect(result).toContain("status");
     expect(result).toContain("delegate");
+  });
+});
+
+
+// ── AI-1488: Default-deny allowlist acceptance tests ─────────────────────────
+// Verifies the complete acceptance criteria from the AI-1488 spec:
+// On any wf:-tagged ticket the proxy rejects every command/mutation not on the
+// allowlist { state-legal verbs ∪ read-only ∪ state-preserving activity ping ∪ break-glass }.
+// Also covers: delete/destroy protection, edit-field locking, delegate locking,
+// needs-human/block retaining delegate, ad-hoc ticket pass-through.
+
+describe("checkRawMutationInterception — AI-1488: default-deny command surface", () => {
+  let ai1488Dir: string;
+  let ai1488OriginalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    ai1488Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1488-test-"));
+    const policyFile = path.join(ai1488Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(ai1488Dir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    resetPolicyCache();
+    resetWorkflowCache();
+    ai1488OriginalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = ai1488OriginalFetch;
+  });
+
+  const WORKFLOW_INTAKE_LABELS = {
+    data: { issue: {
+      labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:intake" }] },
+      delegate: null,
+    } },
+  };
+
+  const WORKFLOW_IMPL_LABELS = {
+    data: { issue: {
+      labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] },
+      delegate: null,
+    } },
+  };
+
+  const AD_HOC_LABELS = {
+    data: { issue: { labels: { nodes: [{ name: "bug" }] }, delegate: null } },
+  };
+
+  function mockFetch(labelResponse: object, commentIssueId?: string) {
+    return async (url: unknown, init?: RequestInit) => {
+      if (typeof url === "string" && url.includes("api.linear.app")) {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("CommentIssue") && commentIssueId) {
+          return new Response(
+            JSON.stringify({ data: { comment: { issue: { id: commentIssueId } } } }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        if (bodyText.includes("IssueContext") || bodyText.includes("IssueLabels")) {
+          return new Response(JSON.stringify(labelResponse), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+      return ai1488OriginalFetch(url as string, init);
+    };
+  }
+
+  // AC: issueDelete is blocked on a governed ticket
+  it("blocks issueDelete on a wf: ticket (destroy protection)", async () => {
+    globalThis.fetch = mockFetch(WORKFLOW_IMPL_LABELS);
+    const body = {
+      query: "mutation M($id: String!) { issueDelete(id: $id) { success } }",
+      variables: { id: "issue-uuid" },
+    };
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("wf:dev-impl");
+  });
+
+  // AC: issueDelete passes on an ad-hoc ticket (§4.5 mode switch)
+  it("passes issueDelete on ad-hoc ticket (§4.5 mode switch)", async () => {
+    globalThis.fetch = mockFetch(AD_HOC_LABELS);
+    const body = {
+      query: "mutation M($id: String!) { issueDelete(id: $id) { success } }",
+      variables: { id: "issue-uuid" },
+    };
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).toBeNull();
+  });
+
+  // AC: commentDelete is blocked on a governed ticket (audit trail protection)
+  it("blocks commentDelete on a wf: ticket (audit trail protection)", async () => {
+    globalThis.fetch = mockFetch(WORKFLOW_IMPL_LABELS, "issue-uuid");
+    const body = {
+      query: "mutation M($id: String!) { commentDelete(id: $id) { success } }",
+      variables: { id: "comment-uuid" },
+    };
+    const result = await checkRawMutationInterception(body, null, "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("wf:dev-impl");
+  });
+
+  // AC: issue-move-team (teamId change) is blocked on a governed ticket
+  it("blocks teamId (issue-move-team) on a wf: ticket", async () => {
+    globalThis.fetch = mockFetch(WORKFLOW_IMPL_LABELS);
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { teamId: "new-team-uuid" } },
+    };
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("team");
+  });
+
+  // AC: parentId change is blocked on a governed ticket
+  it("blocks parentId change on a wf: ticket", async () => {
+    globalThis.fetch = mockFetch(WORKFLOW_IMPL_LABELS);
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { parentId: "parent-uuid" } },
+    };
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("parent");
+  });
+
+  // AC: edit-field rejections name the legal alternatives (wf commands, not raw fields)
+  it("rejection for title mutation includes wf command guidance", async () => {
+    globalThis.fetch = mockFetch(WORKFLOW_IMPL_LABELS);
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { title: "Rewritten title" } },
+    };
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("workflow commands");
+  });
+
+  // AC: undelegate / delegate-clear rejected, names legal alternatives
+  it("blocks undelegate (delegateId null) and names block/needs-human as alternatives", async () => {
+    const labelResponseWithDelegate = {
+      data: { issue: {
+        labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] },
+        delegate: { id: "delegate-user-uuid" },
+      } },
+    };
+    globalThis.fetch = mockFetch(labelResponseWithDelegate);
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { delegateId: null } },
+    };
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles", "delegate-user-uuid");
+    expect(result).not.toBeNull();
+    expect(result).toContain("Direct delegate change blocked");
+    expect(result).toContain("block");
+    expect(result).toContain("needs-human");
+  });
+
+  // AC: non-intercepted fields (dueDate) still pass through on wf: tickets
+  it("passes dueDate-only mutation on wf: ticket (not on blocked surface)", async () => {
+    globalThis.fetch = mockFetch(WORKFLOW_IMPL_LABELS);
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { dueDate: "2026-12-31" } },
+    };
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).toBeNull();
+  });
+
+  // AC: all edit fields blocked together on wf: ticket
+  it("blocks all AI-1488 edit fields together on wf: ticket", async () => {
+    globalThis.fetch = mockFetch(WORKFLOW_INTAKE_LABELS);
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { title: "T", description: "D", priority: 2, parentId: "p", teamId: "t" } },
+    };
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    // All five fields named in rejection
+    expect(result).toContain("title");
+    expect(result).toContain("description");
+    expect(result).toContain("priority");
+    expect(result).toContain("parent");
+    expect(result).toContain("team");
+  });
+
+  // AC: ad-hoc tickets: title/description/delegate all pass through (§4.5 mode switch)
+  it("passes title/description/priority on ad-hoc ticket (§4.5 full pass-through)", async () => {
+    globalThis.fetch = mockFetch(AD_HOC_LABELS);
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { title: "New title", description: "New desc", priority: 1 } },
+    };
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).toBeNull();
+  });
+});
+
+// ── AI-1488: intent-path default-deny allowlist acceptance tests ─────────────
+// Tests the checkWorkflowRules intent path: generic commands rejected with legal verbs named.
+
+describe("checkWorkflowRules — AI-1488: intent-path default-deny (generic commands blocked)", () => {
+  let ai1488IntentDir: string;
+  let ai1488IntentOriginalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    ai1488IntentDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1488-intent-"));
+    const policyFile = path.join(ai1488IntentDir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(ai1488IntentDir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    resetPolicyCache();
+    resetWorkflowCache();
+    ai1488IntentOriginalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = ai1488IntentOriginalFetch;
+  });
+
+  // AC: generic ad-hoc commands rejected at intake, error names legal verbs
+  it("blocks consider-work at intake and names accept as the legal verb", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
+    const result = await checkWorkflowRules("consider-work", "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("consider-work");
+    expect(result).toContain("accept"); // legal verb at intake
+  });
+
+  it("blocks handoff-work at intake and names accept as the legal verb", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
+    const result = await checkWorkflowRules("handoff-work", "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("handoff-work");
+    expect(result).toContain("accept");
+  });
+
+  it("blocks complete at intake and names accept as the legal verb", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
+    const result = await checkWorkflowRules("complete", "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("complete");
+    expect(result).toContain("accept");
+  });
+
+  // AC: a fixture unknown command (not in any allowlist) is also rejected
+  it("blocks a fixture unknown command (not on any state allowlist)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    const result = await checkWorkflowRules("xyzzy-nonexistent-verb-fixture", "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("xyzzy-nonexistent-verb-fixture");
+    expect(result).toContain("submit"); // legal at implementation
+  });
+
+  // AC: ping / activity-ping pass through (state-preserving observability signal)
+  it("passes ping (activity presence signal) on wf: ticket in any state", async () => {
+    for (const state of ["intake", "implementation", "code-review"]) {
+      resetWorkflowCache();
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", `state:${state}`]);
+      const result = await checkWorkflowRules("ping", "issue-uuid", "Bearer tok", "charles");
+      expect(result).toBeNull(); // state: ${state}
+    }
+  });
+
+  it("passes activity-ping (alias) on wf: ticket", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    const result = await checkWorkflowRules("activity-ping", "issue-uuid", "Bearer tok", "charles");
+    expect(result).toBeNull();
+  });
+
+  // AC: needs-human passes in all states (blocked-but-keep-owner allowlist)
+  it("passes needs-human in all wf: states (AI-1488 allowlisted)", async () => {
+    for (const state of ["intake", "implementation", "code-review", "deployment"]) {
+      resetWorkflowCache();
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", `state:${state}`]);
+      const result = await checkWorkflowRules("needs-human", "issue-uuid", "Bearer tok", "charles");
+      expect(result).toBeNull(); // state: ${state}
+    }
+  });
+
+  // AC: steward (astrid) gets same rejections as any other caller on wf: tickets
+  it("rejects generic command for steward caller (no steward exemption)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
+    // astrid is the steward (break_glass.owner_role = "steward")
+    const result = await checkWorkflowRules("handoff-work", "issue-uuid", "Bearer tok", "astrid");
+    expect(result).not.toBeNull();
+    expect(result).toContain("handoff-work");
+  });
+
+  // AC: break-glass (escape) always passes — the §4.4 invariant
+  it("break-glass (escape) passes from any state even under default-deny", async () => {
+    for (const state of ["intake", "implementation", "code-review", "deployment"]) {
+      resetWorkflowCache();
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", `state:${state}`]);
+      const result = await checkWorkflowRules("escape", "issue-uuid", "Bearer tok", "charles");
+      expect(result).toBeNull(); // state: ${state}
+    }
   });
 });
 
@@ -5123,7 +5457,9 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     expect(result).toContain("status/assignee/labels");
   });
 
-  it("allows raw non-workflow mutations (title, description, etc.)", async () => {
+  // AI-1488: title/description/priority are now blocked on wf: tickets.
+  // Only non-intercepted fields (e.g. dueDate) still pass through.
+  it("blocks raw title/description/priority mutations on wf: ticket (AI-1488: edit-field locked surface)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
     const result = await checkRawMutationInterception(
       { query: "mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }", variables: { input: { title: "New title", description: "New description", priority: 1 } } },
@@ -5131,7 +5467,9 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
       "Bearer tok",
       "charles",
     );
-    expect(result).toBeNull(); // Not a workflow-affecting mutation
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("title");
   });
 
   it("exactly one issueUpdate mutation per transition (no separate native-state write)", async () => {
