@@ -1498,7 +1498,7 @@ describe("proxy — Phase 6.5 fail-closed (AI-1476)", () => {
     expect(res.body.errors[0].message).toContain("could not be loaded");
   });
 
-  // AC4: The break-glass moves a wedged ticket.
+  // AC4: The break-glass moves a wedged ticket (G-13a: only stewards may use break-glass).
   it("allows break-glass header to bypass enforcement when config is degraded", async () => {
     // Break config
     process.env.WORKFLOW_DEF_PATH = path.join(dir, "nonexistent-workflow.yaml");
@@ -1506,10 +1506,11 @@ describe("proxy — Phase 6.5 fail-closed (AI-1476)", () => {
 
     globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
 
+    // G-13a: break-glass requires human:escalate (steward). Use astrid, not charles.
     const res = await request(appState.app)
       .post("/proxy/graphql")
       .set("Authorization", "Bearer test-token")
-      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Agent", "astrid")
       .set("X-Openclaw-Linear-Intent", "submit")
       .set("X-Openclaw-Break-Glass", "true")
       .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
