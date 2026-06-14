@@ -38,6 +38,31 @@ import { getAgent, getAgentByProxyToken } from "./agents.js";
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 
+// G-16/AI-1548: per-ticket command lock (first-wins).
+// Tracks ticket IDs whose commands are currently in-flight. A second concurrent
+// command for the same ticket is rejected immediately — it never reaches B1 and
+// never forwards. The lock is acquired synchronously (before any await) so the
+// in-flight flag is visible to all other handlers that enter handleProxyRequest
+// before the first command yields to the event loop.
+const inFlightTickets = new Set<string>();
+
+async function runWithTicketLock(
+  ticketId: string,
+  fn: () => Promise<void>,
+  onConflict: () => void,
+): Promise<void> {
+  if (inFlightTickets.has(ticketId)) {
+    onConflict();
+    return;
+  }
+  inFlightTickets.add(ticketId);
+  try {
+    await fn();
+  } finally {
+    inFlightTickets.delete(ticketId);
+  }
+}
+
 /**
  * Minimum CLI version required to issue workflow mutations (AI-1397).
  * CLIs below this version lack proxy-side delegate guards and advancement
@@ -209,12 +234,6 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
 
   log.info(`forward agent=${agentId} op=${opName}${ticketCtx}${intent ? ` intent=${intent}` : ""}${cliVersion ? ` cli=${cliVersion}` : ""}`);
 
-  // AI-1498: capture the ticket's workflow state BEFORE forwarding. The CLI
-  // advances the state:* label inside its own forwarded mutation, so the
-  // post-forward applyStateTransition would otherwise read the destination
-  // state and skip the native-stateId write. We snapshot the true source here.
-  let sourceStateOverride: string | undefined;
-
   // AI-1583: enforcement and the B2 writer apply to mutations only. A read can
   // never change workflow state, but reads issued mid-command inherit the sticky
   // intent header — gating them produced spurious delegate-only blocks.
@@ -223,6 +242,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
   // Phase 2 / slice 1 + Phase 3 B1: evaluate enforcement rules before forwarding.
   if (intent && isMutation) {
     // AI-1397: version floor — reject workflow mutations from stale CLIs.
+    // Stateless check; stays outside the per-ticket lock.
     if (cliVersion) {
       const minVer = minWorkflowCliVersion();
       const parsed = parseSemver(cliVersion);
@@ -237,32 +257,118 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       log.warn(`version-header-missing agent=${agentId} intent=${intent}${ticketCtx} — update CLI to emit X-Openclaw-Linear-Cli-Version`);
     }
 
-    const p2rejection = await checkEnforcementRules(intent, issueId, authorization, agentId);
-    if (p2rejection) {
-      log.warn(`enforcement-block agent=${agentId} intent=${intent}${ticketCtx}: ${p2rejection}`);
-      res.status(200).json({ errors: [{ message: p2rejection }] });
-      return;
-    }
+    // G-16/AI-1548: per-ticket command serialisation.
+    // The lock must be acquired synchronously (before any await) so a second
+    // concurrent request on the same ticket sees the updated queue tail and waits.
+    // Enforcement (B1), forward, and B2 all run inside the lock so the second
+    // command re-validates against the state written by the first.
+    const runCommand = async (): Promise<void> => {
+      // AI-1498: capture the ticket's workflow state BEFORE forwarding.
+      let sourceStateOverride: string | undefined;
 
-    const p3rejection = await checkWorkflowRules(intent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride);
-    if (p3rejection) {
-      log.warn(`workflow-block agent=${agentId} intent=${intent}${ticketCtx}: ${p3rejection}`);
-      res.status(200).json({ errors: [{ message: p3rejection }] });
-      return;
-    }
+      const p2rejection = await checkEnforcementRules(intent, issueId, authorization, agentId);
+      if (p2rejection) {
+        log.warn(`enforcement-block agent=${agentId} intent=${intent}${ticketCtx}: ${p2rejection}`);
+        res.status(200).json({ errors: [{ message: p2rejection }] });
+        return;
+      }
 
-    // AI-1498: snapshot the pre-forward workflow state for applyStateTransition.
-    // Fail-open: on any fetch error leave it undefined and let applyStateTransition
-    // fall back to the ticket's current state:* label (legacy behavior).
-    if (issueId) {
+      const p3rejection = await checkWorkflowRules(intent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride);
+      if (p3rejection) {
+        log.warn(`workflow-block agent=${agentId} intent=${intent}${ticketCtx}: ${p3rejection}`);
+        res.status(200).json({ errors: [{ message: p3rejection }] });
+        return;
+      }
+
+      // AI-1498: snapshot the pre-forward workflow state for applyStateTransition.
+      // Fail-open: on any fetch error leave it undefined and let applyStateTransition
+      // fall back to the ticket's current state:* label (legacy behavior).
+      if (issueId) {
+        try {
+          const preLabels = await fetchWorkflowLabels(issueId, authorization);
+          sourceStateOverride = getCurrentState(preLabels) ?? undefined;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.warn(`source-state snapshot failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
+        }
+      }
+
+      let upstreamRes: globalThis.Response;
       try {
-        const preLabels = await fetchWorkflowLabels(issueId, authorization);
-        sourceStateOverride = getCurrentState(preLabels) ?? undefined;
+        upstreamRes = await fetch(LINEAR_API_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: authorization },
+          body: JSON.stringify(body),
+        });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        log.warn(`source-state snapshot failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
+        log.error(`upstream request failed: ${msg}`);
+        res.status(502).json({ errors: [{ message: `Linear API unreachable: ${msg}` }] });
+        return;
       }
+
+      const responseText = await upstreamRes.text();
+      log.info(`response agent=${agentId} op=${opName} status=${upstreamRes.status}`);
+
+      // Phase 3 B2: apply state:* label transition after a successful forward.
+      // Phase 4 / P4-1: record feedback observation for feedback transitions.
+      // Fail-open: errors are logged and never propagate to the agent's response.
+      if (upstreamRes.ok) {
+        try {
+          let feedback: TransitionFeedback | undefined;
+          if (feedbackCategoryHeader && (intent === "request-changes" || intent === "reject" || intent === "ac-fail")) {
+            const fromBodyHeader = (req.headers["x-openclaw-from-body"] as string | undefined) ?? null;
+            feedback = {
+              fromBody: fromBodyHeader,
+              reasonCode: feedbackCategoryHeader as ReasonCode,
+              freeText: extractCommentBody(body),
+            };
+          }
+          await applyStateTransition(intent, issueId, authorization, {
+            bodyId: agentId,
+            observationStore: deps?.observationStore,
+            feedback,
+            artifactRef: artifactRefHeader,
+            sourceStateOverride,
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.warn(`state-transition failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
+        }
+
+        // Layer 1 (AI-1387): proactive legal-verb re-injection at completion.
+        let workflowReminder: string | null = null;
+        try {
+          workflowReminder = await buildStateTransitionReminder(intent, issueId, authorization);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.warn(`reminder-build failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
+        }
+
+        if (workflowReminder) {
+          try {
+            const parsedResponse = JSON.parse(responseText);
+            parsedResponse._workflowReminder = workflowReminder;
+            res.status(upstreamRes.status).set("Content-Type", "application/json").send(JSON.stringify(parsedResponse));
+            return;
+          } catch {
+            // If response isn't valid JSON, fall through to send as-is.
+          }
+        }
+      }
+
+      res.status(upstreamRes.status).set("Content-Type", "application/json").send(responseText);
+    };
+
+    if (issueId) {
+      await runWithTicketLock(issueId, runCommand, () => {
+        log.warn(`concurrent-command-block agent=${agentId} intent=${intent}${ticketCtx}`);
+        res.status(200).json({ errors: [{ message: `[Proxy] '${intent}' blocked: another command is currently in-flight for ${issueId}. Retry once it completes.` }] });
+      });
+    } else {
+      await runCommand();
     }
+    return;
   } else if (!intent) {
     // Layer 2 (AI-1387): intercept raw status/assignee mutations on workflow tickets.
     // When no intent header is present but the mutation touches stateId or assigneeId,
@@ -277,6 +383,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
     }
   }
 
+  // Non-intent forward path (reads and raw non-workflow mutations).
   let upstreamRes: globalThis.Response;
   try {
     upstreamRes = await fetch(LINEAR_API_URL, {
@@ -298,65 +405,6 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
 
   const responseText = await upstreamRes.text();
   log.info(`response agent=${agentId} op=${opName} status=${upstreamRes.status}`);
-
-  // Phase 3 B2: apply state:* label transition after a successful forward.
-  // Phase 4 / P4-1: record feedback observation for feedback transitions.
-  // Only runs when the command was validated (intent present, no P2/P3 block).
-  // AI-1583: mutations only — a forwarded read must not re-trigger the writer.
-  // Fail-open: errors are logged and never propagate to the agent's response.
-  if (intent && isMutation && upstreamRes.ok) {
-    try {
-      // Build feedback context for observation recording.
-      let feedback: TransitionFeedback | undefined;
-      if (feedbackCategoryHeader && (intent === "request-changes" || intent === "reject" || intent === "ac-fail")) {
-        const fromBodyHeader = (req.headers["x-openclaw-from-body"] as string | undefined) ?? null;
-        feedback = {
-          fromBody: fromBodyHeader,
-          reasonCode: feedbackCategoryHeader as ReasonCode,
-          freeText: extractCommentBody(body),
-        };
-      }
-      await applyStateTransition(intent, issueId, authorization, {
-        bodyId: agentId,
-        observationStore: deps?.observationStore,
-        feedback,
-        artifactRef: artifactRefHeader,
-        sourceStateOverride,
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      log.warn(`state-transition failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
-    }
-
-    // Layer 1 (AI-1387): proactive legal-verb re-injection at completion.
-    // After a successful state transition, generate the legal commands for
-    // the NEW state and include in the response body so the agent sees them
-    // at the decision moment — not just at delegation time.
-    // Injected into the response JSON as `_workflowReminder` since HTTP headers
-    // cannot carry newlines.
-    let workflowReminder: string | null = null;
-    try {
-      workflowReminder = await buildStateTransitionReminder(intent, issueId, authorization);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      log.warn(`reminder-build failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
-    }
-
-    // If we have a reminder, inject it into the response body.
-    if (workflowReminder) {
-      try {
-        const parsedResponse = JSON.parse(responseText);
-        parsedResponse._workflowReminder = workflowReminder;
-        res
-          .status(upstreamRes.status)
-          .set("Content-Type", "application/json")
-          .send(JSON.stringify(parsedResponse));
-        return;
-      } catch {
-        // If response isn't valid JSON, fall through to send as-is.
-      }
-    }
-  }
 
   res
     .status(upstreamRes.status)
