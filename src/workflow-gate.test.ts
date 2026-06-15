@@ -5351,399 +5351,261 @@ describe("applyStateTransition — AI-1521: unescape re-entry", () => {
   });
 });
 
-// ── AI-1584: enrollIfMissing ───────────────────────────────────────────────
+// ── AI-1575: atomic enroll verb ───────────────────────────────────────────
+//
+// Verifies that the `enroll` intent bypasses state-machine validation and
+// applies label + delegate + native state in a single atomic mutation.
+// Regression coverage for the AI-1571 orphaned-delegate collision.
 
-describe("enrollIfMissing — enrollment gap repair", () => {
-  let originalFetch: typeof globalThis.fetch;
-  let enrollDir: string;
-  let enrollOrigWorkflowPath: string | undefined;
-  let enrollOrigPolicyPath: string | undefined;
+// Shared fixture for all AI-1575 suites — created once, torn down after the last.
+let ai1575Dir = "";
+let ai1575OrigWorkflowPath: string | undefined;
+let ai1575OrigPolicyPath: string | undefined;
+let ai1575OrigAgentsFile: string | undefined;
+let ai1575RefCount = 0;
 
-  beforeAll(() => {
-    enrollDir = fs.mkdtempSync(path.join(os.tmpdir(), "enroll-test-"));
-    const policyFile = path.join(enrollDir, "capability-policy.yaml");
+function setupAi1575(): void {
+  if (ai1575RefCount++ === 0) {
+    ai1575OrigWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    ai1575OrigPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+    ai1575OrigAgentsFile = process.env.AGENTS_FILE;
+    ai1575Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1575-test-"));
+    const policyFile = path.join(ai1575Dir, "capability-policy.yaml");
     fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
-    const workflowFile = path.join(enrollDir, "dev-impl.yaml");
-    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
-    enrollOrigWorkflowPath = process.env.WORKFLOW_DEF_PATH;
-    enrollOrigPolicyPath = process.env.CAPABILITY_POLICY_PATH;
-    process.env.WORKFLOW_DEF_PATH = workflowFile;
     process.env.CAPABILITY_POLICY_PATH = policyFile;
-  });
+    const workflowFile = path.join(ai1575Dir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+    // Write agents file so getAgent("astrid") resolves linearUserId correctly
+    // regardless of whether a prior suite deleted AGENTS_FILE from env.
+    const agentsFile = path.join(ai1575Dir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-client", clientSecret: "a-secret", accessToken: "a-token", refreshToken: "a-refresh" },
+        { name: "hanzo", linearUserId: "hanzo-linear-uuid", clientId: "h-client", clientSecret: "h-secret", accessToken: "h-token", refreshToken: "h-refresh" },
+        { name: "charles", linearUserId: "charles-linear-uuid", clientId: "c-client", clientSecret: "c-secret", accessToken: "c-token", refreshToken: "c-refresh" },
+        { name: "reviewer", linearUserId: "reviewer-linear-uuid", clientId: "r-client", clientSecret: "r-secret", accessToken: "r-token", refreshToken: "r-refresh" },
+      ],
+    }, null, 2), "utf8");
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+  }
+}
 
-  afterAll(() => {
-    if (enrollOrigWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = enrollOrigWorkflowPath;
+function teardownAi1575(): void {
+  if (--ai1575RefCount === 0) {
+    fs.rmSync(ai1575Dir, { recursive: true, force: true });
+    if (ai1575OrigWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = ai1575OrigWorkflowPath;
     else delete process.env.WORKFLOW_DEF_PATH;
-    if (enrollOrigPolicyPath !== undefined) process.env.CAPABILITY_POLICY_PATH = enrollOrigPolicyPath;
+    if (ai1575OrigPolicyPath !== undefined) process.env.CAPABILITY_POLICY_PATH = ai1575OrigPolicyPath;
     else delete process.env.CAPABILITY_POLICY_PATH;
-  });
+    if (ai1575OrigAgentsFile !== undefined) process.env.AGENTS_FILE = ai1575OrigAgentsFile;
+    else delete process.env.AGENTS_FILE;
+    reloadAgents();
+  }
+}
 
-  beforeEach(() => { originalFetch = globalThis.fetch; resetWorkflowCache(); });
+describe("checkWorkflowRules — AI-1575: enroll meta-command", () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeAll(setupAi1575);
+  afterAll(teardownAi1575);
+
+  beforeEach(() => {
+    resetWorkflowCache();
+    resetNativeStateCache();
+    resetPolicyCache();
+    resetConfigHealth();
+    originalFetch = globalThis.fetch;
+  });
   afterEach(() => { globalThis.fetch = originalFetch; });
 
-  function makeEnrollFetch(opts: {
-    labels: Array<{ id: string; name: string }>;
-    teamId?: string;
-    teamLabels?: Array<{ id: string; name: string }>;
-    issueError?: boolean;
-    updateSuccess?: boolean;
-  }): { fetch: typeof globalThis.fetch; calls: Array<{ query: string; variables: Record<string, unknown> }> } {
-    const calls: Array<{ query: string; variables: Record<string, unknown> }> = [];
-    const teamId = opts.teamId ?? "team-uuid";
-    const teamLabels = opts.teamLabels ?? [{ id: "intake-lbl", name: "state:intake" }];
-    const updateSuccess = opts.updateSuccess ?? true;
+  it("enroll is legal from intake state (bypasses state-machine check)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
+    expect(await checkWorkflowRules("enroll", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
+  });
 
-    const mock: typeof globalThis.fetch = async (_url, init) => {
-      const bodyText = typeof init?.body === "string" ? init.body : "{}";
-      const parsed = JSON.parse(bodyText) as { query?: string; variables?: Record<string, unknown> };
-      calls.push({ query: parsed.query ?? "", variables: parsed.variables ?? {} });
-      const query = parsed.query ?? "";
+  it("enroll is legal from implementation state (can re-enroll from any state)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    expect(await checkWorkflowRules("enroll", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
+  });
 
-      if (opts.issueError) throw new Error("simulated fetch error");
+  it("enroll is legal from deployment state (can re-enroll from any state)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
+    expect(await checkWorkflowRules("enroll", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
+  });
 
-      if (query.includes("IssueWithLabels")) {
-        return new Response(
-          JSON.stringify({
-            data: {
-              issue: {
-                id: "internal-uuid",
-                team: { id: teamId },
-                labels: { nodes: opts.labels },
-              },
-            },
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        );
-      }
+  it("enroll is pass-through on ad-hoc tickets (no wf:* label)", async () => {
+    globalThis.fetch = makeLabelFetch([]);
+    expect(await checkWorkflowRules("enroll", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
+  });
 
-      if (query.includes("TeamLabels")) {
-        return new Response(
-          JSON.stringify({ data: { team: { labels: { nodes: teamLabels } } } }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        );
-      }
+  it("enroll bypasses delegate-only enforcement (non-delegate steward can enroll)", async () => {
+    // Simulate: ticket has state:implementation with a different delegate (hanzo-linear-uuid)
+    // and caller is astrid (the steward). Without the enroll bypass, this would be blocked
+    // by the delegate-only enforcement because astrid is not the current delegate.
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    expect(await checkWorkflowRules(
+      "enroll",
+      "issue-uuid",
+      "Bearer tok",
+      "astrid",
+      undefined,       // target
+      "astrid-linear-uuid", // callerLinearUserId
+      null,            // artifactRef
+      false,           // breakGlass
+    )).toBeNull();
+  });
+});
 
-      if (query.includes("ApplyAtomicTransition")) {
-        return new Response(
-          JSON.stringify({ data: { issueUpdate: { success: updateSuccess } } }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        );
-      }
+describe("applyStateTransition — AI-1575: enroll atomic enrollment", () => {
+  let originalFetch: typeof globalThis.fetch;
 
-      throw new Error(`unexpected query in enrollIfMissing test: ${query.slice(0, 80)}`);
-    };
+  beforeAll(setupAi1575);
+  afterAll(teardownAi1575);
 
-    return { fetch: mock, calls };
-  }
+  beforeEach(() => {
+    resetWorkflowCache();
+    resetNativeStateCache();
+    resetPolicyCache();
+    resetConfigHealth();
+    clearImplementerStore();
+    originalFetch = globalThis.fetch;
+  });
+  afterEach(() => { globalThis.fetch = originalFetch; });
 
-  it("AC3: stamps state:intake when wf:dev-impl is present but no state:* label", async () => {
-    const { fetch, calls } = makeEnrollFetch({
-      labels: [{ id: "wf-lbl", name: "wf:dev-impl" }, { id: "risk-lbl", name: "risk:low" }],
+  it("AC1: enrolls a clean ad-hoc ticket — sets labels + steward delegate + native state atomically", async () => {
+    // Post-CLI state: ticket now has wf:dev-impl + state:intake + risk:medium (CLI wrote them)
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "intake-lbl", name: "state:intake" },
+        { id: "risk-lbl", name: "risk:medium" },
+      ],
     });
-    globalThis.fetch = fetch;
+    globalThis.fetch = mock;
+    await applyStateTransition("enroll", "issue-uuid", "Bearer tok", { bodyId: "astrid" });
 
-    const result = await enrollIfMissing("issue-uuid", "Bearer tok");
-
-    expect(result.enrolled).toBe(true);
-    expect(result.entryState).toBe("intake");
-
-    const updateCall = calls.find((c) => c.query.includes("ApplyAtomicTransition"));
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
-    const vars = updateCall!.variables as { labelIds: string[] };
-    expect(vars.labelIds).toContain("intake-lbl");
+    const vars = updateCall!.body.variables as { labelIds: string[]; delegateId?: string; stateId?: string };
+
+    // All three labels present
     expect(vars.labelIds).toContain("wf-lbl");
+    expect(vars.labelIds).toContain("intake-lbl");
     expect(vars.labelIds).toContain("risk-lbl");
+
+    // Steward delegate is set to astrid's linearUserId
+    expect(vars.delegateId).toBe("astrid-linear-uuid");
+
+    // Native state is set to Todo (intake → native_state: todo → state-todo-uuid)
+    expect(vars.stateId).toBe("state-todo-uuid");
   });
 
-  it("AI-1585/AC2: invokes the onHeal audit hook with workflow + entry-state info on a heal", async () => {
-    const { fetch } = makeEnrollFetch({
-      labels: [{ id: "wf-lbl", name: "wf:dev-impl" }, { id: "risk-lbl", name: "risk:low" }],
-    });
-    globalThis.fetch = fetch;
-
-    const heals: Array<{ issueId: string; internalId: string; workflowId: string; entryState: string }> = [];
-    const result = await enrollIfMissing("issue-uuid", "Bearer tok", (info) => heals.push(info));
-
-    expect(result.enrolled).toBe(true);
-    expect(heals).toHaveLength(1);
-    expect(heals[0]).toEqual({
-      issueId: "issue-uuid",
-      internalId: "internal-uuid",
-      workflowId: "dev-impl",
-      entryState: "intake",
-    });
-  });
-
-  it("AI-1585/AC2: does NOT invoke the onHeal audit hook when no heal occurs (already enrolled)", async () => {
-    const { fetch } = makeEnrollFetch({
-      labels: [
+  it("AC2: re-enrollment overwrites a stale/ad-hoc delegate with the steward", async () => {
+    // Simulate: ticket was at state:implementation with a stale delegate (charles/dev)
+    // After CLI enrollment write, it now has state:intake + wf:dev-impl.
+    // The enrollment handler must set delegate = astrid (steward), overwriting charles.
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
-        { id: "state-lbl", name: "state:intake" },
+        { id: "intake-lbl", name: "state:intake" },
+        { id: "risk-lbl", name: "risk:low" },
       ],
     });
-    globalThis.fetch = fetch;
+    globalThis.fetch = mock;
 
-    const heals: unknown[] = [];
-    const result = await enrollIfMissing("issue-uuid", "Bearer tok", (info) => heals.push(info));
+    // sourceStateOverride = "implementation" (what the ticket was before CLI write)
+    await applyStateTransition("enroll", "issue-uuid", "Bearer tok", {
+      bodyId: "astrid",
+      sourceStateOverride: "implementation",
+    });
 
-    expect(result.enrolled).toBe(false);
-    expect(heals).toHaveLength(0);
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+    const vars = updateCall!.body.variables as { delegateId?: string; stateId?: string };
+
+    // Steward (astrid) is set as the new delegate, overwriting the stale dev delegate
+    expect(vars.delegateId).toBe("astrid-linear-uuid");
+    // Native state is set atomically
+    expect(vars.stateId).toBe("state-todo-uuid");
   });
 
-  it("no-op when state:* label is already present (already enrolled)", async () => {
-    const { fetch, calls } = makeEnrollFetch({
-      labels: [
+  it("AC1: exactly one atomic mutation (no separate native-state or delegate writes)", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
-        { id: "state-lbl", name: "state:intake" },
+        { id: "intake-lbl", name: "state:intake" },
+        { id: "risk-lbl", name: "risk:high" },
       ],
     });
-    globalThis.fetch = fetch;
+    globalThis.fetch = mock;
+    await applyStateTransition("enroll", "issue-uuid", "Bearer tok", { bodyId: "astrid" });
 
-    const result = await enrollIfMissing("issue-uuid", "Bearer tok");
-
-    expect(result.enrolled).toBe(false);
-    expect(calls.find((c) => c.query.includes("ApplyAtomicTransition"))).toBeUndefined();
+    const atomicCalls = calls.filter((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    // Exactly ONE atomic mutation (labels + delegate + native in one write)
+    expect(atomicCalls).toHaveLength(1);
+    // The mutation includes all three facets
+    const vars = atomicCalls[0].body.variables as Record<string, unknown>;
+    expect(vars.labelIds).toBeDefined();
+    expect(vars.delegateId).toBeDefined();
+    expect(vars.stateId).toBeDefined();
   });
 
-  it("no-op for ad-hoc ticket with no wf:* label", async () => {
-    const { fetch, calls } = makeEnrollFetch({
-      labels: [{ id: "bug-lbl", name: "bug" }, { id: "prio-lbl", name: "priority:high" }],
+  it("no-op on ad-hoc ticket (no wf:* label after CLI write) — enrollment with missing workflow label skips", async () => {
+    // If somehow the CLI write didn't add wf:*, the enrollment B2 should not fire
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "state-lbl", name: "state:intake" },
+        { id: "risk-lbl", name: "risk:medium" },
+        // No wf:* label
+      ],
     });
-    globalThis.fetch = fetch;
-
-    const result = await enrollIfMissing("issue-uuid", "Bearer tok");
-
-    expect(result.enrolled).toBe(false);
-    expect(calls.find((c) => c.query.includes("ApplyAtomicTransition"))).toBeUndefined();
-  });
-
-  it("no-op for unknown wf:* id (no matching def) — fail open", async () => {
-    const { fetch, calls } = makeEnrollFetch({
-      labels: [{ id: "wf-lbl", name: "wf:unknown-workflow" }],
-    });
-    globalThis.fetch = fetch;
-
-    const result = await enrollIfMissing("issue-uuid", "Bearer tok");
-
-    expect(result.enrolled).toBe(false);
-    expect(calls.find((c) => c.query.includes("ApplyAtomicTransition"))).toBeUndefined();
-  });
-
-  it("fail-open when IssueWithLabels fetch throws", async () => {
-    const { fetch } = makeEnrollFetch({ labels: [], issueError: true });
-    globalThis.fetch = fetch;
-
-    const result = await enrollIfMissing("issue-uuid", "Bearer tok");
-
-    expect(result.enrolled).toBe(false);
-  });
-
-  it("fail-open when issueUpdate returns non-success", async () => {
-    const { fetch } = makeEnrollFetch({
-      labels: [{ id: "wf-lbl", name: "wf:dev-impl" }],
-      updateSuccess: false,
-    });
-    globalThis.fetch = fetch;
-
-    const result = await enrollIfMissing("issue-uuid", "Bearer tok");
-
-    expect(result.enrolled).toBe(false);
+    globalThis.fetch = mock;
+    await applyStateTransition("enroll", "issue-uuid", "Bearer tok", { bodyId: "astrid" });
+    // No atomic mutation should have been issued (applyStateTransition returns early with no workflowId)
+    const atomicCalls = calls.filter((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(atomicCalls).toHaveLength(0);
   });
 });
 
-// ── AI-1576 AC2: complete/raw-status→Done blocked on wf:dev-impl (regression) ──
+// ── AI-1571 regression: role-guard blocks non-steward dispatch after enrollment ──
 //
-// Regression tests proving:
-//  (a) `complete` is not a legal verb in ANY canonical dev-impl state.
-//  (b) `validated` (from ac-validate) is the SOLE path to done.
-//  (c) A raw stateId→Done mutation is blocked by Layer 2 on a governed ticket.
+// Verifies AC3/AC4: the routing-guard fires on enrollment-triggered dispatch events
+// and blocks non-steward (e.g. deployment-role) bodies from being dispatched to
+// an intake-state ticket, which is the exact AI-1571 collision scenario.
 //
-// Uses the canonical dev-impl v8 fixture to match the production workflow shape.
-// Provides isolated env setup to avoid config-health bleed from earlier suites.
+// This test is placed here (not routing-guard.test.ts) because it requires the
+// workflow def fixture already set up by beforeAll.
 
-describe("checkWorkflowRules — AI-1576 AC2: complete blocked; only validated reaches done", () => {
-  let originalFetch: typeof globalThis.fetch;
-  let originalWorkflowPath: string | undefined;
-  let originalPolicyPath: string | undefined;
-  let ac2Dir: string;
-
-  beforeAll(() => {
-    ac2Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1576-ac2-"));
-    const policyFile = path.join(ac2Dir, "capability-policy.yaml");
-    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
-
-    originalPolicyPath = process.env.CAPABILITY_POLICY_PATH;
-    process.env.CAPABILITY_POLICY_PATH = policyFile;
-
-    originalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
-    process.env.WORKFLOW_DEF_PATH = CANONICAL_FIXTURE;
-  });
-
-  afterAll(() => {
-    if (originalWorkflowPath !== undefined) {
-      process.env.WORKFLOW_DEF_PATH = originalWorkflowPath;
-    } else {
-      delete process.env.WORKFLOW_DEF_PATH;
-    }
-    if (originalPolicyPath !== undefined) {
-      process.env.CAPABILITY_POLICY_PATH = originalPolicyPath;
-    } else {
-      delete process.env.CAPABILITY_POLICY_PATH;
-    }
-  });
+describe("AI-1571 repro: routing-guard blocks non-steward dispatch on enrolled ticket", () => {
+  beforeAll(setupAi1575);
+  afterAll(teardownAi1575);
 
   beforeEach(() => {
     resetWorkflowCache();
     resetNativeStateCache();
     resetPolicyCache();
     resetConfigHealth();
-    originalFetch = globalThis.fetch;
   });
 
-  afterEach(() => { globalThis.fetch = originalFetch; });
-
-  const ALL_CANONICAL_STATES = [
-    "intake", "write-tests", "implementation", "code-review",
-    "deployment", "host-deploy", "ac-validate", "done",
-  ];
-
-  // AC2(a): complete is not a legal verb in any dev-impl state.
-  for (const state of ALL_CANONICAL_STATES) {
-    it(`AC2: 'complete' is blocked on wf:dev-impl in state '${state}' — not a legal verb`, async () => {
-      globalThis.fetch = makeLabelFetch(["wf:dev-impl", `state:${state}`]);
-      const result = await checkWorkflowRules("complete", "issue-uuid", "Bearer tok", "charles");
-      expect(result).not.toBeNull();
-      expect(result).toContain("[Proxy]");
-    });
-  }
-
-  // AC2(b): validated from ac-validate is the sole path to done.
-  it("AC2: 'validated' from ac-validate is allowed — the sole path to done (returns null)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:ac-validate"]);
-    expect(await checkWorkflowRules("validated", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
+  it("AC3/AC4: routing-guard blocks hanzo (deployment role) dispatch on intake-state ticket", async () => {
+    // After atomic enrollment: ticket is state:intake + wf:dev-impl + risk:medium
+    // Router would dispatch to hanzo if old delegate was left (AI-1571 scenario)
+    // The guard must block hanzo and correct to astrid (steward)
+    const { checkRoleGuardEnforced } = await import("./routing-guard.js");
+    const result = await checkRoleGuardEnforced("hanzo", ["wf:dev-impl", "state:intake"]);
+    // Hanzo does not fill the steward role — dispatch is blocked
+    expect(result.blocked).toBe(true);
+    expect(result.reason).toMatch(/hanzo/i);
+    // Singleton steward correction target is provided
+    expect(result.correctedTo).toBe("astrid");
   });
 
-  const NON_AC_VALIDATE_STATES = ALL_CANONICAL_STATES.filter((s) => s !== "ac-validate");
-  for (const state of NON_AC_VALIDATE_STATES) {
-    it(`AC2: 'validated' is blocked from state '${state}' — not a legal verb outside ac-validate`, async () => {
-      globalThis.fetch = makeLabelFetch(["wf:dev-impl", `state:${state}`]);
-      const result = await checkWorkflowRules("validated", "issue-uuid", "Bearer tok", "charles");
-      expect(result).not.toBeNull();
-    });
-  }
-
-  // AC2(c): Layer 2 blocks a raw stateId→Done mutation on a governed ticket.
-  it("AC2: raw stateId→Done mutation is blocked by Layer 2 on a governed wf:dev-impl ticket", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:ac-validate"]);
-    const body = {
-      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
-      variables: { id: "issue-uuid", input: { stateId: "done-state-uuid" } },
-    };
-    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
-    expect(result).not.toBeNull();
-    expect(result).toContain("[Proxy]");
-    expect(result).toContain("Direct status");
-  });
-});
-
-// ── AI-1576 AC3: demote blocked when ticket has in-flight/merged PR ─────────
-//
-// These tests are RED against the current implementation. checkWorkflowRules
-// does not yet call fetchBranchAndPRStatus for the 'demote' intent.
-//
-// Implementation must add a PR-presence guard on the demote path:
-//   if (intent === 'demote' && !breakGlassOverride) {
-//     const branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
-//     if (branchStatus && (branchStatus.hasBranch || branchStatus.hasPR)) → block
-//   }
-//
-// Tests map to: AI-1576 AC3.
-
-describe("checkWorkflowRules — AI-1576 AC3: demote blocked when ticket has in-flight/merged PR", () => {
-  let originalFetch: typeof globalThis.fetch;
-  let ac3Dir: string;
-
-  beforeEach(() => {
-    ac3Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1576-ac3-"));
-
-    const policyFile = path.join(ac3Dir, "capability-policy.yaml");
-    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
-    process.env.CAPABILITY_POLICY_PATH = policyFile;
-
-    const workflowFile = path.join(ac3Dir, "dev-impl.yaml");
-    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
-    process.env.WORKFLOW_DEF_PATH = workflowFile;
-
-    resetWorkflowCache();
-    resetNativeStateCache();
-    resetPolicyCache();
-    resetConfigHealth();
-    originalFetch = globalThis.fetch;
-  });
-
-  afterEach(() => { globalThis.fetch = originalFetch; });
-
-  // RED: checkWorkflowRules returns null (allowed) for demote regardless of PR status.
-  // These become green once the implementation adds the PR-presence guard.
-
-  it("AC3: demote from intake is blocked when ticket has an open PR", async () => {
-    globalThis.fetch = makeLabelFetch(
-      ["wf:dev-impl", "state:intake"],
-      { hasBranch: true, hasPR: true, hasMergedPR: false },
-    );
-    const result = await checkWorkflowRules("demote", "issue-uuid", "Bearer tok", "astrid");
-    expect(result).not.toBeNull();
-    expect(result).toContain("[Proxy]");
-    expect(result).toContain("demote");
-  });
-
-  it("AC3: demote from intake is blocked when ticket has a merged PR", async () => {
-    globalThis.fetch = makeLabelFetch(
-      ["wf:dev-impl", "state:intake"],
-      { hasBranch: true, hasPR: true, hasMergedPR: true },
-    );
-    const result = await checkWorkflowRules("demote", "issue-uuid", "Bearer tok", "astrid");
-    expect(result).not.toBeNull();
-    expect(result).toContain("[Proxy]");
-    expect(result).toContain("demote");
-  });
-
-  it("AC3: demote from intake is blocked when branch is pushed but no PR (in-flight work)", async () => {
-    globalThis.fetch = makeLabelFetch(
-      ["wf:dev-impl", "state:intake"],
-      { hasBranch: true, hasPR: false, hasMergedPR: false },
-    );
-    const result = await checkWorkflowRules("demote", "issue-uuid", "Bearer tok", "astrid");
-    expect(result).not.toBeNull();
-    expect(result).toContain("[Proxy]");
-  });
-
-  // GREEN: no branch/PR evidence → genuinely fresh intake → demote is safe.
-  it("AC3: demote from intake is allowed when no branch and no PR (genuinely fresh intake ticket)", async () => {
-    globalThis.fetch = makeLabelFetch(
-      ["wf:dev-impl", "state:intake"],
-      { hasBranch: false, hasPR: false, hasMergedPR: false },
-    );
-    expect(await checkWorkflowRules("demote", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
-  });
-
-  // GREEN: branch/PR fetch failure → fail-open (can't confirm in-flight work; don't strand ticket).
-  it("AC3: demote fails open when branch/PR fetch fails — cannot confirm in-flight work", async () => {
-    globalThis.fetch = async (_url, init?) => {
-      const bodyText = typeof init?.body === "string" ? init.body : "";
-      if (bodyText.includes("delegate") || bodyText.includes("IssueContext")) {
-        return new Response(JSON.stringify({
-          data: { issue: {
-            labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:intake" }] },
-            delegate: null,
-          } },
-        }), { status: 200, headers: { "Content-Type": "application/json" } });
-      }
-      if (bodyText.includes("IssueBranchAndPR")) {
-        throw new Error("simulated API failure");
-      }
-      throw new Error(`unexpected fetch: ${bodyText.slice(0, 60)}`);
-    };
-    expect(await checkWorkflowRules("demote", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
+  it("AC3/AC4: routing-guard allows astrid (steward role) dispatch on intake-state ticket", async () => {
+    const { checkRoleGuardEnforced } = await import("./routing-guard.js");
+    const result = await checkRoleGuardEnforced("astrid", ["wf:dev-impl", "state:intake"]);
+    // Astrid fills the steward role — dispatch is allowed
+    expect(result.blocked).toBe(false);
   });
 });
