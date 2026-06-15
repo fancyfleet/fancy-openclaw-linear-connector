@@ -540,6 +540,52 @@ async function fetchIssueWithLabels(
 }
 
 /**
+ * Resolve the set of `state:*` label IDs in the team that owns the given issue.
+ *
+ * AI-1612: the proxy is the sole writer of the workflow state label. To enforce
+ * that, it strips `state:*` label deltas from the forwarded CLI mutation before
+ * `applyStateTransition` runs — so a fail-closed transition is a true no-op
+ * rather than a half-applied label move with a stranded delegate. Identifying
+ * which delta IDs are state labels needs the team's full label set (the added
+ * destination label is not yet on the issue), so this queries team labels, not
+ * just the issue's current labels.
+ *
+ * Returns an empty set on any error — the proxy then fails open (strips nothing),
+ * preserving prior behavior rather than risk dropping legitimate non-state labels.
+ */
+export async function fetchTeamStateLabelIds(
+  issueId: string,
+  authToken: string,
+): Promise<Set<string>> {
+  const query = `
+    query TeamStateLabels($id: String!) {
+      issue(id: $id) {
+        team {
+          labels { nodes { id name } }
+        }
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: issueId } }),
+    });
+    type Resp = {
+      data?: { issue?: { team?: { labels?: { nodes: LabelNode[] } } } };
+    };
+    const data = (await res.json()) as Resp;
+    const nodes = data.data?.issue?.team?.labels?.nodes ?? [];
+    return new Set(nodes.filter((n) => /^state:/i.test(n.name)).map((n) => n.id));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: team state-label fetch failed for ${issueId}: ${msg} — failing open`);
+    return new Set();
+  }
+}
+
+/**
  * Find an existing label by name in the team, or create it if absent.
  * Returns the label ID, or null if both lookup and creation fail.
  */

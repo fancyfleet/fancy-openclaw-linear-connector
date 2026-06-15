@@ -1106,6 +1106,208 @@ describe("proxy enforcement — B2 state-label transition application", () => {
   });
 });
 
+// ── AI-1612: proxy is the sole writer of the state:* label ───────────────
+
+// Team label set used by fetchTeamStateLabelIds to identify which forwarded
+// label-delta IDs are state:* labels (and so must be stripped).
+const AI1612_TEAM_STATE_LABELS = {
+  data: {
+    issue: {
+      team: {
+        labels: {
+          nodes: [
+            { id: "state-impl-lbl", name: "state:implementation" },
+            { id: "state-cr-lbl", name: "state:code-review" },
+            { id: "state-deploy-lbl", name: "state:deployment" },
+            { id: "non-state-lbl", name: "bug" },
+          ],
+        },
+      },
+    },
+  },
+};
+
+describe("proxy — AI-1612 state-label strip (proxy is sole writer)", () => {
+  let dir: string;
+  let appState: ReturnType<typeof createApp>;
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-1612-test-"));
+    process.env.AGENTS_FILE = writeAgents(dir);
+    process.env.CAPABILITY_POLICY_PATH = writePolicyFile(dir, TEST_POLICY_WITH_MERGE_YAML);
+    writeWorkflowFile(dir);
+    resetPolicyCache();
+    resetWorkflowCache();
+    reloadAgents();
+    appState = createApp({
+      bagDbPath: path.join(dir, "bag.db"),
+      agentQueueDbPath: path.join(dir, "queue.db"),
+      operationalEventsDbPath: path.join(dir, "events.db"),
+    });
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    appState.bag.close();
+    appState.sessionTracker.close();
+    appState.agentQueue.close();
+    appState.operationalEventStore.close();
+    appState.watchdog.stop();
+    appState.noActivityDetector.stop();
+    appState.managingPoller.stop();
+  });
+
+  function makeFetch(opts: {
+    b1LabelResponse: object;
+    teamStateLabels?: object;
+    updateSuccess?: boolean;
+  }): { fetch: typeof globalThis.fetch; calls: Array<{ query: string; variables: unknown }> } {
+    const calls: Array<{ query: string; variables: unknown }> = [];
+    const mockFetch: typeof globalThis.fetch = async (url, init) => {
+      if (typeof url !== "string" || !url.includes("api.linear.app")) {
+        return originalFetch(url, init);
+      }
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(bodyText) as { query?: string; variables?: unknown };
+      calls.push({ query: parsed.query ?? "", variables: parsed.variables });
+      const q = parsed.query ?? "";
+
+      if (q.includes("TeamStateLabels")) {
+        return new Response(JSON.stringify(opts.teamStateLabels ?? AI1612_TEAM_STATE_LABELS), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      if ((q.includes("IssueContext") || q.includes("IssueLabels")) && !q.includes("IssueWithLabels")) {
+        return new Response(JSON.stringify(opts.b1LabelResponse), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (q.includes("IssueWithLabels")) {
+        return new Response(JSON.stringify(DEV_IMPL_IMPLEMENTATION_WITH_IDS), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (q.includes("TeamLabels")) {
+        return new Response(JSON.stringify(TEAM_LABELS_WITH_CR), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (q.includes("TeamStates")) {
+        return new Response(JSON.stringify({
+          data: { team: { states: { nodes: [
+            { id: "state-todo-uuid", name: "Todo", type: "unstarted" },
+            { id: "state-doing-uuid", name: "Doing", type: "started" },
+            { id: "state-thinking-uuid", name: "Thinking", type: "started" },
+            { id: "state-done-uuid", name: "Done", type: "completed" },
+            { id: "state-invalid-uuid", name: "Invalid", type: "canceled" },
+          ] } } },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (q.includes("ApplyAtomicTransition")) {
+        return new Response(JSON.stringify({ data: { issueUpdate: { success: opts.updateSuccess ?? true } } }), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify(MOCK_RESPONSE), {
+        status: 200, headers: { "Content-Type": "application/json" },
+      });
+    };
+    return { fetch: mockFetch, calls };
+  }
+
+  // The forwarded agent mutation is the issueUpdate that is NOT the proxy's own
+  // ApplyAtomicTransition write.
+  function forwardedInput(calls: Array<{ query: string; variables: unknown }>): Record<string, unknown> | undefined {
+    const call = calls.find((c) => c.query.includes("issueUpdate") && !c.query.includes("ApplyAtomicTransition"));
+    return (call?.variables as { input?: Record<string, unknown> } | undefined)?.input;
+  }
+
+  const ISSUE_UPDATE_MUTATION =
+    "mutation Reject($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }";
+
+  // AC1: state:* label deltas are stripped from the forwarded mutation; non-state deltas pass through.
+  it("strips state:* label deltas from the forwarded issueUpdate but passes non-state deltas through", async () => {
+    const { fetch: mock, calls } = makeFetch({ b1LabelResponse: DEV_IMPL_IMPLEMENTATION_RESPONSE });
+    globalThis.fetch = mock;
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "submit")
+      .send({
+        query: ISSUE_UPDATE_MUTATION,
+        variables: { id: "issue-uuid", input: { addedLabelIds: ["state-cr-lbl", "non-state-lbl"], removedLabelIds: ["state-impl-lbl"] } },
+      });
+
+    expect(res.status).toBe(200);
+    const input = forwardedInput(calls);
+    expect(input).toBeDefined();
+    // state:* added id stripped, non-state id retained.
+    expect(input!.addedLabelIds).toEqual(["non-state-lbl"]);
+    // removedLabelIds held only a state:* id → key removed entirely.
+    expect(input!.removedLabelIds).toBeUndefined();
+    // AC3: the proxy still lands the transition itself (sole writer).
+    const b2 = calls.find((c) => c.query.includes("ApplyAtomicTransition"));
+    expect(b2).toBeDefined();
+    expect((b2!.variables as { labelIds: string[] }).labelIds).toContain("cr-lbl");
+  });
+
+  // AC2: a governed reject whose delegate resolution fail-closes is a TRUE no-op —
+  // the state label never moved (stripped from the forward) AND no atomic write fired
+  // (so the delegate is untouched). No more half-applied stranding.
+  it("leaves state label AND delegate unchanged when delegate resolution fail-closes", async () => {
+    const { fetch: mock, calls } = makeFetch({ b1LabelResponse: DEV_IMPL_DEPLOYMENT_RESPONSE_HANZO_DELEGATE });
+    globalThis.fetch = mock;
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "hanzo")
+      .set("X-Openclaw-Linear-Intent", "reject") // legal from deployment; dev role has no bodies → fail-closed
+      .send({
+        query: ISSUE_UPDATE_MUTATION,
+        variables: { id: "issue-uuid", input: { addedLabelIds: ["state-impl-lbl"], removedLabelIds: ["state-deploy-lbl"] } },
+      });
+
+    expect(res.status).toBe(200);
+    // The forwarded mutation carried NO state-label delta → upstream state label unchanged.
+    const input = forwardedInput(calls);
+    expect(input).toBeDefined();
+    expect(input!.addedLabelIds).toBeUndefined();
+    expect(input!.removedLabelIds).toBeUndefined();
+    // applyStateTransition fail-closed → no atomic write → delegate + native untouched.
+    expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(false);
+  });
+
+  // Fail-open: if the team state-label set can't be resolved, strip nothing
+  // (preserve prior behavior rather than risk dropping legitimate labels).
+  it("forwards the label delta unchanged when the state-label set cannot be resolved", async () => {
+    const { fetch: mock, calls } = makeFetch({
+      b1LabelResponse: DEV_IMPL_IMPLEMENTATION_RESPONSE,
+      teamStateLabels: { data: { issue: { team: { labels: { nodes: [] } } } } },
+    });
+    globalThis.fetch = mock;
+
+    await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "submit")
+      .send({
+        query: ISSUE_UPDATE_MUTATION,
+        variables: { id: "issue-uuid", input: { addedLabelIds: ["state-cr-lbl"], removedLabelIds: ["state-impl-lbl"] } },
+      });
+
+    const input = forwardedInput(calls);
+    expect(input).toBeDefined();
+    expect(input!.addedLabelIds).toEqual(["state-cr-lbl"]);
+    expect(input!.removedLabelIds).toEqual(["state-impl-lbl"]);
+  });
+});
+
 // ── Layer 2: Raw mutation interception via proxy (AI-1387) ────────────────
 
 describe("proxy — Layer 2 raw mutation interception (AI-1387)", () => {

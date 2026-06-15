@@ -31,7 +31,7 @@
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules } from "./escalation-gate.js";
-import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, getCurrentState, type TransitionFeedback } from "./workflow-gate.js";
+import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, type TransitionFeedback } from "./workflow-gate.js";
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import { getAgent, getAgentByProxyToken } from "./agents.js";
@@ -139,6 +139,68 @@ function extractIssueId(body: GraphQLRequestBody | null): string | null {
     }
   }
   return null;
+}
+
+/**
+ * True when the mutation is an `issueUpdate` (the only mutation that carries a
+ * label delta / state change). Reads and other mutations are left untouched.
+ */
+function isIssueUpdateMutation(body: GraphQLRequestBody | null): boolean {
+  return !!body?.query && /\bissueUpdate\s*\(/.test(body.query);
+}
+
+/**
+ * AI-1612: strip `state:*` label deltas from a forwarded intent-bearing
+ * `issueUpdate` mutation so the proxy becomes the sole writer of the workflow
+ * state label.
+ *
+ * Governed transition verbs set `omitStateId: true` (no native write) but still
+ * carry the `state:*` flip via `addedLabelIds`/`removedLabelIds`. If that delta
+ * lands upstream and `applyStateTransition` then fail-closes (e.g. it cannot
+ * resolve the next delegate), the result is a half-applied transition: the label
+ * moved but the delegate is stranded. By removing the state-label IDs here,
+ * `applyStateTransition` — which re-derives the full correct label set itself in
+ * one atomic mutation — is the only thing that ever moves the state label, so a
+ * fail-closed transition is a true no-op.
+ *
+ * Only `state:*` label IDs are removed; any non-state label deltas pass through
+ * untouched. Returns the count of stripped IDs (for logging).
+ */
+function issueUpdateInput(body: GraphQLRequestBody | null): Record<string, unknown> | undefined {
+  const input = (body?.variables as Record<string, unknown> | undefined)?.input;
+  return input && typeof input === "object" ? (input as Record<string, unknown>) : undefined;
+}
+
+/**
+ * True when the mutation carries a non-empty `state:*`-eligible label delta
+ * (`addedLabelIds`/`removedLabelIds`). Used to skip the team-label resolution
+ * round-trip entirely for mutations that have no label delta to strip.
+ */
+function carriesLabelDelta(body: GraphQLRequestBody | null): boolean {
+  const input = issueUpdateInput(body);
+  if (!input) return false;
+  return ["addedLabelIds", "removedLabelIds"].some(
+    (k) => Array.isArray(input[k]) && (input[k] as unknown[]).length > 0,
+  );
+}
+
+function stripStateLabelDeltas(body: GraphQLRequestBody | null, stateLabelIds: Set<string>): number {
+  if (!body || stateLabelIds.size === 0) return 0;
+  const input = issueUpdateInput(body);
+  if (!input) return 0;
+  let stripped = 0;
+  for (const key of ["addedLabelIds", "removedLabelIds"]) {
+    const arr = input[key];
+    if (!Array.isArray(arr)) continue;
+    const filtered = arr.filter((id) => !(typeof id === "string" && stateLabelIds.has(id)));
+    stripped += arr.length - filtered.length;
+    if (filtered.length === 0) {
+      delete input[key];
+    } else if (filtered.length !== arr.length) {
+      input[key] = filtered;
+    }
+  }
+  return stripped;
 }
 
 /**
@@ -318,6 +380,25 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           log.warn(`source-state snapshot failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
+        }
+
+        // AI-1612: make the proxy the sole writer of the workflow state label.
+        // Strip the `state:*` label delta from the forwarded issueUpdate so the
+        // CLI's pre-write can't land ahead of applyStateTransition. If that apply
+        // later fail-closes, the transition is then a true no-op (state label and
+        // delegate both unchanged) instead of a half-applied stranding.
+        // Fail-open: if the state-label IDs can't be resolved, strip nothing.
+        if (isIssueUpdateMutation(body) && carriesLabelDelta(body)) {
+          try {
+            const stateLabelIds = await fetchTeamStateLabelIds(issueId, authorization);
+            const stripped = stripStateLabelDeltas(body, stateLabelIds);
+            if (stripped > 0) {
+              log.info(`state-label-strip agent=${agentId} intent=${intent}${ticketCtx}: stripped ${stripped} state:* label delta(s) — applyStateTransition is sole writer`);
+            }
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log.warn(`state-label-strip failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg} — forwarding label delta unchanged`);
+          }
         }
       }
 
