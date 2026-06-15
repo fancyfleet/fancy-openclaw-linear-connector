@@ -301,6 +301,16 @@ describe("B3 — outbound per-step instruction injection", () => {
       expect(msg).toContain("linear consider-work AI-002");
       expect(msg).toContain("linear begin-work AI-002");
 
+      // Completed work funnels through Ai for validation (mandatory review hop)
+      expect(msg).toContain("linear handoff-work AI-002 Ai");
+      // Agents no longer pick domain reviewers themselves
+      expect(msg).not.toContain("Charles for code");
+      expect(msg).not.toContain("Astrid for product");
+      // The old "never hand off to Matt" prohibition is gone
+      expect(msg).not.toContain("do NOT hand off to Matt Henry");
+      // No "only if you are NOT the implementer" gate on completion
+      expect(msg).not.toContain("NOT the implementer");
+
       // Workflow-specific content absent
       expect(msg).not.toContain("[dev-impl]");
       expect(msg).not.toContain("state: **");

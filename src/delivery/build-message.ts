@@ -275,13 +275,14 @@ function buildGenericDelegationMessage(actionText: string, identifier: string, t
     `  - and need an agent to act instead, run \`linear refuse-work ${identifier} [delegate] --comment [reason]\``,
     `  - and need a human to help (e.g. credentials, access, infra provision), run \`linear needs-human ${identifier} [human] --comment [reason]\``,
     "",
-    "When you complete the work...",
-    `- To hand off for review, run \`linear handoff-work ${identifier} [delegate] --comment [note]\` (use an agent delegate like Charles for code, Astrid for product)`,
-    `- If the ticket’s acceptance criteria is met and you are NOT the implementer, run \`linear complete ${identifier} --comment [summary]\``,
+    "When the work is done, hand it off to be checked — you do NOT pick a reviewer yourself:",
+    `- Default: hand off to Ai — run \`linear handoff-work ${identifier} Ai --comment [summary]\`. Ai validates the work, answers easy questions, and brings in the requesting human only when their action is actually needed. A second set of eyes catches simple mistakes before the task is called done, and keeps humans from becoming a blocker.`,
+    "- If another AGENT requested this work (you are collaborating with them on the ticket), hand it back to that agent instead.",
+    "- Hand finished work off to be checked even if you did the work yourself — there is no \"only if you are not the implementer\" rule here. Do not silently leave a completed task sitting in your own column.",
     "",
     "📝 Comment discipline: post one substantive comment — your actual findings or result. Do NOT post a comment that only restates what is already on the ticket or narrates that you have handed it back. If a dispatch wakes you and you have no new information to add, do not comment at all — just transition state (or take no action).",
     "",
-    "⚠️ Important: do NOT hand off to Matt Henry for review, sign-off, or closure. Route reviews to the appropriate agent (Charles for code, Astrid for product, Laren for design). Only use \`needs-human\` for genuine blockers that require human action (credentials, access, approvals you cannot obtain yourself)."
+    "⚠️ Important: agents do not decide reviewers. Hand finished work to Ai for validation (or back to the requesting agent), rather than choosing a domain reviewer yourself. Use \`needs-human\` only for genuine blockers that require human action (credentials, access, approvals you cannot obtain yourself) — not as a way to mark work complete."
   ].join("\n");
 }
 
