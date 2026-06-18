@@ -174,6 +174,7 @@ export async function maybeBootstrapWorkflow(
   // Try the provided token first; if issue fetch fails, fall back to other
   // agent tokens (the provided token may lack access to the issue's team).
   let issue: IssueContext | null = null;
+  let effectiveToken = authToken; // may be replaced by a fallback token
   const triedTokens: string[] = [];
   const tryFetch = async (token: string) => {
     triedTokens.push(token.slice(0, 8) + "...");
@@ -195,6 +196,7 @@ export async function maybeBootstrapWorkflow(
           issue = await tryFetch(t);
           if (issue) {
             console.error(`[bootstrap-dbg] fallback token from agent '${a.name}' succeeded for issue ${issueEvent.data.id}`);
+            effectiveToken = t;
             break;
           }
         } catch {
@@ -244,9 +246,23 @@ export async function maybeBootstrapWorkflow(
     // Resolve first-owner delegate from capability policy.
     let delegateLinearUserId: string | undefined;
     let delegateAgentName: string | undefined;
-    if (ownerRole) {
+    let delegateRole = entryStateDef?.owner_role;
+    if (delegateRole) {
       try {
-        const bodies = await resolveBodiesForRole(ownerRole);
+        let bodies = await resolveBodiesForRole(delegateRole);
+        // If the entry role has no bodies (e.g. synthetic "engine" role),
+        // look ahead to the first transition target's owner_role.
+        if (bodies.length === 0 && entryStateDef?.transitions?.length) {
+          const firstTransTarget = def.states.find(
+            (s) => s.id === entryStateDef!.transitions![0].to,
+          );
+          const nextRole = firstTransTarget?.owner_role;
+          if (nextRole && nextRole !== delegateRole) {
+            console.error(`[bootstrap-dbg] entry role '${delegateRole}' has no bodies — falling through to next state role '${nextRole}'`);
+            bodies = await resolveBodiesForRole(nextRole);
+            if (bodies.length > 0) delegateRole = nextRole;
+          }
+        }
         if (bodies.length === 1) {
           delegateAgentName = bodies[0];
           const agents = await loadAgents();
@@ -259,20 +275,20 @@ export async function maybeBootstrapWorkflow(
         }
       } catch (err) {
         log.warn(
-          `workflow-bootstrap: role resolution failed for '${ownerRole}': ${err instanceof Error ? err.message : String(err)}`,
+          `workflow-bootstrap: role resolution failed for '${delegateRole}': ${err instanceof Error ? err.message : String(err)}`,
         );
       }
     }
 
     // Find or create the entry state label.
-    const stateLabelId = await findOrCreateLabel(issue.teamId, `state:${entryState}`, authToken);
+    const stateLabelId = await findOrCreateLabel(issue.teamId, `state:${entryState}`, effectiveToken);
     if (!stateLabelId) {
       log.warn(`workflow-bootstrap: could not resolve label 'state:${entryState}' — aborting bootstrap`);
       return null;
     }
 
     const newLabelIds = Array.from(new Set([...currentLabelIds, stateLabelId]));
-    const success = await issueUpdateAtomic(issue.id, newLabelIds, authToken, delegateLinearUserId);
+    const success = await issueUpdateAtomic(issue.id, newLabelIds, effectiveToken, delegateLinearUserId);
 
     if (!success) {
       log.warn(`workflow-bootstrap: issueUpdate returned non-success for ${issueEvent.data.id}`);
@@ -290,7 +306,7 @@ export async function maybeBootstrapWorkflow(
     const stateLabelIds = new Set(currentStateLabels.map((n) => n.id));
     const newLabelIds = currentLabelIds.filter((id) => !stateLabelIds.has(id));
 
-    await issueUpdateAtomic(issue.id, newLabelIds, authToken);
+    await issueUpdateAtomic(issue.id, newLabelIds, effectiveToken);
 
     log.info(
       `workflow-bootstrap: demoted ${issueEvent.data.id} — removed [${currentStateLabels.map((n) => n.name).join(", ")}]`,
