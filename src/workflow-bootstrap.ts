@@ -176,10 +176,14 @@ export async function maybeBootstrapWorkflow(
   } catch {
     return null;
   }
-  if (!issue) return null;
+  if (!issue) {
+    console.error(`[bootstrap-dbg] fetchIssueContext returned null for issue ${issueEvent.data.id}`);
+    return null;
+  }
 
   const currentWfLabelNode = issue.labels.find((n) => n.name.startsWith("wf:"));
   const currentStateLabels = issue.labels.filter((n) => n.name.startsWith("state:"));
+  console.error(`[bootstrap-dbg] issue=${issue.identifier} labels=[${issue.labels.map(l=>l.name).join(",")}] wfLabel=${currentWfLabelNode?.name ?? "none"} stateLabels=${currentStateLabels.length} addedIds=[${addedIds.join(",")}]`);
 
   // ── Bootstrap path: a wf:* label was newly added ──────────────────────────
   if (addedIds.length > 0 && currentWfLabelNode && addedIds.includes(currentWfLabelNode.id)) {
