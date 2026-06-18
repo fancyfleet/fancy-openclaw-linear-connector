@@ -300,6 +300,62 @@ export function createWebhookRouter(
             log.info(`Workflow bootstrap: ${bootstrapResult.action} (wf:${bootstrapResult.workflowId ?? "unknown"})`);
             const bootstrapOutcome = bootstrapResult.action === "bootstrapped" ? "bootstrap-bootstrapped" : "bootstrap-demoted";
             appendOperationalEvent(operationalEventStore, { outcome: bootstrapOutcome, type: event.type });
+
+            // AI-fix: after bootstrap, deliver a workflow-aware wake to the
+            // newly-assigned delegate so they know what to do.
+            if (bootstrapResult.action === "bootstrapped" && bootstrapResult.delegateAgentName && bootstrapResult.ticketIdentifier) {
+              const wakeSessionKey = normalizeSessionKey(bootstrapResult.ticketIdentifier);
+              const wakeRoute: RouteResult = {
+                agentId: bootstrapResult.delegateAgentName,
+                sessionKey: wakeSessionKey,
+                priority: 0,
+                routingReason: "delegate",
+                event,
+              };
+              const agentCfg = getAgent(bootstrapResult.delegateAgentName);
+              const wakeDeliveryConfig: DeliveryConfig = {
+                nodeBin: process.execPath,
+                hooksUrl: agentCfg?.hooksUrl ?? process.env.OPENCLAW_HOOKS_URL,
+                hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
+                hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
+                hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+              };
+              try {
+                if (throttle) {
+                  await throttle.wait(wakeRoute.agentId);
+                  throttle.record(wakeRoute.agentId);
+                }
+                const wakeResult = await deliverWithSlot(wakeRoute, wakeDeliveryConfig, throttle);
+                log.info(
+                  `Bootstrap wake delivered to ${bootstrapResult.delegateAgentName} for ${bootstrapResult.ticketIdentifier} (runId=${wakeResult.runId ?? "ok"})`,
+                );
+                appendOperationalEvent(operationalEventStore, {
+                  outcome: wakeResult.runId ? "bootstrap-wake-dispatched" : "bootstrap-wake-delivered",
+                  type: event.type,
+                  agent: bootstrapResult.delegateAgentName,
+                  key: wakeSessionKey,
+                  sessionKey: wakeSessionKey,
+                  deliveryMode: "bootstrap-wake",
+                  attemptCount: 1,
+                  runId: wakeResult.runId ?? null,
+                });
+                if (onDispatched) onDispatched(bootstrapResult.delegateAgentName, wakeSessionKey);
+              } catch (err) {
+                log.error(
+                  `Bootstrap wake delivery failed for ${bootstrapResult.delegateAgentName}: ${err instanceof Error ? err.message : String(err)}`,
+                );
+                appendOperationalEvent(operationalEventStore, {
+                  outcome: "bootstrap-wake-failed",
+                  type: event.type,
+                  agent: bootstrapResult.delegateAgentName,
+                  key: wakeSessionKey,
+                  sessionKey: wakeSessionKey,
+                  deliveryMode: "bootstrap-wake",
+                  attemptCount: 1,
+                  errorSummary: errorSummary(err),
+                });
+              }
+            }
             return;
           }
         } catch (err) {

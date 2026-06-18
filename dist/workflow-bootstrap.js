@@ -55,6 +55,8 @@ async function fetchIssueContext(issueId, authToken) {
         return {
             id: issue.id,
             teamId: issue.team.id,
+            identifier: issue.identifier,
+            title: issue.title,
             labels: issue.labels.nodes,
         };
     }
@@ -146,17 +148,19 @@ export async function maybeBootstrapWorkflow(event, authToken) {
         const ownerRole = entryStateDef?.owner_role;
         // Resolve first-owner delegate from capability policy.
         let delegateLinearUserId;
+        let delegateAgentName;
         if (ownerRole) {
             try {
                 const bodies = await resolveBodiesForRole(ownerRole);
                 if (bodies.length === 1) {
+                    delegateAgentName = bodies[0];
                     const agents = await loadAgents();
-                    const agent = agents.find((a) => a.name === bodies[0]);
+                    const agent = agents.find((a) => a.name === delegateAgentName);
                     if (agent?.linearUserId) {
                         delegateLinearUserId = agent.linearUserId;
                     }
                     else {
-                        log.warn(`workflow-bootstrap: body '${bodies[0]}' has no linearUserId — delegate not set`);
+                        log.warn(`workflow-bootstrap: body '${delegateAgentName}' has no linearUserId — delegate not set`);
                     }
                 }
             }
@@ -178,7 +182,7 @@ export async function maybeBootstrapWorkflow(event, authToken) {
         else {
             log.info(`workflow-bootstrap: bootstrapped ${issueEvent.data.id} → ${workflowId}:${entryState}, delegate=${delegateLinearUserId ?? "none"}`);
         }
-        return { action: "bootstrapped", workflowId, entryState };
+        return { action: "bootstrapped", workflowId, entryState, delegateAgentName, ticketIdentifier: issue.identifier, ticketTitle: issue.title };
     }
     // ── Demote path: wf:* was removed, state:* labels remain ─────────────────
     if (removedIds.length > 0 && !currentWfLabelNode && currentStateLabels.length > 0) {

@@ -30,6 +30,12 @@ export interface BootstrapResult {
   action: "bootstrapped" | "demoted";
   workflowId?: string;
   entryState?: string;
+  /** OpenClaw agent name of the newly-set delegate (bootstrapped only). */
+  delegateAgentName?: string;
+  /** Ticket identifier for wake delivery (bootstrapped only). */
+  ticketIdentifier?: string;
+  /** Ticket title for wake delivery (bootstrapped only). */
+  ticketTitle?: string;
 }
 
 // ── Agents loader ─────────────────────────────────────────────────────────────
@@ -50,6 +56,8 @@ async function loadAgents(): Promise<Array<{ name: string; linearUserId?: string
 interface IssueContext {
   id: string;
   teamId: string;
+  identifier: string;
+  title: string;
   labels: Array<{ id: string; name: string }>;
 }
 
@@ -74,6 +82,8 @@ async function fetchIssueContext(issueId: string, authToken: string): Promise<Is
       data?: {
         issue?: {
           id: string;
+          identifier: string;
+          title: string;
           team: { id: string };
           labels: { nodes: Array<{ id: string; name: string }> };
           delegate: { id: string } | null;
@@ -86,6 +96,8 @@ async function fetchIssueContext(issueId: string, authToken: string): Promise<Is
     return {
       id: issue.id,
       teamId: issue.team.id,
+      identifier: issue.identifier,
+      title: issue.title,
       labels: issue.labels.nodes,
     };
   } catch {
@@ -194,16 +206,18 @@ export async function maybeBootstrapWorkflow(
 
     // Resolve first-owner delegate from capability policy.
     let delegateLinearUserId: string | undefined;
+    let delegateAgentName: string | undefined;
     if (ownerRole) {
       try {
         const bodies = await resolveBodiesForRole(ownerRole);
         if (bodies.length === 1) {
+          delegateAgentName = bodies[0];
           const agents = await loadAgents();
-          const agent = agents.find((a) => a.name === bodies[0]);
+          const agent = agents.find((a) => a.name === delegateAgentName);
           if (agent?.linearUserId) {
             delegateLinearUserId = agent.linearUserId;
           } else {
-            log.warn(`workflow-bootstrap: body '${bodies[0]}' has no linearUserId — delegate not set`);
+            log.warn(`workflow-bootstrap: body '${delegateAgentName}' has no linearUserId — delegate not set`);
           }
         }
       } catch (err) {
@@ -231,7 +245,7 @@ export async function maybeBootstrapWorkflow(
       );
     }
 
-    return { action: "bootstrapped", workflowId, entryState };
+    return { action: "bootstrapped", workflowId, entryState, delegateAgentName, ticketIdentifier: issue.identifier, ticketTitle: issue.title };
   }
 
   // ── Demote path: wf:* was removed, state:* labels remain ─────────────────

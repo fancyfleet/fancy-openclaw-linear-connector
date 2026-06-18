@@ -16,6 +16,12 @@ export interface BootstrapResult {
     action: "bootstrapped" | "demoted";
     workflowId?: string;
     entryState?: string;
+    /** OpenClaw agent name of the newly-set delegate (bootstrapped only). */
+    delegateAgentName?: string;
+    /** Ticket identifier for wake delivery (bootstrapped only). */
+    ticketIdentifier?: string;
+    /** Ticket title for wake delivery (bootstrapped only). */
+    ticketTitle?: string;
 }
 /**
  * Pre-routing bootstrap hook — runs before the delegate-based router.

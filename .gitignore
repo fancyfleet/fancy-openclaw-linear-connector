@@ -13,3 +13,6 @@ coverage/
 data/
 agents.json
 # node_modules
+agents.json.bak-*
+tmp/
+scripts/validate-story-defs.ts
