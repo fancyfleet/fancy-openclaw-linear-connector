@@ -164,7 +164,7 @@ export async function maybeBootstrapWorkflow(
   const removedIds = previousLabelIds.filter((id) => !currentSet.has(id));
 
   if (addedIds.length === 0 && removedIds.length === 0) {
-    console.error(`[bootstrap-dbg] no label delta: current=${currentLabelIds.length} previous=${previousLabelIds.length} updatedFrom=${!!updatedFrom}`);
+    console.error(`[bootstrap-dbg] no label delta: current=${currentLabelIds.length} previous=${previousLabelIds.length} updatedFrom=${!!updatedFrom} dataKeys=${Object.keys(issueEvent.data).join(",")} rawLabelIds=${JSON.stringify((issueEvent as any).raw?.data?.labelIds ?? "missing")} updatedFromKeys=${updatedFrom ? Object.keys(updatedFrom).join(",") : "none"}`);
     return null;
   }
   console.error(`[bootstrap-dbg] added=${addedIds.length} removed=${removedIds.length} currentLabels=${currentLabelIds.length} previousLabels=${previousLabelIds.length} updatedFromLen=${Array.isArray(updatedFrom?.labelIds) ? (updatedFrom.labelIds as unknown[]).length : "none"}`);
