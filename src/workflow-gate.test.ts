@@ -1482,6 +1482,7 @@ describe("buildStateTransitionReminder — Layer 1 (AI-1387)", () => {
   it("returns reminder for code-review state after submit from implementation", async () => {
     // After "submit" (implementation → code-review), the new state is code-review.
     // Legal moves: approve, request-changes, escape.
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
     const result = await buildStateTransitionReminder("submit", "ABC-123", "Bearer tok");
     expect(result).not.toBeNull();
     expect(result).toContain("[Workflow]");
@@ -1492,6 +1493,7 @@ describe("buildStateTransitionReminder — Layer 1 (AI-1387)", () => {
   });
 
   it("returns reminder for implementation state after accept from intake", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
     const result = await buildStateTransitionReminder("accept", "ABC-123", "Bearer tok");
     expect(result).not.toBeNull();
     expect(result).toContain("implementation");
@@ -1500,16 +1502,19 @@ describe("buildStateTransitionReminder — Layer 1 (AI-1387)", () => {
 
   it("returns null for terminal state (done)", async () => {
     // After "deploy" (deployment → done), the destination is terminal.
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
     const result = await buildStateTransitionReminder("deploy", "ABC-123", "Bearer tok");
     expect(result).toBeNull();
   });
 
   it("returns null for terminal escape state", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
     const result = await buildStateTransitionReminder("escape", "ABC-123", "Bearer tok");
     expect(result).toBeNull();
   });
 
   it("returns null for unknown intent", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
     const result = await buildStateTransitionReminder("unknown-command", "ABC-123", "Bearer tok");
     expect(result).toBeNull();
   });
@@ -1520,6 +1525,7 @@ describe("buildStateTransitionReminder — Layer 1 (AI-1387)", () => {
   });
 
   it("returns reminder for deployment state after approve from code-review", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
     const result = await buildStateTransitionReminder("approve", "ABC-123", "Bearer tok");
     expect(result).not.toBeNull();
     expect(result).toContain("deployment");
@@ -1528,6 +1534,7 @@ describe("buildStateTransitionReminder — Layer 1 (AI-1387)", () => {
   });
 
   it("returns reminder for implementation state after request-changes from code-review", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
     const result = await buildStateTransitionReminder("request-changes", "ABC-123", "Bearer tok");
     expect(result).not.toBeNull();
     expect(result).toContain("implementation");

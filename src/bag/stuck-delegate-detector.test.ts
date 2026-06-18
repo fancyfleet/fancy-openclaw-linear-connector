@@ -207,7 +207,7 @@ describe("StuckDelegateDetector", () => {
           deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => candidates,
-          loadDef: async () => TEST_WORKFLOW_DEF,
+          loadDefById: async () => TEST_WORKFLOW_DEF,
           sendWake: async (agent, ticket, prompt) => {
             wakeCalls.push({ agent, ticket, prompt });
             return true;
@@ -275,7 +275,7 @@ describe("StuckDelegateDetector", () => {
           deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => candidates,
-          loadDef: async () => TEST_WORKFLOW_DEF,
+          loadDefById: async () => TEST_WORKFLOW_DEF,
           sendWake: async (agent, ticket, prompt) => {
             wakeCalls.push({ agent, ticket, prompt });
             return true;
@@ -334,7 +334,7 @@ describe("StuckDelegateDetector", () => {
           deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => candidates,
-          loadDef: async () => TEST_WORKFLOW_DEF,
+          loadDefById: async () => TEST_WORKFLOW_DEF,
           sendWake: async () => true,
         },
         { pollMs: 60_000, idleGraceMs: 0, maxPrompts: 2 },
@@ -380,7 +380,7 @@ describe("StuckDelegateDetector", () => {
           deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => candidates,
-          loadDef: async () => TEST_WORKFLOW_DEF,
+          loadDefById: async () => TEST_WORKFLOW_DEF,
           sendWake: async () => true,
         },
         { pollMs: 60_000, idleGraceMs: 0, maxPrompts: 2 },
@@ -421,7 +421,7 @@ describe("StuckDelegateDetector", () => {
           deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => candidates,
-          loadDef: async () => TEST_WORKFLOW_DEF,
+          loadDefById: async () => TEST_WORKFLOW_DEF,
           sendWake: async () => true,
         },
         { pollMs: 60_000, idleGraceMs: 0, maxPrompts: 2 },
@@ -465,7 +465,7 @@ describe("StuckDelegateDetector", () => {
           deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => candidates,
-          loadDef: async () => TEST_WORKFLOW_DEF,
+          loadDefById: async () => TEST_WORKFLOW_DEF,
           now: () => mockNow,
           sendWake: async (agent, ticket, prompt) => {
             wakeCalls.push({ agent, ticket, prompt });
@@ -528,7 +528,7 @@ describe("StuckDelegateDetector", () => {
           deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => candidates,
-          loadDef: async () => TEST_WORKFLOW_DEF,
+          loadDefById: async () => TEST_WORKFLOW_DEF,
           sendWake: async () => true,
         },
         { pollMs: 60_000, idleGraceMs: 0, maxPrompts: 2 },
@@ -659,7 +659,7 @@ describe("StuckDelegateDetector", () => {
           deliveryConfig,
           listAgents: () => [igor, noah],
           fetchStuckCandidates: async (agent) => candidateMap.get(agent) ?? [],
-          loadDef: async () => TEST_WORKFLOW_DEF,
+          loadDefById: async () => TEST_WORKFLOW_DEF,
           sendWake: async (agent, ticket, _prompt) => {
             wakeCalls.push({ agent, ticket });
             return true;
@@ -686,7 +686,7 @@ describe("StuckDelegateDetector", () => {
       operationalEventStore.close();
     });
 
-    test("handles workflow def load failure gracefully", async () => {
+    test("handles workflow def load failure gracefully (per-candidate)", async () => {
       const { bag, sessionTracker, operationalEventStore, deliveryConfig } = setupDeps(dir);
 
       const detector = new StuckDelegateDetector(
@@ -696,7 +696,18 @@ describe("StuckDelegateDetector", () => {
           operationalEventStore,
           deliveryConfig,
           listAgents: () => [TEST_AGENT],
-          loadDef: async () => { throw new Error("YAML parse error"); },
+          fetchStuckCandidates: async () => [
+            {
+              identifier: "AI-999",
+              currentState: "implementation",
+              labels: ["wf:dev-impl", "state:implementation"],
+              delegateId: TEST_AGENT.linearUserId,
+              stateEnteredAt: "2026-01-01T00:00:00.000Z",
+              delegateComments: [{ id: "c1", createdAt: "2026-01-01T00:01:00.000Z", body: "done" }],
+              transitionsAfterEntry: [],
+            },
+          ],
+          loadDefById: async () => { throw new Error("YAML parse error"); },
           sendWake: async () => true,
         },
         { pollMs: 60_000, idleGraceMs: 0, maxPrompts: 2 },
@@ -724,7 +735,7 @@ describe("StuckDelegateDetector", () => {
           deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => { throw new Error("API error"); },
-          loadDef: async () => TEST_WORKFLOW_DEF,
+          loadDefById: async () => TEST_WORKFLOW_DEF,
           sendWake: async () => true,
         },
         { pollMs: 60_000, idleGraceMs: 0, maxPrompts: 2 },
@@ -751,7 +762,7 @@ describe("StuckDelegateDetector", () => {
           operationalEventStore,
           deliveryConfig,
           listAgents: () => [],
-          loadDef: async () => TEST_WORKFLOW_DEF,
+          loadDefById: async () => TEST_WORKFLOW_DEF,
           sendWake: async () => true,
         },
         { pollMs: 60_000, idleGraceMs: 0, maxPrompts: 2 },

@@ -214,6 +214,22 @@ export async function loadWorkflowDef(): Promise<WorkflowDef> {
 }
 
 /**
+ * Registry-aware per-workflow def lookup. Returns the WorkflowDef whose id
+ * matches the given workflowId (derived from a ticket's wf:<id> label),
+ * or null if the registry has no matching def.
+ *
+ * This is the correct accessor for enforcement paths that know which workflow
+ * a ticket belongs to — unlike loadWorkflowDef() which always returns the
+ * single primary def regardless of workflowId. Use this anywhere that has
+ * a workflowId available so non-dev-impl workflows (ux-audit, sprint, etc.)
+ * get their own def enforcement instead of silently passing through.
+ */
+export async function loadWorkflowDefById(workflowId: string): Promise<WorkflowDef | null> {
+  const registry = await loadWorkflowRegistry();
+  return registry.get(workflowId) ?? null;
+}
+
+/**
  * AI-1530: Load ALL workflow defs into a registry keyed by def.id.
  *
  * This is the dispatch source for multi-workflow enforcement: the gate resolves
@@ -1500,12 +1516,13 @@ export async function buildStateTransitionReminder(
 ): Promise<string | null> {
   if (!issueId) return null;
 
-  let def: WorkflowDef;
-  try {
-    def = await loadWorkflowDef();
-  } catch {
-    return null;
-  }
+  // Resolve the correct def for this ticket's workflow
+  const labels = await fetchWorkflowLabels(issueId, authToken);
+  const workflowId = getWorkflowId(labels);
+  if (!workflowId) return null; // ad-hoc ticket
+
+  const def = await loadWorkflowDefById(workflowId);
+  if (!def) return null;
 
   const breakGlassCommand = def.break_glass?.command ?? "escape";
 

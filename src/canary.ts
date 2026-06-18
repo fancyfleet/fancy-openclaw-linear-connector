@@ -27,7 +27,7 @@
 
 import { componentLogger, createLogger } from "./logger.js";
 import { isHealthy as isConfigHealthy, getStatus as getConfigStatus, onAlert, type ConfigHealthStatus } from "./config-health.js";
-import { loadWorkflowDef, type WorkflowDef } from "./workflow-gate.js";
+import { loadWorkflowDef, loadWorkflowRegistry, type WorkflowDef } from "./workflow-gate.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "canary");
 
@@ -331,58 +331,66 @@ export async function runTransitionWalk(): Promise<TransitionWalkResult> {
     };
   }
 
-  const stateIds = new Set(def.states.map((s) => s.id));
-
-  for (const state of def.states) {
-    if (state.kind !== "terminal") {
-      if (!state.owner_role) {
-        violations.push({
-          from: state.id,
-          command: "(schema)",
-          to: "(n/a)",
-          issue: "Non-terminal state '" + state.id + "' has no owner_role.",
-        });
-      }
-    }
-
-    for (const transition of state.transitions ?? []) {
-      transitionsChecked++;
-
-      if (!stateIds.has(transition.to) && transition.to !== "__ad_hoc__") {
-        violations.push({
-          from: state.id,
-          command: transition.command,
-          to: transition.to,
-          issue: "Transition leads to undefined state '" + transition.to + "'.",
-        });
-        continue;
-      }
-
-      if (transition.to === "__ad_hoc__") continue;
-
-      const destState = def.states.find((s) => s.id === transition.to);
-      if (!destState) continue;
-
-      if (destState.kind === "terminal") continue;
-
-      if (!destState.owner_role) {
-        violations.push({
-          from: state.id,
-          command: transition.command,
-          to: transition.to,
-          issue: "Transition to non-terminal state '" + transition.to + "' which has no owner_role.",
-        });
-      }
-    }
+  // Walk all defs in the registry (multi-workflow support)
+  const registry = await loadWorkflowRegistry();
+  for (const [, regDef] of registry) {
+    walkDef(regDef);
   }
 
-  if (def.entry_state && !stateIds.has(def.entry_state)) {
-    violations.push({
-      from: "(schema)",
-      command: "entry_state",
-      to: def.entry_state,
-      issue: "entry_state '" + def.entry_state + "' does not reference a defined state.",
-    });
+  function walkDef(walkDef: WorkflowDef) {
+    const stateIds = new Set(walkDef.states.map((s) => s.id));
+
+    for (const state of walkDef.states) {
+      if (state.kind !== "terminal") {
+        if (!state.owner_role) {
+          violations.push({
+            from: state.id,
+            command: "(schema)",
+            to: "(n/a)",
+            issue: "Non-terminal state '" + state.id + "' has no owner_role (wf:" + walkDef.id + ").",
+          });
+        }
+      }
+
+      for (const transition of state.transitions ?? []) {
+        transitionsChecked++;
+
+        if (!stateIds.has(transition.to) && transition.to !== "__ad_hoc__") {
+          violations.push({
+            from: state.id,
+            command: transition.command,
+            to: transition.to,
+            issue: "Transition leads to undefined state '" + transition.to + "' (wf:" + walkDef.id + ").",
+          });
+          continue;
+        }
+
+        if (transition.to === "__ad_hoc__") continue;
+
+        const destState = walkDef.states.find((s) => s.id === transition.to);
+        if (!destState) continue;
+
+        if (destState.kind === "terminal") continue;
+
+        if (!destState.owner_role) {
+          violations.push({
+            from: state.id,
+            command: transition.command,
+            to: transition.to,
+            issue: "Transition to non-terminal state '" + transition.to + "' which has no owner_role (wf:" + walkDef.id + ").",
+          });
+        }
+      }
+    }
+
+    if (walkDef.entry_state && !stateIds.has(walkDef.entry_state)) {
+      violations.push({
+        from: "(schema)",
+        command: "entry_state",
+        to: walkDef.entry_state,
+        issue: "entry_state '" + walkDef.entry_state + "' does not reference a defined state (wf:" + walkDef.id + ").",
+      });
+    }
   }
 
   const passed = violations.length === 0;

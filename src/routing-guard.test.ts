@@ -12,6 +12,7 @@ import { jest, describe, it, expect, beforeEach } from "@jest/globals";
 const mockGetAccessToken = jest.fn<() => string | undefined>().mockReturnValue(undefined);
 const mockGetAgents = jest.fn<() => { name: string; linearUserId: string }[]>().mockReturnValue([]);
 const mockLoadWorkflowDef = jest.fn<() => Promise<unknown>>();
+const mockLoadWorkflowDefById = jest.fn<() => Promise<unknown>>();
 const mockResolveBodiesForRole = jest.fn<(role: string) => Promise<string[]>>();
 
 jest.unstable_mockModule("./agents.js", () => ({
@@ -31,6 +32,7 @@ const _getCurrentState = (labels: string[]): string | null => {
 
 jest.unstable_mockModule("./workflow-gate.js", () => ({
   loadWorkflowDef: mockLoadWorkflowDef,
+  loadWorkflowDefById: mockLoadWorkflowDefById,
   getWorkflowId: jest.fn().mockImplementation(_getWorkflowId),
   getCurrentState: jest.fn().mockImplementation(_getCurrentState),
 }));
@@ -151,7 +153,11 @@ describe("checkRoleGuard (Phase 1 advisory)", () => {
 describe("checkRoleGuardEnforced (Phase 2 enforcement)", () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockLoadWorkflowDef.mockResolvedValue(DEV_IMPL_DEF as never);
+    mockLoadWorkflowDefById.mockImplementation(async (workflowId: string) => {
+      // Only return a def for dev-impl — unknown workflows return null
+      if (workflowId === "dev-impl") return DEV_IMPL_DEF;
+      return null;
+    });
   });
 
   it("passes through non-workflow tickets (no wf: label)", async () => {
@@ -165,7 +171,7 @@ describe("checkRoleGuardEnforced (Phase 2 enforcement)", () => {
   });
 
   it("fails open when workflow def cannot be loaded", async () => {
-    mockLoadWorkflowDef.mockRejectedValue(new Error("ENOENT: file not found") as never);
+    mockLoadWorkflowDefById.mockRejectedValue(new Error("ENOENT: file not found") as never);
     const result = await checkRoleGuardEnforced("charles", ["wf:dev-impl", "state:implementation"]);
     expect(result.blocked).toBe(false);
   });
@@ -190,7 +196,7 @@ describe("checkRoleGuardEnforced (Phase 2 enforcement)", () => {
       id: "dev-impl",
       states: [{ id: "implementation", transitions: [] }],
     };
-    mockLoadWorkflowDef.mockResolvedValue(defNoRole as never);
+    mockLoadWorkflowDefById.mockResolvedValue(defNoRole as never);
     const result = await checkRoleGuardEnforced("charles", ["wf:dev-impl", "state:implementation"]);
     expect(result.blocked).toBe(false);
   });
@@ -271,7 +277,7 @@ describe("checkRoleGuardEnforced (Phase 2 enforcement)", () => {
 describe("checkRoleGuardAndBlock (enforcement + comment/correction, no network)", () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockLoadWorkflowDef.mockResolvedValue(DEV_IMPL_DEF as never);
+    mockLoadWorkflowDefById.mockResolvedValue(DEV_IMPL_DEF as never);
     // No token — skips comment/correction path.
     mockGetAccessToken.mockReturnValue(undefined);
   });

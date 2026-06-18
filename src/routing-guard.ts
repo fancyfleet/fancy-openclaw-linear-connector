@@ -21,7 +21,7 @@
 
 import { createLogger, componentLogger } from "./logger.js";
 import { getAccessToken } from "./agents.js";
-import { loadWorkflowDef, getWorkflowId, getCurrentState } from "./workflow-gate.js";
+import { loadWorkflowDefById, getWorkflowId, getCurrentState } from "./workflow-gate.js";
 import { resolveBodiesForRole } from "./escalation-gate.js";
 
 const log = componentLogger(createLogger(), "routing-guard");
@@ -114,17 +114,18 @@ export async function checkRoleGuardEnforced(
     return { blocked: false };
   }
 
-  // 3. Load workflow def → fail open on error.
+  // 3. Load workflow def by id from registry → fail open on error.
   let def;
   try {
-    def = await loadWorkflowDef();
-  } catch (err) {
-    log.warn(`routing-guard: failed to load workflow def — failing open: ${err instanceof Error ? err.message : String(err)}`);
+    def = await loadWorkflowDefById(workflowId);
+  } catch {
+    log.warn(`routing-guard: failed to load workflow def — failing open for ${targetAgentId}`);
     return { blocked: false };
   }
-
-  // Only enforce for the workflow whose def is loaded.
-  if (workflowId !== def.id) return { blocked: false };
+  if (!def) {
+    log.warn(`routing-guard: no workflow def in registry for wf:${workflowId} — failing open for ${targetAgentId}`);
+    return { blocked: false };
+  }
 
   // 4. Find the state node.
   const stateNode = def.states.find((s) => s.id === currentState);

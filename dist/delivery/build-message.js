@@ -13,8 +13,9 @@
  */
 import fs from "node:fs/promises";
 import path from "node:path";
-import { loadWorkflowDef, fetchWorkflowLabels, getWorkflowId, getCurrentState, resolveTransitionTargets, resolveStakesLevel, } from "../workflow-gate.js";
+import { loadWorkflowDefById, fetchWorkflowLabels, getWorkflowId, getCurrentState, resolveTransitionTargets, resolveStakesLevel, } from "../workflow-gate.js";
 import { getAcRecord } from "../ac-record-store.js";
+import { getAppliedState } from "../store/applied-state-store.js";
 import { componentLogger, createLogger } from "../logger.js";
 import { defaultGuidanceDir } from "../instance-config.js";
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "build-message");
@@ -98,18 +99,24 @@ async function tryBuildWorkflowMessage(actionText, identifier, title, authToken)
     const workflowId = getWorkflowId(labels);
     if (!workflowId)
         return null; // ad-hoc ticket — fall through to generic
-    let def;
-    try {
-        def = await loadWorkflowDef();
-    }
-    catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        log.warn(`build-message: failed to load workflow def: ${msg} — falling back to generic`);
+    const def = await loadWorkflowDefById(workflowId);
+    if (!def) {
+        log.warn(`build-message: no workflow def in registry for wf:${workflowId} — falling back to generic`);
         return null;
     }
-    if (workflowId !== def.id)
-        return null; // unknown workflow — fall back
-    const currentState = getCurrentState(labels);
+    // AI-1534: prefer the connector's just-applied destination state over the live
+    // label read. Linear reads are eventually consistent, so right after a
+    // transition (e.g. accept: intake → write-tests that also reassigns the
+    // delegate) the read above can still return the PRE-transition state, which
+    // would tell the new delegate to run the previous state's verb. The proxy is
+    // the sole writer of transitions, so its recorded post-transition state is
+    // authoritative while fresh.
+    const liveState = getCurrentState(labels);
+    const appliedState = getAppliedState(identifier);
+    const currentState = appliedState ?? liveState;
+    if (appliedState && appliedState !== liveState) {
+        log.info(`build-message: preferring just-applied state '${appliedState}' over live read '${liveState ?? "none"}' for ${identifier} (read-after-write lag guard, AI-1534)`);
+    }
     if (!currentState) {
         log.warn(`build-message: no state:* label on ${identifier} — falling back to generic`);
         return null;
@@ -197,13 +204,14 @@ function buildGenericDelegationMessage(actionText, identifier, title) {
         `  - and need an agent to act instead, run \`linear refuse-work ${identifier} [delegate] --comment [reason]\``,
         `  - and need a human to help (e.g. credentials, access, infra provision), run \`linear needs-human ${identifier} [human] --comment [reason]\``,
         "",
-        "When you complete the work...",
-        `- To hand off for review, run \`linear handoff-work ${identifier} [delegate] --comment [note]\` (use an agent delegate like Charles for code, Astrid for product)`,
-        `- If the ticket’s acceptance criteria is met and you are NOT the implementer, run \`linear complete ${identifier} --comment [summary]\``,
+        "When the work is done, hand it off to be checked — you do NOT pick a reviewer yourself:",
+        `- Default: hand off to Ai — run \`linear handoff-work ${identifier} Ai --comment [summary]\`. Ai validates the work, answers easy questions, and brings in the requesting human only when their action is actually needed. A second set of eyes catches simple mistakes before the task is called done, and keeps humans from becoming a blocker.`,
+        "- If another AGENT requested this work (you are collaborating with them on the ticket), hand it back to that agent instead.",
+        "- Hand finished work off to be checked even if you did the work yourself — there is no \"only if you are not the implementer\" rule here. Do not silently leave a completed task sitting in your own column.",
         "",
         "📝 Comment discipline: post one substantive comment — your actual findings or result. Do NOT post a comment that only restates what is already on the ticket or narrates that you have handed it back. If a dispatch wakes you and you have no new information to add, do not comment at all — just transition state (or take no action).",
         "",
-        "⚠️ Important: do NOT hand off to Matt Henry for review, sign-off, or closure. Route reviews to the appropriate agent (Charles for code, Astrid for product, Laren for design). Only use \`needs-human\` for genuine blockers that require human action (credentials, access, approvals you cannot obtain yourself)."
+        "⚠️ Important: agents do not decide reviewers. Hand finished work to Ai for validation (or back to the requesting agent), rather than choosing a domain reviewer yourself. Use \`needs-human\` only for genuine blockers that require human action (credentials, access, approvals you cannot obtain yourself) — not as a way to mark work complete."
     ].join("\n");
 }
 function buildMentionMessage(actorName, identifier, title) {

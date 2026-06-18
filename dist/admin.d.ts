@@ -4,6 +4,7 @@ import type { PendingWorkBag } from "./bag/index.js";
 import type { SessionTracker } from "./bag/index.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import type { ObservationStore } from "./store/observation-store.js";
+import { type WakeUpConfig } from "./bag/wake-up.js";
 interface AdminDeps {
     agentQueue: AgentQueue;
     bag: PendingWorkBag;
@@ -11,6 +12,8 @@ interface AdminDeps {
     operationalEventStore?: OperationalEventStore;
     observationStore?: ObservationStore;
     deploymentName: string;
+    /** If provided, set-state will re-dispatch to the new state's owner role (AI-1607). */
+    wakeConfigForAgent?: (agentId: string) => WakeUpConfig;
 }
 export declare function createAdminRouter(deps: AdminDeps): Router;
 export {};

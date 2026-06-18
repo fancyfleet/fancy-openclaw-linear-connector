@@ -36,7 +36,7 @@
 
 import { createLogger, componentLogger } from "../logger.js";
 import { getAccessToken, getAgents, isAgentLocal, type AgentConfig } from "../agents.js";
-import { loadWorkflowDef, getCurrentState, getWorkflowId, type WorkflowDef } from "../workflow-gate.js";
+import { loadWorkflowDefById, getCurrentState, getWorkflowId, type WorkflowDef } from "../workflow-gate.js";
 import type { OperationalEventStore } from "../store/operational-event-store.js";
 import type { SessionTracker } from "./session-tracker.js";
 import type { PendingWorkBag } from "./pending-work-bag.js";
@@ -76,8 +76,8 @@ export interface StuckDelegateDeps {
   now?: () => number;
   /** Overridable for testing. */
   fetchStuckCandidates?: (agent: AgentConfig) => Promise<StuckCandidate[]>;
-  /** Overridable for testing — loads workflow def. */
-  loadDef?: () => Promise<WorkflowDef>;
+  /** Overridable for testing — loads workflow def by id. */
+  loadDefById?: (workflowId: string) => Promise<WorkflowDef | null>;
 }
 
 // ── Data types ───────────────────────────────────────────────────────────────
@@ -216,7 +216,7 @@ export class StuckDelegateDetector {
       listAgents: deps.listAgents ?? (() => getAgents().filter(isAgentLocal)),
       now: deps.now ?? (() => Date.now()),
       fetchStuckCandidates: deps.fetchStuckCandidates ?? defaultFetchStuckCandidates,
-      loadDef: deps.loadDef ?? loadWorkflowDef,
+      loadDefById: deps.loadDefById ?? loadWorkflowDefById,
     };
     this.promptCounter = new PromptCounter();
   }
@@ -258,7 +258,7 @@ export class StuckDelegateDetector {
    * and re-prompts as needed.
    */
   async runCycle(): Promise<StuckDelegateCycleResult> {
-    const { listAgents, fetchStuckCandidates, loadDef, sessionTracker, bag, operationalEventStore, sendWake, now: getNow } = this.deps;
+    const { listAgents, fetchStuckCandidates, loadDefById, sessionTracker, bag, operationalEventStore, sendWake, now: getNow } = this.deps;
     const agents = listAgents();
     const result: StuckDelegateCycleResult = {
       agentsChecked: 0,
@@ -269,14 +269,7 @@ export class StuckDelegateDetector {
       errors: 0,
     };
 
-    let def: WorkflowDef;
-    try {
-      def = await loadDef();
-    } catch (err) {
-      log.error(`Failed to load workflow def: ${err instanceof Error ? err.message : String(err)}`);
-      result.errors++;
-      return result;
-    }
+    let def: WorkflowDef | null;
 
     for (const agent of agents) {
       result.agentsChecked++;
@@ -346,6 +339,21 @@ export class StuckDelegateDetector {
           log.info(
             `Stuck-delegate: skipping ${ticketId} — already prompted ${promptCount} times (max=${this.config.maxPrompts})`,
           );
+          continue;
+        }
+
+        // Resolve the correct workflow def for this candidate
+        const candidateWorkflowId = getWorkflowId(candidate.labels);
+        try {
+          def = candidateWorkflowId ? await loadDefById(candidateWorkflowId) : null;
+        } catch (err) {
+          log.error(`Stuck-delegate: failed to load def for wf:${candidateWorkflowId} on ${ticketId}: ${err instanceof Error ? err.message : String(err)}`);
+          result.errors++;
+          continue;
+        }
+        if (!def) {
+          log.warn(`Stuck-delegate: skipping ${ticketId} — no workflow def for wf:${candidateWorkflowId}`);
+          result.errors++;
           continue;
         }
 

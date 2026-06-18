@@ -16,7 +16,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { RouteResult } from "../types.js";
 import {
-  loadWorkflowDef,
+  loadWorkflowDefById,
   fetchWorkflowLabels,
   getWorkflowId,
   getCurrentState,
@@ -140,16 +140,11 @@ async function tryBuildWorkflowMessage(
   const workflowId = getWorkflowId(labels);
   if (!workflowId) return null; // ad-hoc ticket — fall through to generic
 
-  let def: WorkflowDef;
-  try {
-    def = await loadWorkflowDef();
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    log.warn(`build-message: failed to load workflow def: ${msg} — falling back to generic`);
+  const def = await loadWorkflowDefById(workflowId);
+  if (!def) {
+    log.warn(`build-message: no workflow def in registry for wf:${workflowId} — falling back to generic`);
     return null;
   }
-
-  if (workflowId !== def.id) return null; // unknown workflow — fall back
 
   // AI-1534: prefer the connector's just-applied destination state over the live
   // label read. Linear reads are eventually consistent, so right after a

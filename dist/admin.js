@@ -4,6 +4,7 @@ import { getAgents, getAccessToken } from "./agents.js";
 import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forensics.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
 import { setStateAtomic } from "./workflow-gate.js";
+import { sendWakeUpSignal } from "./bag/wake-up.js";
 function bool(value) {
     return typeof value === "string" ? value.length > 0 : Boolean(value);
 }
@@ -539,7 +540,13 @@ export function createAdminRouter(deps) {
             res.status(503).json({ ok: false, error: "no Linear auth token available" });
             return;
         }
-        const result = await setStateAtomic(ticketId, targetState, delegate, authToken);
+        const sendWakeUp = deps.wakeConfigForAgent
+            ? async (agentId, ticketIdentifier) => {
+                const config = deps.wakeConfigForAgent(agentId);
+                await sendWakeUpSignal(agentId, [ticketIdentifier], config);
+            }
+            : undefined;
+        const result = await setStateAtomic(ticketId, targetState, delegate, authToken, { sendWakeUp });
         res.status(result.ok ? 200 : 422).json(result);
     });
     router.get(["/", "/agents", "/tasks", "/settings"], (req, res) => {
