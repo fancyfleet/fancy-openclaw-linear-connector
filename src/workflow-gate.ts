@@ -86,6 +86,11 @@ function workflowDefPath(): string {
 export interface WorkflowTransition {
   command: string;
   to: string;
+  /** AI-1640: human-facing "use when" context for this transition, rendered into
+   *  the per-state wake message so an agent can map a situation (e.g. "PR is not
+   *  mergeable") to the correct command. Most important for back/exit transitions
+   *  (reject, request-changes, ac-fail) an agent might otherwise miss. */
+  description?: string;
   requires_capability?: string;
   /** §5.7 item 1: if true, this transition requires a bound artifact ref (e.g. sprint-plan doc). */
   requires_artifact?: boolean;

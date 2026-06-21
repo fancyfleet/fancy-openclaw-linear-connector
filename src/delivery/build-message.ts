@@ -197,7 +197,12 @@ async function tryBuildWorkflowMessage(
         note = ` [defaults to prior implementer; overridable with --target]`;
       }
 
-      return `- Run \`${cmd}\`${arrow}${note}`;
+      // AI-1640: surface the transition's "use when" context so an agent can map a
+      // situation (e.g. an unmergeable PR) to the right command instead of falling
+      // back to a plain comment.
+      const useWhen = t.description ? ` — use when: ${t.description}` : '';
+
+      return `- Run \`${cmd}\`${arrow}${note}${useWhen}`;
     })),
     loadStepGuidance(def.id, currentState),
   ]);

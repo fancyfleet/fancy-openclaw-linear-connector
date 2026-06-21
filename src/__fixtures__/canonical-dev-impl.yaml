@@ -67,6 +67,7 @@ states:
         capture_ac: true
       - command: demote
         to: __ad_hoc__          # ticket leaves the workflow entirely (design.md §4.5)
+        description: "this ticket does not belong in dev-impl — remove it from the workflow"
 
   - id: write-tests
     owner_role: test-author     # TestDrivenDevelopmentAgent; dev container (§16.2)
@@ -111,6 +112,7 @@ states:
         assign: { mode: auto }
       - command: request-changes
         to: implementation
+        description: "the code has issues (failing tests, defects, scope/AC problems) that must be fixed before it can merge"
         feedback:
           required: true
           category_enum:
@@ -145,6 +147,7 @@ states:
         assign: { mode: auto }     # host-deploy is singleton (Grover) — auto-assign
       - command: reject
         to: implementation
+        description: "the PR is not mergeable as-is (conflicts, failing CI, defects) — send it back to implementation with feedback instead of leaving a plain comment"
         feedback:
           required: true
           category_enum:
@@ -171,6 +174,7 @@ states:
         assign: { mode: auto }     # ac-validate steward is singleton (Astrid) — auto-assign
       - command: reject
         to: implementation
+        description: "the host deploy cannot proceed (broken build, failed migration, unrunnable artifact) — send it back to implementation with feedback"
         feedback:
           required: true
           category_enum:
@@ -194,6 +198,7 @@ states:
         # terminal → no assignment
       - command: ac-fail
         to: implementation
+        description: "the deployed artifact fails its acceptance criteria in real conditions — send it back to implementation with what failed"
         feedback:
           required: true
           category_enum:

@@ -73,6 +73,7 @@ states:
         requires_capability: deploy:execute
       - command: reject
         to: implementation
+        description: "the PR is not mergeable as-is — send it back with feedback"
         feedback:
           required: true
           category_enum: [missing-tests, style, scope-creep, correctness, ac-mismatch]
@@ -287,6 +288,30 @@ describe("B3 — outbound per-step instruction injection", () => {
         }
       },
     );
+
+    // AI-1640: a transition with a `description` renders its "use when" context so
+    // an agent can map a situation to the right back/exit command.
+    it("renders a transition's description as a 'use when' annotation", async () => {
+      globalThis.fetch = makeLabelFetch([`wf:dev-impl`, `state:deployment`]);
+
+      const buildDeliveryMessage = await getbuildDeliveryMessage();
+      const msg = await buildDeliveryMessage(makeRoute("AI-001", "Test ticket"), "Bearer tok");
+
+      // reject carries a description → use-when annotation attached to its line
+      const rejectLine = msg
+        .split("\n")
+        .find((l) => l.includes("linear reject AI-001"));
+      expect(rejectLine).toBeDefined();
+      expect(rejectLine).toContain("→ implementation");
+      expect(rejectLine).toContain("use when: the PR is not mergeable as-is");
+
+      // deploy has no description → no use-when annotation on its line
+      const deployLine = msg
+        .split("\n")
+        .find((l) => l.includes("linear deploy AI-001"));
+      expect(deployLine).toBeDefined();
+      expect(deployLine).not.toContain("use when:");
+    });
   });
 
   describe("ad-hoc ticket — generic message unchanged", () => {
