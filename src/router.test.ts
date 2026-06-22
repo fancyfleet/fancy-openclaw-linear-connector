@@ -440,7 +440,6 @@ describe("routeEvent", () => {
   });
 });
 
-<<<<<<< HEAD
 // ── routeEventAll — multi-mention fan-out (audit #3) ─────────────────────────
 
 describe("routeEventAll", () => {
@@ -456,42 +455,11 @@ describe("routeEventAll", () => {
     reloadAgents();
     // No roster loaded — fan-out tests exercise mechanical (agent-map) routing.
     delete process.env.DEPARTMENT_ROSTER_PATH;
-=======
-// ── routeEvent + department roster integration ───────────────────────────────
-
-describe("routeEvent with department roster — self-trigger suppression", () => {
-  let agentsFile: string;
-  let rosterFile: string;
-
-  // Roster: AI → charles, ILL → astrid, steward → astrid
-  const ROSTER_YAML = `
-version: 1
-steward: astrid
-departments:
-  AI:
-    name: AI Team
-    defaultTarget: charles
-  ILL:
-    name: ILL Team
-    defaultTarget: astrid
-`;
-
-  beforeEach(() => {
-    agentsFile = makeTempAgentsFile(BASE_AGENTS);
-    process.env.AGENTS_FILE = agentsFile;
-    reloadAgents();
-
-    const dir = path.dirname(agentsFile);
-    rosterFile = path.join(dir, "department-roster.yaml");
-    fs.writeFileSync(rosterFile, ROSTER_YAML);
-    process.env.DEPARTMENT_ROSTER_PATH = rosterFile;
->>>>>>> 7e3f86a (fix(AI-1479): self-trigger suppression must check department roster before suppressing)
     resetRosterCache();
   });
 
   afterEach(() => {
     delete process.env.AGENTS_FILE;
-<<<<<<< HEAD
     resetRosterCache();
     fs.rmSync(path.dirname(agentsFile), { recursive: true, force: true });
   });
@@ -540,16 +508,50 @@ departments:
   it("returns empty when no target resolves", async () => {
     const event = makeIssueEvent({ commentBody: "no agents mentioned here" });
     expect(await routeEventAll(event)).toEqual([]);
-=======
+  });
+});
+
+// ── routeEvent + department roster integration ───────────────────────────────
+
+describe("routeEvent with department roster — self-trigger suppression", () => {
+  let agentsFile: string;
+  let rosterFile: string;
+
+  // Roster: AI → charles, ILL → astrid, steward → astrid
+  const ROSTER_YAML = `
+version: 1
+steward: astrid
+departments:
+  AI:
+    name: AI Team
+    defaultTarget: charles
+  ILL:
+    name: ILL Team
+    defaultTarget: astrid
+`;
+
+  beforeEach(() => {
+    agentsFile = makeTempAgentsFile(BASE_AGENTS);
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+
+    const dir = path.dirname(agentsFile);
+    rosterFile = path.join(dir, "department-roster.yaml");
+    fs.writeFileSync(rosterFile, ROSTER_YAML);
+    process.env.DEPARTMENT_ROSTER_PATH = rosterFile;
+    resetRosterCache();
+  });
+
+  afterEach(() => {
+    delete process.env.AGENTS_FILE;
     delete process.env.DEPARTMENT_ROSTER_PATH;
     fs.rmSync(path.dirname(agentsFile), { recursive: true, force: true });
     resetRosterCache();
   });
 
   it("agent actor with no mechanical target routes via department prefix (not suppressed)", async () => {
-    // Igor (not in BASE_AGENTS, so use charles as the actor) comments on ILL-42.
-    // No delegate/assignee/mention. Roster routes ILL → astrid.
-    // This should NOT be suppressed — astrid != charles (the actor).
+    // Charles comments on ILL-42. No delegate/assignee/mention. Roster routes
+    // ILL → astrid. This should NOT be suppressed — astrid != charles (the actor).
     const event = makeIssueEvent({
       actorId: CHARLES_ID,
       identifier: "ILL-42",
@@ -600,6 +602,5 @@ departments:
     expect(result).not.toBeNull();
     expect(result?.agentId).toBe("astrid");
     expect(result?.routingReason).toBe("department-prefix");
->>>>>>> 7e3f86a (fix(AI-1479): self-trigger suppression must check department roster before suppressing)
   });
 });
