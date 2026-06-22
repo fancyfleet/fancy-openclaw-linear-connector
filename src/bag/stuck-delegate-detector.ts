@@ -40,14 +40,16 @@ import { loadWorkflowDefById, getCurrentState, getWorkflowId, type WorkflowDef }
 import type { OperationalEventStore } from "../store/operational-event-store.js";
 import type { SessionTracker } from "./session-tracker.js";
 import type { PendingWorkBag } from "./pending-work-bag.js";
+import type { DispatchAckTracker } from "./dispatch-ack-tracker.js";
 import { normalizeSessionKey } from "../session-key.js";
 import { deliverMessageToAgent, type DeliveryConfig } from "../delivery/index.js";
 
 const log = componentLogger(createLogger(), "stuck-delegate-detector");
 
-const DEFAULT_POLL_MS = 5 * 60 * 1000;       // 5 minutes
-const DEFAULT_IDLE_GRACE_MS = 3 * 60 * 1000;  // 3 minutes
+const DEFAULT_POLL_MS = 5 * 60 * 1000;           // 5 minutes
+const DEFAULT_IDLE_GRACE_MS = 3 * 60 * 1000;      // 3 minutes
 const DEFAULT_MAX_PROMPTS = 2;
+const DEFAULT_SESSION_ACTIVE_MS = 10 * 60 * 1000; // 10 minutes
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
@@ -58,6 +60,13 @@ export interface StuckDelegateConfig {
   idleGraceMs: number;
   /** Max re-prompts per ticket. Default: 2. */
   maxPrompts: number;
+  /**
+   * How recent a pending ack dispatch must be to treat the session as active (restart-safe guard).
+   * If a pending DispatchAckTracker entry exists and is newer than this threshold, the session is
+   * assumed to still be running — re-prompt is skipped. Set to 0 to disable. Default: 10 min.
+   * Env var: STUCK_DELEGATE_SESSION_ACTIVE_MS
+   */
+  sessionActiveThresholdMs: number;
 }
 
 // ── Dependencies ─────────────────────────────────────────────────────────────
@@ -68,6 +77,13 @@ export interface StuckDelegateDeps {
   operationalEventStore: OperationalEventStore;
   /** Delivery config for sending re-prompt messages to agents. */
   deliveryConfig: DeliveryConfig;
+  /**
+   * Persisted dispatch ack tracker. When provided, the detector checks whether a recent
+   * pending dispatch exists for the (agent, ticket) pair before re-prompting. This guard
+   * survives connector restarts, unlike the in-memory SessionTracker. Optional — falls
+   * through to existing behavior when absent.
+   */
+  ackTracker?: DispatchAckTracker;
   /** Deliver a re-prompt wake signal to the agent. */
   sendWake?: (agentOpenclawName: string, ticketId: string, prompt: string) => Promise<boolean>;
   /** Overridable for testing. */
@@ -101,6 +117,8 @@ export interface StuckDelegateCycleResult {
   stuckFound: number;
   rePromptsSent: number;
   skippedAlreadyPrompted: number;
+  /** Tickets skipped because ackTracker showed a recent pending dispatch (session likely active). */
+  skippedSessionActive: number;
   errors: number;
 }
 
@@ -196,7 +214,8 @@ export function buildRePrompt(
 export class StuckDelegateDetector {
   private timer?: ReturnType<typeof setInterval>;
   private config: StuckDelegateConfig;
-  private deps: Required<StuckDelegateDeps>;
+  private deps: Required<Omit<StuckDelegateDeps, "ackTracker">>;
+  private ackTracker?: DispatchAckTracker;
   private promptCounter: PromptCounter;
   /** Tracks when sessions ended per (agent, sessionKey) for idle-grace calculation. */
   private sessionEndedAt: Map<string, number> = new Map();
@@ -206,7 +225,9 @@ export class StuckDelegateDetector {
       pollMs: config?.pollMs ?? parseEnvInt("STUCK_DELEGATE_POLL_MS", DEFAULT_POLL_MS),
       idleGraceMs: config?.idleGraceMs ?? parseEnvInt("STUCK_DELEGATE_IDLE_GRACE_MS", DEFAULT_IDLE_GRACE_MS),
       maxPrompts: config?.maxPrompts ?? parseEnvInt("STUCK_DELEGATE_MAX_PROMPTS", DEFAULT_MAX_PROMPTS),
+      sessionActiveThresholdMs: config?.sessionActiveThresholdMs ?? parseEnvInt("STUCK_DELEGATE_SESSION_ACTIVE_MS", DEFAULT_SESSION_ACTIVE_MS),
     };
+    this.ackTracker = deps.ackTracker;
     this.deps = {
       sessionTracker: deps.sessionTracker,
       bag: deps.bag,
@@ -225,7 +246,8 @@ export class StuckDelegateDetector {
     if (this.timer) return;
     log.info(
       `Stuck-delegate detector started — poll=${this.config.pollMs}ms ` +
-      `idleGrace=${this.config.idleGraceMs}ms maxPrompts=${this.config.maxPrompts}`,
+      `idleGrace=${this.config.idleGraceMs}ms maxPrompts=${this.config.maxPrompts} ` +
+      `sessionActiveThreshold=${this.config.sessionActiveThresholdMs}ms ackTracker=${this.ackTracker ? "yes" : "no"}`,
     );
     this.timer = setInterval(() => {
       this.runCycle().catch((err) => {
@@ -266,6 +288,7 @@ export class StuckDelegateDetector {
       stuckFound: 0,
       rePromptsSent: 0,
       skippedAlreadyPrompted: 0,
+      skippedSessionActive: 0,
       errors: 0,
     };
 
@@ -296,6 +319,27 @@ export class StuckDelegateDetector {
           // Session is active — clear any stale "ended at" tracking
           this.sessionEndedAt.delete(`${openclawAgent}:${sessionKey}`);
           continue;
+        }
+
+        // Restart-safe session-active guard: check DispatchAckTracker (persisted in SQLite).
+        // If a pending dispatch for this (agent, ticket) is newer than sessionActiveThresholdMs,
+        // the session is likely still running — skip. This catches the case where the connector
+        // restarted mid-session and the in-memory sessionTracker was reset (AI-1650).
+        if (this.ackTracker && this.config.sessionActiveThresholdMs > 0) {
+          const pendingAcks = this.ackTracker.getPendingTimedOut(0);
+          const entry = pendingAcks.find((e) => e.agentId === openclawAgent && e.ticketId === sessionKey);
+          if (entry) {
+            const lastSignalMs = new Date(entry.lastSignalAt.replace(" ", "T") + "Z").getTime();
+            const ageMs = getNow() - lastSignalMs;
+            if (ageMs < this.config.sessionActiveThresholdMs) {
+              result.skippedSessionActive++;
+              log.info(
+                `Stuck-delegate: skipping ${ticketId} — pending dispatch is ${Math.round(ageMs / 1000)}s old ` +
+                `(threshold=${Math.round(this.config.sessionActiveThresholdMs / 1000)}s); session likely active`,
+              );
+              continue;
+            }
+          }
         }
 
         // Apply idle grace period: if the session recently ended, wait
