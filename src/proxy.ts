@@ -262,6 +262,13 @@ export interface ProxyDeps {
   operationalEventStore?: OperationalEventStore;
   /** AI-1664: Optional no-activity detector — proxy calls with a resolvable ticket ID satisfy the timer. */
   noActivityDetector?: NoActivityDetector;
+  /**
+   * Called on the first proxy call from an agent for a ticket — auto-acknowledges the
+   * dispatch so the watchdog doesn't re-signal an agent that is actively working but
+   * hasn't sent an explicit pull-ack (e.g. during sessions_yield). The callback is
+   * idempotent; calling it multiple times for the same agent+ticket is harmless.
+   */
+  onProxyCall?: (agentId: string, ticketId: string) => void;
 }
 
 export async function handleProxyRequest(req: Request, res: Response, deps?: ProxyDeps): Promise<void> {
@@ -306,12 +313,16 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
   // AI-1664: proxy call with a resolvable ticket identifier counts as evidence of agent starting.
   // Prefer the body issueId if it normalizes (e.g. "AI-1664"); fall back to the Target header.
   // UUID-only calls (no normalizable ID, no Target header) do not affect the timer.
-  if (deps?.noActivityDetector) {
+  {
     const proxyTicketId = (issueId && tryNormalizeSessionKey(issueId) !== null)
       ? issueId
       : (target && tryNormalizeSessionKey(target) !== null ? target : null);
     if (proxyTicketId) {
-      deps.noActivityDetector.recordProxyActivity(agentId, proxyTicketId);
+      deps?.noActivityDetector?.recordProxyActivity(agentId, proxyTicketId);
+      // Auto-ack: any proxy call from an agent for a ticket counts as evidence that
+      // the agent is working. This prevents the watchdog from re-signaling agents
+      // that are in sessions_yield (no explicit pull-ack-activity is ever sent).
+      deps?.onProxyCall?.(agentId, proxyTicketId);
     }
   }
 

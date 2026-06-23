@@ -16,7 +16,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { createLogger, componentLogger } from "../logger.js";
-import { getAccessToken, getAgent, getOpenclawAgentName } from "../agents.js";
+import { getAccessToken, getAgent, getLinearUserIdForAgent, getOpenclawAgentName } from "../agents.js";
 import { normalizeSessionKey } from "../session-key.js";
 import { StaleRedispatchCounter } from "./stale-redispatch-counter.js";
 
@@ -775,13 +775,13 @@ export async function recoverTicket(
       method: "POST",
       headers: { "content-type": "application/json", authorization: authHeader },
       body: JSON.stringify({
-        query: `query IssueWithTeam($id: String!) { issue(id: $id) { id team { id } state { name type } } }`,
+        query: `query IssueWithTeam($id: String!) { issue(id: $id) { id team { id } state { name type } delegate { id } } }`,
         variables: { id: identifier },
       }),
     });
 
     const issueBody = (await issueRes.json()) as {
-      data?: { issue?: { id: string; team: { id: string }; state?: { name?: string; type?: string } | null } | null };
+      data?: { issue?: { id: string; team: { id: string }; state?: { name?: string; type?: string } | null; delegate?: { id: string } | null } | null };
     };
     const issueId = issueBody.data?.issue?.id;
     const teamId = issueBody.data?.issue?.team?.id;
@@ -836,6 +836,24 @@ export async function recoverTicket(
         action: "re-poke-c4",
         rePoke: true,
         detail: "C4 first stall — delegate retained, re-poke requested",
+      };
+    }
+
+    // Wrong-delegate guard: if another agent is currently the delegate, this stale session
+    // is a ghost from an earlier dispatch (e.g. a watchdog re-signal that arrived while a
+    // different agent was actively working). Clearing the delegate here would orphan live
+    // work. Skip recovery entirely — just close the stale session silently.
+    const liveDelegateLinearId = issueBody.data?.issue?.delegate?.id ?? null;
+    const staleAgentLinearId = getLinearUserIdForAgent(agentId) ?? null;
+    if (liveDelegateLinearId && staleAgentLinearId && liveDelegateLinearId !== staleAgentLinearId) {
+      log.info(
+        `Recovery for ${identifier}: stale agent ${agentId} is not the current delegate ` +
+        `(delegate=${liveDelegateLinearId}, stale=${staleAgentLinearId}) — skipping recovery to avoid orphaning live work`,
+      );
+      return {
+        success: true,
+        action: "skipped-wrong-delegate",
+        detail: `Stale agent ${agentId} is not the current delegate — recovery skipped`,
       };
     }
 

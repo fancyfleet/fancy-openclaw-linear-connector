@@ -133,7 +133,20 @@ export function createApp(options?: CreateAppOptions) {
   // Intercepts every Linear CLI call from Nakazawa agents; forwards unchanged
   // for now. Future phases add per-step instruction injection and command
   // validation. ILL fleet runs the main branch and is unaffected.
-  app.post("/proxy/graphql", (req, res) => handleProxyRequest(req, res, { observationStore, operationalEventStore, noActivityDetector }));
+  app.post("/proxy/graphql", (req, res) => handleProxyRequest(req, res, {
+    observationStore,
+    operationalEventStore,
+    noActivityDetector,
+    onProxyCall: (agentId, ticketId) => {
+      // Any proxy call = implicit acknowledgment. Prevents the dispatch watchdog from
+      // re-signaling agents that are working silently (e.g. sessions_yield during image gen).
+      const acknowledged = ackTracker.acknowledge(agentId, ticketId);
+      if (acknowledged > 0) {
+        noActivityDetector.clearWarned(agentId, ticketId);
+        log.info(`proxy-auto-ack agent=${agentId} ticket=${ticketId}`);
+      }
+    },
+  }));
 
   // Health check
   app.get("/health", (_req: Request, res: Response) => {
