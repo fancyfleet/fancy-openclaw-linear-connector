@@ -258,9 +258,7 @@ async function tryBuildWorkflowMessage(
       const arrow = ` (→ ${t.to})`;
 
       let note = '';
-      if (t.generic) {
-        note = ` [alias for \`${t.command}\`]`;
-      } else if (mode === 'auto' && bodies.length === 1) {
+      if (mode === 'auto' && bodies.length === 1) {
         note = ` [auto-assigns to ${bodies[0]}]`;
       } else if (mode === 'required' && t.assign?.constraint === 'not-implementer') {
         note = ` [reviewer required; must not be you]`;
@@ -274,8 +272,6 @@ async function tryBuildWorkflowMessage(
     stateNode.deliverLastComment ? fetchLastComment(identifier, authToken) : Promise.resolve(null),
   ]);
 
-  // Always-available break-glass escape (§4.4)
-  stepLines.push(`- Run \`linear ${breakGlassCommand} ${identifier}\` to break glass and hand to steward (→ ${def.break_glass?.to ?? "escape"}, legal from any state)`);
 
   const guidanceBlock: string[] = guidance
     ? ["", "---", "**Step guidance (accumulated lessons for this state):**", "", guidance.trim(), "---"]
@@ -347,8 +343,6 @@ async function tryBuildWorkflowMessage(
     ...acRecordBlock,
     "",
     "📝 Comment discipline: post one substantive comment — your actual findings or result. Do NOT post a comment that only restates what is already on the ticket or narrates that you have handed it back. If you have no new information to add, do not comment at all — just transition state.",
-    "",
-    "⚠️ Important: do NOT hand off to Matt Henry for review, sign-off, or closure. Use the workflow commands above. Only use break-glass (\`escape\`) for genuine unresolvable blockers that require steward intervention.",
   ].join("\n");
 }
 
