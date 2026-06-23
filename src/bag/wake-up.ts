@@ -13,6 +13,7 @@
  */
 
 import { deliverMessageToAgent, type DeliveryConfig, type DeliveryResult } from "../delivery/index.js";
+import { buildWorkflowAwareDeliveryMessage } from "../delivery/build-message.js";
 import { normalizeSessionKey } from "../session-key.js";
 import { createLogger, componentLogger } from "../logger.js";
 
@@ -21,6 +22,14 @@ const log = componentLogger(createLogger(), "wakeup");
 export interface WakeUpConfig extends DeliveryConfig {
   /** Signal message template. {count} and {tickets} are replaced. */
   signalTemplate?: string;
+  /**
+   * Linear auth token for the agent receiving the wake-up.
+   * When provided and ticketIds.length === 1, the wake-up message is replaced
+   * with the same rich per-step workflow instruction block that event-driven
+   * delegation produces — so agents get full context upfront instead of a thin
+   * "run consider-work" prompt that is blocked on workflow tickets.
+   */
+  linearAuthToken?: string;
 }
 
 export const SINGLE_TICKET_TEMPLATE =
@@ -93,15 +102,30 @@ export function buildWakeUpMessage(
 /**
  * Send a wake-up signal to an agent.
  *
- * The signal is intentionally thin — just tells the agent how many tickets
- * are pending and their IDs. The agent re-queries Linear for full details.
+ * For single-ticket workflow dispatches where a linearAuthToken is available,
+ * the message is upgraded to the same rich per-step instruction block that
+ * event-driven delegation produces. For multi-ticket dispatches or ad-hoc tickets,
+ * falls back to the thin template.
  */
 export async function sendWakeUpSignal(
   agentId: string,
   ticketIds: string[],
   config: WakeUpConfig,
 ): Promise<{ runId?: string } | void> {
-  const message = buildWakeUpMessage(ticketIds, config.signalTemplate);
+  let message: string;
+
+  if (ticketIds.length === 1 && config.linearAuthToken) {
+    const plainId = ticketIds[0].replace(/^linear-/i, "");
+    const rich = await buildWorkflowAwareDeliveryMessage(plainId, config.linearAuthToken);
+    if (rich) {
+      message = rich;
+      log.info(`Rich workflow delivery for ${agentId} [${plainId}]`);
+    } else {
+      message = buildWakeUpMessage(ticketIds, config.signalTemplate);
+    }
+  } else {
+    message = buildWakeUpMessage(ticketIds, config.signalTemplate);
+  }
 
   // Normalize to strip any legacy prefixes and enforce uppercase.
   // Result is always exactly `linear-<TEAM>-<NUMBER>`.

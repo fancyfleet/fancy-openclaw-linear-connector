@@ -95,6 +95,35 @@ export async function buildDeliveryMessage(route: RouteResult, authToken?: strin
   return message;
 }
 
+/**
+ * Build a workflow-aware per-step delivery message for a single ticket by identifier.
+ * Fetches title and labels from Linear; returns null when the ticket is not a workflow
+ * ticket or on any fetch failure (caller should fall back to a thin message).
+ *
+ * Used by the pending-bag wake-up path so agents get the same rich instruction block
+ * that event-driven delegation produces.
+ */
+export async function buildWorkflowAwareDeliveryMessage(
+  identifier: string,
+  authToken: string,
+  actionText = `You have a pending ticket: ${identifier}`,
+): Promise<string | null> {
+  const query = `query IssueTitle($id: String!) { issue(id: $id) { title labels { nodes { name } } } }`;
+  let title = "";
+  try {
+    const res = await fetch("https://api.linear.app/graphql", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: identifier } }),
+    });
+    const json = (await res.json()) as { data?: { issue?: { title?: string; labels?: { nodes: Array<{ name: string }> } } } };
+    title = json.data?.issue?.title ?? "";
+  } catch {
+    return null;
+  }
+  return tryBuildWorkflowMessage(actionText, identifier, title, authToken);
+}
+
 async function buildDelegationMessage(
   reason: string,
   identifier: string,

@@ -170,10 +170,15 @@ export function createApp(options?: CreateAppOptions) {
   };
   const wakeConfigForAgent = (agentIdLookup: string): WakeUpConfig => {
     const cfg = getAgent(agentIdLookup);
+    const rawToken = getAccessToken(agentIdLookup) ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+    const linearAuthToken = rawToken
+      ? (/^Bearer\s+/i.test(rawToken) ? rawToken : `Bearer ${rawToken}`)
+      : undefined;
     return {
       ...wakeConfig,
       hooksUrl: cfg?.hooksUrl ?? wakeConfig.hooksUrl,
       hooksToken: cfg?.hooksToken ?? wakeConfig.hooksToken,
+      linearAuthToken,
     };
   };
   const resignalOptions = {
