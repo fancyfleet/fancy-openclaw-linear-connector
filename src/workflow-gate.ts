@@ -1270,12 +1270,15 @@ export async function checkRawMutationInterception(
 ): Promise<string | null> {
   if (!body) return null;
 
-  // Only intercept issueUpdate mutations.
+  // Intercept issueUpdate and commentCreate mutations (AI-1658).
   const q = body.query ?? "";
-  if (!q.includes("issueUpdate")) return null;
+  const isIssueUpdate = q.includes("issueUpdate");
+  const isCommentCreate = q.includes("commentCreate");
+  if (!isIssueUpdate && !isCommentCreate) return null;
 
   // Check if the mutation touches any workflow-affecting field.
-  // Blocked: stateId (status), assigneeId (assignee), labelIds (label manipulation).
+  // Blocked: stateId (status), assigneeId (assignee), labelIds (label manipulation),
+  //   addedLabelIds / removedLabelIds (additive/subtractive label mutations — AI-1658).
   // Allowed: title, description, priority, dueDate, and other non-workflow fields.
   //
   // AI-1402 follow-up: a field can reach issueUpdate three ways and the old
@@ -1300,24 +1303,43 @@ export async function checkRawMutationInterception(
   };
   const touches = (field: string) => queryHasField(field) || varsHaveKey(vars, field);
 
-  const hasStateChange = touches("stateId");
-  const hasAssigneeChange = touches("assigneeId");
-  const hasLabelChange = touches("labelIds");
-  // AI-1535: delegate is a distinct field from assignee. App-user delegates are
-  // written via `delegateId` (assigneeId is omitted for them, AI-1395), so a raw
-  // delegate write was invisible to this detector and bypassed the delegate-only
-  // guard entirely — a non-delegate could yank the delegate off the rightful owner.
-  const hasDelegateChange = touches("delegateId");
+  // Field detection only applies to issueUpdate. commentCreate is always subject
+  // to governance check below (any raw comment on a governed ticket is blocked).
+  let hasStateChange = false;
+  let hasAssigneeChange = false;
+  let hasLabelChange = false;
+  let hasDelegateChange = false;
 
-  if (!hasStateChange && !hasAssigneeChange && !hasLabelChange && !hasDelegateChange) return null;
+  if (isIssueUpdate) {
+    hasStateChange = touches("stateId");
+    hasAssigneeChange = touches("assigneeId");
+    // AI-1658: also detect additive/subtractive label mutations; the gate previously
+    // only checked labelIds (full-replace), leaving addedLabelIds / removedLabelIds
+    // as an unguarded bypass path for state:* label manipulation.
+    hasLabelChange = touches("labelIds") || touches("addedLabelIds") || touches("removedLabelIds");
+    // AI-1535: delegate is a distinct field from assignee. App-user delegates are
+    // written via `delegateId` (assigneeId is omitted for them, AI-1395), so a raw
+    // delegate write was invisible to this detector and bypassed the delegate-only
+    // guard entirely — a non-delegate could yank the delegate off the rightful owner.
+    hasDelegateChange = touches("delegateId");
+
+    if (!hasStateChange && !hasAssigneeChange && !hasLabelChange && !hasDelegateChange) return null;
+  }
 
   // AI-1347: this is a raw workflow-affecting mutation but the caller did not
   // expose the ticket id in a place the proxy could resolve (no id variable, no
   // inline id in the query). We cannot fetch labels to confirm whether the ticket
   // is governed, so we cannot prove it is safe. Fail CLOSED: a raw stateId /
-  // assigneeId / labelIds change with no resolvable ticket and no intent header
-  // is exactly the bypass shape this gate exists to stop.
+  // assigneeId / labelIds / commentCreate with no resolvable ticket and no intent
+  // header is exactly the bypass shape this gate exists to stop.
   if (!issueId) {
+    if (isCommentCreate && !isIssueUpdate) {
+      log.warn(`workflow-gate: raw commentCreate with unresolvable issueId — blocking (fail-closed)`);
+      return (
+        `[Proxy] Direct comments on workflow tickets must go through workflow commands, ` +
+        `and the ticket id could not be resolved from this request.`
+      );
+    }
     log.warn(`workflow-gate: raw workflow-field mutation with unresolvable issueId — blocking (fail-closed)`);
     return (
       `[Proxy] Direct status/assignee/label changes on workflow tickets must go through ` +
@@ -1363,7 +1385,7 @@ export async function checkRawMutationInterception(
   //   - caller unverifiable + ticket has delegate → block (AI-1400 B2 parity)
   //   - no current delegate / no caller+delegate  → fail-open (establishing first delegate)
   const delegateOnlyChange =
-    hasDelegateChange && !hasStateChange && !hasAssigneeChange && !hasLabelChange;
+    isIssueUpdate && hasDelegateChange && !hasStateChange && !hasAssigneeChange && !hasLabelChange;
   if (delegateOnlyChange) {
     if (callerLinearUserId && delegateId && callerLinearUserId === delegateId) {
       return null; // current delegate may re-route
@@ -1485,6 +1507,7 @@ export async function checkRawMutationInterception(
   helpLines.push(`  - \`linear ${breakGlassCommand} ${issueId}\` (break glass → ${def.break_glass?.to ?? "escape"}, legal from any state)`);
 
   const changedFields: string[] = [];
+  if (isCommentCreate && !isIssueUpdate) changedFields.push("comment");
   if (hasStateChange) changedFields.push("status");
   if (hasAssigneeChange) changedFields.push("assignee");
   if (hasLabelChange) changedFields.push("labels");
