@@ -22,6 +22,7 @@ import {
   getCurrentState,
   resolveTransitionTargets,
   resolveStakesLevel,
+  TransientLabelFetchError,
   type WorkflowDef,
   type StakesLevel,
 } from "../workflow-gate.js";
@@ -121,7 +122,8 @@ export async function buildWorkflowAwareDeliveryMessage(
   } catch {
     return null;
   }
-  return tryBuildWorkflowMessage(actionText, identifier, title, authToken);
+  const result = await tryBuildWorkflowMessage(actionText, identifier, title, authToken);
+  return result.message;
 }
 
 async function buildDelegationMessage(
@@ -137,13 +139,16 @@ async function buildDelegationMessage(
 
   // §4.6 mode switch: attempt workflow-aware per-step injection for delegation events.
   if (authToken) {
-    const workflowMessage = await tryBuildWorkflowMessage(
+    const result = await tryBuildWorkflowMessage(
       actionText,
       identifier,
       title,
       authToken,
     );
-    if (workflowMessage !== null) return workflowMessage;
+    if (result.message !== null) return result.message;
+    // AI-1708: if the fallback was due to a label-fetch failure (not a genuine
+    // ad-hoc ticket), pass the flag so the generic message includes a notice.
+    return buildGenericDelegationMessage(actionText, identifier, title, result.fetchFailed);
   }
 
   return buildGenericDelegationMessage(actionText, identifier, title);
@@ -182,29 +187,77 @@ async function fetchLastComment(
 }
 
 /**
+ * Retry a transient label fetch with backoff before giving up. (AI-1708)
+ *
+ * Returns the labels array on success, or null if all retries are exhausted
+ * (caller falls back to generic). Non-transient errors return null immediately.
+ *
+ * Retry parameters are configurable via env vars for test-injection:
+ *   LABEL_FETCH_MAX_RETRIES (default 2), LABEL_FETCH_BASE_DELAY_MS (default 500)
+ */
+async function fetchLabelsWithRetry(
+  identifier: string,
+  authToken: string,
+): Promise<string[] | null> {
+  const maxRetries = Number(process.env.LABEL_FETCH_MAX_RETRIES ?? 2);
+  const baseDelayMs = Number(process.env.LABEL_FETCH_BASE_DELAY_MS ?? 500);
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fetchWorkflowLabels(identifier, authToken);
+    } catch (err) {
+      if (err instanceof TransientLabelFetchError) {
+        if (attempt < maxRetries) {
+          const delay = baseDelayMs * Math.pow(2, attempt);
+          log.warn(
+            `build-message: label fetch attempt ${attempt + 1}/${maxRetries + 1} failed for ${identifier} (${err.causeMessage}) — retrying in ${delay}ms`,
+          );
+          await new Promise((r) => setTimeout(r, delay));
+          continue;
+        }
+        log.warn(
+          `build-message: all label fetch retries exhausted for ${identifier} (${err.causeMessage}) — falling back to generic`,
+        );
+        return null;
+      }
+      // Non-transient: log and fail open.
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`build-message: label fetch failed for ${identifier}: ${msg} — falling back to generic`);
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
  * Attempt to build a workflow-aware per-step instruction block.
  * Returns null to signal "fall back to generic" on any error or ad-hoc ticket.
+ *
+ * If the label fetch fails with a transient error, retries with backoff before
+ * falling back. The dispatch site logs a WARN with the failure reason so the
+ * silent-downgrade class (AI-1707) is observable. (AI-1708)
  */
 async function tryBuildWorkflowMessage(
   actionText: string,
   identifier: string,
   title: string,
   authToken: string,
-): Promise<string | null> {
+): Promise<{ message: string | null; fetchFailed: boolean }> {
   let labels: string[];
-  try {
-    labels = await fetchWorkflowLabels(identifier, authToken);
-  } catch {
-    return null;
+  const labelsOrError = await fetchLabelsWithRetry(identifier, authToken);
+  if (labelsOrError === null) {
+    // Transient failure — all retries exhausted. Signal the caller to include
+    // a context-fetch-failure notice in the generic message.
+    return { message: null, fetchFailed: true };
   }
+  labels = labelsOrError;
 
   const workflowId = getWorkflowId(labels);
-  if (!workflowId) return null; // ad-hoc ticket — fall through to generic
+  if (!workflowId) return { message: null, fetchFailed: false }; // ad-hoc ticket — fall through to generic
 
   const def = await loadWorkflowDefById(workflowId);
   if (!def) {
     log.warn(`build-message: no workflow def in registry for wf:${workflowId} — falling back to generic`);
-    return null;
+    return { message: null, fetchFailed: false };
   }
 
   // AI-1534: prefer the connector's just-applied destination state over the live
@@ -224,13 +277,13 @@ async function tryBuildWorkflowMessage(
   }
   if (!currentState) {
     log.warn(`build-message: no state:* label on ${identifier} — falling back to generic`);
-    return null;
+    return { message: null, fetchFailed: false };
   }
 
   const stateNode = def.states.find((s) => s.id === currentState);
   if (!stateNode) {
     log.warn(`build-message: unknown state '${currentState}' on ${identifier} — falling back to generic`);
-    return null;
+    return { message: null, fetchFailed: false };
   }
 
   const breakGlassCommand = def.break_glass?.command ?? "escape";
@@ -329,30 +382,51 @@ async function tryBuildWorkflowMessage(
       ]
     : [];
 
-  return [
-    `${actionText}: ${title}`,
-    "",
-    `This is a [${def.id}] workflow ticket in state: **${currentState}**`,
-    ...stakesBlock,
-    ...lastCommentBlock,
-    "",
-    "Your legal action(s) for this state:",
-    ...stepLines,
-    ...resourcesBlock,
-    ...guidanceBlock,
-    ...acRecordBlock,
-    "",
-    "📝 Comment discipline: post one substantive comment — your actual findings or result. Do NOT post a comment that only restates what is already on the ticket or narrates that you have handed it back. If you have no new information to add, do not comment at all — just transition state.",
-  ].join("\n");
+  return {
+    message: [
+      `${actionText}: ${title}`,
+      "",
+      `This is a [${def.id}] workflow ticket in state: **${currentState}**`,
+      ...stakesBlock,
+      ...lastCommentBlock,
+      "",
+      "Your legal action(s) for this state:",
+      ...stepLines,
+      ...resourcesBlock,
+      ...guidanceBlock,
+      ...acRecordBlock,
+      "",
+      "📝 Comment discipline: post one substantive comment — your actual findings or result. Do NOT post a comment that only restates what is already on the ticket or narrates that you have handed it back. If you have no new information to add, do not comment at all — just transition state.",
+    ].join("\n"),
+    fetchFailed: false,
+  };
 }
 
-function buildGenericDelegationMessage(actionText: string, identifier: string, title: string): string {
-  return [
+function buildGenericDelegationMessage(
+  actionText: string,
+  identifier: string,
+  title: string,
+  workflowFetchFailed = false,
+): string {
+  const lines = [
     `${actionText}: ${title}`,
     "",
     "This task has been delegated to you and you are expected to take the next action on it.",
     "",
     `Run \`linear consider-work ${identifier}\` NOW to review the issue and understand the request.`,
+  ];
+
+  // AI-1708: when the generic message is a last-resort fallback because workflow
+  // labels couldn't be fetched, tell the agent explicitly so it doesn't guess
+  // its workflow state from memory (root cause of the AI-1707 incident).
+  if (workflowFetchFailed) {
+    lines.push(
+      "",
+      `⚠️ **Workflow context unavailable:** The connector could not fetch this ticket's workflow labels after retrying. If this is a \`wf:*\` workflow ticket, run \`linear consider-work ${identifier}\` to get the current state and legal commands before acting — do not assume the workflow step from memory.`,
+    );
+  }
+
+  lines.push(
     "",
     "Next Steps:",
     `- If you need to do some work, run \`linear begin-work ${identifier}\``,
@@ -368,7 +442,9 @@ function buildGenericDelegationMessage(actionText: string, identifier: string, t
     "📝 Comment discipline: post one substantive comment — your actual findings or result. Do NOT post a comment that only restates what is already on the ticket or narrates that you have handed it back. If a dispatch wakes you and you have no new information to add, do not comment at all — just transition state (or take no action).",
     "",
     "⚠️ Important: agents do not decide reviewers. Hand finished work to Ai for validation (or back to the requesting agent), rather than choosing a domain reviewer yourself. Use \`needs-human\` only for genuine blockers that require human action (credentials, access, approvals you cannot obtain yourself) — not as a way to mark work complete."
-  ].join("\n");
+  );
+
+  return lines.join("\n");
 }
 
 function buildMentionMessage(actorName: string, identifier: string, title: string): string {

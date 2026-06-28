@@ -196,6 +196,9 @@ beforeEach(() => {
   process.env.WORKFLOW_DEF_PATH = tmpYamlPath;
   process.env.WORKFLOW_GUIDANCE_DIR = tmpGuidanceDir;
   process.env.CAPABILITY_POLICY_PATH = tmpPolicyPath;
+  // AI-1708: zero retry delays so tests don't wait on backoff.
+  process.env.LABEL_FETCH_MAX_RETRIES = "1";
+  process.env.LABEL_FETCH_BASE_DELAY_MS = "0";
   originalFetch = globalThis.fetch;
 });
 
@@ -204,6 +207,8 @@ afterEach(() => {
   delete process.env.WORKFLOW_DEF_PATH;
   delete process.env.WORKFLOW_GUIDANCE_DIR;
   delete process.env.CAPABILITY_POLICY_PATH;
+  delete process.env.LABEL_FETCH_MAX_RETRIES;
+  delete process.env.LABEL_FETCH_BASE_DELAY_MS;
   resetPolicyCache();
   // Remove any guidance files written by tests
   for (const f of fs.readdirSync(path.join(tmpGuidanceDir, "dev-impl"))) {
@@ -379,7 +384,7 @@ describe("B3 — outbound per-step instruction injection", () => {
       expect(msg).not.toContain("[dev-impl]");
     });
 
-    it("fetch throws → generic", async () => {
+    it("fetch throws → generic with workflow-context-unavailable notice (AI-1708)", async () => {
       globalThis.fetch = async () => {
         throw new Error("network error");
       };
@@ -388,6 +393,9 @@ describe("B3 — outbound per-step instruction injection", () => {
       const msg = await buildDeliveryMessage(makeRoute("AI-007", "Fetch error"), "Bearer tok");
 
       expect(msg).toContain("Next Steps:");
+      // AI-1708: the agent must be told that workflow context could not be fetched.
+      expect(msg).toContain("Workflow context unavailable");
+      expect(msg).toContain("linear consider-work AI-007");
     });
   });
 
@@ -532,6 +540,101 @@ describe("B3 — outbound per-step instruction injection", () => {
 
       expect(msg).toContain("state: **implementation**");
       expect(msg).toContain("linear submit AI-103");
+    });
+  });
+
+  // ── AI-1708 — no silent downgrade to generic on label-fetch failure ──────
+  describe("AI-1708 — label-fetch failure does not silently downgrade to generic", () => {
+    it("network error on all retries → generic WITH workflow-context-unavailable notice", async () => {
+      const fetchCalls: number[] = [];
+      globalThis.fetch = async () => {
+        fetchCalls.push(1);
+        throw new Error("ECONNRESET");
+      };
+
+      const buildDeliveryMessage = await getbuildDeliveryMessage();
+      const msg = await buildDeliveryMessage(makeRoute("AI-200", "Transient net err"), "Bearer tok");
+
+      // Retried (initial + 1 retry = 2 calls).
+      expect(fetchCalls.length).toBe(2);
+      // Generic message produced.
+      expect(msg).toContain("Next Steps:");
+      // AI-1708: agent is told workflow context was unavailable.
+      expect(msg).toContain("Workflow context unavailable");
+      expect(msg).toContain("linear consider-work AI-200");
+    });
+
+    it("401 on all retries → generic WITH workflow-context-unavailable notice", async () => {
+      globalThis.fetch = async () =>
+        new Response("{\"error\":\"unauthorized\"}", { status: 401 });
+
+      const buildDeliveryMessage = await getbuildDeliveryMessage();
+      const msg = await buildDeliveryMessage(makeRoute("AI-201", "Token expired"), "Bearer expired");
+
+      expect(msg).toContain("Next Steps:");
+      expect(msg).toContain("Workflow context unavailable");
+    });
+
+    it("500 on all retries → generic WITH workflow-context-unavailable notice", async () => {
+      globalThis.fetch = async () =>
+        new Response("{\"error\":\"server\"}", { status: 500 });
+
+      const buildDeliveryMessage = await getbuildDeliveryMessage();
+      const msg = await buildDeliveryMessage(makeRoute("AI-202", "Server error"), "Bearer tok");
+
+      expect(msg).toContain("Next Steps:");
+      expect(msg).toContain("Workflow context unavailable");
+    });
+
+    it("transient error then success → rich workflow message (retry recovers)", async () => {
+      let callCount = 0;
+      globalThis.fetch = async () => {
+        callCount++;
+        if (callCount === 1) {
+          return new Response("{\"error\":\"unauthorized\"}", { status: 401 });
+        }
+        return new Response(
+          JSON.stringify({
+            data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] } } },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      };
+
+      const buildDeliveryMessage = await getbuildDeliveryMessage();
+      const msg = await buildDeliveryMessage(makeRoute("AI-203", "Recovered"), "Bearer tok");
+
+      // Retry succeeded → agent gets the rich workflow message, not generic.
+      expect(msg).toContain("[dev-impl]");
+      expect(msg).toContain("state: **implementation**");
+      expect(msg).toContain("linear submit AI-203");
+      expect(msg).not.toContain("Workflow context unavailable");
+      expect(msg).not.toContain("Next Steps:");
+    });
+
+    it("genuine ad-hoc ticket (200 OK, no labels) → generic WITHOUT workflow-context-unavailable notice", async () => {
+      // 200 OK with empty labels is a genuine ad-hoc ticket, not a fetch failure.
+      globalThis.fetch = makeLabelFetch([]);
+
+      const buildDeliveryMessage = await getbuildDeliveryMessage();
+      const msg = await buildDeliveryMessage(makeRoute("AI-204", "Real ad-hoc"), "Bearer tok");
+
+      expect(msg).toContain("Next Steps:");
+      // Must NOT have the fetch-failure notice — this is a real ad-hoc ticket.
+      expect(msg).not.toContain("Workflow context unavailable");
+    });
+
+    it("non-transient 404 → generic WITHOUT workflow-context-unavailable notice (fail-open)", async () => {
+      // 404 is not transient — it's a genuinely missing/invalid ticket, not a
+      // transient outage. Fail open without the scary workflow-unavailable notice.
+      globalThis.fetch = async () =>
+        new Response("{\"error\":\"not found\"}", { status: 404 });
+
+      const buildDeliveryMessage = await getbuildDeliveryMessage();
+      const msg = await buildDeliveryMessage(makeRoute("AI-205", "Missing ticket"), "Bearer tok");
+
+      expect(msg).toContain("Next Steps:");
+      expect(msg).not.toContain("Workflow context unavailable");
     });
   });
 });

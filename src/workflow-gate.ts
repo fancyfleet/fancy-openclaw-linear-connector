@@ -743,26 +743,63 @@ export function getCurrentState(labels: string[]): string | null {
 }
 
 /**
+ * Transient label-fetch error (network, 401, 5xx). Thrown by fetchWorkflowLabels
+ * so callers can distinguish "fetch failed" from "ticket has no labels" and
+ * decide whether to retry or fail open. (AI-1708)
+ */
+export class TransientLabelFetchError extends Error {
+  readonly statusCode?: number;
+  readonly causeMessage: string;
+  constructor(message: string, causeMessage: string, statusCode?: number) {
+    super(message);
+    this.name = "TransientLabelFetchError";
+    this.causeMessage = causeMessage;
+    this.statusCode = statusCode;
+  }
+}
+
+/**
  * Fetch label names for a Linear issue.
  * Used by the outbound delivery path (B3) to detect workflow/state labels.
- * Returns an empty array on any error — callers fail open.
+ *
+ * Returns an empty array for a successful response with no labels (genuine
+ * ad-hoc ticket). Throws TransientLabelFetchError on network errors, 401,
+ * or 5xx responses so callers can retry before falling back to generic. (AI-1708)
  */
 export async function fetchWorkflowLabels(issueId: string, authToken: string): Promise<string[]> {
   const query = `query IssueLabels($id: String!) { issue(id: $id) { labels { nodes { name } } } }`;
+  let res: Response;
   try {
-    const res = await fetch(LINEAR_API_URL, {
+    res = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({ query, variables: { id: issueId } }),
     });
-    type LabelResp = { data?: { issue?: { labels?: { nodes: Array<{ name: string }> } } } };
-    const data = (await res.json()) as LabelResp;
-    return (data.data?.issue?.labels?.nodes ?? []).map((n) => n.name);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    log.warn(`workflow-gate: outbound label fetch failed for ${issueId}: ${msg} — failing open`);
+    const causeMsg = err instanceof Error ? err.message : String(err);
+    throw new TransientLabelFetchError(
+      `workflow-gate: outbound label fetch network error for ${issueId}: ${causeMsg}`,
+      causeMsg,
+    );
+  }
+  // 401 (expired token) and 5xx (server error) are transient — caller should retry.
+  if (res.status === 401 || res.status >= 500) {
+    const body = await res.text().catch(() => "no body");
+    throw new TransientLabelFetchError(
+      `workflow-gate: outbound label fetch got ${res.status} for ${issueId}: ${body}`,
+      `HTTP ${res.status}`,
+      res.status,
+    );
+  }
+  // Non-OK non-transient responses (4xx other than 401): fail open with empty.
+  if (!res.ok) {
+    const body = await res.text().catch(() => "no body");
+    log.warn(`workflow-gate: outbound label fetch got ${res.status} for ${issueId}: ${body} — failing open`);
     return [];
   }
+  type LabelResp = { data?: { issue?: { labels?: { nodes: Array<{ name: string }> } } } };
+  const data = (await res.json()) as LabelResp;
+  return (data.data?.issue?.labels?.nodes ?? []).map((n) => n.name);
 }
 
 // ── Done gate: branch/PR verification (AI-1475 Defect 1) ─────────────────
