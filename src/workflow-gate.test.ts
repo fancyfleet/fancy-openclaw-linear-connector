@@ -209,6 +209,7 @@ entry_state: intake
 
 break_glass:
   command: escape
+  to: intake
   owner_role: steward
 
 states:
@@ -258,14 +259,6 @@ states:
     kind: terminal
     native_state: done
     transitions: []
-
-  - id: escape
-    kind: terminal
-    native_state: invalid
-    transitions:
-      - command: unescape
-        to: intake
-        assign: { mode: auto }
 `;
 
 let dir: string;
