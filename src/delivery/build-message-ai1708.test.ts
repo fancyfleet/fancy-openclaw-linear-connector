@@ -238,6 +238,12 @@ beforeEach(() => {
   process.env.WORKFLOW_DEF_PATH = tmpYamlPath;
   process.env.WORKFLOW_GUIDANCE_DIR = tmpGuidanceDir;
   process.env.CAPABILITY_POLICY_PATH = tmpPolicyPath;
+  // AI-1708 AC2: The connector logger reads LOG_LEVEL at module-import time and
+  // suppresses warn-level output when LOG_LEVEL=error (as CI sets). The AC2
+  // tests assert on warn-level log output, so force a permissive level and
+  // reset modules to ensure the logger re-initialises with it.
+  process.env.LOG_LEVEL = "debug";
+  jest.resetModules();
   originalFetch = globalThis.fetch;
 });
 
@@ -246,6 +252,7 @@ afterEach(() => {
   delete process.env.WORKFLOW_DEF_PATH;
   delete process.env.WORKFLOW_GUIDANCE_DIR;
   delete process.env.CAPABILITY_POLICY_PATH;
+  delete process.env.LOG_LEVEL;
   resetPolicyCache();
   for (const f of fs.readdirSync(path.join(tmpGuidanceDir, "dev-impl"))) {
     fs.rmSync(path.join(tmpGuidanceDir, "dev-impl", f));
