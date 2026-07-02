@@ -427,7 +427,7 @@ export function createApp(options?: CreateAppOptions) {
   const managingPoller = new ManagingPoller({
     store: managingStateStore,
     operationalEventStore,
-    deliveryConfig: wakeConfig,
+    resolveDeliveryConfig: wakeConfigForAgent,
   });
   managingPoller.start();
 

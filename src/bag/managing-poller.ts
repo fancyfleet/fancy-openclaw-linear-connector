@@ -41,7 +41,13 @@ export interface ManagingPollerConfig {
 export interface ManagingPollerDeps {
   store: ManagingStateStore;
   operationalEventStore: OperationalEventStore;
-  deliveryConfig: DeliveryConfig;
+  /**
+   * Resolves the delivery config for a given agent. This is called per-agent
+   * inside the poll loop so that containerized agents (with their own
+   * hooksUrl) get wakes delivered to the right endpoint instead of the global
+   * host hooks URL. (AI-1751)
+   */
+  resolveDeliveryConfig: (agentId: string) => DeliveryConfig;
   /** Overridable for testing — returns the agents to consider. */
   listAgents?: () => AgentConfig[];
   /** Overridable for testing — returns Managing-state tickets for an agent. */
@@ -180,7 +186,7 @@ export class ManagingPoller {
     this.deps = {
       store: deps.store,
       operationalEventStore: deps.operationalEventStore,
-      deliveryConfig: deps.deliveryConfig,
+      resolveDeliveryConfig: deps.resolveDeliveryConfig,
       listAgents: deps.listAgents ?? (() => getAgents().filter(isAgentLocal)),
       fetchManagingTickets: deps.fetchManagingTickets ?? fetchManagingTicketsForAgent,
       sendWake: deps.sendWake ?? sendManagingWakeSignal,
@@ -213,7 +219,7 @@ export class ManagingPoller {
    * and operator visibility.
    */
   async runCycle(): Promise<PollerCycleResult> {
-    const { store, operationalEventStore, deliveryConfig, listAgents, fetchManagingTickets, sendWake, now } = this.deps;
+    const { store, operationalEventStore, resolveDeliveryConfig, listAgents, fetchManagingTickets, sendWake, now } = this.deps;
     const agents = listAgents();
     const result: PollerCycleResult = {
       agentsChecked: 0,
@@ -287,7 +293,8 @@ export class ManagingPoller {
       }
 
       try {
-        await sendWake(openclawAgent, dueTickets, deliveryConfig);
+        const agentDeliveryConfig = resolveDeliveryConfig(openclawAgent);
+        await sendWake(openclawAgent, dueTickets, agentDeliveryConfig);
         result.ticketsDispatched += dueTickets.length;
         result.agentsWaked++;
         const stamp = now();
