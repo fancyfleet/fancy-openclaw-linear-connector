@@ -2,7 +2,7 @@ import crypto from "crypto";
 import { Router } from "express";
 import { verifyLinearSignatureMulti, parseWebhookSecrets } from "./signature.js";
 import { normalizeLinearEvent } from "./normalize.js";
-import { routeEvent } from "../router.js";
+import { routeEventAll } from "../router.js";
 import { createSessionAndEmitThought } from "../agent-session.js";
 import { deliverToAgent } from "../delivery/index.js";
 import { normalizeSessionKey } from "../session-key.js";
@@ -328,8 +328,8 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
                 log.warn(`Workflow bootstrap failed (fail-safe): ${err instanceof Error ? err.message : String(err)}`);
             }
         }
-        const route = routeEvent(event);
-        if (!route) {
+        const routes = routeEventAll(event);
+        if (routes.length === 0) {
             log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);
             appendOperationalEvent(operationalEventStore, { outcome: "no-route", type: event.type, errorSummary: `No agent target for ${event.type}` });
             // Audit finding #1: this was the fully-silent "assigned it and nothing
@@ -348,290 +348,307 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
             }
             return;
         }
-        // ── 9a. Stale-route guard ───────────────────────────────────────────
-        // Linear webhook payloads are snapshots. Before waking an agent from a
-        // delegate/assignee event, re-check Linear's current issue state so an
-        // accidental delegation that was already corrected does not let the old
-        // agent take ownership or mutate the ticket later.
-        const ticketId = route.sessionKey;
-        if (!(await isLinearIssueStillRoutedToAgent(ticketId, route.agentId, route.routingReason))) {
-            appendOperationalEvent(operationalEventStore, { outcome: "dedup-suppressed", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "stale-route" });
-            return;
+        // Dispatch each route through the full guard pipeline, sequentially.
+        // Multi-route events (mention fan-out, audit #3) are rare; sequential
+        // keeps per-agent throttle and bag semantics simple. A failure in one
+        // route's dispatch must not starve the remaining routes.
+        for (const dispatchTarget of routes) {
+            try {
+                await dispatchRoute(dispatchTarget);
+            }
+            catch (err) {
+                log.error(`dispatchRoute failed for ${dispatchTarget.agentId} [${dispatchTarget.sessionKey}]: ${err instanceof Error ? err.message : String(err)}`);
+            }
         }
-        // ── 9b. Nudge deduplication + coalescing ─────────────────────────────
-        // Suppress rapid-fire duplicate events for the same agent+ticket.
-        if (NUDGE_DEDUP_WINDOW_MS > 0 && nudgeStore) {
-            const info = nudgeStore.getCoalesceInfo(route.agentId, ticketId, NUDGE_DEDUP_WINDOW_MS);
-            if (info.suppressed) {
-                log.info(`Nudge dedup: coalescing delivery for ${route.agentId} [${ticketId}] — within ${NUDGE_DEDUP_WINDOW_MS}ms window`);
-                nudgeStore.recordCoalesced(route.agentId, ticketId, event.type, "action" in event ? event.action : undefined);
-                appendOperationalEvent(operationalEventStore, { outcome: "dedup-suppressed", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "nudge-dedup" });
+        return;
+        async function dispatchRoute(route) {
+            // ── 9a. Stale-route guard ───────────────────────────────────────────
+            // Linear webhook payloads are snapshots. Before waking an agent from a
+            // delegate/assignee event, re-check Linear's current issue state so an
+            // accidental delegation that was already corrected does not let the old
+            // agent take ownership or mutate the ticket later.
+            const ticketId = route.sessionKey;
+            if (!(await isLinearIssueStillRoutedToAgent(ticketId, route.agentId, route.routingReason))) {
+                appendOperationalEvent(operationalEventStore, { outcome: "dedup-suppressed", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "stale-route" });
                 return;
             }
-            // Window expired — drain coalesced count before delivering
-            const coalescedCount = nudgeStore.drainCoalescedCount(route.agentId, ticketId);
-            nudgeStore.recordNudge(route.agentId, ticketId);
-            if (coalescedCount > 0) {
-                log.info(`Nudge dedup: delivering for ${route.agentId} [${ticketId}] with ${coalescedCount} coalesced event(s)`);
-                route.coalescedCount = coalescedCount;
-            }
-        }
-        const agentName = route.agentId;
-        log.info(`Routed event to ${agentName} [${route.sessionKey}]`);
-        appendOperationalEvent(operationalEventStore, { outcome: "routed", type: event.type, agent: agentName, key: route.sessionKey, sessionKey: route.sessionKey, deliveryMode: bag && sessionTracker ? "pending-bag" : agentQueue ? "agent-queue" : "direct" });
-        // ── 9c. AI-1428: Pre-flight liveness check + role-guard ────────────
-        // Before dispatching to an agent, verify it's reachable. If not,
-        // emit DELEGATE_UNAVAILABLE instead of silently stalling.
-        // Also check role-guard for implementation-state tickets.
-        const livenessConfig = {
-            hooksUrl: process.env.OPENCLAW_HOOKS_URL,
-            hooksToken: process.env.OPENCLAW_HOOKS_TOKEN,
-        };
-        const agentLivenessCfg = getAgent(route.agentId);
-        if (agentLivenessCfg?.hooksUrl)
-            livenessConfig.hooksUrl = agentLivenessCfg.hooksUrl;
-        if (agentLivenessCfg?.hooksToken)
-            livenessConfig.hooksToken = agentLivenessCfg.hooksToken;
-        const liveness = await checkAgentLiveness(route.agentId, livenessConfig);
-        if (!liveness.available) {
-            // Agent unreachable — emit DELEGATE_UNAVAILABLE escalation.
-            log.warn(`DELEGATE_UNAVAILABLE: ${route.agentId} is unreachable (${liveness.reason}: ${liveness.detail ?? "unknown"}) — skipping delivery for ${ticketId}`);
-            appendOperationalEvent(operationalEventStore, {
-                outcome: "delivery-failed",
-                type: event.type,
-                agent: agentName,
-                key: ticketId,
-                sessionKey: ticketId,
-                deliveryMode: "delegate-unavailable",
-                attemptCount: 1,
-                errorSummary: `DELEGATE_UNAVAILABLE: ${liveness.reason}: ${liveness.detail ?? "unknown"}`,
-            });
-            await emitDelegateUnavailable(ticketId.replace(/^linear-/, ""), route.agentId, `${liveness.reason}: ${liveness.detail ?? "unknown"}`);
-            // No delivery was sent — roll back the dedup priming so a later genuine
-            // dispatch to this agent+ticket inside the window is not swallowed (AI-1538).
-            nudgeStore?.clearNudge(route.agentId, ticketId);
-            // Do NOT deliver — return immediately.
-            return;
-        }
-        // Role-guard (AI-1459 enforcement mode): check whether the target agent
-        // fills the owner_role for the ticket's current workflow state.
-        // If blocked: skip delivery — the guard has posted a comment and
-        // attempted delegate correction.
-        const issueIdentifier = ticketId.replace(/^linear-/, "");
-        const roleGuardToken = getAccessToken(route.agentId) ??
-            process.env.LINEAR_OAUTH_TOKEN ??
-            process.env.LINEAR_API_KEY;
-        if (roleGuardToken) {
-            try {
-                const guardLabels = await fetchWorkflowLabels(issueIdentifier, roleGuardToken);
-                // Provide a resolver so the guard can auto-correct the delegate
-                // without needing to import agents.ts directly (avoids the test
-                // compile-time dependency on fancy-openclaw-linear-skill-cli).
-                const linearUserIdResolver = (bodyName) => {
-                    const agents = getAgents();
-                    const agent = agents.find((a) => a.name.toLowerCase() === bodyName.toLowerCase() ||
-                        a.openclawAgent?.toLowerCase() === bodyName.toLowerCase());
-                    return agent?.linearUserId ?? null;
-                };
-                const guardResult = await checkRoleGuardAndBlock(route.agentId, issueIdentifier, guardLabels, linearUserIdResolver);
-                if (guardResult.blocked) {
-                    log.warn(`routing-guard: dispatch blocked for ${route.agentId} [${issueIdentifier}] — ${guardResult.reason ?? "role mismatch"}; ` +
-                        (guardResult.correctedTo ? `corrected to ${guardResult.correctedTo}` : "delegate cleared"));
-                    appendOperationalEvent(operationalEventStore, {
-                        outcome: "delivery-failed",
-                        type: event.type,
-                        agent: agentName,
-                        key: ticketId,
-                        sessionKey: ticketId,
-                        deliveryMode: "role-guard-blocked",
-                        attemptCount: 1,
-                        errorSummary: `routing-guard blocked: ${guardResult.reason ?? "role mismatch"}`,
-                    });
-                    // No delivery was sent — roll back the dedup priming so the genuine
-                    // dispatch to the agent that legitimately becomes the delegate is not
-                    // swallowed as a "duplicate" of this blocked attempt (AI-1538).
-                    nudgeStore?.clearNudge(route.agentId, ticketId);
+            // ── 9b. Nudge deduplication + coalescing ─────────────────────────────
+            // Suppress rapid-fire duplicate events for the same agent+ticket.
+            if (NUDGE_DEDUP_WINDOW_MS > 0 && nudgeStore) {
+                const info = nudgeStore.getCoalesceInfo(route.agentId, ticketId, NUDGE_DEDUP_WINDOW_MS);
+                if (info.suppressed) {
+                    log.info(`Nudge dedup: coalescing delivery for ${route.agentId} [${ticketId}] — within ${NUDGE_DEDUP_WINDOW_MS}ms window`);
+                    nudgeStore.recordCoalesced(route.agentId, ticketId, event.type, "action" in event ? event.action : undefined);
+                    appendOperationalEvent(operationalEventStore, { outcome: "dedup-suppressed", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "nudge-dedup" });
                     return;
                 }
+                // Window expired — drain coalesced count before delivering
+                const coalescedCount = nudgeStore.drainCoalescedCount(route.agentId, ticketId);
+                nudgeStore.recordNudge(route.agentId, ticketId);
+                if (coalescedCount > 0) {
+                    log.info(`Nudge dedup: delivering for ${route.agentId} [${ticketId}] with ${coalescedCount} coalesced event(s)`);
+                    route.coalescedCount = coalescedCount;
+                }
             }
-            catch (err) {
-                log.warn(`Role-guard check failed for ${issueIdentifier}: ${err instanceof Error ? err.message : String(err)} — continuing`);
-            }
-        }
-        // Delivery is now committed: the event routed to a delegate that passed
-        // the stale-route, liveness, and role-guard checks. Register a pending
-        // dispatch expectation BEFORE the actual send so that if the delivery is
-        // later swallowed (nudge-dedup) or sent through a path that records no
-        // ack, the watchdog still sees an unacknowledged dispatch and re-signals
-        // it (AI-1538). ensurePending uses attempt_count=0 + ON CONFLICT DO
-        // NOTHING, so the happy path's counter is unchanged.
-        onDeliveryCommitted?.(agentName, ticketId);
-        // ── 10. Create agent session + emit thought ───────────────────────────
-        const data = event.data;
-        const issueId = data?.id;
-        let agentSessionId = null;
-        if (issueId && event.type === "Issue") {
-            try {
-                const sessionResult = await createSessionAndEmitThought(issueId, agentName, {
-                    identifier: data?.identifier,
-                    title: data?.title,
-                    description: data?.description,
-                });
-                agentSessionId = sessionResult.sessionId;
-            }
-            catch (err) {
-                log.error(`Failed to create agent session: ${err instanceof Error ? err.message : String(err)}`);
-            }
-        }
-        // ── v1.1: Pull-based wake-up via PendingWorkBag ─────────────────────
-        // Add to bag (deduped by ticket ID). Send wake-up signal only if
-        // agent has no active session. Bursts collapse to 1 signal.
-        if (bag && sessionTracker) {
-            const normalizedTicketId = normalizeSessionKey(ticketId);
-            bag.add(agentName, normalizedTicketId, event.type, route.routingReason);
-            // Purge stale bag entries for this ticket from all other agents. When a
-            // delegate changes, the previous holder's bag entry must be removed so it
-            // doesn't receive a spurious consider-work wake for a ticket it no longer owns.
-            const purgedStale = bag.removeTicketForOtherAgents(agentName, normalizedTicketId);
-            if (purgedStale > 0) {
-                log.info(`Bag: purged stale entries for ${normalizedTicketId} from ${purgedStale} other agent(s)`);
-            }
-            appendOperationalEvent(operationalEventStore, { outcome: "bag-added", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "pending-bag" });
-            const wakeConfig = {
-                nodeBin: process.execPath,
+            const agentName = route.agentId;
+            log.info(`Routed event to ${agentName} [${route.sessionKey}]`);
+            appendOperationalEvent(operationalEventStore, { outcome: "routed", type: event.type, agent: agentName, key: route.sessionKey, sessionKey: route.sessionKey, deliveryMode: bag && sessionTracker ? "pending-bag" : agentQueue ? "agent-queue" : "direct" });
+            // ── 9c. AI-1428: Pre-flight liveness check + role-guard ────────────
+            // Before dispatching to an agent, verify it's reachable. If not,
+            // emit DELEGATE_UNAVAILABLE instead of silently stalling.
+            // Also check role-guard for implementation-state tickets.
+            const livenessConfig = {
                 hooksUrl: process.env.OPENCLAW_HOOKS_URL,
                 hooksToken: process.env.OPENCLAW_HOOKS_TOKEN,
-                hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
-                hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
-                timeoutMs: process.env.NODE_ENV === "test" ? 50 : undefined,
-                maxRetries: process.env.NODE_ENV === "test" ? 0 : undefined,
             };
-            // Per-agent override: prefer the agent's own hooksUrl/hooksToken from
-            // agents.json so dispatches reach the right gateway/container instead of
-            // always hitting OPENCLAW_HOOKS_URL (which may belong to a different fleet).
-            const wakeConfigForAgent = (agentIdLookup) => {
-                const cfg = getAgent(agentIdLookup);
-                return {
-                    ...wakeConfig,
-                    hooksUrl: cfg?.hooksUrl ?? wakeConfig.hooksUrl,
-                    hooksToken: cfg?.hooksToken ?? wakeConfig.hooksToken,
-                };
-            };
-            // Before honoring in-memory active-session locks, synchronously expire
-            // stale sessions. The interval-based cleanup is only a backstop; webhook
-            // traffic should not wait up to another minute behind an already-expired
-            // lock, and stale cleanup must re-signal queued work instead of stranding it.
-            const staleSessions = sessionTracker.cleanupStale();
-            for (const stale of staleSessions) {
-                log.info(`Webhook stale-session drain: re-signaling ${stale.agentId} for ${stale.pendingTickets.length} ticket(s)`);
-                await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfigForAgent(stale.agentId), { markActive: true, onDispatched });
+            const agentLivenessCfg = getAgent(route.agentId);
+            if (agentLivenessCfg?.hooksUrl)
+                livenessConfig.hooksUrl = agentLivenessCfg.hooksUrl;
+            if (agentLivenessCfg?.hooksToken)
+                livenessConfig.hooksToken = agentLivenessCfg.hooksToken;
+            const liveness = await checkAgentLiveness(route.agentId, livenessConfig);
+            if (!liveness.available) {
+                // Agent unreachable — emit DELEGATE_UNAVAILABLE escalation.
+                log.warn(`DELEGATE_UNAVAILABLE: ${route.agentId} is unreachable (${liveness.reason}: ${liveness.detail ?? "unknown"}) — skipping delivery for ${ticketId}`);
+                appendOperationalEvent(operationalEventStore, {
+                    outcome: "delivery-failed",
+                    type: event.type,
+                    agent: agentName,
+                    key: ticketId,
+                    sessionKey: ticketId,
+                    deliveryMode: "delegate-unavailable",
+                    attemptCount: 1,
+                    errorSummary: `DELEGATE_UNAVAILABLE: ${liveness.reason}: ${liveness.detail ?? "unknown"}`,
+                });
+                await emitDelegateUnavailable(ticketId.replace(/^linear-/, ""), route.agentId, `${liveness.reason}: ${liveness.detail ?? "unknown"}`);
+                // No delivery was sent — roll back the dedup priming so a later genuine
+                // dispatch to this agent+ticket inside the window is not swallowed (AI-1538).
+                nudgeStore?.clearNudge(route.agentId, ticketId);
+                // Do NOT deliver — return immediately.
+                return;
             }
-            if (sessionTracker.isActiveForTicket(agentName, normalizedTicketId)) {
-                // Same ticket already has an active session: deliver directly into it.
-                // Waiting for /session-end here would strand same-ticket conversational updates.
-                log.info(`Bag: active same-ticket session for ${agentName} [${normalizedTicketId}], delivering immediately`);
+            // Role-guard (AI-1459 enforcement mode): check whether the target agent
+            // fills the owner_role for the ticket's current workflow state.
+            // If blocked: skip delivery — the guard has posted a comment and
+            // attempted delegate correction.
+            const issueIdentifier = ticketId.replace(/^linear-/, "");
+            const roleGuardToken = getAccessToken(route.agentId) ??
+                process.env.LINEAR_OAUTH_TOKEN ??
+                process.env.LINEAR_API_KEY;
+            if (roleGuardToken) {
                 try {
-                    if (throttle) {
-                        log.info(`Dispatch throttle: waiting for ${agentName} (same-ticket active)`);
-                        await throttle.wait(route.agentId);
-                        throttle.record(route.agentId);
+                    const guardLabels = await fetchWorkflowLabels(issueIdentifier, roleGuardToken);
+                    // Provide a resolver so the guard can auto-correct the delegate
+                    // without needing to import agents.ts directly (avoids the test
+                    // compile-time dependency on fancy-openclaw-linear-skill-cli).
+                    const linearUserIdResolver = (bodyName) => {
+                        const agents = getAgents();
+                        const agent = agents.find((a) => a.name.toLowerCase() === bodyName.toLowerCase() ||
+                            a.openclawAgent?.toLowerCase() === bodyName.toLowerCase());
+                        return agent?.linearUserId ?? null;
+                    };
+                    const guardResult = await checkRoleGuardAndBlock(route.agentId, issueIdentifier, guardLabels, linearUserIdResolver);
+                    if (guardResult.blocked) {
+                        log.warn(`routing-guard: dispatch blocked for ${route.agentId} [${issueIdentifier}] — ${guardResult.reason ?? "role mismatch"}; ` +
+                            (guardResult.correctedTo ? `corrected to ${guardResult.correctedTo}` : "delegate cleared"));
+                        appendOperationalEvent(operationalEventStore, {
+                            outcome: "delivery-failed",
+                            type: event.type,
+                            agent: agentName,
+                            key: ticketId,
+                            sessionKey: ticketId,
+                            deliveryMode: "role-guard-blocked",
+                            attemptCount: 1,
+                            errorSummary: `routing-guard blocked: ${guardResult.reason ?? "role mismatch"}`,
+                        });
+                        // No delivery was sent — roll back the dedup priming so the genuine
+                        // dispatch to the agent that legitimately becomes the delegate is not
+                        // swallowed as a "duplicate" of this blocked attempt (AI-1538).
+                        nudgeStore?.clearNudge(route.agentId, ticketId);
+                        return;
                     }
-                    const sameTicketResult = await deliverWithSlot(route, wakeConfigForAgent(route.agentId), throttle);
-                    bag.removeTicket(agentName, normalizedTicketId);
-                    appendOperationalEvent(operationalEventStore, {
-                        outcome: sameTicketResult.runId ? "dispatch-accepted" : "delivered",
-                        type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId,
-                        deliveryMode: "active-same-ticket", attemptCount: 1, runId: sameTicketResult.runId ?? null
-                    });
                 }
                 catch (err) {
-                    log.error(`Same-ticket active delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
-                    appendOperationalEvent(operationalEventStore, { outcome: "delivery-failed", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "active-same-ticket", attemptCount: 1, errorSummary: errorSummary(err) });
-                    sessionTracker.queueSignal(agentName, [normalizedTicketId]);
+                    log.warn(`Role-guard check failed for ${issueIdentifier}: ${err instanceof Error ? err.message : String(err)} — continuing`);
                 }
-                return;
             }
-            // No active session for this specific ticket key. Dispatch a wake-up
-            // immediately — even if the agent has other active sessions for other
-            // tickets. Each ticket gets its own independent per-ticket session.
-            const pending = bag.getPendingTickets(agentName);
-            const pendingIds = pending.map((e) => e.ticketId);
-            log.info(`Bag: sending wake-up signal(s) to ${agentName} with ${pendingIds.length} ticket(s)`);
-            const dispatchResults = await resignalPendingTickets(agentName, pendingIds, bag, sessionTracker, wakeConfigForAgent(agentName), { markActive: true, onDispatched });
-            const dispatched = dispatchResults.filter(r => r.dispatched).length;
-            const firstRunId = dispatchResults.find(r => r.runId)?.runId ?? null;
-            appendOperationalEvent(operationalEventStore, {
-                outcome: dispatched > 0 ? "dispatch-accepted" : "delivery-failed",
-                type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId,
-                deliveryMode: "wake-up", attemptCount: pendingIds.length, runId: firstRunId,
-                errorSummary: dispatched > 0 ? null : "No wake-up signals dispatched"
-            });
-            return;
-        }
-        // ── v1.0 fallback: Agent queue with ticket-level coalescing ─────────
-        if (agentQueue) {
-            const queueResult = agentQueue.enqueueOrCoalesce(route);
-            if (queueResult.action === "active-busy") {
-                log.info(`Agent queue: ${route.agentId} already has active task for [${ticketId}] — skipping`);
-                appendOperationalEvent(operationalEventStore, { outcome: "dedup-suppressed", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "agent-queue-active-busy" });
-                return;
+            // Delivery is now committed: the event routed to a delegate that passed
+            // the stale-route, liveness, and role-guard checks. Register a pending
+            // dispatch expectation BEFORE the actual send so that if the delivery is
+            // later swallowed (nudge-dedup) or sent through a path that records no
+            // ack, the watchdog still sees an unacknowledged dispatch and re-signals
+            // it (AI-1538). ensurePending uses attempt_count=0 + ON CONFLICT DO
+            // NOTHING, so the happy path's counter is unchanged.
+            onDeliveryCommitted?.(agentName, ticketId);
+            // ── 10. Create agent session + emit thought ───────────────────────────
+            const data = event.data;
+            const issueId = data?.id;
+            let agentSessionId = null;
+            if (issueId && event.type === "Issue") {
+                try {
+                    const sessionResult = await createSessionAndEmitThought(issueId, agentName, {
+                        identifier: data?.identifier,
+                        title: data?.title,
+                        description: data?.description,
+                    });
+                    agentSessionId = sessionResult.sessionId;
+                }
+                catch (err) {
+                    log.error(`Failed to create agent session: ${err instanceof Error ? err.message : String(err)}`);
+                }
             }
-            if (queueResult.action === "coalesced") {
-                log.info(`Agent queue: coalesced queued event for ${route.agentId} [${ticketId}]`);
-                appendOperationalEvent(operationalEventStore, { outcome: "dedup-suppressed", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "agent-queue-coalesced" });
-                return;
-            }
-            if (queueResult.action === "queued") {
-                log.info(`Agent queue: queued event for ${route.agentId} [${ticketId}] (active task for different ticket)`);
-                appendOperationalEvent(operationalEventStore, { outcome: "queued", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "agent-queue" });
-                return;
-            }
-            log.info(`Agent queue: delivering immediately for ${route.agentId} [${ticketId}]`);
-        }
-        // Deliver to OpenClaw agent via delivery module
-        const agentCfg = getAgent(route.agentId);
-        const deliveryConfig = {
-            nodeBin: process.execPath,
-            hooksUrl: agentCfg?.hooksUrl ?? process.env.OPENCLAW_HOOKS_URL,
-            hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
-            hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
-            hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
-        };
-        try {
-            if (throttle) {
-                log.info(`Dispatch throttle: waiting for ${agentName}`);
-                await throttle.wait(route.agentId);
-                throttle.record(route.agentId);
-            }
-            const directResult = await deliverWithSlot(route, deliveryConfig, throttle);
-            appendOperationalEvent(operationalEventStore, { outcome: directResult.runId ? "dispatch-accepted" : "delivered", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1, runId: directResult.runId ?? null });
-        }
-        catch (err) {
-            log.error(`OpenClaw delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
-            appendOperationalEvent(operationalEventStore, { outcome: "delivery-failed", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1, errorSummary: errorSummary(err) });
-        }
-        finally {
-            if (agentQueue) {
-                let next = agentQueue.complete(route.agentId);
-                while (next) {
-                    log.info(`Agent queue: promoting next task for ${route.agentId} [${next.sessionKey}]`);
+            // ── v1.1: Pull-based wake-up via PendingWorkBag ─────────────────────
+            // Add to bag (deduped by ticket ID). Send wake-up signal only if
+            // agent has no active session. Bursts collapse to 1 signal.
+            if (bag && sessionTracker) {
+                const normalizedTicketId = normalizeSessionKey(ticketId);
+                bag.add(agentName, normalizedTicketId, event.type, route.routingReason);
+                // Purge stale bag entries for this ticket from all other agents. When a
+                // delegate changes, the previous holder's bag entry must be removed so it
+                // doesn't receive a spurious consider-work wake for a ticket it no longer owns.
+                if (route.routingReason === "delegate" || route.routingReason === "assignee") {
+                    const purgedStale = bag.removeTicketForOtherAgents(agentName, normalizedTicketId);
+                    if (purgedStale > 0) {
+                        log.info(`Bag: purged stale entries for ${normalizedTicketId} from ${purgedStale} other agent(s)`);
+                    }
+                }
+                appendOperationalEvent(operationalEventStore, { outcome: "bag-added", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "pending-bag" });
+                const wakeConfig = {
+                    nodeBin: process.execPath,
+                    hooksUrl: process.env.OPENCLAW_HOOKS_URL,
+                    hooksToken: process.env.OPENCLAW_HOOKS_TOKEN,
+                    hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
+                    hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+                    timeoutMs: process.env.NODE_ENV === "test" ? 50 : undefined,
+                    maxRetries: process.env.NODE_ENV === "test" ? 0 : undefined,
+                };
+                // Per-agent override: prefer the agent's own hooksUrl/hooksToken from
+                // agents.json so dispatches reach the right gateway/container instead of
+                // always hitting OPENCLAW_HOOKS_URL (which may belong to a different fleet).
+                const wakeConfigForAgent = (agentIdLookup) => {
+                    const cfg = getAgent(agentIdLookup);
+                    return {
+                        ...wakeConfig,
+                        hooksUrl: cfg?.hooksUrl ?? wakeConfig.hooksUrl,
+                        hooksToken: cfg?.hooksToken ?? wakeConfig.hooksToken,
+                    };
+                };
+                // Before honoring in-memory active-session locks, synchronously expire
+                // stale sessions. The interval-based cleanup is only a backstop; webhook
+                // traffic should not wait up to another minute behind an already-expired
+                // lock, and stale cleanup must re-signal queued work instead of stranding it.
+                const staleSessions = sessionTracker.cleanupStale();
+                for (const stale of staleSessions) {
+                    log.info(`Webhook stale-session drain: re-signaling ${stale.agentId} for ${stale.pendingTickets.length} ticket(s)`);
+                    await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfigForAgent(stale.agentId), { markActive: true, onDispatched });
+                }
+                if (sessionTracker.isActiveForTicket(agentName, normalizedTicketId)) {
+                    // Same ticket already has an active session: deliver directly into it.
+                    // Waiting for /session-end here would strand same-ticket conversational updates.
+                    log.info(`Bag: active same-ticket session for ${agentName} [${normalizedTicketId}], delivering immediately`);
                     try {
                         if (throttle) {
-                            log.info(`Dispatch throttle: waiting for ${route.agentId} (drain)`);
+                            log.info(`Dispatch throttle: waiting for ${agentName} (same-ticket active)`);
                             await throttle.wait(route.agentId);
                             throttle.record(route.agentId);
                         }
-                        const drainResult = await deliverWithSlot(next, deliveryConfig, throttle);
-                        appendOperationalEvent(operationalEventStore, { outcome: drainResult.runId ? "dispatch-accepted" : "delivered", type: next.event.type, agent: route.agentId, key: next.sessionKey, sessionKey: next.sessionKey, deliveryMode: "agent-queue-drain", attemptCount: 1, runId: drainResult.runId ?? null });
+                        const sameTicketResult = await deliverWithSlot(route, wakeConfigForAgent(route.agentId), throttle);
+                        bag.removeTicket(agentName, normalizedTicketId);
+                        appendOperationalEvent(operationalEventStore, {
+                            outcome: sameTicketResult.runId ? "dispatch-accepted" : "delivered",
+                            type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId,
+                            deliveryMode: "active-same-ticket", attemptCount: 1, runId: sameTicketResult.runId ?? null
+                        });
                     }
                     catch (err) {
-                        log.error(`Agent queue: failed to deliver promoted task for ${route.agentId}: ${err instanceof Error ? err.message : String(err)}`);
-                        appendOperationalEvent(operationalEventStore, { outcome: "delivery-failed", type: next.event.type, agent: route.agentId, key: next.sessionKey, sessionKey: next.sessionKey, deliveryMode: "agent-queue-drain", attemptCount: 1, errorSummary: errorSummary(err) });
+                        log.error(`Same-ticket active delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
+                        appendOperationalEvent(operationalEventStore, { outcome: "delivery-failed", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "active-same-ticket", attemptCount: 1, errorSummary: errorSummary(err) });
+                        sessionTracker.queueSignal(agentName, [normalizedTicketId]);
                     }
-                    next = agentQueue.complete(route.agentId);
+                    return;
+                }
+                // No active session for this specific ticket key. Dispatch a wake-up
+                // immediately — even if the agent has other active sessions for other
+                // tickets. Each ticket gets its own independent per-ticket session.
+                const pending = bag.getPendingTickets(agentName);
+                const pendingIds = pending.map((e) => e.ticketId);
+                log.info(`Bag: sending wake-up signal(s) to ${agentName} with ${pendingIds.length} ticket(s)`);
+                const dispatchResults = await resignalPendingTickets(agentName, pendingIds, bag, sessionTracker, wakeConfigForAgent(agentName), { markActive: true, onDispatched });
+                const dispatched = dispatchResults.filter(r => r.dispatched).length;
+                const firstRunId = dispatchResults.find(r => r.runId)?.runId ?? null;
+                appendOperationalEvent(operationalEventStore, {
+                    outcome: dispatched > 0 ? "dispatch-accepted" : "delivery-failed",
+                    type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId,
+                    deliveryMode: "wake-up", attemptCount: pendingIds.length, runId: firstRunId,
+                    errorSummary: dispatched > 0 ? null : "No wake-up signals dispatched"
+                });
+                return;
+            }
+            // ── v1.0 fallback: Agent queue with ticket-level coalescing ─────────
+            if (agentQueue) {
+                const queueResult = agentQueue.enqueueOrCoalesce(route);
+                if (queueResult.action === "active-busy") {
+                    log.info(`Agent queue: ${route.agentId} already has active task for [${ticketId}] — skipping`);
+                    appendOperationalEvent(operationalEventStore, { outcome: "dedup-suppressed", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "agent-queue-active-busy" });
+                    return;
+                }
+                if (queueResult.action === "coalesced") {
+                    log.info(`Agent queue: coalesced queued event for ${route.agentId} [${ticketId}]`);
+                    appendOperationalEvent(operationalEventStore, { outcome: "dedup-suppressed", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "agent-queue-coalesced" });
+                    return;
+                }
+                if (queueResult.action === "queued") {
+                    log.info(`Agent queue: queued event for ${route.agentId} [${ticketId}] (active task for different ticket)`);
+                    appendOperationalEvent(operationalEventStore, { outcome: "queued", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "agent-queue" });
+                    return;
+                }
+                log.info(`Agent queue: delivering immediately for ${route.agentId} [${ticketId}]`);
+            }
+            // Deliver to OpenClaw agent via delivery module
+            const agentCfg = getAgent(route.agentId);
+            const deliveryConfig = {
+                nodeBin: process.execPath,
+                hooksUrl: agentCfg?.hooksUrl ?? process.env.OPENCLAW_HOOKS_URL,
+                hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
+                hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
+                hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+            };
+            try {
+                if (throttle) {
+                    log.info(`Dispatch throttle: waiting for ${agentName}`);
+                    await throttle.wait(route.agentId);
+                    throttle.record(route.agentId);
+                }
+                const directResult = await deliverWithSlot(route, deliveryConfig, throttle);
+                appendOperationalEvent(operationalEventStore, { outcome: directResult.runId ? "dispatch-accepted" : "delivered", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1, runId: directResult.runId ?? null });
+            }
+            catch (err) {
+                log.error(`OpenClaw delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
+                appendOperationalEvent(operationalEventStore, { outcome: "delivery-failed", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1, errorSummary: errorSummary(err) });
+            }
+            finally {
+                if (agentQueue) {
+                    let next = agentQueue.complete(route.agentId);
+                    while (next) {
+                        log.info(`Agent queue: promoting next task for ${route.agentId} [${next.sessionKey}]`);
+                        try {
+                            if (throttle) {
+                                log.info(`Dispatch throttle: waiting for ${route.agentId} (drain)`);
+                                await throttle.wait(route.agentId);
+                                throttle.record(route.agentId);
+                            }
+                            const drainResult = await deliverWithSlot(next, deliveryConfig, throttle);
+                            appendOperationalEvent(operationalEventStore, { outcome: drainResult.runId ? "dispatch-accepted" : "delivered", type: next.event.type, agent: route.agentId, key: next.sessionKey, sessionKey: next.sessionKey, deliveryMode: "agent-queue-drain", attemptCount: 1, runId: drainResult.runId ?? null });
+                        }
+                        catch (err) {
+                            log.error(`Agent queue: failed to deliver promoted task for ${route.agentId}: ${err instanceof Error ? err.message : String(err)}`);
+                            appendOperationalEvent(operationalEventStore, { outcome: "delivery-failed", type: next.event.type, agent: route.agentId, key: next.sessionKey, sessionKey: next.sessionKey, deliveryMode: "agent-queue-drain", attemptCount: 1, errorSummary: errorSummary(err) });
+                        }
+                        next = agentQueue.complete(route.agentId);
+                    }
                 }
             }
-        }
+        } // dispatchRoute
     });
     return router;
 }

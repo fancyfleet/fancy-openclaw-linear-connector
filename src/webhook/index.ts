@@ -6,7 +6,7 @@ import type { LinearEvent } from "./schema.js";
 import { EventStore } from "../store/event-store.js";
 import { NudgeStore } from "../store/nudge-store.js";
 import type { OperationalEventInput, OperationalEventStore } from "../store/operational-event-store.js";
-import { routeEvent } from "../router.js";
+import { routeEvent, routeEventAll } from "../router.js";
 import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
 import { deliverToAgent, DeliveryThrottle, type DeliveryConfig } from "../delivery/index.js";
 import type { RouteResult } from "../types.js";
@@ -374,8 +374,8 @@ export function createWebhookRouter(
         }
       }
 
-      const route = routeEvent(event);
-      if (!route) {
+      const routes = routeEventAll(event);
+      if (routes.length === 0) {
         log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);
         appendOperationalEvent(operationalEventStore, { outcome: "no-route", type: event.type, errorSummary: `No agent target for ${event.type}` });
         // Audit finding #1: this was the fully-silent "assigned it and nothing
@@ -395,6 +395,20 @@ export function createWebhookRouter(
         return;
       }
 
+      // Dispatch each route through the full guard pipeline, sequentially.
+      // Multi-route events (mention fan-out, audit #3) are rare; sequential
+      // keeps per-agent throttle and bag semantics simple. A failure in one
+      // route's dispatch must not starve the remaining routes.
+      for (const dispatchTarget of routes) {
+        try {
+          await dispatchRoute(dispatchTarget);
+        } catch (err) {
+          log.error(`dispatchRoute failed for ${dispatchTarget.agentId} [${dispatchTarget.sessionKey}]: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      return;
+
+      async function dispatchRoute(route: RouteResult): Promise<void> {
       // ── 9a. Stale-route guard ───────────────────────────────────────────
       // Linear webhook payloads are snapshots. Before waking an agent from a
       // delegate/assignee event, re-check Linear's current issue state so an
@@ -555,9 +569,11 @@ export function createWebhookRouter(
         // Purge stale bag entries for this ticket from all other agents. When a
         // delegate changes, the previous holder's bag entry must be removed so it
         // doesn't receive a spurious consider-work wake for a ticket it no longer owns.
-        const purgedStale = bag.removeTicketForOtherAgents(agentName, normalizedTicketId);
-        if (purgedStale > 0) {
-          log.info(`Bag: purged stale entries for ${normalizedTicketId} from ${purgedStale} other agent(s)`);
+        if (route.routingReason === "delegate" || route.routingReason === "assignee") {
+          const purgedStale = bag.removeTicketForOtherAgents(agentName, normalizedTicketId);
+          if (purgedStale > 0) {
+            log.info(`Bag: purged stale entries for ${normalizedTicketId} from ${purgedStale} other agent(s)`);
+          }
         }
         appendOperationalEvent(operationalEventStore, { outcome: "bag-added", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "pending-bag" });
 
@@ -698,6 +714,7 @@ export function createWebhookRouter(
           }
         }
       }
+      } // dispatchRoute
     },
   );
 

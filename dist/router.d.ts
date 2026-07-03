@@ -19,8 +19,22 @@ export declare function extractAgentTarget(event: LinearEvent): {
     reason: "delegate" | "assignee" | "mention" | "body-mention";
 } | null;
 /**
+ * All registered agents mentioned in the event beyond the given primary
+ * registry name — payload `mentionedUsers` plus comment-body @mentions —
+ * excluding the acting agent (self-trigger) and the primary itself.
+ * Returns registry names. (Audit #3: only the first mention used to wake.)
+ */
+export declare function extractAdditionalMentionTargets(event: LinearEvent, primaryName: string | null): string[];
+/**
  * Route a Linear event to an OpenClaw agent.
  * Returns a RouteResult if routing succeeded, null if no agent found.
  */
 export declare function routeEvent(event: LinearEvent): RouteResult | null;
+/**
+ * Route a Linear event to ALL its targets: the primary route (delegate →
+ * assignee → first mention, exactly as routeEvent) plus one mention route per
+ * additional registered agent mentioned in the event (audit #3 — previously
+ * only the first mentioned agent was ever woken).
+ */
+export declare function routeEventAll(event: LinearEvent): RouteResult[];
 //# sourceMappingURL=router.d.ts.map

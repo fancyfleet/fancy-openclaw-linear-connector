@@ -8,7 +8,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { extractAgentTarget, routeEvent } from "./router.js";
+import { extractAgentTarget, routeEvent, routeEventAll } from "./router.js";
 import { reloadAgents } from "./agents.js";
 import type { LinearEvent } from "./webhook/schema.js";
 
@@ -402,5 +402,72 @@ describe("routeEvent", () => {
     const event = makeIssueEvent({});
     const result = routeEvent(event);
     expect(result).toBeNull();
+  });
+});
+
+// ── routeEventAll — multi-mention fan-out (audit #3) ─────────────────────────
+
+describe("routeEventAll", () => {
+  const IGOR_ID = "11111111-2222-3333-4444-555555555555";
+  let agentsFile: string;
+
+  beforeEach(() => {
+    agentsFile = makeTempAgentsFile([
+      ...BASE_AGENTS,
+      { name: "igor", linearUserId: IGOR_ID, openclawAgent: "igor", clientId: "c3", clientSecret: "s3", accessToken: "tok3", refreshToken: "ref3" },
+    ]);
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+  });
+
+  afterEach(() => {
+    delete process.env.AGENTS_FILE;
+    fs.rmSync(path.dirname(agentsFile), { recursive: true, force: true });
+  });
+
+  it("returns primary route only when nothing else is mentioned", () => {
+    const event = makeIssueEvent({ delegateId: CHARLES_ID, updatedFrom: { delegateId: null } });
+    const routes = routeEventAll(event);
+    expect(routes.map((r) => r.agentId)).toEqual(["charles"]);
+  });
+
+  it("wakes every registered agent mentioned in a comment body, not just the first", () => {
+    const event = makeIssueEvent({ commentBody: "@astrid please loop in @igor and @charles on this" });
+    const routes = routeEventAll(event);
+    // astrid is primary (first body mention); igor + charles fan out
+    expect(routes[0].agentId).toBe("astrid");
+    expect(routes.map((r) => r.agentId).sort()).toEqual(["astrid", "charles", "igor"]);
+    // all share the ticket session key
+    expect(new Set(routes.map((r) => r.sessionKey)).size).toBe(1);
+    expect(routes.slice(1).every((r) => r.routingReason === "mention")).toBe(true);
+  });
+
+  it("fans out payload mentionedUsers beyond the first", () => {
+    const event = makeIssueEvent({ commentBody: "please review" });
+    (event as { data: { mentionedUsers: unknown } }).data.mentionedUsers = [
+      { id: ASTRID_ID }, { id: IGOR_ID }, { id: "not-an-agent" },
+    ];
+    const routes = routeEventAll(event);
+    expect(routes.map((r) => r.agentId).sort()).toEqual(["astrid", "igor"]);
+  });
+
+  it("excludes the acting agent from fan-out (self-trigger)", () => {
+    const event = makeIssueEvent({ actorId: CHARLES_ID, commentBody: "@astrid see my note, cc @charles" });
+    const routes = routeEventAll(event);
+    // charles is the actor — mentioned but never fanned out to
+    expect(routes.map((r) => r.agentId).sort()).toEqual(["astrid"]);
+  });
+
+  it("does not duplicate the delegate when they are also mentioned", () => {
+    const event = makeIssueEvent({ delegateId: CHARLES_ID, updatedFrom: { delegateId: null } });
+    (event as { data: { mentionedUsers: unknown } }).data.mentionedUsers = [{ id: CHARLES_ID }, { id: IGOR_ID }];
+    const routes = routeEventAll(event);
+    expect(routes.map((r) => r.agentId).sort()).toEqual(["charles", "igor"]);
+    expect(routes[0].routingReason).toBe("delegate");
+  });
+
+  it("returns empty when no target resolves", () => {
+    const event = makeIssueEvent({ commentBody: "no agents mentioned here" });
+    expect(routeEventAll(event)).toEqual([]);
   });
 });

@@ -233,28 +233,61 @@ function buildNameMap(): Record<string, string> {
 
 /** Detect an @mention in a comment body and return the matched agent key from nameMap */
 function detectMentionInBody(body: string, nameMap: Record<string, string>): string | null {
+  return detectAllMentionsInBody(body, nameMap)[0] ?? null;
+}
+
+/** Detect ALL @mentions in a comment body, in order, deduped (audit #3). */
+function detectAllMentionsInBody(body: string, nameMap: Record<string, string>): string[] {
   // Match @word or @[Multi Word] patterns
   const mentionPattern = /@\[([^\]]+)\]|@(\w+)/g;
+  const found: string[] = [];
   let match: RegExpExecArray | null;
   while ((match = mentionPattern.exec(body)) !== null) {
     const name = (match[1] || match[2]).toLowerCase();
-    if (nameMap[name]) {
-      return name;
+    if (nameMap[name] && !found.includes(name)) {
+      found.push(name);
     }
   }
-  return null;
+  return found;
 }
 
 /**
- * Route a Linear event to an OpenClaw agent.
- * Returns a RouteResult if routing succeeded, null if no agent found.
+ * All registered agents mentioned in the event beyond the given primary
+ * registry name — payload `mentionedUsers` plus comment-body @mentions —
+ * excluding the acting agent (self-trigger) and the primary itself.
+ * Returns registry names. (Audit #3: only the first mention used to wake.)
  */
-export function routeEvent(event: LinearEvent): RouteResult | null {
-  const result = extractAgentTarget(event);
-  if (!result) return null;
+export function extractAdditionalMentionTargets(event: LinearEvent, primaryName: string | null): string[] {
+  if (event.type === "AgentSessionEvent") return [];
+  const agentMap = buildAgentMap();
+  const actorId = event.actor?.id;
+  const actorAgent = actorId ? agentMap[actorId] : undefined;
+  const data = ("data" in event ? event.data : undefined) as Record<string, unknown> | undefined;
+  if (!data) return [];
 
-  const agent = getAgent(result.name);
-  const openclawName = getOpenclawAgentName(result.name);
+  const targets = new Set<string>();
+  const mentionedUsers = data.mentionedUsers as Array<{ id?: string }> | null | undefined;
+  if (mentionedUsers) {
+    for (const user of mentionedUsers) {
+      if (user.id && agentMap[user.id]) targets.add(agentMap[user.id]);
+    }
+  }
+  if (event.type === "Comment" && typeof data.body === "string") {
+    const nameMap = buildNameMap();
+    for (const key of detectAllMentionsInBody(data.body, nameMap)) {
+      targets.add(nameMap[key]);
+    }
+  }
+  if (primaryName) targets.delete(primaryName);
+  if (actorAgent) targets.delete(actorAgent);
+  return [...targets];
+}
+
+function buildRouteResult(
+  target: { name: string; reason: "delegate" | "assignee" | "mention" | "body-mention" },
+  event: LinearEvent,
+): RouteResult {
+  const openclawName = getOpenclawAgentName(target.name);
   const identifier = extractIssueIdentifier(event);
   const rawKey = identifier
     ? `linear-${identifier}`
@@ -271,7 +304,7 @@ export function routeEvent(event: LinearEvent): RouteResult | null {
       ` data=${dataStr}`
     );
   } else {
-    log.info(`routeEvent: type=${event.type} identifier=${identifier} reason=${result.reason}`);
+    log.info(`routeEvent: type=${event.type} identifier=${identifier} reason=${target.reason}`);
   }
 
   return {
@@ -279,6 +312,33 @@ export function routeEvent(event: LinearEvent): RouteResult | null {
     sessionKey,
     priority: 0,
     event,
-    routingReason: result.reason,
+    routingReason: target.reason,
   };
+}
+
+/**
+ * Route a Linear event to an OpenClaw agent.
+ * Returns a RouteResult if routing succeeded, null if no agent found.
+ */
+export function routeEvent(event: LinearEvent): RouteResult | null {
+  const result = extractAgentTarget(event);
+  if (!result) return null;
+  return buildRouteResult(result, event);
+}
+
+/**
+ * Route a Linear event to ALL its targets: the primary route (delegate →
+ * assignee → first mention, exactly as routeEvent) plus one mention route per
+ * additional registered agent mentioned in the event (audit #3 — previously
+ * only the first mentioned agent was ever woken).
+ */
+export function routeEventAll(event: LinearEvent): RouteResult[] {
+  const primary = extractAgentTarget(event);
+  if (!primary) return [];
+  const routes = [buildRouteResult(primary, event)];
+  for (const name of extractAdditionalMentionTargets(event, primary.name)) {
+    log.info(`Fan-out mention route: ${name} (primary: ${primary.name})`);
+    routes.push(buildRouteResult({ name, reason: "mention" }, event));
+  }
+  return routes;
 }
