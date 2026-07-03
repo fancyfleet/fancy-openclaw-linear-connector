@@ -6,7 +6,7 @@ import type { LinearEvent } from "./schema.js";
 import { EventStore } from "../store/event-store.js";
 import { NudgeStore } from "../store/nudge-store.js";
 import type { OperationalEventInput, OperationalEventStore } from "../store/operational-event-store.js";
-import { routeEvent, routeEventAll } from "../router.js";
+import { routeEvent, routeEventAll, unresolvedRoutingCandidates } from "../router.js";
 import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
 import { deliverToAgent, DeliveryThrottle, type DeliveryConfig } from "../delivery/index.js";
 import type { RouteResult } from "../types.js";
@@ -380,15 +380,18 @@ export function createWebhookRouter(
         appendOperationalEvent(operationalEventStore, { outcome: "no-route", type: event.type, errorSummary: `No agent target for ${event.type}` });
         // Audit finding #1: this was the fully-silent "assigned it and nothing
         // happened" case — a delegate/assignee/mention matching no registered
-        // agent left no artifact anywhere. Now it pushes. (AgentSessionEvents
-        // are benign UI-widget events — unresolvable ones are expected and
-        // deliberately do not alert.)
-        if (event.type !== "AgentSessionEvent") {
+        // agent left no artifact anywhere. Now it pushes — but only when the
+        // event actually named someone we couldn't resolve. Events with no
+        // routing candidates at all (IssueLabel/Project/... entity writes,
+        // unassigned issues, plain comments, AgentSessionEvent UI widgets)
+        // no-route by construction and stay log+store only.
+        const unresolved = unresolvedRoutingCandidates(event);
+        if (unresolved.length > 0) {
           notify({
             severity: "warning",
             source: "routing",
-            title: "no-route: event matched no registered agent (delegate/assignee/mention unknown to agents.json)",
-            detail: `type=${event.type} action=${"action" in event ? event.action : "?"}`,
+            title: "no-route: event named a delegate/assignee/mention unknown to agents.json",
+            detail: `type=${event.type} action=${"action" in event ? event.action : "?"} unresolved=${unresolved.join(",")}`,
             ticket: issueIdentifierFromEvent(event) ?? undefined,
           });
         }

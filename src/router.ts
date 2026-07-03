@@ -283,6 +283,33 @@ export function extractAdditionalMentionTargets(event: LinearEvent, primaryName:
   return [...targets];
 }
 
+/**
+ * Routing-candidate ids named by the event (delegate/assignee/mentioned users)
+ * that do NOT resolve to a registered agent. Drives the webhook no-route alert
+ * (audit #1): an unresolved id is the silent "assigned it and nothing
+ * happened" case, whereas an event that names nobody (IssueLabel/Project/...
+ * entity writes, unassigned issues, plain comments) no-routes by construction
+ * and is not a routing failure.
+ */
+export function unresolvedRoutingCandidates(event: LinearEvent): string[] {
+  if (event.type === "AgentSessionEvent") return [];
+  const data = ("data" in event ? event.data : undefined) as Record<string, unknown> | undefined;
+  if (!data) return [];
+  const agentMap = buildAgentMap();
+  const candidates = new Set<string>();
+  for (const field of [data.delegate, data.delegateId, data.assignee, data.assigneeId]) {
+    const id = extractId(field);
+    if (id) candidates.add(id);
+  }
+  const mentionedUsers = data.mentionedUsers as Array<{ id?: string }> | null | undefined;
+  if (Array.isArray(mentionedUsers)) {
+    for (const user of mentionedUsers) {
+      if (user?.id) candidates.add(user.id);
+    }
+  }
+  return [...candidates].filter((id) => !agentMap[id]);
+}
+
 function buildRouteResult(
   target: { name: string; reason: "delegate" | "assignee" | "mention" | "body-mention" },
   event: LinearEvent,
