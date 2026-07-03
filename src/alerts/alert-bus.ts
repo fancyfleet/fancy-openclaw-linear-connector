@@ -67,7 +67,9 @@ export class AlertBus {
     let store: AlertStore | null = options.store ?? null;
     if (!store) {
       try {
-        store = new AlertStore();
+        // Under jest, an unconfigured default bus must not write the real
+        // alerts.db (wire-in suites exercise notify() paths constantly).
+        store = new AlertStore(process.env.JEST_WORKER_ID ? ":memory:" : undefined);
       } catch (err) {
         // A broken store must never make notify() a crash source — degrade to log-only.
         this.log.error(`alert store unavailable, degrading to log-only: ${err instanceof Error ? err.message : String(err)}`);
@@ -76,7 +78,10 @@ export class AlertBus {
     }
     this.store = store;
     this.pushFn = options.pushFn ?? gatewayPush;
-    this.pushEnabled = options.pushEnabled ?? envBool("ALERT_PUSH_ENABLED", true);
+    // Never fire real pushes from a test run (jest suites exercise wire-in
+    // sites with the default bus); store/log sinks still work under test.
+    const inTestRun = Boolean(process.env.JEST_WORKER_ID);
+    this.pushEnabled = options.pushEnabled ?? (envBool("ALERT_PUSH_ENABLED", true) && !inTestRun);
     this.pushMinSeverity = options.pushMinSeverity ?? envSeverity("ALERT_PUSH_MIN_SEVERITY", "warning");
     this.pushBudget = options.pushBudget ?? parseInt(process.env.ALERT_PUSH_BUDGET ?? "10", 10);
     this.now = options.now ?? (() => new Date());
