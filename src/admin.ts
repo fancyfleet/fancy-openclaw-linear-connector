@@ -10,7 +10,9 @@ import type { OperationalEventStore, OperationalEventOutcome } from "./store/ope
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
 import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forensics.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
-import { setStateAtomic } from "./workflow-gate.js";
+import { setStateAtomic, loadWorkflowRegistry } from "./workflow-gate.js";
+import { getStatus as getConfigHealthStatus } from "./config-health.js";
+import { getRegistryPolicyStatus } from "./registry-policy.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 
 interface AdminDeps {
@@ -460,6 +462,28 @@ export function createAdminRouter(deps: AdminDeps): Router {
   router.use(adminAuth);
   router.get("/api/dashboard", (_req: Request, res: Response) => {
     res.json(buildDashboard(deps));
+  });
+  // Structural health: config artifacts, loaded workflow defs, registry⇄policy
+  // drift. The verification surface for cutovers (dir-mode, policy edits).
+  router.get("/api/structure", async (_req: Request, res: Response) => {
+    let workflows: Array<{ id: string; version: number | string | undefined; states: number }> = [];
+    let workflowError: string | null = null;
+    try {
+      const registry = await loadWorkflowRegistry();
+      workflows = [...registry.values()].map((def) => ({
+        id: def.id,
+        version: def.version,
+        states: def.states?.length ?? 0,
+      }));
+    } catch (err) {
+      workflowError = err instanceof Error ? err.message : String(err);
+    }
+    res.json({
+      configHealth: getConfigHealthStatus(),
+      workflows,
+      workflowError,
+      registryPolicy: getRegistryPolicyStatus(),
+    });
   });
   router.get("/api/events", (req: Request, res: Response) => {
     if (!deps.operationalEventStore) {

@@ -210,3 +210,22 @@ describe("admin dashboard", () => {
   });
 
 });
+
+describe("GET /admin/api/structure", () => {
+  it("returns config health, loaded workflows, and registry-policy status", async () => {
+    const request = (await import("supertest")).default;
+    const express = (await import("express")).default;
+    const { createAdminRouter } = await import("./admin.js");
+    const app = express();
+    process.env.ADMIN_SECRET = "test-secret";
+    app.use("/admin", createAdminRouter({} as any));
+    const res = await request(app)
+      .get("/admin/api/structure")
+      .set("x-admin-secret", "test-secret");
+    expect(res.status).toBe(200);
+    expect(res.body.configHealth).toBeDefined();
+    expect(res.body.configHealth.artifacts).toBeDefined();
+    expect(Array.isArray(res.body.workflows)).toBe(true);
+    expect(res.body.registryPolicy).toBeDefined();
+  });
+});
