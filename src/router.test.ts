@@ -308,6 +308,7 @@ describe("routeEvent", () => {
       data: {
         agentSession: {
           issue: { identifier: "SAK-50", id: "issue-1" },
+          appUser: { id: CHARLES_ID },
         },
         delegate: { id: CHARLES_ID, name: "Charles" },
       },
@@ -316,6 +317,23 @@ describe("routeEvent", () => {
     const result = routeEvent(event);
     expect(result).not.toBeNull();
     expect(result?.sessionKey).toBe("linear-SAK-50");
+  });
+
+  it("AgentSessionEvent with no resolvable session owner wakes nobody (audit #16)", () => {
+    const event: LinearEvent = {
+      type: "AgentSessionEvent",
+      action: "create",
+      actor: { id: "actor-1", name: "System" },
+      createdAt: "2026-04-27T00:00:00.000Z",
+      data: {
+        agentSession: {
+          issue: { identifier: "SAK-51", id: "issue-2" },
+          appUser: { id: "not-a-registered-agent" },
+        },
+      },
+      raw: {},
+    };
+    expect(routeEvent(event)).toBeNull();
   });
 
   it("extracts identifier from notification.issue path", () => {

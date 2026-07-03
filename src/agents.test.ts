@@ -7,6 +7,7 @@ import {
   getAgents,
   isAgentLocal,
   reloadAgents,
+  safeReloadAgents,
   updateTokens,
   upsertAgent,
   type AgentConfig,
@@ -221,5 +222,37 @@ describe("broker proxy-token model", () => {
     expect(env).not.toContain("rotated-real-token");
     // The rotated real token still lands in the vault for the proxy to use.
     expect(getAccessToken("charles")).toBe("rotated-real-token");
+  });
+});
+
+describe("safeReloadAgents — malformed hot edit must not crash (audit #15)", () => {
+  let dir: string;
+  let agentsFile: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "agents-safe-reload-"));
+    agentsFile = path.join(dir, "agents.json");
+    process.env.AGENTS_FILE = agentsFile;
+    fs.writeFileSync(agentsFile, JSON.stringify({ agents: [{ name: "felix", linearUserId: "u1" }] }), "utf8");
+    reloadAgents();
+  });
+
+  afterEach(() => {
+    delete process.env.AGENTS_FILE;
+    fs.rmSync(dir, { recursive: true, force: true });
+    reloadAgents();
+  });
+
+  test("valid edit reloads and returns true", () => {
+    fs.writeFileSync(agentsFile, JSON.stringify({ agents: [{ name: "felix", linearUserId: "u1" }, { name: "igor", linearUserId: "u2" }] }), "utf8");
+    expect(safeReloadAgents()).toBe(true);
+    expect(getAgents().map((a) => a.name)).toEqual(["felix", "igor"]);
+  });
+
+  test("malformed edit keeps last-good registry and does not throw", () => {
+    fs.writeFileSync(agentsFile, "{ agents: [ TRUNCATED", "utf8");
+    expect(() => safeReloadAgents()).not.toThrow();
+    expect(safeReloadAgents()).toBe(false);
+    expect(getAgents().map((a) => a.name)).toEqual(["felix"]);
   });
 });

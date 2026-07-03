@@ -9,6 +9,8 @@ import { jest, describe, it, expect, afterEach } from "@jest/globals";
 const mockGetAccessToken = jest.fn<() => string | undefined>().mockReturnValue(undefined);
 jest.unstable_mockModule("./agents.js", () => ({
   getAccessToken: mockGetAccessToken,
+  getAgent: jest.fn().mockReturnValue(undefined),
+  getLinearUserIdForAgent: jest.fn().mockReturnValue(undefined),
 }));
 
 const { emitDelegateUnavailable } = await import("./escalation.js");

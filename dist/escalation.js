@@ -10,7 +10,7 @@
  * the outbound "agent unreachable" notification path.
  */
 import { createLogger, componentLogger } from "./logger.js";
-import { getAccessToken } from "./agents.js";
+import { getAccessToken, getAgent, getLinearUserIdForAgent } from "./agents.js";
 import { notify } from "./alerts/alert-bus.js";
 const log = componentLogger(createLogger(), "escalation");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
@@ -44,19 +44,60 @@ export async function emitDelegateUnavailable(issueIdentifier, targetAgentId, re
     if (!posted) {
         log.error(`escalation: failed to post comment on ${issueIdentifier}`);
     }
-    // 3. Structured log event.
-    log.warn(`DELEGATE_UNAVAILABLE: agent=${targetAgentId} issue=${issueIdentifier} reason=${reason}`);
-    // 4. Human push (audit #11): the ticket comment above is only visible to
-    // someone reading that ticket, and delivery to the dead agent was SKIPPED —
-    // the ticket will sit with an unreachable delegate until something re-fires.
+    // 3. Reassign the delegate to the steward (Ai) so the ticket does not sit
+    // stranded on a dead agent. Audit #11: the docstring always promised this
+    // but delegateChanged was never set — the comment landed and nothing
+    // re-fired until something else touched the ticket. The delegate write
+    // itself emits a webhook, which routes to Ai and wakes her.
+    const stewardUserId = getAgent(STEWARD_AGENT_ID)?.linearUserId ?? getLinearUserIdForAgent(STEWARD_AGENT_ID);
+    if (stewardUserId && targetAgentId !== STEWARD_AGENT_ID) {
+        result.delegateChanged = await updateDelegate(internalId, stewardUserId, authHeader);
+        if (!result.delegateChanged) {
+            log.error(`escalation: failed to reassign delegate to ${STEWARD_AGENT_ID} on ${issueIdentifier}`);
+        }
+    }
+    else if (!stewardUserId) {
+        log.error(`escalation: steward '${STEWARD_AGENT_ID}' has no linearUserId in the registry — cannot reassign`);
+    }
+    // 4. Structured log event.
+    log.warn(`DELEGATE_UNAVAILABLE: agent=${targetAgentId} issue=${issueIdentifier} reason=${reason} reassigned=${result.delegateChanged}`);
+    // 5. Human push (audit #11): the ticket comment above is only visible to
+    // someone reading that ticket, and delivery to the dead agent was SKIPPED.
     notify({
         severity: "warning",
         source: "dispatch",
-        title: `delegate unreachable — delivery skipped, ticket is stranded on a dead agent (${reason})`,
+        title: result.delegateChanged
+            ? `delegate unreachable — delivery skipped, ticket reassigned to ${STEWARD_AGENT_ID} (${reason})`
+            : `delegate unreachable — delivery skipped and reassignment FAILED, ticket is stranded on a dead agent (${reason})`,
         agent: targetAgentId,
         ticket: issueIdentifier,
     });
     return result;
+}
+/** Steward who inherits tickets stranded on unreachable delegates. */
+const STEWARD_AGENT_ID = process.env.DELEGATE_UNAVAILABLE_STEWARD ?? "ai";
+/** Set the issue's delegate. Fail-open: returns false on any error. */
+async function updateDelegate(internalId, delegateLinearUserId, authHeader) {
+    const mutation = `
+    mutation UpdateDelegate($issueId: String!, $delegateId: String!) {
+      issueUpdate(id: $issueId, input: { delegateId: $delegateId }) {
+        success
+      }
+    }
+  `;
+    try {
+        const res = await fetch(LINEAR_API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: authHeader },
+            body: JSON.stringify({ query: mutation, variables: { issueId: internalId, delegateId: delegateLinearUserId } }),
+        });
+        const data = (await res.json());
+        return Boolean(data.data?.issueUpdate?.success);
+    }
+    catch (err) {
+        log.error(`escalation: delegate update failed for ${internalId}: ${err instanceof Error ? err.message : String(err)}`);
+        return false;
+    }
 }
 // ── Internal helpers ────────────────────────────────────────────────────────
 async function resolveIssueId(identifier, authHeader) {

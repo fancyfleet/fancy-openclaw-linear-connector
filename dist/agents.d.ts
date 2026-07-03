@@ -32,6 +32,14 @@ export interface AgentConfig {
     /** Maximum concurrent sessions this agent can handle. Overrides the global default. */
     maxConcurrent?: number;
 }
+/**
+ * Reload the registry from disk, keeping the previous in-memory registry on
+ * failure. A malformed hot edit must never take the running connector down
+ * (audit #15: load() rethrows inside the watch debounce timer = uncaught
+ * exception = process crash; boot-time load stays strict on purpose).
+ * Exported for tests.
+ */
+export declare function safeReloadAgents(): boolean;
 /** Start watching agents.json for external changes (e.g. manual edits). */
 export declare function watchAgentsFile(): void;
 export declare function reloadAgents(): void;

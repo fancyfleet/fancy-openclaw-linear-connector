@@ -13,6 +13,7 @@ import {
 } from "fancy-openclaw-linear-skill-cli";
 import { createLogger, componentLogger } from "./logger.js";
 import { recordSuccess, recordFailure } from "./config-health.js";
+import { notify } from "./alerts/alert-bus.js";
 
 const log = componentLogger(createLogger(), "agents");
 
@@ -166,6 +167,37 @@ function save(agents: AgentConfig[]): void {
 // In-memory cache, kept in sync with disk via file watcher
 let _agents: AgentConfig[] = load();
 
+/**
+ * Reload the registry from disk, keeping the previous in-memory registry on
+ * failure. A malformed hot edit must never take the running connector down
+ * (audit #15: load() rethrows inside the watch debounce timer = uncaught
+ * exception = process crash; boot-time load stays strict on purpose).
+ * Exported for tests.
+ */
+export function safeReloadAgents(): boolean {
+  try {
+    const reloaded = load();
+    const added = reloaded.filter((r) => !_agents.some((a) => a.name === r.name));
+    const removed = _agents.filter((a) => !reloaded.some((r) => r.name === a.name));
+    _agents = reloaded;
+    log.info(`agents.json reloaded: ${_agents.length} agent(s)` +
+      (added.length ? ` — added: ${added.map((a) => a.name).join(", ")}` : "") +
+      (removed.length ? ` — removed: ${removed.map((a) => a.name).join(", ")}` : ""));
+    return true;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log.error(`agents.json hot-reload failed — keeping previous registry (${_agents.length} agent(s)): ${message}`);
+    notify({
+      severity: "critical",
+      source: "config-health",
+      title: "agents.json hot-reload failed — running on last-good registry until the file is fixed",
+      detail: message,
+      dedupKey: "agents|reload-failed",
+    });
+    return false;
+  }
+}
+
 /** Start watching agents.json for external changes (e.g. manual edits). */
 export function watchAgentsFile(): void {
   const filePath = getAgentsPath();
@@ -177,13 +209,7 @@ export function watchAgentsFile(): void {
         // Debounce — editors often write in multiple steps
         if (debounceTimer) clearTimeout(debounceTimer);
         debounceTimer = setTimeout(() => {
-          const reloaded = load();
-          const added = reloaded.filter((r) => !_agents.some((a) => a.name === r.name));
-          const removed = _agents.filter((a) => !reloaded.some((r) => r.name === a.name));
-          _agents = reloaded;
-          log.info(`agents.json reloaded: ${_agents.length} agent(s)` +
-            (added.length ? ` — added: ${added.map((a) => a.name).join(", ")}` : "") +
-            (removed.length ? ` — removed: ${removed.map((a) => a.name).join(", ")}` : ""));
+          safeReloadAgents();
         }, 250);
       }
     });

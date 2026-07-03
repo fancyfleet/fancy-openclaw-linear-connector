@@ -35,11 +35,26 @@ export function extractAgentTarget(event) {
         const upd = event.updatedFrom;
         return upd !== undefined && "stateId" in upd;
     })();
-    // For AgentSessionEvent, route to the agent that owns the session
+    // For AgentSessionEvent, route to the agent that owns the session — the
+    // session's appUser/creator is the OAuth app user, i.e. the same Linear user
+    // id space as delegates. Previously this returned agents[0] (audit #16:
+    // widget events woke an arbitrary agent). Unresolvable → wake nobody.
     if (event.type === "AgentSessionEvent") {
-        // TODO: extract agent from session data if needed
-        const agents = Object.values(agentMap);
-        return agents.length > 0 ? { name: agents[0], reason: "delegate" } : null;
+        const d = ("data" in event ? event.data : undefined);
+        const session = d?.agentSession;
+        const candidates = [
+            extractId(session?.appUser),
+            typeof session?.appUserId === "string" ? session.appUserId : null,
+            extractId(session?.creator),
+        ];
+        for (const id of candidates) {
+            if (id && agentMap[id]) {
+                log.info(`AgentSessionEvent routed via session owner: ${id} → ${agentMap[id]}`);
+                return { name: agentMap[id], reason: "delegate" };
+            }
+        }
+        log.info("AgentSessionEvent: no owning agent resolvable from session payload — not waking anyone");
+        return null;
     }
     const data = "data" in event ? event.data : null;
     // 1. Check delegate first — OAuth app actors are set as delegates, not assignees

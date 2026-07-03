@@ -380,14 +380,18 @@ export function createWebhookRouter(
         appendOperationalEvent(operationalEventStore, { outcome: "no-route", type: event.type, errorSummary: `No agent target for ${event.type}` });
         // Audit finding #1: this was the fully-silent "assigned it and nothing
         // happened" case — a delegate/assignee/mention matching no registered
-        // agent left no artifact anywhere. Now it pushes.
-        notify({
-          severity: "warning",
-          source: "routing",
-          title: "no-route: event matched no registered agent (delegate/assignee/mention unknown to agents.json)",
-          detail: `type=${event.type} action=${"action" in event ? event.action : "?"}`,
-          ticket: issueIdentifierFromEvent(event) ?? undefined,
-        });
+        // agent left no artifact anywhere. Now it pushes. (AgentSessionEvents
+        // are benign UI-widget events — unresolvable ones are expected and
+        // deliberately do not alert.)
+        if (event.type !== "AgentSessionEvent") {
+          notify({
+            severity: "warning",
+            source: "routing",
+            title: "no-route: event matched no registered agent (delegate/assignee/mention unknown to agents.json)",
+            detail: `type=${event.type} action=${"action" in event ? event.action : "?"}`,
+            ticket: issueIdentifierFromEvent(event) ?? undefined,
+          });
+        }
         return;
       }
 
