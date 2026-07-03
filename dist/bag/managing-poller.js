@@ -122,7 +122,7 @@ export class ManagingPoller {
         this.deps = {
             store: deps.store,
             operationalEventStore: deps.operationalEventStore,
-            deliveryConfig: deps.deliveryConfig,
+            resolveDeliveryConfig: deps.resolveDeliveryConfig,
             listAgents: deps.listAgents ?? (() => getAgents().filter(isAgentLocal)),
             fetchManagingTickets: deps.fetchManagingTickets ?? fetchManagingTicketsForAgent,
             sendWake: deps.sendWake ?? sendManagingWakeSignal,
@@ -151,7 +151,7 @@ export class ManagingPoller {
      * and operator visibility.
      */
     async runCycle() {
-        const { store, operationalEventStore, deliveryConfig, listAgents, fetchManagingTickets, sendWake, now } = this.deps;
+        const { store, operationalEventStore, resolveDeliveryConfig, listAgents, fetchManagingTickets, sendWake, now } = this.deps;
         const agents = listAgents();
         const result = {
             agentsChecked: 0,
@@ -210,7 +210,8 @@ export class ManagingPoller {
                 }
             }
             try {
-                await sendWake(openclawAgent, dueTickets, deliveryConfig);
+                const agentDeliveryConfig = resolveDeliveryConfig(openclawAgent);
+                await sendWake(openclawAgent, dueTickets, agentDeliveryConfig);
                 result.ticketsDispatched += dueTickets.length;
                 result.agentsWaked++;
                 const stamp = now();

@@ -38,13 +38,80 @@ export const ENFORCEMENT_RULES = [
 ];
 // ── Policy cache ───────────────────────────────────────────────────────────
 let _policyCache = null;
+/**
+ * Validate structural invariants of the capability policy (design.md §16.0).
+ * Returns a list of human-readable violation strings; empty array = healthy.
+ *
+ * Seeded by the AI-1738 incident: `bodies[astrid].container: workflow` was a
+ * dangling reference (containers[] had `steward`, not `workflow`), so
+ * resolveBodyCapabilities("astrid") silently returned an empty set — killing
+ * her escalation authority while the YAML still parsed and config-health stayed
+ * green. These invariants make that class of breakage loud (AI-1749).
+ *
+ * Checks:
+ *   1. Container join — every body.container exists in containers[].
+ *   2. Exclusive roles — every role with `exclusive: true` is filled by exactly
+ *      one body via fills_roles.
+ *   3. Exclusive capabilities — every capability with `exclusive: true` is
+ *      reachable via exactly one body's container grant chain.
+ */
+export function validatePolicyInvariants(policy) {
+    const violations = [];
+    const bodies = policy.bodies ?? [];
+    const containers = policy.containers ?? [];
+    const roles = policy.roles ?? [];
+    const capabilities = policy.capabilities ?? [];
+    const containerById = new Map(containers.map((c) => [c.id, c]));
+    // 1. Container join — every body.container must resolve.
+    for (const body of bodies) {
+        if (!containerById.has(body.container)) {
+            violations.push(`body '${body.id}' references container '${body.container}' which is not defined in containers[]`);
+        }
+    }
+    // 2. Exclusive roles — filled by exactly one body.
+    for (const role of roles) {
+        if (!role.exclusive)
+            continue;
+        const holders = bodies
+            .filter((b) => (b.fills_roles ?? []).includes(role.id))
+            .map((b) => b.id);
+        if (holders.length !== 1) {
+            violations.push(`exclusive role '${role.id}' must be filled by exactly one body, found ${holders.length}` +
+                (holders.length ? ` (${holders.join(", ")})` : ""));
+        }
+    }
+    // 3. Exclusive capabilities — reachable via exactly one body's container.
+    for (const cap of capabilities) {
+        if (!cap.exclusive)
+            continue;
+        const holders = bodies
+            .filter((b) => containerById.get(b.container)?.grants.includes(cap.id))
+            .map((b) => b.id);
+        if (holders.length !== 1) {
+            violations.push(`exclusive capability '${cap.id}' must be reachable by exactly one body, found ${holders.length}` +
+                (holders.length ? ` (${holders.join(", ")})` : ""));
+        }
+    }
+    return violations;
+}
 async function loadPolicy() {
     if (_policyCache)
         return _policyCache;
     try {
         const raw = await fs.readFile(policyPath(), "utf8");
-        _policyCache = yaml.load(raw);
-        recordSuccess("capability-policy");
+        const parsed = yaml.load(raw);
+        _policyCache = parsed;
+        // §16.0 load-time invariants (AI-1749). Do NOT throw on violation: the
+        // fail-closed resolver already returns empty capability sets for unresolved
+        // bodies, so runtime stays safe. We only make the degradation VISIBLE by
+        // flipping config-health red instead of letting it silently stay green.
+        const violations = validatePolicyInvariants(parsed);
+        if (violations.length > 0) {
+            recordFailure("capability-policy", `invariant violations: ${violations.join("; ")}`);
+        }
+        else {
+            recordSuccess("capability-policy");
+        }
         return _policyCache;
     }
     catch (err) {

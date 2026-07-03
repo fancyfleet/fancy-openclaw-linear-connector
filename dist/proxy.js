@@ -363,7 +363,8 @@ export async function handleProxyRequest(req, res, deps) {
             if (breakGlassOverride) {
                 deps?.operationalEventStore?.append({ outcome: "break-glass-used", agent: agentId, key: issueId ?? undefined });
             }
-            const p3rejection = await checkWorkflowRules(effectiveIntent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride, intent !== effectiveIntent);
+            const requestHasComment = extractCommentBody(body) !== null;
+            const p3rejection = await checkWorkflowRules(effectiveIntent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride, intent !== effectiveIntent, requestHasComment);
             if (p3rejection) {
                 log.warn(`workflow-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${p3rejection}`);
                 res.status(200).json({ errors: [{ message: p3rejection }] });
@@ -410,7 +411,7 @@ export async function handleProxyRequest(req, res, deps) {
                 // mutation. Running it here — after strip has removed legitimate state:* deltas
                 // — catches anything that survived (strip failure, non-state label manipulation).
                 // commentCreate is excluded: workflow commands legitimately use it.
-                const intentPathRawRejection = await checkRawMutationInterception(body, issueId, authorization, agentId, callerLinearUserId, /* skipCommentCreate */ true);
+                const intentPathRawRejection = await checkRawMutationInterception(body, issueId, authorization, agentId, callerLinearUserId, /* skipCommentCreate */ true, /* skipLabelFields */ true);
                 if (intentPathRawRejection) {
                     log.warn(`raw-mutation-block-on-intent-path agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${intentPathRawRejection}`);
                     res.status(200).json({ errors: [{ message: intentPathRawRejection }] });

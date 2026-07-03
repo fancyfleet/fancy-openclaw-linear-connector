@@ -13,7 +13,9 @@ import {
   checkEnforcementRules,
   ENFORCEMENT_RULES,
   resetPolicyCache,
+  validatePolicyInvariants,
 } from "./escalation-gate.js";
+import yaml from "js-yaml";
 
 // ── Minimal test policy ───────────────────────────────────────────────────
 
@@ -97,6 +99,93 @@ describe("bodyHasCapability", () => {
   it("resolves main (openclaw_agent alias) to ai body capabilities", async () => {
     expect(await bodyHasCapability("main", "linear:transition")).toBe(true);
     expect(await bodyHasCapability("main", "human:escalate")).toBe(false);
+  });
+});
+
+// ── validatePolicyInvariants (AI-1749, §16.0) ─────────────────────────────
+
+describe("validatePolicyInvariants", () => {
+  it("returns no violations for a well-formed policy", () => {
+    const policy = yaml.load(`
+capabilities:
+  - id: human:escalate
+    exclusive: true
+  - id: linear:transition
+containers:
+  - id: workflow
+    grants: [linear:transition, human:escalate]
+  - id: dev
+    grants: [linear:transition]
+roles:
+  - id: steward
+    requires: [human:escalate]
+    exclusive: true
+bodies:
+  - id: astrid
+    container: workflow
+    fills_roles: [steward]
+  - id: felix
+    container: dev
+    fills_roles: []
+`) as Parameters<typeof validatePolicyInvariants>[0];
+    expect(validatePolicyInvariants(policy)).toEqual([]);
+  });
+
+  // The exact AI-1738 failure mode: body points at a container that isn't defined.
+  it("catches a dangling body.container reference", () => {
+    const policy = yaml.load(`
+containers:
+  - id: steward
+    grants: [human:escalate]
+bodies:
+  - id: astrid
+    container: workflow
+    fills_roles: []
+`) as Parameters<typeof validatePolicyInvariants>[0];
+    const violations = validatePolicyInvariants(policy);
+    expect(violations.length).toBe(1);
+    expect(violations[0]).toContain("astrid");
+    expect(violations[0]).toContain("workflow");
+  });
+
+  it("catches an exclusive role filled by two bodies", () => {
+    const policy = yaml.load(`
+containers:
+  - id: workflow
+    grants: [human:escalate]
+roles:
+  - id: steward
+    requires: [human:escalate]
+    exclusive: true
+bodies:
+  - id: astrid
+    container: workflow
+    fills_roles: [steward]
+  - id: impostor
+    container: workflow
+    fills_roles: [steward]
+`) as Parameters<typeof validatePolicyInvariants>[0];
+    const violations = validatePolicyInvariants(policy);
+    expect(violations.some((v) => v.includes("steward") && v.includes("2"))).toBe(true);
+  });
+
+  it("catches an exclusive capability reachable by zero bodies", () => {
+    const policy = yaml.load(`
+capabilities:
+  - id: human:escalate
+    exclusive: true
+containers:
+  - id: workflow
+    grants: [human:escalate]
+  - id: dev
+    grants: []
+bodies:
+  - id: felix
+    container: dev
+    fills_roles: []
+`) as Parameters<typeof validatePolicyInvariants>[0];
+    const violations = validatePolicyInvariants(policy);
+    expect(violations.some((v) => v.includes("human:escalate") && v.includes("0"))).toBe(true);
   });
 });
 

@@ -200,6 +200,23 @@ export declare function attemptBarrierTransition(parentIdentifier: string, authT
     teamId: string;
 } | null): Promise<BarrierTransitionResult>;
 /**
+ * AI-1730: Entry-time barrier check for a parent entering the managing state.
+ *
+ * Called unconditionally after the fan-out block in workflow-gate.ts.
+ * This is a no-op when children are in-progress — it only fires when
+ * the barrier is already satisfied (zero children or all children already
+ * terminal at entry time).
+ *
+ * Steps:
+ *   1. Fetch children of the parent.
+ *   2. If evaluateBarrier reports allTerminal, attempt the transition.
+ *   3. Otherwise return null (children still in progress, normal flow).
+ *
+ * Returns BarrierTransitionResult if a transition was attempted,
+ * null if the barrier is not yet satisfied (not an error).
+ */
+export declare function onManagingEntry(parentIdentifier: string, authToken: string): Promise<BarrierTransitionResult | null>;
+/**
  * Main entry point for the webhook-driven barrier check.
  *
  * Call this when a child issue reaches a terminal state. It:

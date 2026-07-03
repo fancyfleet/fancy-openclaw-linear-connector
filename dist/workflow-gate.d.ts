@@ -275,7 +275,7 @@ export declare function resolveMetaIntent(intent: string, issueId: string, authT
  * @param callerLinearUserId - Linear user ID of the requesting agent (from agents.ts);
  *   used for delegate-only enforcement (AI-1397). Null/undefined → fail-open.
  */
-export declare function checkWorkflowRules(intent: string, issueId: string | null, authToken: string, bodyId: string, target?: string | null, callerLinearUserId?: string | null, artifactRef?: string | null, breakGlassOverride?: boolean, isMetaIntent?: boolean): Promise<string | null>;
+export declare function checkWorkflowRules(intent: string, issueId: string | null, authToken: string, bodyId: string, target?: string | null, callerLinearUserId?: string | null, artifactRef?: string | null, breakGlassOverride?: boolean, isMetaIntent?: boolean, hasComment?: boolean): Promise<string | null>;
 /**
  * Detect raw mutations on workflow tickets (AI-1387, expanded in AI-1402).
  *
@@ -297,7 +297,7 @@ export declare function checkRawMutationInterception(body: {
     query?: string;
     variables?: Record<string, unknown>;
     operationName?: string;
-} | null, issueId: string | null, authToken: string, bodyId?: string, callerLinearUserId?: string | null, skipCommentCreate?: boolean): Promise<string | null>;
+} | null, issueId: string | null, authToken: string, bodyId?: string, callerLinearUserId?: string | null, skipCommentCreate?: boolean, skipLabelFields?: boolean): Promise<string | null>;
 /**
  * Generate a legal-verb reminder for the NEW state after a successful transition.
  *

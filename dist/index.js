@@ -365,7 +365,7 @@ export function createApp(options) {
     const managingPoller = new ManagingPoller({
         store: managingStateStore,
         operationalEventStore,
-        deliveryConfig: wakeConfig,
+        resolveDeliveryConfig: wakeConfigForAgent,
     });
     managingPoller.start();
     // Operator nudge endpoint — sends a short instruction into an already-active

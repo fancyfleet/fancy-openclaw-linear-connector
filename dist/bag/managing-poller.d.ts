@@ -31,7 +31,13 @@ export interface ManagingPollerConfig {
 export interface ManagingPollerDeps {
     store: ManagingStateStore;
     operationalEventStore: OperationalEventStore;
-    deliveryConfig: DeliveryConfig;
+    /**
+     * Resolves the delivery config for a given agent. This is called per-agent
+     * inside the poll loop so that containerized agents (with their own
+     * hooksUrl) get wakes delivered to the right endpoint instead of the global
+     * host hooks URL. (AI-1751)
+     */
+    resolveDeliveryConfig: (agentId: string) => DeliveryConfig;
     /** Overridable for testing — returns the agents to consider. */
     listAgents?: () => AgentConfig[];
     /** Overridable for testing — returns Managing-state tickets for an agent. */

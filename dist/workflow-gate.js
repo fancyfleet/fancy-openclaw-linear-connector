@@ -43,7 +43,7 @@ import { ObservationStore } from "./store/observation-store.js";
 import { isBodyKnown } from "./escalation-gate.js";
 import { getAgent, getAgents } from "./agents.js";
 import { executeFanout, shouldTriggerFanout } from "./fanout.js";
-import { onChildTerminal, isTerminalState } from "./barrier.js";
+import { onChildTerminal, onManagingEntry, isTerminalState } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
 import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store.js";
 import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./config-health.js";
@@ -804,7 +804,7 @@ export async function resolveMetaIntent(intent, issueId, authToken) {
  * @param callerLinearUserId - Linear user ID of the requesting agent (from agents.ts);
  *   used for delegate-only enforcement (AI-1397). Null/undefined → fail-open.
  */
-export async function checkWorkflowRules(intent, issueId, authToken, bodyId, target = null, callerLinearUserId, artifactRef, breakGlassOverride = false, isMetaIntent = false) {
+export async function checkWorkflowRules(intent, issueId, authToken, bodyId, target = null, callerLinearUserId, artifactRef, breakGlassOverride = false, isMetaIntent = false, hasComment = false) {
     // TODO(AI-1347): fail-open on missing issueId is a Layer A carry-forward.
     // Harden by deriving issueId from the request body when headers are absent.
     if (!issueId)
@@ -1032,6 +1032,15 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
                 `Legal moves: ${legalMoves}.`);
         }
     }
+    // AI-1731: Comment requirement gate.
+    // Transitions marked requires_comment: true must be accompanied by a non-empty
+    // comment body (posted via commentCreate in the same request). This ensures
+    // review feedback and rejection reasons are never lost. Break-glass is exempt.
+    if (match.requires_comment && !hasComment && !breakGlassOverride) {
+        log.warn(`workflow-gate: comment gate: '${intent}' on ${issueId} requires a comment — none provided`);
+        return (`[Proxy] '${intent}' requires a comment explaining the transition. ` +
+            `Use --comment-file (or the X-Openclaw-Comment header) to attach a comment to '${intent}'.`);
+    }
     // §5.7 item 1 / C-2: Artifact-binding gate.
     // If the transition requires an artifact (requires_artifact: true), the caller
     // must supply an artifact ref via the X-Openclaw-Artifact-Ref header.
@@ -1175,7 +1184,7 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
  * or no workflow-affecting fields in input). Returns a rejection string otherwise.
  * Fail-open on any error — missing issueId, label fetch failure, etc.
  */
-export async function checkRawMutationInterception(body, issueId, authToken, bodyId, callerLinearUserId, skipCommentCreate) {
+export async function checkRawMutationInterception(body, issueId, authToken, bodyId, callerLinearUserId, skipCommentCreate, skipLabelFields) {
     if (!body)
         return null;
     // Intercept issueUpdate mutations and commentCreate mutations on governed tickets.
@@ -1273,7 +1282,10 @@ export async function checkRawMutationInterception(body, issueId, authToken, bod
     const hasAssigneeChange = touches("assigneeId");
     // AI-1658 AC1: also intercept addedLabelIds/removedLabelIds — additive/subtractive
     // label mutations that the old check missed, letting agents bypass Layer 2 via these fields.
-    const hasLabelChange = touches("labelIds") || touches("addedLabelIds") || touches("removedLabelIds");
+    // When skipLabelFields is true (intent path after state-label stripping), label fields
+    // are excluded from interception — the proxy's stripStateLabelDeltas already handled
+    // state:* labels, and non-state labels are legitimate payload.
+    const hasLabelChange = !skipLabelFields && (touches("labelIds") || touches("addedLabelIds") || touches("removedLabelIds"));
     // AI-1535: delegate is a distinct field from assignee. App-user delegates are
     // written via `delegateId` (assigneeId is omitted for them, AI-1395), so a raw
     // delegate write was invisible to this detector and bypassed the delegate-only
@@ -1988,6 +2000,30 @@ export async function applyStateTransition(intent, issueId, authToken, options) 
         catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             log.warn(`workflow-gate: B-2 fan-out: fan-out failed for ${issueId}: ${msg}`);
+        }
+    }
+    // ── AI-1730: Zero-child barrier auto-advance on managing entry ────────
+    // After the fan-out block (which may create 0..N children), check if
+    // the barrier is already satisfied. This is a no-op when children are
+    // in-progress — it only fires when all children are terminal or none exist.
+    // Called unconditionally; the barrier module handles early exit.
+    if (applied && toStateName === "managing") {
+        try {
+            const barrierResult = await onManagingEntry(issueId, authToken);
+            if (barrierResult) {
+                if (barrierResult.transitioned) {
+                    log.info(`workflow-gate: AI-1730: zero-child/all-terminal barrier auto-advanced ` +
+                        `${issueId} managing → (next state) (${barrierResult.totalChildren} children)`);
+                    clearAppliedState(issue.identifier);
+                    return;
+                }
+                log.info(`workflow-gate: AI-1730: onManagingEntry returned no transition for ${issueId} — children still active`);
+            }
+        }
+        catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log.warn(`workflow-gate: AI-1730: onManagingEntry failed for ${issueId}: ${msg}`);
+            // Fail-open: don't block the flow
         }
     }
     // ── Phase 4 / P4-1: Record feedback observation ──────────────────────
