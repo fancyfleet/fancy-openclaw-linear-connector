@@ -67,6 +67,8 @@ async function fetchIssueContext(issueId: string, authToken: string): Promise<Is
     query IssueWithLabels($id: String!) {
       issue(id: $id) {
         id
+        identifier
+        title
         team { id }
         labels { nodes { id name } }
         delegate { id }

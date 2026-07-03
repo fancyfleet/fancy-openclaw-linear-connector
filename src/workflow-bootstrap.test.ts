@@ -598,3 +598,28 @@ describe("AC6: removing wf:* label (demote) cleans up state:* label", () => {
     expect(mutationBodies.length).toBe(0);
   });
 });
+
+describe("bootstrap wake regression (2026-07-03) — issue query must select identifier + title", () => {
+  it("IssueWithLabels selects identifier and title (wake gate depends on them)", async () => {
+    // The wake block in webhook/index.ts is gated on result.ticketIdentifier.
+    // A query that omits 'identifier' makes it undefined at runtime while the
+    // TS cast still claims it exists — every bootstrap wake silently skipped
+    // (found live on AI-1755). Pin the selection set.
+    const captured: string[] = [];
+    globalThis.fetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const body = typeof init?.body === "string" ? init.body : "";
+      captured.push(body);
+      return new Response(JSON.stringify({ data: {} }), { status: 200 });
+    }) as typeof globalThis.fetch;
+
+    await maybeBootstrapWorkflow(
+      makeIssueUpdateEvent({ currentLabelIds: [WF_LABEL_ID] }) as never,
+      "Bearer test-token",
+    );
+
+    const issueQuery = captured.find((b) => b.includes("IssueWithLabels"));
+    expect(issueQuery).toBeDefined();
+    expect(issueQuery).toContain("identifier");
+    expect(issueQuery).toContain("title");
+  });
+});
