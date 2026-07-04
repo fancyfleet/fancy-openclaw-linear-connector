@@ -7,6 +7,7 @@ RUN apk add --no-cache python3 make g++
 WORKDIR /app
 
 COPY package.json package-lock.json ./
+COPY vendor/ vendor/
 RUN npm ci
 
 COPY tsconfig.json ./
@@ -22,6 +23,7 @@ RUN apk add --no-cache python3 make g++ libstdc++
 WORKDIR /app
 
 COPY package.json package-lock.json ./
+COPY vendor/ vendor/
 RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --from=builder /app/dist/ dist/
