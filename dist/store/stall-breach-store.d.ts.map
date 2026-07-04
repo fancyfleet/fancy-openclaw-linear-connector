@@ -1,1 +1,0 @@
-{"version":3,"file":"stall-breach-store.d.ts","sourceRoot":"","sources":["../../src/store/stall-breach-store.ts"],"names":[],"mappings":"AAIA;;;;;;GAMG;AACH,qBAAa,gBAAgB;IAC3B,OAAO,CAAC,EAAE,CAAoB;gBAElB,MAAM,CAAC,EAAE,MAAM;IAiB3B,iBAAiB,CAAC,OAAO,EAAE,MAAM,EAAE,cAAc,EAAE,MAAM,GAAG,OAAO;IAOnE,YAAY,CAAC,OAAO,EAAE,MAAM,EAAE,cAAc,EAAE,MAAM,GAAG,IAAI;IAQ3D,KAAK,IAAI,IAAI;CAGd"}
