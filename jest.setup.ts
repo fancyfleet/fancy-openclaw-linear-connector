@@ -7,10 +7,24 @@
  *
  * Tests that need one of these set their own value in beforeAll/beforeEach.
  */
+// jest only sets NODE_ENV=test when it is unset; the deployment container
+// exports NODE_ENV=production, which silently disabled createApp's test-mode
+// delivery config (50ms timeout, 0 retries) and let tests run with the
+// production 30s/1-retry schedule.
+process.env.NODE_ENV = "test";
+
 // dir-mode defs dir points at the prod instance-config path; tests build
 // their own single-file defs via WORKFLOW_DEF_PATH fixtures. Pinned to ""
 // (falsy) because it IS in .env and dotenv skips existing vars.
 process.env.WORKFLOW_DEFS_DIR = "";
+
+// Both ARE in .env. With them set, delivery goes through deliverViaHooks and
+// tests fire real HTTP wake-ups at the production gateway (re-signal test:
+// two ~10s failed fetches + 5s retry delay blew the 15s test timeout).
+// Pinned to "" so delivery falls back to CLI-spawn mode, which fails fast
+// and stays on-host.
+process.env.OPENCLAW_HOOKS_URL = "";
+process.env.OPENCLAW_HOOKS_TOKEN = "";
 
 // A live token in the container/shell env changes linear-actionable behavior
 // (previously worked around with `env -u LINEAR_OAUTH_TOKEN npm test`).
