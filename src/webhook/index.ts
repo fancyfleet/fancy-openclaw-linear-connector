@@ -748,6 +748,12 @@ export function createWebhookRouter(
         }
         const directResult = await deliverWithSlot(route, deliveryConfig, throttle);
         appendOperationalEvent(operationalEventStore, { outcome: directResult.runId ? "dispatch-accepted" : "delivered", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1, runId: directResult.runId ?? null });
+        // Direct deliveries (incl. comment-routed wakes into an existing
+        // session) must register the dispatch and flip engagement → Thinking
+        // like every other delivery path. Observed on AI-1768 (2026-07-04
+        // 07:13): a revision comment woke the delegate but the ticket sat at
+        // To Do with no ack expectation — invisible pickup, unwatched dispatch.
+        if (directResult.runId && onDispatched) onDispatched(agentName, ticketId);
       } catch (err) {
         log.error(`OpenClaw delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
         appendOperationalEvent(operationalEventStore, { outcome: "delivery-failed", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1, errorSummary: errorSummary(err) });
