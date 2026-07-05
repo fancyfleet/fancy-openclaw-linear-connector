@@ -37,6 +37,11 @@ const log = componentLogger(createLogger(), "server");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3100;
 const DEPLOYMENT_NAME = process.env.DEPLOYMENT_NAME ?? "fancymatt";
 
+// ── Startup commit (exposed via /health for deploy verification) ─────
+let startupCommit: string = "unknown";
+function setStartupCommit(hash: string) { startupCommit = hash; }
+function getStartupCommit(): string { return startupCommit; }
+
 /**
  * Constant-time secret comparison to prevent timing attacks.
  */
@@ -171,6 +176,7 @@ export function createApp(options?: CreateAppOptions) {
       status: healthy ? "ok" : "degraded",
       service: "fancy-openclaw-linear-connector",
       deployment: DEPLOYMENT_NAME,
+      commit: getStartupCommit(),
       agents: agents.length,
       agentNames: agents.map((a) => a.name),
     });
@@ -952,6 +958,7 @@ if (isEntryPoint) {
     // verification, and crash-loop indicator (repeat bursts fold + count).
     execFile("git", ["rev-parse", "--short", "HEAD"], { cwd: process.cwd() }, (gitErr, stdout) => {
       const commit = gitErr ? "unknown" : stdout.trim();
+      setStartupCommit(commit);
       notify({
         severity: "warning",
         source: "lifecycle",
