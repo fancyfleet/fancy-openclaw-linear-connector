@@ -2,12 +2,14 @@
  * AI-1800 AC2 — BoardCard renders delegate, ticket ID, time-in-state with SLA coloring,
  * and last event as prose.
  *
+ * AI-1801 — Adds dispatch-health badge (working/quiet/unconfirmed/exhausted/at-capacity/idle).
+ *
  * SLA thresholds (per spec):
  *   neutral: time_in_state < 50% of SLA
  *   amber:   time_in_state >= 80% of SLA
  *   red:     time_in_state > SLA (breach)
  */
-import type { BoardTicket } from "../board-types";
+import type { BoardTicket, DispatchHealthBadge } from "../board-types";
 
 function formatDuration(ms: number | null | undefined): string {
   if (ms == null) return "—";
@@ -28,6 +30,31 @@ function computeSlaTone(timeInStateMs: number, slaMs: number): "neutral" | "ambe
   return "neutral";
 }
 
+const BADGE_LABELS: Record<DispatchHealthBadge, string> = {
+  working: "Working",
+  quiet: "Quiet",
+  unconfirmed: "Unconfirmed",
+  exhausted: "Exhausted",
+  "at-capacity": "At capacity",
+  idle: "Idle",
+};
+
+function DispatchHealthBadgePill({ health }: { health: NonNullable<BoardTicket["dispatch_health"]> }) {
+  const { badge, attempt, maxAttempts } = health;
+  const label = BADGE_LABELS[badge];
+  const suffix = badge === "unconfirmed" && attempt != null ? ` ${attempt}/${maxAttempts}` : "";
+  return (
+    <div
+      data-testid="dispatch-health-badge"
+      data-badge-state={badge}
+      className={`dispatch-health-badge badge-${badge}`}
+    >
+      <span className="dispatch-health-badge-dot" />
+      <span className="dispatch-health-badge-label">{label}{suffix}</span>
+    </div>
+  );
+}
+
 interface BoardCardProps {
   ticket: BoardTicket;
 }
@@ -41,7 +68,10 @@ export function BoardCard({ ticket }: BoardCardProps) {
       data-muted={ticket.muted ? "true" : undefined}
       className={`board-card${ticket.muted ? " muted" : ""}`}
     >
-      <div className="board-card-id">{ticket.ticket_id}</div>
+      <div className="board-card-header">
+        <div className="board-card-id">{ticket.ticket_id}</div>
+        {ticket.dispatch_health && <DispatchHealthBadgePill health={ticket.dispatch_health} />}
+      </div>
       <div className="board-card-delegate">{ticket.delegate}</div>
       {ticket.last_event_prose && (
         <div className="board-card-event">{ticket.last_event_prose}</div>
