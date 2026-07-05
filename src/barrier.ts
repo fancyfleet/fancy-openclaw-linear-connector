@@ -50,12 +50,22 @@ import {
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "barrier");
 
+/** Barrier workflow ids — the set of orchestrator workflows whose managing state
+ *  owns stall detection for managed children. The sla-sweep driver imports this
+ *  set to avoid re-implementing the predicate (AI-1773). */
+export const BARRIER_WORKFLOWS = new Set([
+  "ux-audit",
+  "sprint",
+  "vocab-builder",
+  "word-build",
+]);
+
 /**
  * Parse a per-state SLA duration string into milliseconds.
  * Accepts `<n>h`, `<n>m`, `<n>s`, or a bare millisecond number (e.g. "24h",
  * "90m", "3600000"). Returns null when the value can't be parsed.
  */
-function parseSlaToMs(sla: string): number | null {
+export function parseSlaToMs(sla: string): number | null {
   const m = /^\s*(\d+(?:\.\d+)?)\s*(h|m|s|ms)?\s*$/i.exec(sla);
   if (!m) return null;
   const n = parseFloat(m[1]);
@@ -470,15 +480,6 @@ export async function attemptBarrierTransition(
     result.error = "No workflow ID found on parent labels";
     return result;
   }
-  // Phase 6 / C-3 (AI-1473): generalized from ux-audit-only to archetype-agnostic.
-  // ux-audit (managing → review), sprint (managing → validating), vocab-builder,
-  // and word-build all use the same barrier pattern.
-  const BARRIER_WORKFLOWS = new Set([
-    "ux-audit",
-    "sprint",
-    "vocab-builder",
-    "word-build",
-  ]);
   if (!BARRIER_WORKFLOWS.has(workflowId)) {
     log.info(`barrier: parent ${parentIdentifier} workflow wf:${workflowId} is not a barrier workflow — skipping`);
     result.error = `Parent workflow is '${workflowId}', not a barrier workflow`;
@@ -728,6 +729,62 @@ export async function isChildOfUxAuditParent(
 
   const workflowId = getWorkflowId(parentState.labels);
   return workflowId === "ux-audit";
+}
+
+/**
+ * Pure predicate: returns true if the given parent labels indicate the parent
+ * is a barrier workflow currently in managing state.
+ *
+ * Shared by isManagedBarrierChild (async/fetch path) and the sla-sweep driver
+ * (batch-embedded path) so both paths use the same logic — no re-implementation.
+ */
+export function isManagedBarrierFromLabels(parentLabels: string[]): boolean {
+  const wfId = getWorkflowId(parentLabels);
+  const state = getCurrentState(parentLabels);
+  return wfId !== null && BARRIER_WORKFLOWS.has(wfId) && state === "managing";
+}
+
+/**
+ * Returns true if the given issue is a managed child of a barrier workflow
+ * parent currently in managing state (i.e. the barrier stall path owns it).
+ *
+ * Covers all BARRIER_WORKFLOWS (ux-audit, sprint, vocab-builder, word-build),
+ * replacing the ux-audit-only isChildOfUxAuditParent for sla-sweep exclusion.
+ * The sla-sweep driver imports and uses this function — not a parallel heuristic.
+ */
+export async function isManagedBarrierChild(
+  issueIdentifier: string,
+  authToken: string,
+): Promise<boolean> {
+  const query = `
+    query IsManagedBarrierChild($id: String!) {
+      issue(id: $id) {
+        parent {
+          labels { nodes { name } }
+        }
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: issueIdentifier } }),
+    });
+    type Resp = {
+      data?: {
+        issue?: {
+          parent?: { labels: { nodes: Array<{ name: string }> } } | null;
+        } | null;
+      };
+    };
+    const data = (await res.json()) as Resp;
+    const parent = data.data?.issue?.parent;
+    if (!parent) return false;
+    return isManagedBarrierFromLabels(parent.labels.nodes.map((l) => l.name));
+  } catch {
+    return false;
+  }
 }
 
 // ── Public API: Stall detection ───────────────────────────────────────────
