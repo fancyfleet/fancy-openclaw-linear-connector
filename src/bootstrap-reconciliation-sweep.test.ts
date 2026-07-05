@@ -610,18 +610,14 @@ describe("AC4: Linear API error → alert rather than crash", () => {
 
     globalThis.fetch = makeReconciliationFetch({ networkError: true });
 
-    let result: ReconciliationSweepResult;
-    await expect(async () => {
-      result = await runBootstrapReconciliationSweep({
-        authToken: "Bearer test-token",
-        workflowRegistry: WORKFLOW_REGISTRY as never,
-        alertBus: bus,
-        wakeFn: async () => {},
-      });
-    }).not.toThrow();
+    // The sweep must not throw on fetch errors — errors are captured in the result.
+    const result = await runBootstrapReconciliationSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: WORKFLOW_REGISTRY as never,
+      alertBus: bus,
+      wakeFn: async () => {},
+    });
 
-    // Must not throw; errors captured in result
-    result = result!;
     expect(result.errors.length).toBeGreaterThanOrEqual(1);
   });
 
