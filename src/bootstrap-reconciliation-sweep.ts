@@ -274,26 +274,38 @@ export async function runBootstrapReconciliationSweep(
 /**
  * Register the reconciliation sweep as a recurring interval timer.
  *
+ * The caller MUST supply the Linear auth token — typically resolved in
+ * `index.ts` via `getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ??
+ * process.env.LINEAR_API_KEY`, matching every other server-side Linear call.
+ *
  * Returns the NodeJS.Timeout so the caller can clear it (e.g. on shutdown).
  * In production this is called once from index.ts alongside other periodic
  * loops.
  */
 export function registerBootstrapReconciliationCron(
-  opts?: { intervalMs?: number },
+  opts: { authToken: string; intervalMs?: number },
 ): NodeJS.Timeout {
-  const intervalMs = opts?.intervalMs ?? DEFAULT_INTERVAL_MS;
+  const intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
+
+  if (!opts.authToken) {
+    log.warn(
+      "bootstrap-reconciliation: no auth token provided — sweep will be skipped until the next call",
+    );
+  }
 
   const timer = setInterval(() => {
     // Fire-and-forget — errors are captured inside the sweep and surfaced
     // via the alert bus, not propagated to the interval handler.
     void runBootstrapReconciliationSweep({
-      authToken: process.env.LINEAR_GENERIC_TOKEN ?? "",
+      authToken: opts.authToken,
     }).catch((err) => {
       log.error(
         `bootstrap-reconciliation: unexpected sweep failure: ${err instanceof Error ? err.message : String(err)}`,
       );
     });
   }, intervalMs);
+
+  timer.unref();
 
   log.info(`bootstrap-reconciliation: cron registered (${intervalMs}ms interval)`);
   return timer;

@@ -24,6 +24,7 @@ import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState
 import { registerDistillationCron } from "./cron/p4-metrics-distillation.js";
 import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
+import { registerBootstrapReconciliationCron } from "./bootstrap-reconciliation-sweep.js";
 import { notify } from "./alerts/alert-bus.js";
 import { onAlert as onConfigHealthAlert } from "./config-health.js";
 import { startRegistryPolicyCheck } from "./registry-policy.js";
@@ -920,6 +921,12 @@ if (isEntryPoint) {
   registerDistillationCron(observationStore);
   // AI-1566: periodic rescue sweep — detect and repair dormant/malformed wf:* tickets
   registerRescueSweepCron();
+
+  // AI-1775: periodic reconciliation sweep — heal wf:* tickets that never
+  // enrolled (dropped Issue-update webhook). Safety net for the bootstrap path.
+  registerBootstrapReconciliationCron({
+    authToken: getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "",
+  });
 
   // G-20: scheduled gate-silently-off canary (AI-1552, §5.1)
   registerG20CanaryCron();

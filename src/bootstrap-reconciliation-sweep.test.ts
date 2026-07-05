@@ -645,15 +645,25 @@ describe("AC4: Linear API error → alert rather than crash", () => {
 describe("registerBootstrapReconciliationCron", () => {
   it("returns a NodeJS.Timeout and does not throw on registration", () => {
     expect(() => {
-      const timer = registerBootstrapReconciliationCron({ intervalMs: 10_000 });
+      const timer = registerBootstrapReconciliationCron({ authToken: "test-token", intervalMs: 10_000 });
       clearInterval(timer);
     }).not.toThrow();
   });
 
   it("respects intervalMs override from options", () => {
     // Just verify registration doesn't explode with a short interval
-    const timer = registerBootstrapReconciliationCron({ intervalMs: 500 });
+    const timer = registerBootstrapReconciliationCron({ authToken: "test-token", intervalMs: 500 });
     expect(timer).toBeDefined();
     clearInterval(timer);
+  });
+
+  it("requires authToken — empty token logs a warning but still registers", () => {
+    // The caller (index.ts) is responsible for resolving the token; the
+    // function logs but does not throw so a misconfigured deploy still
+    // starts and the warning is visible in logs.
+    expect(() => {
+      const timer = registerBootstrapReconciliationCron({ authToken: "", intervalMs: 10_000 });
+      clearInterval(timer);
+    }).not.toThrow();
   });
 });
