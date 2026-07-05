@@ -18,6 +18,8 @@ import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forens
 import { tryNormalizeSessionKey } from "./session-key.js";
 import { setStateAtomic, loadWorkflowRegistry } from "./workflow-gate.js";
 import { parseSlaToMs } from "./barrier.js";
+import { computeDispatchHealth } from "./dispatch-health.js";
+import type { DispatchAckEntry } from "./bag/dispatch-ack-tracker.js";
 import { recaptureAc } from "./ac-record-store.js";
 import { getStatus as getConfigHealthStatus } from "./config-health.js";
 import { getRegistryPolicyStatus } from "./registry-policy.js";
@@ -697,6 +699,15 @@ export function createAdminRouter(deps: AdminDeps): Router {
       workflows.push({ id: summary.id, states: summary.states });
     }
 
+    // AI-1801: Pre-fetch ack tracker entries for dispatch-health projection.
+    const ackEntriesByTicket = new Map<string, DispatchAckEntry | null>();
+    if (deps.ackTracker) {
+      const recentAcks = deps.ackTracker.listRecent(500);
+      for (const ack of recentAcks) {
+        ackEntriesByTicket.set(ack.ticketId, ack);
+      }
+    }
+
     // Build enriched ticket array.
     const tickets: Array<Record<string, unknown>> = [];
     for (const row of allTickets) {
@@ -712,6 +723,11 @@ export function createAdminRouter(deps: AdminDeps): Router {
       if (row.terminal === 1 && terminal_duration_ms !== undefined && terminal_duration_ms > TWENTY_FOUR_H_MS) {
         continue;
       }
+
+      // AI-1801: Compute dispatch-health badge from operational events + ack tracker.
+      const normalizedTicketKey = `linear-${row.ticket_id}`;
+      const ackEntry = ackEntriesByTicket.get(normalizedTicketKey) ?? null;
+      const dispatch_health = computeDispatchHealth(events, ackEntry);
 
       tickets.push({
         ticket_id: row.ticket_id,
@@ -729,6 +745,7 @@ export function createAdminRouter(deps: AdminDeps): Router {
         last_event_prose: renderEventProse(row),
         muted,
         terminal_duration_ms: row.terminal === 1 ? terminal_duration_ms : undefined,
+        dispatch_health,
       });
     }
     res.json({ workflows, tickets });

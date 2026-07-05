@@ -5,6 +5,23 @@
  * The implementer must conform to these shapes.
  */
 
+/** AI-1801: Dispatch-health badge states projected from operational events. */
+export type DispatchHealthBadge =
+  | "working"
+  | "quiet"
+  | "unconfirmed"
+  | "exhausted"
+  | "at-capacity"
+  | "idle";
+
+export interface DispatchHealth {
+  badge: DispatchHealthBadge;
+  /** Attempt number for unconfirmed (N of max), null otherwise. */
+  attempt: number | null;
+  /** Max attempts (for display "N/3"). */
+  maxAttempts: number;
+}
+
 export interface BoardWorkflow {
   /** Workflow ID matching the YAML def's `id` field. */
   id: string;
@@ -29,4 +46,6 @@ export interface BoardTicket {
   muted: boolean;
   /** Milliseconds since terminal disposition (AC3). */
   terminal_duration_ms?: number;
+  /** AI-1801: Dispatch-health badge state for the card. */
+  dispatch_health?: DispatchHealth;
 }
