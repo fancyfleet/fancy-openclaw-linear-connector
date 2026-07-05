@@ -31,7 +31,7 @@
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules } from "./escalation-gate.js";
-import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, resolveMetaIntent, verifyCommentSatisfiedBy, type TransitionFeedback } from "./workflow-gate.js";
+import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, resolveMetaIntent, verifyCommentSatisfiedBy, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
@@ -528,8 +528,12 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
 
       // Phase 3 B2: apply state:* label transition after a successful forward.
       // Phase 4 / P4-1: record feedback observation for feedback transitions.
-      // Fail-open: errors are logged and never propagate to the agent's response.
+      // AI-1809: the transition outcome is no longer swallowed — it is attached
+      // to the agent's response as a machine-readable `_workflowTransition`
+      // field. A stderr-only warning beside a success payload is how AI-1773
+      // was stranded half-applied (comment landed, label/delegate did not).
       if (upstreamRes.ok) {
+        let transitionResult: TransitionApplyResult | null = null;
         try {
           let feedback: TransitionFeedback | undefined;
           if (feedbackCategoryHeader && (effectiveIntent === "request-changes" || effectiveIntent === "reject" || effectiveIntent === "ac-fail")) {
@@ -540,7 +544,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
               freeText: extractCommentBody(body),
             };
           }
-          await applyStateTransition(effectiveIntent, issueId, authorization, {
+          transitionResult = await applyStateTransition(effectiveIntent, issueId, authorization, {
             bodyId: agentId,
             observationStore: deps?.observationStore,
             feedback,
@@ -549,9 +553,13 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             cliTarget: target ?? undefined,
             enrolledTicketsStore: deps?.enrolledTicketsStore,
           });
+          if (transitionResult.status === "failed") {
+            log.error(`state-transition FAILED agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${transitionResult.code}${transitionResult.detail ? ` — ${transitionResult.detail}` : ""}`);
+          }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          log.warn(`state-transition failed agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${msg}`);
+          log.error(`state-transition threw agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${msg}`);
+          transitionResult = { status: "failed", code: "transition-exception", detail: msg };
         }
 
         // Layer 1 (AI-1387): proactive legal-verb re-injection at completion.
@@ -563,10 +571,19 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           log.warn(`reminder-build failed agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${msg}`);
         }
 
-        if (workflowReminder) {
+        // Attach transition outcome for workflow tickets. Pure pass-through
+        // outcomes (ad-hoc ticket, no issue id) stay unannotated so non-workflow
+        // traffic keeps its exact upstream response shape.
+        const attachTransition =
+          transitionResult !== null &&
+          transitionResult.code !== "ad-hoc" &&
+          transitionResult.code !== "no-issue-id";
+
+        if (workflowReminder || attachTransition) {
           try {
             const parsedResponse = JSON.parse(responseText);
-            parsedResponse._workflowReminder = workflowReminder;
+            if (attachTransition) parsedResponse._workflowTransition = transitionResult;
+            if (workflowReminder) parsedResponse._workflowReminder = workflowReminder;
             res.status(upstreamRes.status).set("Content-Type", "application/json").send(JSON.stringify(parsedResponse));
             return;
           } catch {

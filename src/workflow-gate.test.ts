@@ -1042,8 +1042,8 @@ describe("applyStateTransition — no-ops (fail-open / mode switch)", () => {
       issueError: true,
     });
     globalThis.fetch = mock;
-    // Should not throw even on fetch failure.
-    await expect(applyStateTransition("submit", "issue-uuid", "Bearer tok")).resolves.toBeUndefined();
+    // Should not throw even on fetch failure — AI-1809: surfaces a machine-readable failure.
+    await expect(applyStateTransition("submit", "issue-uuid", "Bearer tok")).resolves.toMatchObject({ status: "failed", code: "context-fetch-failed" });
     expect(calls.some((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"))).toBe(false);
   });
 
@@ -1250,7 +1250,8 @@ describe("applyStateTransition — normal state advance", () => {
       issueUpdateSuccess: false,
     });
     globalThis.fetch = mock;
-    await expect(applyStateTransition("submit", "issue-uuid", "Bearer tok")).resolves.toBeUndefined();
+    // AI-1809: no throw, but the failure is machine-readable, not silent.
+    await expect(applyStateTransition("submit", "issue-uuid", "Bearer tok")).resolves.toMatchObject({ status: "failed", code: "atomic-mutation-failed" });
   });
 
   it("fail-open when issueUpdate throws (no throw)", async () => {
@@ -1263,7 +1264,8 @@ describe("applyStateTransition — normal state advance", () => {
       updateError: true,
     });
     globalThis.fetch = mock;
-    await expect(applyStateTransition("submit", "issue-uuid", "Bearer tok")).resolves.toBeUndefined();
+    // AI-1809: no throw, but the failure is machine-readable, not silent.
+    await expect(applyStateTransition("submit", "issue-uuid", "Bearer tok")).resolves.toMatchObject({ status: "failed", code: "atomic-mutation-failed" });
   });
 });
 
