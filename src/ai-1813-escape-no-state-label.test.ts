@@ -208,7 +208,12 @@ describe("AI-1813 AC1: applyStateTransition — escape from no-state-label ticke
     const workflowFile = path.join(dir, "dev-impl.yaml");
     fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
     process.env.WORKFLOW_DEF_PATH = workflowFile;
+    const policyFile = path.join(dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
     resetWorkflowCache();
+    resetPolicyCache();
+    resetConfigHealth();
     originalFetch = globalThis.fetch;
   });
 
@@ -237,22 +242,21 @@ describe("AI-1813 AC1: applyStateTransition — escape from no-state-label ticke
     // No stale state:* label was present, so none to remove.
   });
 
-  it("records from=null in the transition comment when escaping from no-state (AC1)", async () => {
-    const { fetch: mock, calls } = makeTransitionFetch({
+  it("records from=null in the transition result when escaping from no-state (AC1)", async () => {
+    const { fetch: mock } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
       ],
       teamLabels: [{ id: "intake-lbl", name: "state:intake" }],
     });
     globalThis.fetch = mock;
-    await applyStateTransition("escape", "AI-1813", "Bearer tok");
+    const result = await applyStateTransition("escape", "AI-1813", "Bearer tok");
 
-    // Must issue a commentCreate recording the transition (with from=null).
-    const commentCall = calls.find((c) => (c.body.query ?? "").includes("commentCreate"));
-    expect(commentCall).toBeDefined();
-    // The comment should reference from=null or equivalent (no prior state).
-    const commentBody = JSON.stringify(commentCall!.body);
-    expect(commentBody).toContain("intake");
+    // The StateTransitionResult must record from=null (no prior state).
+    // The proxy surfaces this as _workflowTransition in the response body.
+    expect(result.status).toBe("applied");
+    expect(result.from).toBeNull();
+    expect(result.to).toBe("intake");
   });
 
   it("does NOT silently no-op — must issue at least one mutation (AC1)", async () => {
@@ -315,6 +319,7 @@ describe("AI-1813 AC2: checkWorkflowRules — escape passes gate with no state:*
     process.env.CAPABILITY_POLICY_PATH = policyFile;
     resetWorkflowCache();
     resetPolicyCache();
+    resetConfigHealth();
     originalFetch = globalThis.fetch;
   });
 
