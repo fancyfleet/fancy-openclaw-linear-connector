@@ -3,6 +3,7 @@ import type { RouteResult } from "../types.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { buildDeliveryMessage } from "./build-message.js";
 import { getAccessToken } from "../agents.js";
+import { getActiveCanonVersion } from "../policy/universal-canon.js";
 
 const log = componentLogger(createLogger(), "delivery");
 
@@ -28,6 +29,8 @@ export interface DeliveryResult {
   hookErrorSummary?: string;
   /** AI-1428: True when the agent was confirmed unreachable by the pre-flight liveness check. */
   delegateUnavailable?: boolean;
+  /** AI-1848: Canon version injected into the dispatch message (null when no canon loaded). */
+  canonVersion?: string | null;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -56,12 +59,15 @@ export async function deliverToAgent(
     ? /^Bearer\s+/i.test(rawToken) ? rawToken : `Bearer ${rawToken}`
     : undefined;
   const message = await buildDeliveryMessage(route, authToken);
-  return await deliverMessageToAgent(
+  // AI-1848: stamp the canon version that was injected by buildDeliveryMessage.
+  const canonVersion = getActiveCanonVersion();
+  const result = await deliverMessageToAgent(
     route.agentId,
     route.sessionKey,
     message,
     config,
   );
+  return { ...result, canonVersion };
 }
 
 /** Deliver an explicit operator-authored message to an existing OpenClaw session. */

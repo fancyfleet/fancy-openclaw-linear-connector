@@ -153,6 +153,15 @@ describe("AI-1810: production entry point registers all crons in /health", () =>
       // AC1/AC4: exact-set match against the wired bootstrap.
       expect(names).toEqual(EXPECTED_CRONS);
 
+      // AI-1848 (Pillar 2 D1): universal canon liveness field is present from
+      // the production entry point (bootstrap registration proof). No canon
+      // file is configured in this test env, so loaded=false is expected —
+      // the assertion is that the field EXISTS and is well-formed.
+      expect(body.universalCanon).toBeDefined();
+      expect(typeof body.universalCanon.loaded).toBe("boolean");
+      expect(body.universalCanon).toHaveProperty("version");
+      expect(body.universalCanon).toHaveProperty("path");
+
       // AC1: every entry carries a human-readable schedule and a timestamp.
       for (const cron of crons) {
         expect(typeof cron.schedule).toBe("string");

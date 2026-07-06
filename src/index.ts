@@ -36,6 +36,7 @@ import { onAlert as onConfigHealthAlert } from "./config-health.js";
 import { startRegistryPolicyCheck } from "./registry-policy.js";
 import { resolveStartupCommit } from "./startup-commit.js";
 import { getAccessToken, getAgent, getLinearUserIdForAgent } from "./agents.js";
+import { loadUniversalCanon, getCanonLiveness } from "./policy/universal-canon.js";
 import type { StaleSessionDetail } from "./bag/session-tracker.js";
 import crypto from "crypto";
 import path from "path";
@@ -197,6 +198,10 @@ export function createApp(options?: CreateAppOptions) {
       // missing from this list means it shipped without bootstrap wiring
       // (the AI-1773/AI-1775 dead-code-in-prod failure mode).
       crons: getRegisteredCrons(),
+      // AI-1848 (Pillar 2 D1): universal policy canon liveness — confirms
+      // the canon file loaded and its version, observable at ac-validate
+      // without waiting for a dispatch trigger.
+      universalCanon: getCanonLiveness(),
     });
   });
 
@@ -923,6 +928,11 @@ if (isEntryPoint) {
   }
 
   log.info(`Starting connector [${DEPLOYMENT_NAME}] with ${agents.length} agent(s): ${agents.map((a) => a.name).join(", ")}`);
+
+  // AI-1848 (Pillar 2 D1): load the universal policy canon at bootstrap so
+  // /health can report liveness immediately (fail-open: missing file is a
+  // WARN, not a crash). The file is re-read per-dispatch for hot-reload.
+  await loadUniversalCanon();
 
   // Watch agents.json for external changes — no restart needed to add agents
   watchAgentsFile();

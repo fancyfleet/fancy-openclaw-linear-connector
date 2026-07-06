@@ -412,6 +412,7 @@ export function createWebhookRouter(
                   deliveryMode: "bootstrap-wake",
                   attemptCount: 1,
                   runId: wakeResult.runId ?? null,
+                  detail: wakeResult.canonVersion ? { canonVersion: wakeResult.canonVersion } : undefined,
                 });
                 if (onDispatched) onDispatched(bootstrapResult.delegateAgentName, wakeSessionKey);
               } catch (err) {
@@ -706,7 +707,8 @@ export function createWebhookRouter(
             appendOperationalEvent(operationalEventStore, {
               outcome: sameTicketResult.runId ? "dispatch-accepted" : "delivered",
               type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId,
-              deliveryMode: "active-same-ticket", attemptCount: 1, runId: sameTicketResult.runId ?? null, wakeId, plane: "connector"
+              deliveryMode: "active-same-ticket", attemptCount: 1, runId: sameTicketResult.runId ?? null, wakeId, plane: "connector",
+              detail: sameTicketResult.canonVersion ? { canonVersion: sameTicketResult.canonVersion } : undefined,
             });
           } catch (err) {
             log.error(`Same-ticket active delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
@@ -771,7 +773,7 @@ export function createWebhookRouter(
           throttle.record(route.agentId);
         }
         const directResult = await deliverWithSlot(route, deliveryConfig, throttle);
-        appendOperationalEvent(operationalEventStore, { outcome: directResult.runId ? "dispatch-accepted" : "delivered", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1, runId: directResult.runId ?? null, wakeId, plane: "connector" });
+        appendOperationalEvent(operationalEventStore, { outcome: directResult.runId ? "dispatch-accepted" : "delivered", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1, runId: directResult.runId ?? null, wakeId, plane: "connector", detail: directResult.canonVersion ? { canonVersion: directResult.canonVersion } : undefined });
         // Direct deliveries (incl. comment-routed wakes into an existing
         // session) must register the dispatch and flip engagement → Thinking
         // like every other delivery path. Observed on AI-1768 (2026-07-04
@@ -793,7 +795,7 @@ export function createWebhookRouter(
                 throttle.record(route.agentId);
               }
               const drainResult = await deliverWithSlot(next, deliveryConfig, throttle);
-              appendOperationalEvent(operationalEventStore, { outcome: drainResult.runId ? "dispatch-accepted" : "delivered", type: next.event.type, agent: route.agentId, key: next.sessionKey, sessionKey: next.sessionKey, deliveryMode: "agent-queue-drain", attemptCount: 1, runId: drainResult.runId ?? null });
+              appendOperationalEvent(operationalEventStore, { outcome: drainResult.runId ? "dispatch-accepted" : "delivered", type: next.event.type, agent: route.agentId, key: next.sessionKey, sessionKey: next.sessionKey, deliveryMode: "agent-queue-drain", attemptCount: 1, runId: drainResult.runId ?? null, detail: drainResult.canonVersion ? { canonVersion: drainResult.canonVersion } : undefined });
             } catch (err) {
               log.error(`Agent queue: failed to deliver promoted task for ${route.agentId}: ${err instanceof Error ? err.message : String(err)}`);
               appendOperationalEvent(operationalEventStore, { outcome: "delivery-failed", type: next.event.type, agent: route.agentId, key: next.sessionKey, sessionKey: next.sessionKey, deliveryMode: "agent-queue-drain", attemptCount: 1, errorSummary: errorSummary(err) });

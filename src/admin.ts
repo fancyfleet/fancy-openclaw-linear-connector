@@ -758,7 +758,7 @@ export function createAdminRouter(deps: AdminDeps): Router {
       return;
     }
     const allEvents = deps.operationalEventStore.query({ limit: 500 });
-    const byWakeId = new Map<string, { agent_id: string; dispatches: Array<{ ticket_id: string; dispatched_at: string; ack_status: string; attempt_count: number }> }>();
+    const byWakeId = new Map<string, { agent_id: string; dispatches: Array<{ ticket_id: string; dispatched_at: string; ack_status: string; attempt_count: number; canon_version?: string }> }>();
 
     for (const ev of allEvents) {
       if (!ev.wakeId) continue;
@@ -768,11 +768,15 @@ export function createAdminRouter(deps: AdminDeps): Router {
       }
       const group = byWakeId.get(ev.wakeId)!;
       if (!group.dispatches.some((d) => d.ticket_id === ticketId)) {
+        // AI-1848: extract canon version stamped into the dispatch record detail.
+        const detail = ev.detail as Record<string, unknown> | null;
+        const canonVersion = typeof detail?.canonVersion === "string" ? detail.canonVersion : undefined;
         group.dispatches.push({
           ticket_id: ticketId,
           dispatched_at: ev.occurredAt,
           ack_status: 'pending',
           attempt_count: 1,
+          ...(canonVersion ? { canon_version: canonVersion } : {}),
         });
       }
     }
