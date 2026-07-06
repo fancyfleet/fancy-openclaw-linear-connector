@@ -30,6 +30,7 @@ import { getAcRecord } from "../ac-record-store.js";
 import { getAppliedState } from "../store/applied-state-store.js";
 import { componentLogger, createLogger } from "../logger.js";
 import { defaultGuidanceDir } from "../instance-config.js";
+import { loadUniversalCanon, formatCanonBlock } from "../policy/universal-canon.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "build-message");
 
@@ -88,6 +89,25 @@ async function loadStepGuidance(workflowId: string, step: string): Promise<strin
 }
 
 /**
+ * AI-1848: Insert the canon block after the hook line (first paragraph),
+ * before the body / per-step guidance. Returns the message unchanged when
+ * no canon was loaded (fail-open).
+ */
+function withCanonBlock(message: string, canon: { text: string; version: string } | null): string {
+  if (!canon) return message;
+  const block = formatCanonBlock(canon.text, canon.version);
+  if (!block) return message;
+  const firstNewline = message.indexOf("\n");
+  if (firstNewline === -1) {
+    // Single-line message — append canon block.
+    return `${message}${block}`;
+  }
+  // message = "hook\n\nbody..." → "hook\n{block}\n\nbody..."
+  // block already starts with "\n---" and ends with "---".
+  return message.slice(0, firstNewline + 1) + block + "\n" + message.slice(firstNewline + 1);
+}
+
+/**
  * Build a routing-reason-specific delivery message for an agent.
  *
  * Workflow tickets: per-step instruction block for the current state (B3).
@@ -118,11 +138,19 @@ export async function buildDeliveryMessage(route: RouteResult, authToken?: strin
 
   let message: string;
 
+  // AI-1848 (Pillar 2 D1): load the universal canon once per dispatch and
+  // inject it into every message path (workflow / ad-hoc / mention).
+  // Fail-open: loadUniversalCanon returns null on missing/broken file.
+  const canon = await loadUniversalCanon();
+
   if (reason === "mention" || reason === "body-mention") {
     message = buildMentionMessage(actorName, identifier, title);
   } else {
     message = await buildDelegationMessage(reason, identifier, title, authToken);
   }
+
+  // Inject the canon block after the hook line (before per-step guidance).
+  message = withCanonBlock(message, canon);
 
   // Append coalescence note if events were suppressed
   if (route.coalescedCount && route.coalescedCount > 0) {
@@ -172,7 +200,10 @@ export async function buildWorkflowAwareDeliveryMessage(
       `build-message: title fetch failed for ${identifier}: ${reason} — proceeding with fallback`,
     );
   }
-  return tryBuildWorkflowMessage(actionText, identifier, title, authToken);
+  // AI-1848: load canon and inject into the workflow-aware message too.
+  const canon = await loadUniversalCanon();
+  const wfMessage = await tryBuildWorkflowMessage(actionText, identifier, title, authToken);
+  return wfMessage !== null ? withCanonBlock(wfMessage, canon) : null;
 }
 
 async function buildDelegationMessage(

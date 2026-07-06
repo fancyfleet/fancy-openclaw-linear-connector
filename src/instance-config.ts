@@ -41,3 +41,12 @@ export function defaultGuidanceDir(): string {
   // {configRoot}/workflows/{workflowId}/{state}.md
   return path.join(instanceConfigRoot(), "workflows");
 }
+
+/**
+ * AI-1848 (Pillar 2 D1): universal policy canon file.
+ * A short set of task-handling rules inlined into every dispatch message.
+ * Loaded fail-open (missing/broken → dispatch without canon, WARN logged).
+ */
+export function defaultUniversalPolicyPath(): string {
+  return path.join(instanceConfigRoot(), "policy", "universal.md");
+}
