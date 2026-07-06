@@ -124,6 +124,15 @@ beforeAll(() => {
   reloadAgents();
 
   process.env.WORKFLOW_DEF_PATH = CANONICAL_FIXTURE;
+
+  // AC2: Point guidance dir at the committed templates under config-templates/
+  // so tests verify repo-resident files (not instance-level filesystem state).
+  process.env.WORKFLOW_GUIDANCE_DIR = path.resolve(
+    process.cwd(),
+    "config-templates",
+    "workflows",
+  );
+
   savedFetch = globalThis.fetch;
 });
 
@@ -132,6 +141,7 @@ afterAll(() => {
   delete process.env.CAPABILITY_POLICY_PATH;
   delete process.env.AGENTS_FILE;
   delete process.env.WORKFLOW_DEF_PATH;
+  delete process.env.WORKFLOW_GUIDANCE_DIR;
   globalThis.fetch = savedFetch;
 });
 
