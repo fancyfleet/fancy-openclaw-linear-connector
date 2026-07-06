@@ -27,6 +27,8 @@ import { registerDistillationCron } from "./cron/p4-metrics-distillation.js";
 import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
 import { registerBootstrapReconciliationCron } from "./bootstrap-reconciliation-sweep.js";
+import { registerDelegationReconciliationCron, runDelegationReconciliationSweep } from "./delegation-reconciliation-sweep.js";
+import { getAlertBus } from "./alerts/alert-bus.js";
 import { registerSlaSweepCron } from "./sla-sweep.js";
 import { registerOobReconcileCron } from "./oob-reconcile-sweep.js";
 import { MutationAuditStore } from "./store/mutation-audit-store.js";
@@ -971,6 +973,53 @@ if (isEntryPoint) {
   registerBootstrapReconciliationCron({
     authToken: reconciliationAuthToken,
     wakeFn: reconciliationWakeFn,
+  });
+
+  // AI-1807: delegation reconciliation sweep — detect and heal stranded
+  // delegation wakes caused by webhook-ingress gaps. Complements AI-1775
+  // (bootstrap sweep) and the rescue/stuck-delegate/no-activity detectors.
+  registerDelegationReconciliationCron({
+    authToken: reconciliationAuthToken,
+    operationalEventStore,
+    wakeFn: reconciliationWakeFn,
+  });
+
+  // AI-1807 AC5: POST /redispatch — on-demand delegation reconciliation.
+  // ADMIN_SECRET-gated. Supports single-ticket and time-window batch modes.
+  app.post("/redispatch", async (req: express.Request, res: express.Response) => {
+    if (!requireAdminSecret(req, res)) return;
+
+    let body: { ticketId?: string | string[]; since?: string; until?: string } | null;
+    try {
+      body = parseJsonBody(req);
+    } catch {
+      res.status(400).json({ success: false, error: "Malformed JSON" });
+      return;
+    }
+
+    // Parse ticket identifiers: single string or array
+    let ticketIdentifiers: string[] | undefined;
+    if (body?.ticketId) {
+      ticketIdentifiers = Array.isArray(body.ticketId)
+        ? body.ticketId.map(String)
+        : [String(body.ticketId)];
+    }
+
+    try {
+      const result = await runDelegationReconciliationSweep({
+        authToken: reconciliationAuthToken,
+        operationalEventStore,
+        alertBus: getAlertBus(),
+        wakeFn: reconciliationWakeFn,
+        ticketIdentifiers,
+        since: body?.since,
+        until: body?.until,
+      });
+      res.json({ success: true, ...result });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ success: false, error: msg });
+    }
   });
 
   // AI-1773: periodic SLA sweep — detect governed tickets whose time in

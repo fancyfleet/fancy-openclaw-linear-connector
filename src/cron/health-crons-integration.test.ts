@@ -30,6 +30,7 @@ const DIST_ENTRY = path.resolve(__dirname, "../../dist/index.js");
 // Every driver the production bootstrap is expected to schedule.
 const EXPECTED_CRONS = [
   "bootstrap-reconciliation-sweep",
+  "delegation-reconciliation-sweep",
   "g20-canary",
   "oob-reconcile-sweep",
   "p4-metrics-distillation",
