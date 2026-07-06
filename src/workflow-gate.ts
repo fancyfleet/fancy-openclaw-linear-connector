@@ -1247,6 +1247,7 @@ export async function checkWorkflowRules(
   breakGlassOverride: boolean = false,
   isMetaIntent: boolean = false,
   hasComment: boolean = false,
+  authorizedDelegateOverride?: string,
 ): Promise<string | null> {
   // TODO(AI-1347): fail-open on missing issueId is a Layer A carry-forward.
   // Harden by deriving issueId from the request body when headers are absent.
@@ -1263,7 +1264,25 @@ export async function checkWorkflowRules(
     }
   }
 
-  const { labels, delegateId, fetchFailed } = await fetchTicketContext(issueId, authToken);
+  const { labels, delegateId: fetchedDelegateId, fetchFailed } = await fetchTicketContext(issueId, authToken);
+
+  // AI-1860: when a prior mutation in the same multi-step governed command
+  // triggered a delegate change (applyStateTransition), use the snapshotted
+  // delegate instead of the fresh fetch. This prevents the second-chunk
+  // self-blocking pattern where the caller was authorized but the re-fetched
+  // delegate no longer matches.
+  const delegateId = authorizedDelegateOverride ?? fetchedDelegateId;
+
+  // AI-1860: when an authorization snapshot is active, the intent was already
+  // authorized in the original state and the transition has already fired.
+  // The follow-up mutation (comment, chunk) must pass through unconditionally.
+  // Without this bypass, the post-transition state check rejects the original
+  // intent (e.g. ac-fail is not legal in state:implementation after the
+  // ac-validate → implementation transition already applied).
+  if (authorizedDelegateOverride) {
+    log.info(`workflow-gate: auth-snapshot bypass — passing through '${intent}' for ${issueId}`);
+    return null;
+  }
 
   // Phase 6.5 / H-1: Fail-closed on context-fetch failure.
   // When we can't fetch the ticket's labels, we cannot determine whether

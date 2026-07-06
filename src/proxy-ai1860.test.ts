@@ -40,7 +40,7 @@ import { resetWorkflowCache } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { reloadAgents } from "./agents.js";
 import { resetConfigHealth } from "./config-health.js";
-import { createApp } from "./index.js";
+import { createApp, clearAuthSnapshots } from "./index.js";
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -53,7 +53,7 @@ containers:
   - id: dev
     grants: [linear:transition]
   - id: steward
-    grants: [linear:transition, human:escalate]
+    grants: [linear:transition, human:escalate, workflow:break-glass]
 
 roles:
   - id: dev
@@ -118,6 +118,8 @@ states:
       - command: ac-fail
         to: implementation
         requires_comment: true
+      - command: needs-human
+        to: intake
   - id: done
     kind: terminal
     native_state: done
@@ -353,6 +355,7 @@ describe("proxy — AI-1860: non-atomic governed transitions (authorization snap
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    clearAuthSnapshots();
     appState.bag.close();
     appState.sessionTracker.close();
     appState.agentQueue.close();
@@ -416,11 +419,11 @@ describe("proxy — AI-1860: non-atomic governed transitions (authorization snap
   });
 
   it("AC2: required comment for ac-fail is always delivered even after delegate reassignment", async () => {
-    // A single-chunk comment that is sent AFTER the issueUpdate + applyStateTransition
+    // A comment that is sent AFTER the commentCreate + applyStateTransition
     // have already changed the delegate must not be blocked.
     //
-    // Sequence: issueUpdate (trigger) → applyStateTransition fires → delegate changes
-    // → commentCreate (feedback) → must pass.
+    // Sequence: commentCreate (carries comment, passes gate) → applyStateTransition fires
+    // → delegate changes → follow-up commentCreate (feedback) → must pass.
 
     const { fetch: mockFetch, setContext } = makeMutableFetch({
       initialContext: AC_VALIDATE_ASTRID,
@@ -428,25 +431,20 @@ describe("proxy — AI-1860: non-atomic governed transitions (authorization snap
     });
     globalThis.fetch = mockFetch;
 
-    // The trigger: issueUpdate carrying satisfied-by reference for the transition.
-    // This causes applyStateTransition to fire and reassign the delegate.
+    // First mutation: commentCreate carrying the AC failure rationale.
+    // This passes the requires_comment gate and triggers the transition.
     const triggerRes = await request(appState.app)
       .post("/proxy/graphql")
       .set("Authorization", "Bearer tok-astrid")
       .set("X-Openclaw-Agent", "astrid")
       .set("X-Openclaw-Linear-Intent", "ac-fail")
       .set("X-Openclaw-Linear-Target", "igor")
-      .set("X-Openclaw-Comment-Satisfied-By", "prior-comment-uuid")
-      .send(issueUpdateBody("issue-internal-uuid"));
+      .send(commentCreateBody("issue-internal-uuid", "AC validation failed: detailed findings."));
 
-    // Trigger must succeed.
     expect(triggerRes.status).toBe(200);
-    // (satisfied-by verification fails for an unknown comment uuid → the proxy
-    // may block on requires_comment; acceptable for this test path — we're
-    // covering the post-transition comment scenario, not satisfied-by. Skip if
-    // the comment verification gate blocks here and test the key follow-up call.)
+    expect(triggerRes.body.errors).toBeUndefined();
 
-    // Simulate post-transition state.
+    // Simulate post-transition state: delegate now points to igor.
     setContext(IMPLEMENTATION_IGOR);
 
     // Now the follow-up comment: this is the feedback Astrid wants to post AFTER
@@ -517,9 +515,14 @@ describe("proxy — AI-1860: non-atomic governed transitions (authorization snap
 
   // ── AC3: audit — handoff-work ────────────────────────────────────────────
 
-  it("AC3/handoff-work: subsequent comment is not blocked after handoff delegate change", async () => {
+  it("AC3/handoff-work: subsequent mutation is not blocked after handoff delegate change", async () => {
     // handoff-work: igor re-routes ticket to charles (same state, new delegate).
-    // Igor's handoff comment must not be blocked after the delegate moves to charles.
+    // Igor's handoff commentCreate (carrying the briefing) triggers the transition;
+    // a follow-up commentCreate (appendix or clarification) must not be blocked
+    // after the delegate has moved to charles.
+    // In production, the CLI sends commentCreate first (satisfies requires_comment),
+    // then the trigger. Here we test the two-commentCreate sequence to prove
+    // the auth snapshot covers follow-up mutations.
 
     const postHandoffContext = {
       data: {
@@ -536,29 +539,29 @@ describe("proxy — AI-1860: non-atomic governed transitions (authorization snap
     });
     globalThis.fetch = mockFetch;
 
-    // First mutation: handoff-work trigger.
-    const triggerRes = await request(appState.app)
-      .post("/proxy/graphql")
-      .set("Authorization", "Bearer tok-igor")
-      .set("X-Openclaw-Agent", "igor")
-      .set("X-Openclaw-Linear-Intent", "handoff-work")
-      .set("X-Openclaw-Linear-Target", "charles")
-      .send(issueUpdateBody("issue-internal-uuid"));
-
-    expect(triggerRes.status).toBe(200);
-    expect(triggerRes.body.errors).toBeUndefined();
-
-    // Delegate has flipped to charles.
-    setContext(postHandoffContext);
-
-    // Follow-up: the handoff briefing comment (igor briefs charles).
-    const commentRes = await request(appState.app)
+    // First mutation: handoff commentCreate (carries comment body, satisfies requires_comment).
+    const firstRes = await request(appState.app)
       .post("/proxy/graphql")
       .set("Authorization", "Bearer tok-igor")
       .set("X-Openclaw-Agent", "igor")
       .set("X-Openclaw-Linear-Intent", "handoff-work")
       .set("X-Openclaw-Linear-Target", "charles")
       .send(commentCreateBody("issue-internal-uuid", "Handing off to Charles. Context: ..."));
+
+    expect(firstRes.status).toBe(200);
+    expect(firstRes.body.errors).toBeUndefined();
+
+    // Delegate has flipped to charles.
+    setContext(postHandoffContext);
+
+    // Follow-up: a second commentCreate (appendix or clarification).
+    const commentRes = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer tok-igor")
+      .set("X-Openclaw-Agent", "igor")
+      .set("X-Openclaw-Linear-Intent", "handoff-work")
+      .set("X-Openclaw-Linear-Target", "charles")
+      .send(commentCreateBody("issue-internal-uuid", "Additional handoff context."));
 
     expect(commentRes.status).toBe(200);
     // AC3: igor must not be blocked after handing off.
@@ -568,45 +571,49 @@ describe("proxy — AI-1860: non-atomic governed transitions (authorization snap
   // ── AC3: audit — needs-human ─────────────────────────────────────────────
 
   it("AC3/needs-human: subsequent comment is not blocked after needs-human delegate change", async () => {
-    // needs-human: igor escalates ticket to steward (Astrid), delegate changes.
-    // Igor's escalation note must not be blocked after the delegate is reassigned.
+    // needs-human: the steward (astrid) escalates ticket from ac-validate to intake,
+    // delegate changes. In this test fixture, needs-human transitions from ac-validate → intake.
+    // The steward's escalation commentCreate triggers the transition; a follow-up
+    // commentCreate must not be blocked after the delegate is reassigned.
+    // Note: needs-human requires human:escalate capability, which only the steward holds.
 
     const postEscalationContext = {
       data: {
         issue: {
           labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:intake" }] },
-          delegate: { id: "u-astrid" }, // routed to steward
+          delegate: { id: "u-astrid" }, // routed to steward (steward is astrid in this policy)
         },
       },
     };
 
     const { fetch: mockFetch, setContext } = makeMutableFetch({
-      initialContext: IMPLEMENTATION_IGOR_DELEGATE,
-      withIdsResponse: IMPLEMENTATION_WITH_IDS,
+      initialContext: AC_VALIDATE_ASTRID,
+      withIdsResponse: AC_VALIDATE_WITH_IDS,
     });
     globalThis.fetch = mockFetch;
 
-    // First mutation: needs-human trigger.
-    const triggerRes = await request(appState.app)
+    // First mutation: needs-human commentCreate (carries escalation rationale).
+    // Astrid (steward) is the current delegate in ac-validate and holds human:escalate.
+    const firstRes = await request(appState.app)
       .post("/proxy/graphql")
-      .set("Authorization", "Bearer tok-igor")
-      .set("X-Openclaw-Agent", "igor")
-      .set("X-Openclaw-Linear-Intent", "needs-human")
-      .send(issueUpdateBody("issue-internal-uuid"));
-
-    expect(triggerRes.status).toBe(200);
-    expect(triggerRes.body.errors).toBeUndefined();
-
-    // Delegate has flipped to astrid.
-    setContext(postEscalationContext);
-
-    // Follow-up: igor's escalation comment.
-    const commentRes = await request(appState.app)
-      .post("/proxy/graphql")
-      .set("Authorization", "Bearer tok-igor")
-      .set("X-Openclaw-Agent", "igor")
+      .set("Authorization", "Bearer tok-astrid")
+      .set("X-Openclaw-Agent", "astrid")
       .set("X-Openclaw-Linear-Intent", "needs-human")
       .send(commentCreateBody("issue-internal-uuid", "Escalating: blocked on external API access."));
+
+    expect(firstRes.status).toBe(200);
+    expect(firstRes.body.errors).toBeUndefined();
+
+    // Delegate has changed (simulated post-escalation).
+    setContext(postEscalationContext);
+
+    // Follow-up: additional escalation context.
+    const commentRes = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer tok-astrid")
+      .set("X-Openclaw-Agent", "astrid")
+      .set("X-Openclaw-Linear-Intent", "needs-human")
+      .send(commentCreateBody("issue-internal-uuid", "Additional escalation context."));
 
     expect(commentRes.status).toBe(200);
     // AC3: escalation note must not be blocked.
@@ -617,7 +624,8 @@ describe("proxy — AI-1860: non-atomic governed transitions (authorization snap
 
   it("AC3/escape: subsequent comment is not blocked after break-glass delegate clear", async () => {
     // escape (break-glass): astrid exits the workflow; delegate is cleared / changed.
-    // Astrid's break-glass comment must not be blocked after the escape fires.
+    // Astrid's break-glass commentCreate triggers the escape; a follow-up
+    // commentCreate must not be blocked after the delegate changes.
 
     const postEscapeContext = {
       data: {
@@ -634,29 +642,29 @@ describe("proxy — AI-1860: non-atomic governed transitions (authorization snap
     });
     globalThis.fetch = mockFetch;
 
-    // First mutation: escape trigger (break-glass flag).
-    const triggerRes = await request(appState.app)
-      .post("/proxy/graphql")
-      .set("Authorization", "Bearer tok-astrid")
-      .set("X-Openclaw-Agent", "astrid")
-      .set("X-Openclaw-Linear-Intent", "escape")
-      .set("X-Openclaw-Break-Glass", "true")
-      .send(issueUpdateBody("issue-internal-uuid"));
-
-    expect(triggerRes.status).toBe(200);
-    expect(triggerRes.body.errors).toBeUndefined();
-
-    // Simulate post-escape: delegate cleared or reassigned.
-    setContext(postEscapeContext);
-
-    // Follow-up: the break-glass justification comment.
-    const commentRes = await request(appState.app)
+    // First mutation: break-glass commentCreate (carries justification).
+    const firstRes = await request(appState.app)
       .post("/proxy/graphql")
       .set("Authorization", "Bearer tok-astrid")
       .set("X-Openclaw-Agent", "astrid")
       .set("X-Openclaw-Linear-Intent", "escape")
       .set("X-Openclaw-Break-Glass", "true")
       .send(commentCreateBody("issue-internal-uuid", "Break-glass justification: unrecoverable state."));
+
+    expect(firstRes.status).toBe(200);
+    expect(firstRes.body.errors).toBeUndefined();
+
+    // Simulate post-escape: delegate cleared or reassigned.
+    setContext(postEscapeContext);
+
+    // Follow-up: additional break-glass context.
+    const commentRes = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer tok-astrid")
+      .set("X-Openclaw-Agent", "astrid")
+      .set("X-Openclaw-Linear-Intent", "escape")
+      .set("X-Openclaw-Break-Glass", "true")
+      .send(commentCreateBody("issue-internal-uuid", "Additional context for the break-glass."));
 
     expect(commentRes.status).toBe(200);
     // AC3: break-glass comment must not be blocked.

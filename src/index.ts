@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express, { Request, Response, NextFunction } from "express";
 import { createWebhookRouter } from "./webhook/index.js";
-import { handleProxyRequest } from "./proxy.js";
+import { handleProxyRequest, clearAuthSnapshots } from "./proxy.js";
 import { handleProxyUploadRequest } from "./proxy-upload.js";
 import { startTokenRefresh } from "./token-refresh.js";
 import { getAgents, watchAgentsFile } from "./agents.js";
@@ -1167,3 +1167,5 @@ if (isEntryPoint) {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
 }
+
+export { clearAuthSnapshots } from "./proxy.js";

@@ -51,6 +51,55 @@ const LINEAR_API_URL = "https://api.linear.app/graphql";
 // before the first command yields to the event loop.
 const inFlightTickets = new Set<string>();
 
+// AI-1860: Authorization snapshot for multi-step governed commands.
+// When a governed transition fires (applyStateTransition) and changes the
+// delegate, the original caller must still be allowed to post follow-up
+// mutations (comments, chunks) for the same intent on the same ticket.
+// Without this, the second mutation re-fetches ticket context, sees the new
+// delegate, and blocks the original caller (self-blocking exit 1).
+//
+// Key format: "${issueId}:${agentId}:${intent}"
+// Value: the caller's linearUserId that was the authorized delegate at command start.
+const AUTH_SNAPSHOT_TTL_MS = 60_000; // 60 seconds — covers CLI chunked requests
+const authSnapshots = new Map<string, { delegateId: string; timestamp: number }>();
+
+/**
+ * Record an authorization snapshot after a successful transition changes the
+ * delegate. Subsequent checkWorkflowRules calls for the same ticket+caller+intent
+ * will use the snapshotted delegate instead of re-fetching.
+ */
+function recordAuthSnapshot(issueId: string, agentId: string, intent: string, callerLinearUserId: string): void {
+  const key = `${issueId}:${agentId}:${intent}`;
+  const now = Date.now();
+  authSnapshots.set(key, { delegateId: callerLinearUserId, timestamp: now });
+  // Prune expired entries (lazy cleanup).
+  for (const [k, v] of authSnapshots) {
+    if (now - v.timestamp > AUTH_SNAPSHOT_TTL_MS) authSnapshots.delete(k);
+  }
+}
+
+/**
+ * Clear all authorization snapshots. Used in tests to prevent cross-test
+ * contamination (snapshots are module-level and persist between test cases).
+ */
+export function clearAuthSnapshots(): void {
+  authSnapshots.clear();
+}
+
+/**
+ * Look up a recent authorization snapshot for a ticket+caller+intent combo.
+ * Returns the snapshotted delegateId if a valid (non-expired) entry exists.
+ */
+function lookupAuthSnapshot(issueId: string, agentId: string, intent: string): string | undefined {
+  const key = `${issueId}:${agentId}:${intent}`;
+  const entry = authSnapshots.get(key);
+  if (entry && Date.now() - entry.timestamp <= AUTH_SNAPSHOT_TTL_MS) {
+    return entry.delegateId;
+  }
+  if (entry) authSnapshots.delete(key); // expired
+  return undefined;
+}
+
 async function runWithTicketLock(
   ticketId: string,
   fn: () => Promise<void>,
@@ -446,7 +495,21 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         log.warn(`break-glass-audit agent=${agentId} authorized=true${ticketCtx} intent=${intent}`);
       }
 
-      const p2rejection = await checkEnforcementRules(effectiveIntent, issueId, authorization, agentId);
+      // AI-1860: look up authorization snapshot for this ticket+caller+intent combo.
+      // Must run BEFORE escalation-gate (p2) and workflow-gate (p3) because both
+      // would reject the follow-up mutation after the delegate/state change.
+      // The snapshot means the intent was already authorized and the transition
+      // already fired — the follow-up mutation must pass through unconditionally.
+      const authorizedDelegateOverride = (issueId && agentId && effectiveIntent && callerLinearUserId)
+        ? lookupAuthSnapshot(issueId, agentId, effectiveIntent)
+        : undefined;
+      if (authorizedDelegateOverride) {
+        log.info(`auth-snapshot-hit agent=${agentId} intent=${effectiveIntent}${ticketCtx} delegate=${authorizedDelegateOverride}`);
+      }
+
+      const p2rejection = authorizedDelegateOverride
+        ? null
+        : await checkEnforcementRules(effectiveIntent, issueId, authorization, agentId);
       if (p2rejection) {
         log.warn(`enforcement-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${p2rejection}`);
         res.status(200).json({ errors: [{ message: p2rejection }] });
@@ -472,7 +535,9 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           log.warn(`comment-satisfied-by rejected agent=${agentId} intent=${effectiveIntent}${ticketCtx} comment=${satisfiedByHeader}`);
         }
       }
-      const p3rejection = await checkWorkflowRules(effectiveIntent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride, intent !== effectiveIntent, requestHasComment);
+      const p3rejection = authorizedDelegateOverride
+        ? null
+        : await checkWorkflowRules(effectiveIntent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride, intent !== effectiveIntent, requestHasComment, authorizedDelegateOverride);
       if (p3rejection) {
         log.warn(`workflow-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${p3rejection}`);
         res.status(200).json({ errors: [{ message: p3rejection }] });
@@ -635,6 +700,17 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           });
           if (transitionResult.status === "failed") {
             log.error(`state-transition FAILED agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${transitionResult.code}${transitionResult.detail ? ` — ${transitionResult.detail}` : ""}`);
+          }
+
+          // AI-1860: after a successful transition (applied, noop, or blocked-but-delegate-changed),
+          // record an authorization snapshot so the caller can post follow-up
+          // mutations (comments, chunks) without being self-blocked by the
+          // re-fetched delegate check.
+          // noop: the state was already correct (e.g. handoff-work doesn't change
+          // state, only delegate). applied: state and/or delegate changed.
+          if (transitionResult.status !== "failed" && issueId && callerLinearUserId && effectiveIntent) {
+            recordAuthSnapshot(issueId, agentId, effectiveIntent, callerLinearUserId);
+            log.info(`auth-snapshot-recorded agent=${agentId} intent=${effectiveIntent}${ticketCtx} status=${transitionResult.status}`);
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
