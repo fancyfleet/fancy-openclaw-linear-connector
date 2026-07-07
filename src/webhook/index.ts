@@ -8,6 +8,7 @@ import { NudgeStore } from "../store/nudge-store.js";
 import type { OperationalEventInput, OperationalEventStore } from "../store/operational-event-store.js";
 import type { EnrolledTicketsStore } from "../store/enrolled-tickets-store.js";
 import type { MutationAuditStore } from "../store/mutation-audit-store.js";
+import type { DispatchIdempotencyStore } from "../store/dispatch-idempotency-store.js";
 import { extractWebhookMutations } from "./mutation-extraction.js";
 import { routeEvent, routeEventAll, unresolvedRoutingCandidates } from "../router.js";
 import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
@@ -152,6 +153,7 @@ export function createWebhookRouter(
   onDeliveryCommitted?: (agentId: string, ticketId: string) => void,
   enrolledTicketsStore?: EnrolledTicketsStore,
   mutationAuditStore?: MutationAuditStore,
+  idempotencyStore?: DispatchIdempotencyStore,
 ): Router {
   const router = Router();
 
@@ -492,6 +494,49 @@ export function createWebhookRouter(
       // AI-1799 AC2: mint a wake_id at route time so the full dispatch cycle
       // (routed → bag-added → dispatch-accepted → delivered) can be correlated.
       const wakeId = crypto.randomUUID();
+
+      // ── AI-1918: Dispatch idempotency + stale-dispatch guard ───────────
+      // Check (ticket, workflowState, agent) against the persistent idempotency
+      // store BEFORE emitting the routed event. A suppressed duplicate or
+      // dropped stale dispatch must never reach the routed/bag/wake path.
+      if (idempotencyStore) {
+        const ticketId = route.sessionKey;
+        const data = event.data as Record<string, unknown> | null;
+        const stateName = (data?.state as Record<string, unknown> | undefined)?.name as string
+          ?? route.routingReason
+          ?? "unknown";
+        const updatedAt = (data?.updatedAt as string) ?? new Date().toISOString();
+        const idempotencyResult = idempotencyStore.checkAndRecord(
+          ticketId, stateName, route.agentId, updatedAt,
+        );
+        if (idempotencyResult.stale) {
+          log.info(`Dispatch idempotency: dropped stale dispatch for ${route.agentId} [${ticketId}]`);
+          appendOperationalEvent(operationalEventStore, {
+            outcome: "dropped-stale" as never,
+            type: event.type,
+            agent: route.agentId,
+            key: ticketId,
+            sessionKey: ticketId,
+            workflowState: stateName,
+            plane: "connector",
+          });
+          return;
+        }
+        if (idempotencyResult.suppressed) {
+          log.info(`Dispatch idempotency: suppressed duplicate for ${route.agentId} [${ticketId}]`);
+          appendOperationalEvent(operationalEventStore, {
+            outcome: "suppressed-duplicate" as never,
+            type: event.type,
+            agent: route.agentId,
+            key: ticketId,
+            sessionKey: ticketId,
+            workflowState: stateName,
+            plane: "connector",
+          });
+          return;
+        }
+      }
+
       // ── 9a. Stale-route guard ───────────────────────────────────────────
       // Linear webhook payloads are snapshots. Before waking an agent from a
       // delegate/assignee event, re-check Linear's current issue state so an
