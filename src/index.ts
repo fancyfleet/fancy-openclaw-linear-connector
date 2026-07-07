@@ -20,6 +20,7 @@ import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, N
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 import { getTicketNoActivityTimeoutMs, getWorkflowRegistryLiveness, loadWorkflowRegistry } from "./workflow-gate.js";
 import { getDefStateMigrationLiveness, registerDefStateMigrationRunner } from "./def-state-migration.js";
+import { armDefStateRemovalGuard } from "./def-state-snapshot-store.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { applyEngagementStatus } from "./engagement-status.js";
 import { createAdminRouter } from "./admin.js";
@@ -917,6 +918,16 @@ export function createApp(options?: CreateAppOptions) {
     operationalEventStore,
     wakeFn: migrationWakeFn,
   });
+
+  // AI-1914 AC3: arm the def-state-removal guard from the production entry point
+  // (createApp). Once armed, loadWorkflowRegistry refuses to activate a def
+  // version that removes a state relative to the last activated version without a
+  // migrations mapping or a strand_acknowledged entry (fail-closed: excluded in
+  // dir mode, rethrown in single-file mode). Arming here — not at module import —
+  // keeps the general unit-test population (which loads varied fixtures under the
+  // same def id as independent scenarios, not sequential versions) unaffected,
+  // mirroring the AC6 load-sweep auth-token gate.
+  armDefStateRemovalGuard();
 
   return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore };
 }

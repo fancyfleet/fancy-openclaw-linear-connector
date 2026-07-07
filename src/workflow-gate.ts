@@ -48,6 +48,13 @@ import { onChildTerminal, onManagingEntry, isTerminalState } from "./barrier.js"
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
 import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store.js";
 import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./config-health.js";
+import { validateDefStateRemovals } from "./def-state-migration.js";
+import {
+  getDefStateSnapshot,
+  recordDefStateSnapshot,
+  clearDefStateSnapshotStore,
+  isDefStateRemovalGuardArmed,
+} from "./def-state-snapshot-store.js";
 import { captureAc, extractAcFromDescription, removeAcRecord } from "./ac-record-store.js";
 import { recordImplementer, getImplementer, removeImplementer } from "./implementer-store.js";
 import { recordAppliedState, clearAppliedState } from "./store/applied-state-store.js";
@@ -263,6 +270,32 @@ export async function loadWorkflowDefById(workflowId: string): Promise<WorkflowD
 }
 
 /**
+ * AC3 (AI-1914): throw if activating `def` would remove a state relative to the
+ * last activated version of the same def id without a migrations mapping or a
+ * strand_acknowledged entry.
+ *
+ * `previousStateIds` comes from the persisted def-state snapshot store, which is
+ * restart-durable (disk-backed) — an in-memory-only baseline would fail open on
+ * exactly the deploy where a new def version activates (a restart has no prior
+ * in-process cache). First-ever load (no snapshot) ⇒ empty baseline ⇒ nothing
+ * looks removed ⇒ activation proceeds and the snapshot is recorded by the caller.
+ *
+ * Reading the snapshot is fail-open (a missing/corrupt file yields no baseline);
+ * the fail-CLOSED behavior is here — a detected removal throws, and the caller
+ * excludes (dir mode) or rethrows (single-file mode) per the AI-1530 posture.
+ */
+async function assertNoUnsafeStateRemoval(def: WorkflowDef): Promise<void> {
+  const previousStateIds = await getDefStateSnapshot(def.id);
+  if (!previousStateIds) return; // no prior activated version to diff against
+  const errors = validateDefStateRemovals(previousStateIds, def);
+  if (errors.length > 0) {
+    throw new Error(
+      `workflow def '${def.id}' refused activation — unsafe state removal (AI-1914 AC3): ${errors.join("; ")}`,
+    );
+  }
+}
+
+/**
  * AI-1530: Load ALL workflow defs into a registry keyed by def.id.
  *
  * This is the dispatch source for multi-workflow enforcement: the gate resolves
@@ -309,7 +342,19 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
           log.warn(`workflow-gate: duplicate workflow id '${def.id}' (${full}) — keeping first, ignoring this file`);
           continue;
         }
-        registry.set(def.id, def);
+        // AC3 (AI-1914): refuse to activate a def version that removes a state
+        // relative to the last activated version without a migrations mapping or
+        // a strand_acknowledged entry. Per-def fail-closed (AI-1530): this def is
+        // excluded from the registry; the prior good snapshot is preserved (we
+        // only record AFTER the def is accepted below), so the operator can fix
+        // the def and reload.
+        if (isDefStateRemovalGuardArmed()) {
+          await assertNoUnsafeStateRemoval(def);
+          registry.set(def.id, def);
+          await recordDefStateSnapshot(def.id, def.states.map((s) => s.id), def.version);
+        } else {
+          registry.set(def.id, def);
+        }
       } catch (err) {
         // AC2: one bad def fails that def only — exclude it, keep the rest.
         failures++;
@@ -328,7 +373,16 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
     // loader did, so the current deploy's safety posture is unchanged.
     try {
       const def = await loadDefFromFile(workflowDefPath());
-      registry.set(def.id, def);
+      // AC3 (AI-1914): fail-closed on unsafe state removal. In single-file mode
+      // the failure rethrows (AI-1530 posture), so the primary deploy refuses to
+      // come up on a def that would silently strand in-flight tickets.
+      if (isDefStateRemovalGuardArmed()) {
+        await assertNoUnsafeStateRemoval(def);
+        registry.set(def.id, def);
+        await recordDefStateSnapshot(def.id, def.states.map((s) => s.id), def.version);
+      } else {
+        registry.set(def.id, def);
+      }
       recordSuccess("workflow-def");
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -341,9 +395,12 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
   return registry;
 }
 
-/** Invalidate the in-process workflow registry cache (used in tests & live-reload). */
+/** Invalidate the in-process workflow registry cache (used in tests & live-reload).
+ *  Also clears the in-memory def-state snapshot baseline so a fresh reload re-reads
+ *  the persisted snapshot from disk (the durable baseline is NOT deleted). */
 export function resetWorkflowCache(): void {
   _registryCache = null;
+  clearDefStateSnapshotStore();
 }
 
 /**
