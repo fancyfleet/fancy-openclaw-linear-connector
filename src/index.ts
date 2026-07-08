@@ -34,6 +34,7 @@ import { registerSlaSweepCron } from "./sla-sweep.js";
 import { registerOobReconcileCron } from "./oob-reconcile-sweep.js";
 import { MutationAuditStore } from "./store/mutation-audit-store.js";
 import { DispatchIdempotencyStore } from "./store/dispatch-idempotency-store.js";
+import { clearAcRecordStore } from "./ac-record-store.js";
 import { getRegisteredCrons } from "./cron/registry.js";
 import { getRescueSweepState } from "./rescue-sweep-state.js";
 import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
@@ -143,6 +144,8 @@ export interface CreateAppOptions {
 }
 
 export function createApp(options?: CreateAppOptions) {
+  // Reset module-level singleton so per-test AC_RECORDS_PATH is picked up.
+  clearAcRecordStore();
   const app = express();
   app.set("trust proxy", true);
 
@@ -679,7 +682,7 @@ export function createApp(options?: CreateAppOptions) {
   });
 
   // Management console (Phase 3): React SPA + JSON API, session or secret auth.
-  app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, ackTracker, deploymentName: DEPLOYMENT_NAME, enrolledTicketsStore, forensicsDiagnosticsDir: options?.forensicsDiagnosticsDir }));
+  app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, ackTracker, deploymentName: DEPLOYMENT_NAME, enrolledTicketsStore, forensicsDiagnosticsDir: options?.forensicsDiagnosticsDir, mutationAuditStore }));
 
   app.use("/", createWebhookRouter(
     eventStore,
