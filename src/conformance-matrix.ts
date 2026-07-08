@@ -229,7 +229,10 @@ function resolveExpected(
     spec.delegateLinearUserId &&
     spec.linearUserId !== spec.delegateLinearUserId
   ) {
-    return { expected: 'block', blockReason: 'wrong-delegate' };
+    const stewardBodyId = findStewardBody(policy);
+    if (!(stewardBodyId && spec.bodyId === stewardBodyId)) {
+      return { expected: 'block', blockReason: 'wrong-delegate' };
+    }
   }
   // Unknown callerLinearUserId with a known delegate → block (unknown-caller variant)
   if (!spec.linearUserId && spec.delegateLinearUserId) {

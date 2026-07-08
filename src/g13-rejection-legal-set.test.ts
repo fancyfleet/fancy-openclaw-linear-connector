@@ -156,6 +156,9 @@ bodies:
   - id: hanzo
     container: deployment
     fills_roles: [deployment]
+  - id: yuki
+    container: deployment
+    fills_roles: [deployment]
   - id: astrid
     container: steward
     fills_roles: [steward]
@@ -169,6 +172,7 @@ const TEST_AGENTS = {
     { name: "igor",     linearUserId: "igor-uuid",     clientId: "ig-c", clientSecret: "ig-s", accessToken: "ig-t", refreshToken: "ig-r" },
     { name: "charles",  linearUserId: "charles-uuid",  clientId: "ch-c", clientSecret: "ch-s", accessToken: "ch-t", refreshToken: "ch-r" },
     { name: "hanzo",    linearUserId: "hanzo-uuid",    clientId: "ha-c", clientSecret: "ha-s", accessToken: "ha-t", refreshToken: "ha-r" },
+    { name: "yuki",     linearUserId: "yuki-uuid",     clientId: "yk-c", clientSecret: "yk-s", accessToken: "yk-t", refreshToken: "yk-r" },
     { name: "astrid",   linearUserId: "astrid-uuid",   clientId: "as-c", clientSecret: "as-s", accessToken: "as-t", refreshToken: "as-r" },
     { name: "reviewer", linearUserId: "reviewer-uuid", clientId: "rv-c", clientSecret: "rv-s", accessToken: "rv-t", refreshToken: "rv-r" },
   ],
