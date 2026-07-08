@@ -137,25 +137,60 @@ describe("AI-1973 — delegate-change invalidation (AI-1855/AI-1926 round-trip s
 });
 
 describe("AI-1973 — dedup TTL", () => {
+  // ── Reconciled dedup semantics (AI-1987 adjudication, steward: Astrid) ──
+  // These three lines are canonical; a test that contradicts them is the bug,
+  // not the production code (which already implements this on main):
+  //   1. Within TTL, a replay with the SAME or OLDER updatedAt → suppressed.
+  //   2. Within TTL, a replay with a STRICTLY NEWER updatedAt → admitted (this
+  //      is AI-1969 admit-newer: workflow re-entry must re-wake, TTL or not).
+  //   3. Past TTL → admitted (unchanged).
+  // AI-1973's original withinTtl leg replayed with a NEWER updatedAt and
+  // asserted suppression; that collided with rule 2. This test isolates the
+  // TTL-expiry boundary by holding updatedAt constant (a true duplicate), so
+  // the ONLY variable is elapsed time vs the TTL.
   it("stops suppressing once the row passes the TTL", () => {
     const { dbPath, cleanup } = makeTempDb();
     const store = new DispatchIdempotencyStore(dbPath, 2 * HOUR);
     store.checkAndRecord(TICKET, "To Do", AGENT, iso(T0), { nowMs: T0 });
 
-    // Within TTL: a newer payload on the same key is still a suppressed
-    // duplicate (replay-window semantics).
-    const withinTtl = store.checkAndRecord(TICKET, "To Do", AGENT, iso(T0 + 60_000), { nowMs: T0 + HOUR });
+    // Within TTL: a true duplicate (SAME updatedAt) on the same key is a
+    // suppressed replay (rule 1). A newer updatedAt would be admitted — that is
+    // asserted separately in the boundary test below.
+    const withinTtl = store.checkAndRecord(TICKET, "To Do", AGENT, iso(T0), { nowMs: T0 + HOUR });
     expect(withinTtl).toMatchObject({ suppressed: true });
 
-    // Past TTL: the same shape is admitted — a 19-hour stall like AI-1965
-    // can no longer be held by one dedup row.
-    const pastTtl = store.checkAndRecord(TICKET, "To Do", AGENT, iso(T0 + 60_000), { nowMs: T0 + 3 * HOUR });
+    // Past TTL: the same duplicate is now admitted purely because the row aged
+    // out (rule 3) — a 19-hour stall like AI-1965 can no longer be held by one
+    // dedup row.
+    const pastTtl = store.checkAndRecord(TICKET, "To Do", AGENT, iso(T0), { nowMs: T0 + 3 * HOUR });
     expect(pastTtl).toMatchObject({ suppressed: false, stale: false, ttlExpired: true });
     expect(store.counters.ttlExpiredAdmits).toBe(1);
 
     // The admit refreshed the row: an immediate replay is suppressed again.
-    const replay = store.checkAndRecord(TICKET, "To Do", AGENT, iso(T0 + 60_000), { nowMs: T0 + 3 * HOUR + 5_000 });
+    const replay = store.checkAndRecord(TICKET, "To Do", AGENT, iso(T0), { nowMs: T0 + 3 * HOUR + 5_000 });
     expect(replay).toMatchObject({ suppressed: true });
+    store.close();
+    cleanup();
+  });
+
+  it("within TTL: same updatedAt is suppressed, strictly newer updatedAt is admitted", () => {
+    // The reconciled boundary from the AI-1987 adjudication, asserted directly:
+    // TTL dedup suppresses genuine duplicates but never swallows newer
+    // information, even inside the TTL window.
+    const { dbPath, cleanup } = makeTempDb();
+    const store = new DispatchIdempotencyStore(dbPath, 2 * HOUR);
+    store.checkAndRecord(TICKET, "To Do", AGENT, iso(T0), { nowMs: T0 });
+
+    // Same updatedAt, well within TTL → suppressed (true duplicate).
+    const sameWithinTtl = store.checkAndRecord(TICKET, "To Do", AGENT, iso(T0), { nowMs: T0 + HOUR });
+    expect(sameWithinTtl).toMatchObject({ suppressed: true, stale: false });
+
+    // Strictly newer updatedAt, still well within TTL → admitted (re-entry).
+    // ttlExpired stays falsy: the admit is driven by the newer snapshot, not by
+    // the row aging out.
+    const newerWithinTtl = store.checkAndRecord(TICKET, "To Do", AGENT, iso(T0 + 60_000), { nowMs: T0 + HOUR });
+    expect(newerWithinTtl).toMatchObject({ suppressed: false, stale: false });
+    expect(newerWithinTtl.ttlExpired ?? false).toBe(false);
     store.close();
     cleanup();
   });

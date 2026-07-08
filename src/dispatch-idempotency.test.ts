@@ -435,12 +435,37 @@ describe("AI-1918 — dispatch idempotency + stale guard", () => {
 // forever. Only an IDENTICAL updatedAt (true webhook replay / restart echo) may
 // be suppressed; a strictly newer snapshot is a new event and must wake.
 describe("AI-1969 — re-entry dispatch with a newer updatedAt is admitted", () => {
+  // AI-1987 de-flake: this block MUST own its process.env, exactly like the
+  // AI-1918 block above. Without a beforeEach that pins LINEAR_WEBHOOK_SECRET
+  // and scrubs Linear tokens / hooks URLs, the test inherited whatever env the
+  // last block to run in this worker left behind — the AI-1918 afterEach
+  // restores process.env to the ambient parent env, which in CI carries a real
+  // LINEAR_WEBHOOK_SECRET (and possibly a Linear token). The webhook signature
+  // then failed to verify (test SECRET vs CI secret) or the path went online,
+  // so leg dispatches were never admitted and routedCount(...) came up short.
+  // It passed file-scoped locally (clean ambient env) and failed under
+  // full-suite parallel CI — the reported order/worker-isolation flake. Owning
+  // env here makes the outcome independent of test order and worker assignment.
+  const originalEnv = process.env;
   let dir: string | undefined;
   let app: ReturnType<typeof createApp> | undefined;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    process.env.LINEAR_WEBHOOK_SECRET = SECRET;
+    // Keep the dispatch path offline & deterministic (no api.linear.app calls).
+    delete process.env.LINEAR_OAUTH_TOKEN;
+    delete process.env.LINEAR_API_KEY;
+    delete process.env.LINEAR_DEVELOPER_TOKEN;
+    delete process.env.OPENCLAW_HOOKS_URL;
+    delete process.env.OPENCLAW_HOOKS_TOKEN;
+  });
 
   afterEach(() => {
     closeApp(app);
     app = undefined;
+    delete process.env.AGENTS_FILE;
+    process.env = originalEnv;
     if (dir) fs.rmSync(dir, { recursive: true, force: true });
     dir = undefined;
   });
