@@ -42,6 +42,7 @@ import { clearArtifactStore, getBoundArtifact, hasBoundArtifact } from "./artifa
 import { runTransitionWalk } from "./canary.js";
 import { clearAcRecordStore, getAcRecord } from "./ac-record-store.js";
 import { resetConfigHealth } from "./config-health.js";
+import { defStateSnapshotPath } from "./store/def-state-snapshot-store.js";
 import { clearImplementerStore } from "./implementer-store.js";
 
 // Resolved from the project root (jest cwd) so it works under both the
@@ -325,6 +326,13 @@ beforeEach(() => {
   resetWorkflowCache();
   resetNativeStateCache();
   resetPolicyCache();
+  // AI-1914 AC3: the def-state-removal check reads a persisted "previous version"
+  // snapshot that (by design) survives resetWorkflowCache. These legacy cases
+  // reload the same `dev-impl` id with different state subsets across unrelated
+  // scenarios, which would otherwise read as a state removal. Clear the snapshot
+  // per test so each starts with no prior version (dedicated coverage for the
+  // removal path lives in ai-1914-ac3-load-validation.test.ts).
+  fs.rmSync(defStateSnapshotPath(), { force: true });
 });
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -3671,8 +3679,23 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
     // We need to test applyStateTransition with the artifact recording.
     // Set up the mock fetch to handle label fetch + issue fetch + label swap + delegate
     let commentCreated = false;
+    let lastAtomicWrite: { labelIds?: string[]; delegateId?: string; stateId?: string } | undefined;
     globalThis.fetch = async (_url, init) => {
       const bodyText = typeof init?.body === "string" ? init.body : "";
+      // AI-1762 read-after-write verification — echo back what the atomic mutation wrote.
+      if (bodyText.includes("VerifyTransitionWrite")) {
+        const labelNames = (lastAtomicWrite?.labelIds ?? []).map((id) =>
+          id === "lbl-1" ? "wf:sprint" : id === "lbl-ux-shaping" ? "state:ux-shaping" : id,
+        );
+        return new Response(
+          JSON.stringify({ data: { issue: {
+            labels: { nodes: labelNames.map((name) => ({ name })) },
+            delegate: lastAtomicWrite?.delegateId ? { id: lastAtomicWrite.delegateId } : null,
+            state: lastAtomicWrite?.stateId ? { id: lastAtomicWrite.stateId } : null,
+          } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
       // Issue context fetch (for delegate check in checkWorkflowRules)
       if (bodyText.includes("delegate")) {
         return new Response(
@@ -3704,6 +3727,9 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
       }
       // Label swap mutation
       if (bodyText.includes("issueUpdate")) {
+        try {
+          lastAtomicWrite = (JSON.parse(bodyText) as { variables?: typeof lastAtomicWrite }).variables;
+        } catch { /* keep prior */ }
         return new Response(
           JSON.stringify({ data: { issueUpdate: { success: true } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
@@ -5561,6 +5587,22 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
       if (q.includes("IssueDescription")) {
         return new Response(
           JSON.stringify({ data: { issue: { description: "" } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // AI-1762 read-after-write verification — echo back what the last atomic mutation wrote.
+      if (q.includes("VerifyTransitionWrite")) {
+        const last = mutations[mutations.length - 1]?.variables as
+          | { labelIds?: string[]; delegateId?: string; stateId?: string }
+          | undefined;
+        const labelNames = (last?.labelIds ?? []).map((id) => id.replace(/^lbl-/, ""));
+        return new Response(
+          JSON.stringify({ data: { issue: {
+            labels: { nodes: labelNames.map((name) => ({ name })) },
+            delegate: last?.delegateId ? { id: last.delegateId } : null,
+            state: last?.stateId ? { id: last.stateId } : null,
+          } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }

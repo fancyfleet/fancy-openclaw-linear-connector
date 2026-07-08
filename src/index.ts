@@ -33,6 +33,7 @@ import { getAlertBus } from "./alerts/alert-bus.js";
 import { registerSlaSweepCron } from "./sla-sweep.js";
 import { registerOobReconcileCron } from "./oob-reconcile-sweep.js";
 import { MutationAuditStore } from "./store/mutation-audit-store.js";
+import { DispatchIdempotencyStore } from "./store/dispatch-idempotency-store.js";
 import { getRegisteredCrons } from "./cron/registry.js";
 import { getRescueSweepState } from "./rescue-sweep-state.js";
 import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
@@ -129,8 +130,8 @@ export interface CreateAppOptions {
   enrolledTicketsDbPath?: string;
   /** Override MutationAuditStore database path (for testing). AI-1838. */
   mutationAuditDbPath?: string;
-  /** Override forensics diagnostics base directory (for testing, AI-1953). */
-  forensicsDiagnosticsDir?: string;
+  /** Override DispatchIdempotencyStore database path (for testing). AI-1918. */
+  idempotencyDbPath?: string;
   /**
    * Test hook: override wake-up delivery for resignal/hold-retry dispatches.
    * When provided, replaces the real sendWakeUpSignal so tests don't hit the
@@ -218,6 +219,16 @@ export function createApp(options?: CreateAppOptions) {
       universalCanon: getCanonLiveness(),
       // AI-1849 (Pillar 2 D2): docs endpoint liveness — confirms /docs is registered.
       docs: getDocsLiveness(),
+      // AI-1918: dispatch idempotency liveness — confirms the dedup/stale-guard
+      // layer is active, observable at ac-validate without waiting for a real
+      // duplicate event.
+      dispatchIdempotency: {
+        active: true,
+        suppressedDuplicates: idempotencyStore.counters.suppressedDuplicates,
+        droppedStale: idempotencyStore.counters.droppedStale,
+        delegateChangeCleared: idempotencyStore.counters.delegateChangeCleared,
+        ttlExpiredAdmits: idempotencyStore.counters.ttlExpiredAdmits,
+      },
       // AI-1872: workflow registry liveness — exposes the loaded workflow defs
       // (id → {version, states}) so ac-validate can confirm the updated def
       // is live without waiting for a dispatch trigger.
@@ -245,6 +256,7 @@ export function createApp(options?: CreateAppOptions) {
   const operationalEventStore = new OperationalEventStore(options?.operationalEventsDbPath);
   const enrolledTicketsStore = new EnrolledTicketsStore(options?.enrolledTicketsDbPath);
   const mutationAuditStore = new MutationAuditStore(options?.mutationAuditDbPath);
+  const idempotencyStore = new DispatchIdempotencyStore(options?.idempotencyDbPath);
   const agentQueue = new AgentQueue(options?.agentQueueDbPath);
   const bag = new PendingWorkBag(options?.bagDbPath);
   const wakeConfig = {
@@ -665,7 +677,7 @@ export function createApp(options?: CreateAppOptions) {
   });
 
   // Management console (Phase 3): React SPA + JSON API, session or secret auth.
-  app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, ackTracker, deploymentName: DEPLOYMENT_NAME, enrolledTicketsStore, forensicsDiagnosticsDir: options?.forensicsDiagnosticsDir, mutationAuditStore }));
+  app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, ackTracker, deploymentName: DEPLOYMENT_NAME, enrolledTicketsStore }));
 
   app.use("/", createWebhookRouter(
     eventStore,
@@ -695,6 +707,7 @@ export function createApp(options?: CreateAppOptions) {
     (agentId, ticketId) => ackTracker.ensurePending(agentId, ticketId),
     enrolledTicketsStore,
     mutationAuditStore,
+    idempotencyStore,
   ));
 
   // ── v1.1: Session-end callback endpoint ──────────────────────────────
@@ -920,7 +933,7 @@ export function createApp(options?: CreateAppOptions) {
     wakeFn: migrationWakeFn,
   });
 
-  return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore };
+  return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore };
 }
 
 /**
