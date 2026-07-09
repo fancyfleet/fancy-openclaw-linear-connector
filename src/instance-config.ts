@@ -50,3 +50,13 @@ export function defaultGuidanceDir(): string {
 export function defaultUniversalPolicyPath(): string {
   return path.join(instanceConfigRoot(), "policy", "universal.md");
 }
+
+/**
+ * AI-1479 (Phase 6.5 / H-4): department roster for the routing functionary.
+ * Maps department prefixes → default worker and names the steward an
+ * unroutable request escalates to. Instance config (env override
+ * DEPARTMENT_ROSTER_PATH wins where consumers honor it; tests rely on it).
+ */
+export function defaultDepartmentRosterPath(): string {
+  return path.join(instanceConfigRoot(), "config", "department-roster.yaml");
+}

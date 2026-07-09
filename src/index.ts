@@ -46,6 +46,7 @@ import { startRegistryPolicyCheck } from "./registry-policy.js";
 import { resolveStartupCommit } from "./startup-commit.js";
 import { getAccessToken, getAgent, getLinearUserIdForAgent } from "./agents.js";
 import { loadUniversalCanon, getCanonLiveness } from "./policy/universal-canon.js";
+import { loadRoster, getRoutingFunctionaryLiveness } from "./department-roster.js";
 import { createGuidanceRouter, getDocsLiveness } from "./docs/guidance-router.js";
 import type { StaleSessionDetail } from "./bag/session-tracker.js";
 import crypto from "crypto";
@@ -266,6 +267,11 @@ export function createApp(options?: CreateAppOptions) {
       universalCanon: getCanonLiveness(),
       // AI-1849 (Pillar 2 D2): docs endpoint liveness — confirms /docs is registered.
       docs: getDocsLiveness(),
+      // AI-1479 (Phase 6.5 / H-4): routing-functionary liveness — confirms the
+      // department roster loaded at bootstrap and the functionary is active in
+      // the live dispatch path (routeEventAll), observable at ac-validate without
+      // waiting for a webhook to arrive.
+      routingFunctionary: getRoutingFunctionaryLiveness(),
       // AI-1918: dispatch idempotency liveness — confirms the dedup/stale-guard
       // layer is active, observable at ac-validate without waiting for a real
       // duplicate event.
@@ -1070,6 +1076,12 @@ if (isEntryPoint) {
   // /health can report liveness immediately (fail-open: missing file is a
   // WARN, not a crash). The file is re-read per-dispatch for hot-reload.
   await loadUniversalCanon();
+
+  // AI-1479 (Phase 6.5 / H-4): load the department roster at bootstrap so the
+  // routing functionary is active in the live dispatch path (routeEventAll) and
+  // /health can report liveness immediately (fail-open: a missing/broken roster
+  // is a WARN and leaves mechanical routing + no-route paging untouched).
+  await loadRoster();
 
   // Watch agents.json for external changes — no restart needed to add agents
   watchAgentsFile();

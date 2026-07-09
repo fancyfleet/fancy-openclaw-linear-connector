@@ -124,9 +124,18 @@ export interface RoutingCheckResult {
 export async function checkLinearIssueRouting(
   ticketId: string,
   agentId: string,
-  routingReason: "delegate" | "assignee" | "mention" | "body-mention" | undefined,
+  routingReason: "delegate" | "assignee" | "mention" | "body-mention" | "department-prefix" | "steward-escalation" | undefined,
 ): Promise<RoutingCheckResult> {
-  if (routingReason === "mention" || routingReason === "body-mention") {
+  // Mentions and functionary routes (AI-1479 department-prefix / steward
+  // escalation) have no delegate/assignee ownership on the ticket to re-verify —
+  // the route was decided by mention or roster prefix, not by a delegation the
+  // stale-route guard could confirm. Treat them as actionable.
+  if (
+    routingReason === "mention" ||
+    routingReason === "body-mention" ||
+    routingReason === "department-prefix" ||
+    routingReason === "steward-escalation"
+  ) {
     return { actionable: true, failOpen: false };
   }
 
@@ -227,7 +236,7 @@ export async function checkLinearIssueRouting(
 export async function isLinearIssueStillRoutedToAgent(
   ticketId: string,
   agentId: string,
-  routingReason: "delegate" | "assignee" | "mention" | "body-mention" | undefined,
+  routingReason: "delegate" | "assignee" | "mention" | "body-mention" | "department-prefix" | "steward-escalation" | undefined,
 ): Promise<boolean> {
   return (await checkLinearIssueRouting(ticketId, agentId, routingReason)).actionable;
 }
