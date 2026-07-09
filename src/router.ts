@@ -9,6 +9,7 @@
  */
 
 import { buildAgentMap, getAccessToken, getAgent, getOpenclawAgentName, getAgents } from "./agents.js";
+import { getCachedRoster, resolveRoute } from "./department-roster.js";
 import type { LinearEvent } from "./webhook/schema.js";
 import type { RouteResult } from "./types.js";
 import { normalizeSessionKey } from "./session-key.js";
@@ -311,7 +312,7 @@ export function unresolvedRoutingCandidates(event: LinearEvent): string[] {
 }
 
 function buildRouteResult(
-  target: { name: string; reason: "delegate" | "assignee" | "mention" | "body-mention" },
+  target: { name: string; reason: "delegate" | "assignee" | "mention" | "body-mention" | "department-prefix" | "steward-escalation" },
   event: LinearEvent,
 ): RouteResult {
   const openclawName = getOpenclawAgentName(target.name);
@@ -361,11 +362,31 @@ export function routeEvent(event: LinearEvent): RouteResult | null {
  */
 export function routeEventAll(event: LinearEvent): RouteResult[] {
   const primary = extractAgentTarget(event);
-  if (!primary) return [];
-  const routes = [buildRouteResult(primary, event)];
-  for (const name of extractAdditionalMentionTargets(event, primary.name)) {
-    log.info(`Fan-out mention route: ${name} (primary: ${primary.name})`);
-    routes.push(buildRouteResult({ name, reason: "mention" }, event));
+  if (primary) {
+    const routes = [buildRouteResult(primary, event)];
+    for (const name of extractAdditionalMentionTargets(event, primary.name)) {
+      log.info(`Fan-out mention route: ${name} (primary: ${primary.name})`);
+      routes.push(buildRouteResult({ name, reason: "mention" }, event));
+    }
+    return routes;
   }
-  return routes;
+
+  // AI-1479 (Phase 6.5 / H-4): routing functionary — a *fallback* consulted only
+  // when nothing was explicitly delegated/assigned/mentioned (mechanical-first
+  // ordering). A clean department-prefix match routes to the department default
+  // with no person in the loop. Anything else (no roster loaded, or a prefix that
+  // matches no department → steward escalation) falls through to the existing
+  // no-route paging path — we do not fabricate a route here, so mention fan-out
+  // and no-route paging (AI-1766 / AI-1900) are composed with, not reverted.
+  const roster = getCachedRoster();
+  if (roster) {
+    const decision = resolveRoute(extractIssueIdentifier(event), event.type, roster, null);
+    if (decision.reason === "department-prefix") {
+      log.info(
+        `Department route: ${event.type} identifier=${extractIssueIdentifier(event)} → ${decision.target} (prefix=${decision.matchedPrefix})`,
+      );
+      return [buildRouteResult({ name: decision.target, reason: "department-prefix" }, event)];
+    }
+  }
+  return [];
 }
