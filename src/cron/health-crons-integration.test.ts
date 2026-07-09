@@ -32,6 +32,7 @@ const EXPECTED_CRONS = [
   "bootstrap-reconciliation-sweep",
   "delegation-reconciliation-sweep",
   "dispatch-delivery-scheduler", // AI-2008: acknowledged dispatch delivery + retry driver
+  "first-action-watchdog",
   "g20-canary",
   "oob-reconcile-sweep",
   "p4-metrics-distillation",
