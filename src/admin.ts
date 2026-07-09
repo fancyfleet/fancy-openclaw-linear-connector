@@ -19,6 +19,7 @@ import { tryNormalizeSessionKey } from "./session-key.js";
 import { setStateAtomic, loadWorkflowRegistry } from "./workflow-gate.js";
 import { parseSlaToMs } from "./barrier.js";
 import { computeDispatchHealth } from "./dispatch-health.js";
+import { getFirstActionLadder } from "./first-action-watchdog-state.js";
 import type { DispatchAckEntry } from "./bag/dispatch-ack-tracker.js";
 import { recaptureAc } from "./ac-record-store.js";
 import type { MutationAuditStore } from "./store/mutation-audit-store.js";
@@ -754,6 +755,10 @@ export function createAdminRouter(deps: AdminDeps): Router {
         muted,
         terminal_duration_ms: row.terminal === 1 ? terminal_duration_ms : undefined,
         dispatch_health,
+        // AI-2009 AC5: per-ticket first-action watchdog ladder state (armed
+        // deadline, rungs fired, unreachable) — visible in /admin without waiting
+        // for a breach.
+        first_action_ladder: getFirstActionLadder(row.ticket_id),
       });
     }
     res.json({ workflows, tickets });

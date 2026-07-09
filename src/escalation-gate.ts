@@ -65,7 +65,7 @@ interface PolicyRole {
   exclusive?: boolean;
 }
 
-interface CapabilityPolicy {
+export interface CapabilityPolicy {
   bodies: PolicyBody[];
   containers: PolicyContainer[];
   capabilities?: PolicyCapability[];
@@ -202,6 +202,15 @@ export function resetPolicyCache(): void {
 export async function getPolicyBodies(): Promise<PolicyBody[]> {
   const policy = await loadPolicy();
   return policy.bodies ?? [];
+}
+
+/**
+ * Full capability-policy snapshot. Used by the first-action watchdog (AI-2009)
+ * to resolve re-route targets: bodies that fill a role + which roles are
+ * exclusive (singletons that must never be re-routed).
+ */
+export async function getCapabilityPolicy(): Promise<CapabilityPolicy> {
+  return loadPolicy();
 }
 
 // ── Body → capability resolution ───────────────────────────────────────────

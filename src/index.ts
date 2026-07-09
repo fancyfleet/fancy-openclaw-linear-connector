@@ -37,6 +37,9 @@ import { DispatchIdempotencyStore } from "./store/dispatch-idempotency-store.js"
 import { clearAcRecordStore } from "./ac-record-store.js";
 import { getRegisteredCrons } from "./cron/registry.js";
 import { getRescueSweepState } from "./rescue-sweep-state.js";
+import { registerFirstActionWatchdogCron } from "./first-action-watchdog.js";
+import { getFirstActionWatchdogState } from "./first-action-watchdog-state.js";
+import { getCapabilityPolicy } from "./escalation-gate.js";
 import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
 import { onAlert as onConfigHealthAlert } from "./config-health.js";
 import { startRegistryPolicyCheck } from "./registry-policy.js";
@@ -218,6 +221,9 @@ export function createApp(options?: CreateAppOptions) {
       crons: getRegisteredCrons(),
       // AI-1857 AC3: rescue-sweep last-run visibility — "did it run" without log access.
       rescueSweep: getRescueSweepState(),
+      // AI-2009 AC7: first-action watchdog liveness — scheduled + armedCount,
+      // observable at ac-validate without waiting for a deadline breach.
+      firstActionWatchdog: getFirstActionWatchdogState(),
       // AI-1848 (Pillar 2 D1): universal policy canon liveness — confirms
       // the canon file loaded and its version, observable at ac-validate
       // without waiting for a dispatch trigger.
@@ -1023,7 +1029,7 @@ if (isEntryPoint) {
     startTokenRefresh();
   }
 
-  const { app, agentQueue, bag, sessionTracker, operationalEventStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, mutationAuditStore } = createApp();
+  const { app, agentQueue, bag, sessionTracker, operationalEventStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, mutationAuditStore, enrolledTicketsStore, idempotencyStore } = createApp();
 
   // P4-3: periodic distillation of reject metrics into skill-workshop proposals
   registerDistillationCron(observationStore);
@@ -1067,6 +1073,94 @@ if (isEntryPoint) {
     authToken: reconciliationAuthToken,
     operationalEventStore,
     wakeFn: reconciliationWakeFn,
+  });
+
+  // AI-2009: first-action watchdog — arm a per-state deadline at dispatch
+  // delivery and, on breach, walk the remediation ladder (re-dispatch →
+  // unreachable + ops alert → optional capability-policy re-route). Unlike the
+  // reconciliation sweeps above (which heal broken ticket SHAPE — lost delegate,
+  // drifted labels), this catches well-formed dispatches that were delivered to
+  // the right owner and then simply sat: the wake that never landed, the agent
+  // that bounced, the revision round-trip that was dropped.
+  //
+  // The data plane is derived from the durable enrolled-tickets mirror
+  // (delegate/state/entered-at) cross-referenced with the operational event
+  // store (first visible owner action). Registered here at bootstrap so it is
+  // reachable from the production entry point (AI-1810 registry ⇒ /health.crons).
+  const firstActionCapabilityPolicy = await getCapabilityPolicy()
+    .then((p) => ({ bodies: p.bodies, roles: p.roles }))
+    .catch(() => undefined);
+  const firstActionAgentNames = new Set(getAgents().map((a) => a.name.toLowerCase()));
+  registerFirstActionWatchdogCron({
+    authToken: reconciliationAuthToken,
+    workflowDefPath: process.env.WORKFLOW_DEFS_DIR ?? process.env.WORKFLOW_DEF_DIR,
+    capabilityPolicy: firstActionCapabilityPolicy,
+    listTickets: async () => {
+      const rows = enrolledTicketsStore.getAll();
+      return rows
+        .filter((row) => row.terminal !== 1 && row.state && row.state !== "done")
+        .map((row) => {
+          const delegate = row.delegate ?? "";
+          // Only AI agents in the roster are watched; a null delegate or a
+          // non-roster (human) assignee is excluded from nudging (AC3).
+          const humanAssigned = !delegate || !firstActionAgentNames.has(delegate.toLowerCase());
+          const deliveredMs = Date.parse(row.entered_state_at);
+          // First visible owner action: earliest operational event authored by
+          // the delegate at/after the ticket entered its current state.
+          let firstOwnerActionAtMs: number | null = null;
+          if (delegate) {
+            const events = operationalEventStore.query({
+              key: `linear-${row.ticket_id}`,
+              since: row.entered_state_at,
+              limit: 200,
+            });
+            const actionTimes = events
+              .filter((e) => e.agent && e.agent.toLowerCase() === delegate.toLowerCase())
+              .map((e) => Date.parse(e.occurredAt))
+              .filter((ms) => Number.isFinite(ms));
+            if (actionTimes.length > 0) firstOwnerActionAtMs = Math.min(...actionTimes);
+          }
+          return {
+            ticket: row.ticket_id,
+            workflow: row.workflow,
+            state: row.state,
+            delegate,
+            humanAssigned,
+            labels: [`wf:${row.workflow}`, `state:${row.state}`],
+            dispatchDeliveredAtMs: Number.isFinite(deliveredMs) ? deliveredMs : Date.now(),
+            dispatchUpdatedAt: row.entered_state_at,
+            firstOwnerActionAtMs,
+          };
+        });
+    },
+    // Rung 1: a genuine fresh wake. Clear the idempotency rows for (ticket,
+    // agent) so the re-dispatch is admitted rather than swallowed as a
+    // duplicate (AI-1969 admit semantics), then deliver via the same primitive
+    // the reconciliation sweeps use.
+    redispatch: async ({ ticket, agent }) => {
+      try {
+        idempotencyStore.clearAgentRows(`linear-${ticket}`, agent);
+      } catch {
+        /* best-effort — a missing row must not block the wake */
+      }
+      await reconciliationWakeFn(agent, ticket);
+      return { admitted: true };
+    },
+    // Rung 2: alert the ops channel with ticket/state/delegate for the on-call.
+    notify: (alert) =>
+      notify({
+        severity: "warning",
+        source: "first-action-watchdog",
+        title: alert.title,
+        detail: `${alert.ticket} (${alert.state}) — delegate ${alert.delegate} unreachable after ${alert.history.length} rung(s)`,
+        dedupKey: `first-action-watchdog|${alert.ticket}|${alert.state}`,
+      }),
+    // Rung 3: re-route to the fallback body by waking it directly. The delegate
+    // reassignment itself is left to the steward — the ladder never mutates
+    // workflow state — but the fallback body is surfaced immediately.
+    reroute: async ({ ticket, toAgent }) => {
+      await reconciliationWakeFn(toAgent, ticket);
+    },
   });
 
   // AI-1807 AC5: POST /redispatch — on-demand delegation reconciliation.
