@@ -813,7 +813,12 @@ describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
     expect(res.body.errors).toBeUndefined();
   });
 
-  it("fails open (allows) when version header is absent", async () => {
+  // AI-1998: a missing version header is treated as below-floor and rejected
+  // (loud) by default — a CLI old enough to omit the header must not bypass the
+  // floor the way it used to (this test previously asserted fail-open).
+  it("blocks a workflow mutation when the version header is absent (default fail-closed)", async () => {
+    process.env.PROXY_MIN_CLI_VERSION = "0.3.7";
+    delete process.env.PROXY_ALLOW_MISSING_CLI_VERSION;
     globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
 
     const res = await request(appState.app)
@@ -824,6 +829,35 @@ describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
       // no X-Openclaw-Linear-Cli-Version header
       .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
 
+    delete process.env.PROXY_MIN_CLI_VERSION;
+    // Restore the suite-wide grace default (jest.setup.ts) so later tests in this
+    // file are not affected by the delete above.
+    process.env.PROXY_ALLOW_MISSING_CLI_VERSION = "1";
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("[Proxy]");
+    expect(res.body.errors[0].message).toContain("missing");
+    expect(res.body.errors[0].message).toContain("0.3.7");
+  });
+
+  // AI-1998: opt-in grace period restores the old fail-open behaviour for any
+  // un-headered client while the fleet is confirmed all-headered.
+  it("allows a mutation with an absent version header when PROXY_ALLOW_MISSING_CLI_VERSION is set", async () => {
+    process.env.PROXY_MIN_CLI_VERSION = "0.3.7";
+    process.env.PROXY_ALLOW_MISSING_CLI_VERSION = "1";
+    globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "submit")
+      // no X-Openclaw-Linear-Cli-Version header
+      .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
+
+    delete process.env.PROXY_MIN_CLI_VERSION;
+    // Leave PROXY_ALLOW_MISSING_CLI_VERSION="1" (the suite-wide grace default) in
+    // place for later tests in this file.
     expect(res.status).toBe(200);
     expect(res.body.errors).toBeUndefined();
   });
