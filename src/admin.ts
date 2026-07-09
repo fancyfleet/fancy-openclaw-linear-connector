@@ -38,6 +38,7 @@ import {
   LoginRateLimiter,
 } from "./admin-session.js";
 import { mountStreamRoute } from "./admin-stream.js";
+import { listWebhooks, addWebhook, removeWebhook } from "./webhook/registry.js";
 
 interface AdminDeps {
   agentQueue: AgentQueue;
@@ -862,12 +863,36 @@ export function createAdminRouter(deps: AdminDeps): Router {
       wake_cycles: wakeCycles,
     }];
 
+    // AI-2008 AC4: per-ticket dispatch timeline. Project delivery-lifecycle
+    // events into normalized statuses (delivered / failed / retrying /
+    // undeliverable) so the console shows how each dispatch actually landed —
+    // not just raw event summaries.
+    const DISPATCH_STATUS: Record<string, string> = {
+      delivered: "delivered",
+      "delivery-failed": "failed",
+      "delivery-unconfirmed": "retrying",
+      "dispatch-undeliverable": "undeliverable",
+    };
+    const dispatchTimeline = events
+      .filter((e) => e.outcome in DISPATCH_STATUS)
+      .map((e) => ({
+        status: DISPATCH_STATUS[e.outcome],
+        outcome: e.outcome,
+        attempt: e.attemptCount ?? null,
+        dispatch_id: e.wakeId ?? null,
+        delegate: e.agent ?? null,
+        timestamp: e.occurredAt,
+      }))
+      // Oldest-first so the timeline reads in dispatch order.
+      .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+
     res.json({
       ticket_id: row.ticket_id,
       workflow: row.workflow,
       state: row.state,
       delegate: row.delegate,
       state_transitions: stateTransitions,
+      dispatch_timeline: dispatchTimeline,
     });
   });
   router.get("/api/events", (req: Request, res: Response) => {
@@ -1211,6 +1236,38 @@ export function createAdminRouter(deps: AdminDeps): Router {
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ success: false, error: msg });
     }
+  });
+
+  // ── AI-1986: self-service webhook management ─────────────────────────────
+  // CRUD over the Linear webhook signing secrets. Behind adminAuth like the
+  // rest of /api. Secrets persist to LINEAR_WEBHOOK_SECRETS in the env file and
+  // hot-reload per request via parseWebhookSecrets(); url/team metadata rides in
+  // a sidecar JSON beside the env file.
+  router.get("/api/webhooks", (_req: Request, res: Response) => {
+    res.json({ webhooks: listWebhooks() });
+  });
+
+  router.post("/api/webhooks", (req: Request, res: Response) => {
+    const body = parseJsonBody(req);
+    if (!body) {
+      res.status(400).json({ ok: false, error: "Request body must be valid JSON." });
+      return;
+    }
+    const result = addWebhook(body);
+    if (!result.ok) {
+      res.status(result.status).json({ ok: false, error: result.error });
+      return;
+    }
+    res.json({ ok: true, webhook: result.webhook });
+  });
+
+  router.delete("/api/webhooks/:id", (req: Request, res: Response) => {
+    const result = removeWebhook(req.params.id);
+    if (!result.ok) {
+      res.status(result.status).json({ ok: false, error: "No webhook with that id." });
+      return;
+    }
+    res.json({ ok: true });
   });
 
   // ── SPA (management console) ─────────────────────────────────────────────
