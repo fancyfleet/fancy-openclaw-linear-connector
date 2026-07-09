@@ -343,6 +343,9 @@ describe("AI-1992 fanout schema fields", () => {
     expect(fanout.child_workflow).toMatch(/^wf:/);
     expect(fanout.initial_delegate).toBe("igor");
     expect(fanout.block_siblings).toBe(true);
+    // Fail-first: the block must be engine-actionable, not merely carried through
+    // by js-yaml passthrough. The config-driven trigger keys on it.
+    expect(shouldTriggerFanout(def, "spawning", "spawn")).toBeTruthy();
   });
 });
 
@@ -779,6 +782,13 @@ describe("AI-1992 two-phase synthetic def — end to end", () => {
 
     const barrierStates = def!.states.filter((s) => s.barrier).map((s) => s.id).sort();
     expect(barrierStates).toEqual(["managing-arm", "managing-impl"]);
+
+    // Fail-first: both fanout states must be engine-actionable (config-driven
+    // trigger), not merely carried through by js-yaml. Barrier states must not
+    // themselves fan out.
+    expect(shouldTriggerFanout(def!, "arming", "spawn")).toBeTruthy();
+    expect(shouldTriggerFanout(def!, "impl", "spawn")).toBeTruthy();
+    expect(shouldTriggerFanout(def!, "managing-arm", "complete")).toBeFalsy();
   });
 
   it("AC4 phase 1 (spawn): arming fans out children with the wf:sprint-arm child workflow", async () => {
