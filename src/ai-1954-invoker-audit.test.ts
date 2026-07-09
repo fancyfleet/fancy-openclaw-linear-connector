@@ -181,6 +181,31 @@ function makeAdminMutationFetch(opts: {
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
+    // AI-1762 verified read-after-write: setStateAtomic reads the issue back to
+    // confirm the write persisted (state label + native state). Reflect the
+    // post-write (consistency) labels and the native state the target resolves to.
+    if (query.includes("VerifyTransitionWrite")) {
+      const nativeByState: Record<string, string> = {
+        "state:intake": "state-todo-uuid",
+        "state:implementation": "state-todo-uuid",
+        "state:done": "state-done-uuid",
+        "state:escape": "state-invalid-uuid",
+      };
+      const stateLabel = consistencyLabels.find((l) => l.startsWith("state:"));
+      const nativeId = stateLabel ? nativeByState[stateLabel] ?? null : null;
+      return new Response(
+        JSON.stringify({
+          data: {
+            issue: {
+              labels: { nodes: consistencyLabels.map((name) => ({ name })) },
+              delegate: null,
+              state: nativeId ? { id: nativeId } : null,
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
     if (query.includes("commentCreate")) {
       // Capture the body text for AC2 assertions.
       const vars = parsed.variables as { input?: { body?: string } } | undefined;
