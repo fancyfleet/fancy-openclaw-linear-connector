@@ -36,6 +36,16 @@ process.env.WORKFLOW_DEFS_DIR = "";
 process.env.OPENCLAW_HOOKS_URL = "";
 process.env.OPENCLAW_HOOKS_TOKEN = "";
 
+// AI-1998: the version floor now rejects workflow mutations whose CLI omits the
+// X-Openclaw-Linear-Cli-Version header (fail-closed) by default. Most fixtures
+// in this suite predate that header and exercise OTHER enforcement dimensions
+// (delegate guards, break-glass, meta-intents), so they omit it. Grant them the
+// opt-in grace period here so a missing header is not the thing under test.
+// The dedicated version-floor tests toggle this explicitly (delete it to assert
+// the fail-closed default; set it to assert the grace path). Production `.env`
+// leaves it unset → fail-closed, which is the shipped posture.
+process.env.PROXY_ALLOW_MISSING_CLI_VERSION = "1";
+
 // A live token in the container/shell env changes linear-actionable behavior
 // (previously worked around with `env -u LINEAR_OAUTH_TOKEN npm test`).
 // Deleted rather than blanked — those tests distinguish unset from empty —

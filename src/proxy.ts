@@ -79,6 +79,20 @@ function minWorkflowCliVersion(): string {
   return process.env.PROXY_MIN_CLI_VERSION ?? "0.3.0";
 }
 
+/**
+ * AI-1998: whether to allow a workflow mutation from a CLI that omits the
+ * `x-openclaw-linear-cli-version` header entirely. A CLI old enough to omit the
+ * header bypasses the version floor (it can never be compared against it), which
+ * is the same silent-corruption class the floor (AI-1397/AI-1997) exists to
+ * prevent — just via a different entry condition. Default is to reject
+ * (fail-closed). Set PROXY_ALLOW_MISSING_CLI_VERSION=1 to open a grace period
+ * for any un-headered client (then the proxy only warns and proceeds).
+ */
+function allowMissingCliVersion(): boolean {
+  const v = process.env.PROXY_ALLOW_MISSING_CLI_VERSION;
+  return v === "1" || v === "true";
+}
+
 /** Parse a semver string into [major, minor, patch] tuple, or null on failure. */
 function parseSemver(v: string): [number, number, number] | null {
   const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(v.trim());
@@ -424,8 +438,19 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         res.status(200).json({ errors: [{ message: msg }] });
         return;
       }
+    } else if (allowMissingCliVersion()) {
+      // Grace period explicitly opted into via PROXY_ALLOW_MISSING_CLI_VERSION.
+      log.warn(`version-header-missing agent=${agentId} intent=${intent}${ticketCtx} — proceeding (PROXY_ALLOW_MISSING_CLI_VERSION set); update CLI to emit X-Openclaw-Linear-Cli-Version`);
     } else {
-      log.warn(`version-header-missing agent=${agentId} intent=${intent}${ticketCtx} — update CLI to emit X-Openclaw-Linear-Cli-Version`);
+      // AI-1998: a CLI old enough to omit the version header bypasses the floor
+      // entirely — the exact silent-corruption class AC3 (AI-1997) set out to
+      // eliminate, via a different entry condition. Treat a missing header as
+      // below-floor and reject (loud) by default.
+      const minVer = minWorkflowCliVersion();
+      const msg = `[Proxy] CLI version header (X-Openclaw-Linear-Cli-Version) is missing; the minimum required is ${minVer}. Update fancy-openclaw-linear-skill-cli to a version that sends the header to proceed.`;
+      log.warn(`version-header-missing-block agent=${agentId} intent=${intent}${ticketCtx}: rejecting — no version header, floor ${minVer}`);
+      res.status(200).json({ errors: [{ message: msg }] });
+      return;
     }
 
     // G-16/AI-1548: per-ticket command serialisation.
