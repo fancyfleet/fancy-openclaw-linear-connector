@@ -61,14 +61,21 @@ const _store = new Map<string, AcRecord>();
 /** Whether the initial load from disk has been attempted. */
 let _loaded = false;
 
+/** The path from which _store was last loaded — invalidated when the path changes. */
+let _loadedFromPath: string | null = null;
+
 /**
- * Load persisted AC records from disk. Idempotent — only loads once.
+ * Load persisted AC records from disk. Idempotent — only loads once per path.
+ * Re-loads automatically when AC_RECORDS_PATH changes (test isolation).
  * Fail-open: if the file doesn't exist or is corrupt, we start with an empty store
  * and log a warning.
  */
 async function ensureLoaded(): Promise<void> {
-  if (_loaded) return;
+  const currentPath = acRecordsPath();
+  if (_loaded && _loadedFromPath === currentPath) return;
+  _store.clear();
   _loaded = true;
+  _loadedFromPath = currentPath;
   try {
     const raw = await fs.readFile(acRecordsPath(), "utf8");
     const data = JSON.parse(raw) as Record<string, AcRecord>;
@@ -155,6 +162,7 @@ export async function removeAcRecord(ticketId: string): Promise<boolean> {
 export function clearAcRecordStore(): void {
   _store.clear();
   _loaded = false;
+  _loadedFromPath = null;
 }
 
 /**

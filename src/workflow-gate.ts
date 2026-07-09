@@ -289,7 +289,7 @@ export async function loadWorkflowDefById(workflowId: string): Promise<WorkflowD
 export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> {
   if (_registryCache) return _registryCache;
   const registry = new Map<string, WorkflowDef>();
-  const dir = process.env.WORKFLOW_DEFS_DIR;
+  const dir = process.env.WORKFLOW_DEFS_DIR || process.env.WORKFLOW_DEF_DIR || undefined;
 
   // AC3 (AI-1914): the state ids active in the previous version of each def,
   // persisted to disk so this check survives a restart (where _registryCache is
@@ -3548,6 +3548,8 @@ export interface SetStateAtomicResult {
   error?: string;
   /** Body name that received the re-dispatch after the state write, if any. */
   redispatched?: string;
+  /** Linear internal UUID of the issue (set on success). AI-1954 attribution. */
+  internalId?: string;
 }
 
 export interface SetStateAtomicOptions {
@@ -3559,6 +3561,12 @@ export interface SetStateAtomicOptions {
   sendWakeUp?: (agentId: string, ticketId: string) => Promise<void>;
   /** AI-1762: operational-event sink for transition-write-failed events. */
   operationalEventStore?: OperationalEventStore;
+  /**
+   * AI-1954 AC3: allow forcing terminal set-state from an active (non-terminal)
+   * workflow state. Without this flag such transitions are refused with an
+   * explanatory error.
+   */
+  force?: boolean;
 }
 
 /**
@@ -3607,6 +3615,23 @@ export async function setStateAtomic(
     if (!stateNode) {
       const valid = def.states.map((s) => s.id).join(", ");
       return fail(`unknown target state '${targetState}' in workflow '${workflowId}'; valid: ${valid}`, fromState);
+    }
+  }
+
+  // AI-1954 AC3: terminal set-state from a non-terminal (active) workflow state
+  // requires an explicit force:true flag to prevent accidental closure.
+  if (def && !options?.force) {
+    const targetStateNode = def.states.find((s) => s.id === targetState);
+    const fromStateNode = fromState ? def.states.find((s) => s.id === fromState) : null;
+    if (
+      targetStateNode?.kind === "terminal" &&
+      fromStateNode &&
+      fromStateNode.kind !== "terminal"
+    ) {
+      return fail(
+        `set-state to terminal state '${targetState}' from active workflow state '${fromState}' requires force:true`,
+        fromState,
+      );
     }
   }
 
@@ -3709,7 +3734,7 @@ export async function setStateAtomic(
     }
   }
 
-  return { ok: true, ticketId: ticketIdentifier, from: fromState, to: targetState, ...(redispatched ? { redispatched } : {}) };
+  return { ok: true, ticketId: ticketIdentifier, from: fromState, to: targetState, internalId: issue.internalId, ...(redispatched ? { redispatched } : {}) };
 }
 
 /**
