@@ -98,6 +98,8 @@ export interface MetricRow {
   count: number;
   fromBody?: string;
   exceedsThreshold: boolean;
+  /** Distinct tickets contributing to this group, sorted ascending. */
+  tickets: string[];
 }
 
 /** Summary statistics for the metric rollup. */
@@ -283,71 +285,21 @@ export class ObservationStore {
     reasonCode: string;
     count: number;
   }> {
-    const clauses: string[] = [];
-    const params: unknown[] = [];
-
-    if (query.workflow) {
-      clauses.push("workflow = ?");
-      params.push(query.workflow);
-    }
-    if (query.step) {
-      clauses.push("step = ?");
-      params.push(query.step);
-    }
-    if (query.reasonCode) {
-      clauses.push("reason_code = ?");
-      params.push(query.reasonCode);
-    }
-    if (query.since) {
-      clauses.push("created_at >= ?");
-      params.push(query.since);
-    }
-    if (query.until) {
-      clauses.push("created_at <= ?");
-      params.push(query.until);
-    }
-
-    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
-
-    const rows = this.db
-      .prepare(
-        `SELECT workflow, step, reason_code, COUNT(*) as cnt
-         FROM observations ${where}
-         GROUP BY workflow, step, reason_code
-         ORDER BY cnt DESC`,
-      )
-      .all(...params) as Array<{
-      workflow: string;
-      step: string;
-      reason_code: string;
-      cnt: number;
-    }>;
-
-    return rows.map((r) => ({
-      workflow: r.workflow,
-      step: r.step,
-      reasonCode: r.reason_code,
-      count: r.cnt,
-    }));
+    return this.groupedCounts(query).map(({ tickets: _tickets, ...row }) => row);
   }
 
   /**
-   * Count observations grouped by (workflow, step, reason_code, from_body).
-   * The P4-2 "macro" layer — where a step everyone fails becomes visible.
-   * Optionally includes a body dimension for per-implementer breakdowns.
+   * `counts()` plus the distinct tickets behind each group. Private: the ticket
+   * ids reach consumers through `metrics()` (AI-2037 AC2.1). Widening `counts()`
+   * itself would add an unrequested field to the admin counts endpoint, whose
+   * response shape other callers assert on exactly.
    */
-  countsByBody(query: {
-    workflow?: string;
-    step?: string;
-    reasonCode?: ReasonCode;
-    since?: string;
-    until?: string;
-  } = {}): Array<{
+  private groupedCounts(query: { workflow?: string; step?: string; reasonCode?: ReasonCode; since?: string; until?: string } = {}): Array<{
     workflow: string;
     step: string;
     reasonCode: string;
-    fromBody: string;
     count: number;
+    tickets: string[];
   }> {
     const clauses: string[] = [];
     const params: unknown[] = [];
@@ -377,7 +329,95 @@ export class ObservationStore {
 
     const rows = this.db
       .prepare(
-        `SELECT workflow, step, reason_code, from_body, COUNT(*) as cnt
+        `SELECT workflow, step, reason_code, COUNT(*) as cnt,
+                GROUP_CONCAT(DISTINCT ticket) as tickets
+         FROM observations ${where}
+         GROUP BY workflow, step, reason_code
+         ORDER BY cnt DESC`,
+      )
+      .all(...params) as Array<{
+      workflow: string;
+      step: string;
+      reason_code: string;
+      cnt: number;
+      tickets: string | null;
+    }>;
+
+    return rows.map((r) => ({
+      workflow: r.workflow,
+      step: r.step,
+      reasonCode: r.reason_code,
+      count: r.cnt,
+      tickets: splitTickets(r.tickets),
+    }));
+  }
+
+  /**
+   * Count observations grouped by (workflow, step, reason_code, from_body).
+   * The P4-2 "macro" layer — where a step everyone fails becomes visible.
+   * Optionally includes a body dimension for per-implementer breakdowns.
+   */
+  countsByBody(query: {
+    workflow?: string;
+    step?: string;
+    reasonCode?: ReasonCode;
+    since?: string;
+    until?: string;
+  } = {}): Array<{
+    workflow: string;
+    step: string;
+    reasonCode: string;
+    fromBody: string;
+    count: number;
+  }> {
+    return this.groupedCountsByBody(query).map(({ tickets: _tickets, ...row }) => row);
+  }
+
+  /** `countsByBody()` plus the distinct tickets behind each group. See `groupedCounts`. */
+  private groupedCountsByBody(query: {
+    workflow?: string;
+    step?: string;
+    reasonCode?: ReasonCode;
+    since?: string;
+    until?: string;
+  } = {}): Array<{
+    workflow: string;
+    step: string;
+    reasonCode: string;
+    fromBody: string;
+    count: number;
+    tickets: string[];
+  }> {
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+
+    if (query.workflow) {
+      clauses.push("workflow = ?");
+      params.push(query.workflow);
+    }
+    if (query.step) {
+      clauses.push("step = ?");
+      params.push(query.step);
+    }
+    if (query.reasonCode) {
+      clauses.push("reason_code = ?");
+      params.push(query.reasonCode);
+    }
+    if (query.since) {
+      clauses.push("created_at >= ?");
+      params.push(query.since);
+    }
+    if (query.until) {
+      clauses.push("created_at <= ?");
+      params.push(query.until);
+    }
+
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+
+    const rows = this.db
+      .prepare(
+        `SELECT workflow, step, reason_code, from_body, COUNT(*) as cnt,
+                GROUP_CONCAT(DISTINCT ticket) as tickets
          FROM observations ${where}
          GROUP BY workflow, step, reason_code, from_body
          ORDER BY cnt DESC`,
@@ -388,6 +428,7 @@ export class ObservationStore {
       reason_code: string;
       from_body: string;
       cnt: number;
+      tickets: string | null;
     }>;
 
     return rows.map((r) => ({
@@ -396,6 +437,7 @@ export class ObservationStore {
       reasonCode: r.reason_code,
       fromBody: r.from_body,
       count: r.cnt,
+      tickets: splitTickets(r.tickets),
     }));
   }
 
@@ -417,8 +459,8 @@ export class ObservationStore {
   } = {}): MetricRollup {
     const threshold = query.threshold;
     const countsData = query.includeBody
-      ? this.countsByBody(query)
-      : this.counts(query);
+      ? this.groupedCountsByBody(query)
+      : this.groupedCounts(query);
 
     const items: MetricRow[] = countsData.map((row) => ({
       workflow: row.workflow,
@@ -428,6 +470,7 @@ export class ObservationStore {
       ...("fromBody" in row ? { fromBody: (row as { fromBody: string }).fromBody } : {}),
       exceedsThreshold:
         threshold !== undefined && row.count >= threshold,
+      tickets: row.tickets,
     }));
 
     // Compute totals per workflow+step for summary
@@ -457,6 +500,12 @@ export class ObservationStore {
   close(): void {
     this.db.close();
   }
+}
+
+/** GROUP_CONCAT emits a comma-joined string, or NULL for an empty group. */
+function splitTickets(concatenated: string | null): string[] {
+  if (!concatenated) return [];
+  return concatenated.split(",").filter((t) => t.length > 0).sort();
 }
 
 function rowToObservation(row: Record<string, unknown>): Observation {

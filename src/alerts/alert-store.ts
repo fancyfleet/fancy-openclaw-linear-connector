@@ -46,6 +46,17 @@ export interface AlertQuery {
   limit?: number;
 }
 
+/** AI-2037 / AC2.3: a dead-letter cluster, keyed on (source, dedupKey, agent). */
+export interface AlertCluster {
+  source: string;
+  dedupKey: string;
+  agent: string | null;
+  count: number;
+  exceedsThreshold: boolean;
+  firstAt: string;
+  lastAt: string;
+}
+
 export interface RecordResult {
   row: AlertRow;
   /** True when this occurrence was folded into an existing burst row. */
@@ -209,6 +220,45 @@ export class AlertStore {
       .prepare(`SELECT * FROM alerts ${where} ORDER BY last_at DESC LIMIT ${limit}`)
       .all(...params) as Record<string, unknown>[];
     return rows.map(rowToAlert);
+  }
+
+  /**
+   * AI-2037 / AC2.3: cluster dead-letter rows by (source, dedup_key, agent).
+   *
+   * A single dedup identity can span several rows: each burst outside the
+   * suppression window inserts a new row carrying its own `count`. The cluster
+   * count is therefore SUM(count) across those rows, not COUNT(*) of them.
+   */
+  clusters(q: { since?: string; until?: string; threshold?: number; limit?: number } = {}): AlertCluster[] {
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    if (q.since) { clauses.push("last_at >= ?"); params.push(q.since); }
+    if (q.until) { clauses.push("last_at <= ?"); params.push(q.until); }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+
+    const rows = this.db
+      .prepare(
+        `SELECT source, dedup_key, agent,
+                SUM(count) AS total,
+                MIN(first_at) AS first_at,
+                MAX(last_at)  AS last_at
+         FROM alerts ${where}
+         GROUP BY source, dedup_key, agent
+         ORDER BY total DESC`
+      )
+      .all(...params) as Array<{ source: string; dedup_key: string; agent: string | null; total: number; first_at: string; last_at: string }>;
+
+    const threshold = q.threshold;
+    const clusters = rows.map((r) => ({
+      source: r.source,
+      dedupKey: r.dedup_key,
+      agent: r.agent ?? null,
+      count: Number(r.total),
+      exceedsThreshold: threshold !== undefined && Number(r.total) >= threshold,
+      firstAt: r.first_at,
+      lastAt: r.last_at,
+    }));
+    return q.limit !== undefined && q.limit > 0 ? clusters.slice(0, q.limit) : clusters;
   }
 
   close(): void {

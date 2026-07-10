@@ -28,6 +28,38 @@ export interface OperationalEvent extends Omit<Required<OperationalEventInput>, 
 export interface OperationalEventQuery { agent?: string; key?: string; outcome?: OperationalEventOutcome; type?: string; since?: string; until?: string; limit?: number; }
 export interface OperationalSnapshot { key?: string; agent?: string; lastSuccess?: OperationalEvent; lastError?: OperationalEvent; lifecycle: OperationalEvent[]; }
 
+/**
+ * AI-2037 / AC2.2: outcomes that never form a failure cluster.
+ *
+ * `signature-rejected` and `duplicate` are transport-level rejections, not
+ * workflow failures; clustering them drowns the real signal. `dropped-stale`
+ * and `suppressed-duplicate` are stale-digest noise emitted by connector bugs
+ * since fixed (webhook/index.ts) — the AC calls for it to be filtered, not
+ * clustered.
+ */
+export const NON_CLUSTERING_OUTCOMES: readonly OperationalEventOutcome[] = [
+  "signature-rejected",
+  "duplicate",
+  "dropped-stale",
+  "suppressed-duplicate",
+] as const;
+
+/** AI-2037: an operational failure cluster, keyed on forward-only enrichment columns. */
+export interface OperationalEventCluster {
+  workflowState: string;
+  plane: string;
+  outcome: OperationalEventOutcome;
+  count: number;
+  exceedsThreshold: boolean;
+  wakeIds: string[];
+}
+
+export interface OperationalEventClusterResult {
+  clusters: OperationalEventCluster[];
+  /** Rows dropped for lacking enrichment columns — reported, not silently discarded. */
+  excludedPreEnrichmentRows: number;
+}
+
 function parseEnvInt(name: string, defaultVal: number): number {
   const raw = process.env[name];
   const parsed = raw !== undefined ? parseInt(raw, 10) : NaN;
@@ -224,5 +256,71 @@ export class OperationalEventStore {
       .prepare(`SELECT id, occurred_at, outcome, event_type, agent, subject_key, delivery_mode, attempt_count, run_id, session_key, error_summary, detail_json, workflow_state, plane, wake_id FROM operational_events WHERE wake_id = ? ORDER BY occurred_at ASC, id ASC`)
       .all(wakeId) as Record<string, unknown>[];
     return rows.map(rowToEvent);
+  }
+
+  /**
+   * AI-2037 / AC2.2 + AC2.5: cluster operational failures by
+   * (workflow_state, plane, outcome).
+   *
+   * Two filters run before grouping, and both are load-bearing:
+   *
+   *  - NON_CLUSTERING_OUTCOMES are dropped (AC2.2).
+   *  - Rows missing the AI-1799 enrichment columns are dropped (AC2.5). Those
+   *    columns are forward-only, so a NULL workflow_state means "written before
+   *    the columns existed", not "no workflow state". Counting such a row would
+   *    assert something about history this data cannot support.
+   *
+   * The enrichment filter silently shrinks counts, which is indistinguishable
+   * from a real drop in failures — so the number of rows it removed is returned
+   * alongside the clusters rather than discarded.
+   */
+  clusters(query: { since?: string; until?: string; threshold?: number; limit?: number } = {}): OperationalEventClusterResult {
+    const excludedPlaceholders = NON_CLUSTERING_OUTCOMES.map(() => "?").join(", ");
+
+    const clusterClauses = [
+      "workflow_state IS NOT NULL",
+      "plane IS NOT NULL",
+      `outcome NOT IN (${excludedPlaceholders})`,
+    ];
+    const clusterParams: unknown[] = [...NON_CLUSTERING_OUTCOMES];
+    if (query.since) { clusterClauses.push("occurred_at >= ?"); clusterParams.push(query.since); }
+    if (query.until) { clusterClauses.push("occurred_at <= ?"); clusterParams.push(query.until); }
+
+    const rows = this.db
+      .prepare(
+        `SELECT workflow_state, plane, outcome, COUNT(*) AS cnt,
+                GROUP_CONCAT(DISTINCT wake_id) AS wake_ids
+         FROM operational_events
+         WHERE ${clusterClauses.join(" AND ")}
+         GROUP BY workflow_state, plane, outcome
+         ORDER BY cnt DESC`,
+      )
+      .all(...clusterParams) as Array<{ workflow_state: string; plane: string; outcome: string; cnt: number; wake_ids: string | null }>;
+
+    // Rows that survive the outcome filter but predate enrichment: the
+    // population this endpoint declines to make any claim about.
+    const excludedClauses = [
+      "(workflow_state IS NULL OR plane IS NULL)",
+      `outcome NOT IN (${excludedPlaceholders})`,
+    ];
+    const excludedParams: unknown[] = [...NON_CLUSTERING_OUTCOMES];
+    if (query.since) { excludedClauses.push("occurred_at >= ?"); excludedParams.push(query.since); }
+    if (query.until) { excludedClauses.push("occurred_at <= ?"); excludedParams.push(query.until); }
+    const { cnt: excludedPreEnrichmentRows } = this.db
+      .prepare(`SELECT COUNT(*) AS cnt FROM operational_events WHERE ${excludedClauses.join(" AND ")}`)
+      .get(...excludedParams) as { cnt: number };
+
+    const threshold = query.threshold;
+    let clusters: OperationalEventCluster[] = rows.map((r) => ({
+      workflowState: r.workflow_state,
+      plane: r.plane,
+      outcome: r.outcome as OperationalEventOutcome,
+      count: r.cnt,
+      exceedsThreshold: threshold !== undefined && r.cnt >= threshold,
+      wakeIds: r.wake_ids ? r.wake_ids.split(",").filter((w) => w.length > 0).sort() : [],
+    }));
+    if (query.limit !== undefined && query.limit > 0) clusters = clusters.slice(0, query.limit);
+
+    return { clusters, excludedPreEnrichmentRows };
   }
 }

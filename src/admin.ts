@@ -13,7 +13,7 @@ import type { RouteResult } from "./types.js";
 import type { LinearEvent } from "./webhook/schema.js";
 import type { OperationalEventStore, OperationalEventOutcome } from "./store/operational-event-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
-import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
+import type { ObservationStore, ReasonCode, MetricSummary } from "./store/observation-store.js";
 import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forensics.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
 import { setStateAtomic, loadWorkflowRegistry } from "./workflow-gate.js";
@@ -61,6 +61,14 @@ interface AdminDeps {
 }
 
 type Severity = "green" | "yellow" | "red" | "gray";
+
+/** AI-2037: the three stores the triage endpoint can cluster over. */
+const TRIAGE_CLUSTER_KINDS = ["observations", "operational-events", "alerts"] as const;
+type TriageClusterKind = (typeof TRIAGE_CLUSTER_KINDS)[number];
+
+function emptyObservationSummary(): MetricSummary {
+  return { totalObservations: 0, uniqueWorkflows: 0, uniqueSteps: 0, stepsAboveThreshold: [] };
+}
 
 interface AttentionItem {
   severity: Exclude<Severity, "green">;
@@ -1017,6 +1025,79 @@ export function createAdminRouter(deps: AdminDeps): Router {
       includeBody: req.query.includeBody === "true",
       threshold,
     }));
+  });
+  // Phase 4 / P4-C2 (AI-2037): triage failure clustering.
+  //
+  // One endpoint, three sources, discriminated by `kind`. Every cluster is
+  // computed live from the stores on each request — there is no precomputed
+  // snapshot, so a row written a millisecond ago shows up (AC2.4). The
+  // exclusion and enrichment rules that AC2.2/AC2.5 depend on live in the
+  // stores, not here, so any other caller of clusters() inherits them.
+  router.get("/api/triage/clusters", (req: Request, res: Response) => {
+    const kindRaw = typeof req.query.kind === "string" ? req.query.kind : "observations";
+    if (!TRIAGE_CLUSTER_KINDS.includes(kindRaw as TriageClusterKind)) {
+      res.status(400).json({ error: `unknown kind: ${kindRaw}`, validKinds: TRIAGE_CLUSTER_KINDS });
+      return;
+    }
+    const kind = kindRaw as TriageClusterKind;
+
+    const thresholdParam = typeof req.query.threshold === "string" ? Number.parseInt(req.query.threshold, 10) : undefined;
+    const threshold = Number.isFinite(thresholdParam ?? NaN) && (thresholdParam ?? 0) > 0 ? thresholdParam : undefined;
+    const limitParam = typeof req.query.limit === "string" ? Number.parseInt(req.query.limit, 10) : undefined;
+    const limit = Number.isFinite(limitParam ?? NaN) && (limitParam ?? 0) > 0 ? limitParam : undefined;
+    const since = typeof req.query.since === "string" ? req.query.since : undefined;
+    const until = typeof req.query.until === "string" ? req.query.until : undefined;
+    const query = { kind, threshold, since, until, limit };
+
+    if (kind === "observations") {
+      if (!deps.observationStore) {
+        res.json({ kind, clusters: [], summary: emptyObservationSummary(), query });
+        return;
+      }
+      const rollup = deps.observationStore.metrics({ since, until, threshold });
+      const clusters = limit !== undefined ? rollup.items.slice(0, limit) : rollup.items;
+      res.json({ kind, clusters, summary: rollup.summary, query });
+      return;
+    }
+
+    if (kind === "operational-events") {
+      if (!deps.operationalEventStore) {
+        res.json({ kind, clusters: [], summary: { totalEvents: 0, uniqueWorkflowStates: 0, uniqueOutcomes: 0 }, excludedPreEnrichmentRows: 0, query });
+        return;
+      }
+      const { clusters, excludedPreEnrichmentRows } = deps.operationalEventStore.clusters({ since, until, threshold, limit });
+      res.json({
+        kind,
+        clusters,
+        summary: {
+          totalEvents: clusters.reduce((sum, c) => sum + c.count, 0),
+          uniqueWorkflowStates: new Set(clusters.map((c) => c.workflowState)).size,
+          uniqueOutcomes: new Set(clusters.map((c) => c.outcome)).size,
+        },
+        // Surfaced at top level: a caller comparing cluster totals over time
+        // needs to see the rows this endpoint refuses to speak for (AC2.5).
+        excludedPreEnrichmentRows,
+        query,
+      });
+      return;
+    }
+
+    const alertStore = getAlertBus().getStore();
+    if (!alertStore) {
+      res.json({ kind, clusters: [], summary: { totalAlerts: 0, uniqueSources: 0, uniqueAgents: 0 }, query });
+      return;
+    }
+    const clusters = alertStore.clusters({ since, until, threshold, limit });
+    res.json({
+      kind,
+      clusters,
+      summary: {
+        totalAlerts: clusters.reduce((sum, c) => sum + c.count, 0),
+        uniqueSources: new Set(clusters.map((c) => c.source)).size,
+        uniqueAgents: new Set(clusters.map((c) => c.agent).filter((a) => a !== null)).size,
+      },
+      query,
+    });
   });
   // AI-1546 / G-6: Steward/human-only atomic set-state.
   // All admin API routes are protected by adminAuth (ADMIN_SECRET or console session).
