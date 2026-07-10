@@ -284,6 +284,21 @@ export class ObservationStore {
     step: string;
     reasonCode: string;
     count: number;
+  }> {
+    return this.groupedCounts(query).map(({ tickets: _tickets, ...row }) => row);
+  }
+
+  /**
+   * `counts()` plus the distinct tickets behind each group. Private: the ticket
+   * ids reach consumers through `metrics()` (AI-2037 AC2.1). Widening `counts()`
+   * itself would add an unrequested field to the admin counts endpoint, whose
+   * response shape other callers assert on exactly.
+   */
+  private groupedCounts(query: { workflow?: string; step?: string; reasonCode?: ReasonCode; since?: string; until?: string } = {}): Array<{
+    workflow: string;
+    step: string;
+    reasonCode: string;
+    count: number;
     tickets: string[];
   }> {
     const clauses: string[] = [];
@@ -343,6 +358,23 @@ export class ObservationStore {
    * Optionally includes a body dimension for per-implementer breakdowns.
    */
   countsByBody(query: {
+    workflow?: string;
+    step?: string;
+    reasonCode?: ReasonCode;
+    since?: string;
+    until?: string;
+  } = {}): Array<{
+    workflow: string;
+    step: string;
+    reasonCode: string;
+    fromBody: string;
+    count: number;
+  }> {
+    return this.groupedCountsByBody(query).map(({ tickets: _tickets, ...row }) => row);
+  }
+
+  /** `countsByBody()` plus the distinct tickets behind each group. See `groupedCounts`. */
+  private groupedCountsByBody(query: {
     workflow?: string;
     step?: string;
     reasonCode?: ReasonCode;
@@ -427,8 +459,8 @@ export class ObservationStore {
   } = {}): MetricRollup {
     const threshold = query.threshold;
     const countsData = query.includeBody
-      ? this.countsByBody(query)
-      : this.counts(query);
+      ? this.groupedCountsByBody(query)
+      : this.groupedCounts(query);
 
     const items: MetricRow[] = countsData.map((row) => ({
       workflow: row.workflow,
