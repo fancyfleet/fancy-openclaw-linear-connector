@@ -453,14 +453,25 @@ export function ProposalsPage({ proposals, now, onApprove, onReject, onRevise, o
    * their action immediately (AC5.4). Tab membership deliberately still keys off the
    * *prop* status: re-partitioning on an unconfirmed action would yank the card out
    * from under the cursor. The card settles into History when fresh props arrive.
+   *
+   * `base` is the server status the guess was made against. The guess only stands
+   * while the server still reports it; the moment the server moves the proposal
+   * anywhere (applied, apply-failed, …) the real status wins. Without this the
+   * overlay would shadow `status` forever, and the operator who approved would be
+   * the one operator who never sees the apply fail or gets the retry button.
    */
-  const [optimisticStatus, setOptimisticStatus] = useState<Record<string, ProposalStatus>>({});
+  const [optimisticStatus, setOptimisticStatus] = useState<
+    Record<string, { guess: ProposalStatus; base: ProposalStatus }>
+  >({});
 
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
   const effectiveStatus = useCallback(
-    (p: Proposal): ProposalStatus => optimisticStatus[p.id] ?? p.status,
+    (p: Proposal): ProposalStatus => {
+      const entry = optimisticStatus[p.id];
+      return entry && entry.base === p.status ? entry.guess : p.status;
+    },
     [optimisticStatus],
   );
 
@@ -525,7 +536,7 @@ export function ProposalsPage({ proposals, now, onApprove, onReject, onRevise, o
 
   function confirmApprove() {
     if (!selected) return;
-    setOptimisticStatus((prev) => ({ ...prev, [selected.id]: "approved" }));
+    setOptimisticStatus((prev) => ({ ...prev, [selected.id]: { guess: "approved", base: selected.status } }));
     setToast(`Proposal approved — applying “${selected.title}”.`);
     onApprove(selected.id);
     closeModal();
@@ -533,7 +544,7 @@ export function ProposalsPage({ proposals, now, onApprove, onReject, onRevise, o
 
   function submitReject(reason: string) {
     if (!selected) return;
-    setOptimisticStatus((prev) => ({ ...prev, [selected.id]: "rejected" }));
+    setOptimisticStatus((prev) => ({ ...prev, [selected.id]: { guess: "rejected", base: selected.status } }));
     setToast("Proposal rejected.");
     onReject(selected.id, reason);
     closeModal();
@@ -541,7 +552,7 @@ export function ProposalsPage({ proposals, now, onApprove, onReject, onRevise, o
 
   function submitRevise(feedback: string) {
     if (!selected) return;
-    setOptimisticStatus((prev) => ({ ...prev, [selected.id]: "in-revision" }));
+    setOptimisticStatus((prev) => ({ ...prev, [selected.id]: { guess: "in-revision", base: selected.status } }));
     setToast("Revision requested.");
     onRevise(selected.id, feedback);
     closeModal();
