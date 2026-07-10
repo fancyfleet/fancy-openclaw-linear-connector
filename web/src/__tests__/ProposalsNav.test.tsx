@@ -49,19 +49,59 @@ function mockApi(pendingCount: number) {
     revisions: [],
   }));
 
+  // While /proposals is unrouted, App's `path="*"` fallback redirects to OverviewPage,
+  // which polls /dashboard, /structure and /alerts and dereferences each payload without
+  // guarding (`d.status.severity`, `s.workflows.map`). A single catch-all body therefore
+  // throws an uncaught TypeError that vitest reports as an unhandled error — which fails
+  // the run and, per vitest's own warning, can produce false positives regardless of the
+  // assertions below. Route per endpoint so the redirect renders cleanly and these tests
+  // fail only for the reason they are meant to: the Proposals route/nav entry is missing.
+  const bodyFor = (url: string): unknown => {
+    if (url.includes("/me")) return { authenticated: true, secretConfigured: true };
+    if (url.includes("proposal")) return { proposals };
+    if (url.includes("/structure")) {
+      return {
+        configHealth: { healthy: true },
+        workflows: [],
+        workflowError: null,
+        registryPolicy: { lastCheck: null, violations: [], notes: [] },
+      };
+    }
+    if (url.includes("/alerts")) return { alerts: [] };
+    if (url.includes("/dashboard")) {
+      return {
+        generatedAt: new Date(0).toISOString(),
+        deployment: "test",
+        attention: [],
+        status: {
+          service: "connector",
+          severity: "green",
+          agentsConfigured: 0,
+          activeSessions: 0,
+          pendingBagSize: 0,
+          eventsReceived: 0,
+          signalsSent: 0,
+        },
+        agents: [],
+        tasks: [],
+        events: [],
+        settings: {
+          effectiveConfig: {},
+          workspaceTeamMappings: [],
+          agentMappings: [],
+          oauthSetup: [],
+          restartRequiredFlags: [],
+        },
+      };
+    }
+    return {};
+  };
+
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL) => {
-      const url = String(input);
-      const json = url.includes("/me")
-        ? { authenticated: true, secretConfigured: true }
-        : url.includes("proposal")
-          ? { proposals }
-          // Enough shape for the other console pages to render without throwing, so a
-          // missing /proposals route fails this file's assertions rather than crashing
-          // inside whatever page the "*" fallback redirects to.
-          : { attention: [], alerts: [], agents: [], webhooks: [] };
-      return new Response(JSON.stringify(json), { status: 200, headers: { "Content-Type": "application/json" } });
+      const body = JSON.stringify(bodyFor(String(input)));
+      return new Response(body, { status: 200, headers: { "Content-Type": "application/json" } });
     }),
   );
 
