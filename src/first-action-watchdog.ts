@@ -34,6 +34,7 @@ import {
   markFirstActionWatchdogScheduled,
   getFirstActionLadder,
   upsertFirstActionLadder,
+  deleteFirstActionLadder,
   type FirstActionLadder,
   type LadderHistoryEntry,
 } from "./first-action-watchdog-state.js";
@@ -86,9 +87,19 @@ export interface UnreachableAlert {
   ticket: string;
   state: string;
   delegate: string;
+  /** Real escalation rungs fired before exhaustion (≤ maxRungs) — use this in
+   *  alert copy, NOT history.length (history also logs the exhaustion entry). */
+  rungsFired: number;
   history: LadderHistoryEntry[];
   [key: string]: unknown;
 }
+
+/** Verdict of the on-breach cross-check against authoritative Linear state.
+ *  "stale" means the caller found the mirror row wrong (ticket done / deleted /
+ *  demoted / state-corrected) and healed it — the ladder must be dropped
+ *  without firing a rung. "unknown" (Linear unreachable) fails open to normal
+ *  ladder behavior. */
+export type CrossCheckVerdict = "live" | "stale" | "unknown";
 
 export interface ReroutePayload {
   ticket: string;
@@ -119,6 +130,11 @@ export interface FirstActionWatchdogOptions {
   }) => Promise<void>;
   /** Rung 3 — optional re-route to a fallback body. */
   reroute?: (payload: ReroutePayload) => Promise<void>;
+  /** On-breach cross-check against authoritative Linear state. The caller is
+   *  responsible for healing the mirror row when it returns "stale". Only
+   *  invoked for breached tickets, so the Linear read cost stays proportional
+   *  to actual stalls. */
+  crossCheck?: (ticket: WatchdogTicket) => Promise<CrossCheckVerdict>;
   /** Present only so the sweep can assert it NEVER auto-transitions. */
   transition?: (payload: unknown) => Promise<void>;
   cadenceMs?: number;
@@ -131,6 +147,9 @@ export interface WatchdogSweepResult {
   redispatched: number;
   unreachable: number;
   reroutes: number;
+  /** Breached tickets whose mirror row turned out stale (done/deleted/demoted
+   *  in Linear) — healed by the cross-check and dropped without alerting. */
+  staleCleared: number;
   /** Always 0 — the ladder never auto-transitions workflow state. */
   transitions: number;
   humanExcluded: number;
@@ -312,6 +331,7 @@ export async function runFirstActionWatchdogSweep(
     redispatched: 0,
     unreachable: 0,
     reroutes: 0,
+    staleCleared: 0,
     transitions: 0,
     humanExcluded: 0,
     errors: [],
@@ -342,11 +362,17 @@ export async function runFirstActionWatchdogSweep(
       const deadlineAtMs = armedAtMs + deadlineMs;
 
       const existing = getFirstActionLadder(t.ticket);
-      const priorRungs = t.rungsFired ?? existing?.rungsFired ?? 0;
-      const history: LadderHistoryEntry[] = existing ? [...existing.history] : [];
+      // A ladder only carries over for the SAME dispatch (same delivery time).
+      // A fresh dispatch — re-entry, revision round-trip, or a state change
+      // re-stamping entered_state_at — re-arms a clean ladder; rungs and an
+      // "unreachable" verdict from a prior dispatch must not swallow it.
+      const sameDispatch =
+        existing != null && Date.parse(existing.armedAt) === armedAtMs;
+      const priorRungs = t.rungsFired ?? (sameDispatch ? existing.rungsFired : 0);
+      const history: LadderHistoryEntry[] = sameDispatch ? [...existing.history] : [];
 
       let rungsFired = priorRungs;
-      let unreachable = existing?.unreachable ?? false;
+      let unreachable = sameDispatch ? existing.unreachable : false;
       result.armed += 1;
 
       const actedInTime =
@@ -355,6 +381,28 @@ export async function runFirstActionWatchdogSweep(
 
       if (breached) {
         result.breached += 1;
+
+        // A breach on a stale mirror row (ticket already done / deleted /
+        // demoted in Linear) is not a stall — heal-and-drop, never alert.
+        if (opts.crossCheck) {
+          let verdict: CrossCheckVerdict = "unknown";
+          try {
+            verdict = await opts.crossCheck(t);
+          } catch {
+            verdict = "unknown"; // fail open to normal ladder behavior
+          }
+          if (verdict === "stale") {
+            deleteFirstActionLadder(t.ticket);
+            result.staleCleared += 1;
+            continue;
+          }
+        }
+
+        if (unreachable) {
+          // Ladder already exhausted for this dispatch — the rung-2 alert
+          // fired once; stay silent instead of re-alerting every sweep.
+          continue;
+        }
 
         if (priorRungs >= maxRungs) {
           // Rung 2 — ladder exhausted: mark unreachable + alert ops, carrying
@@ -370,6 +418,7 @@ export async function runFirstActionWatchdogSweep(
             ticket: t.ticket,
             state: t.state,
             delegate: t.delegate,
+            rungsFired: priorRungs,
             history: history.map((h) => ({ ...h })),
           });
 

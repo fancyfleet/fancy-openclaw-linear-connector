@@ -66,6 +66,12 @@ export function getFirstActionLadder(ticket: string): FirstActionLadder | null {
   return { ...l, history: l.history.map((h) => ({ ...h })) };
 }
 
+/** Drop a ladder entirely — used when the on-breach cross-check finds the
+ *  mirror row was stale (ticket done/deleted/demoted in Linear). */
+export function deleteFirstActionLadder(ticket: string): void {
+  ladders.delete(ticket);
+}
+
 export function getFirstActionWatchdogState(): FirstActionWatchdogState {
   const all = [...ladders.values()].map((l) => ({
     ...l,

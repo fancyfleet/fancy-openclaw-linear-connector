@@ -123,7 +123,7 @@ export class EnrolledTicketsStore {
   /** AC1: Enroll a ticket into the mirror (idempotent). */
   enroll(input: EnrollInput): void {
     const now = preciseTimestamp();
-    this.db
+    const inserted = this.db
       .prepare(
         `INSERT INTO enrolled_tickets (ticket_id, workflow, state, delegate, entered_state_at, enrolled_at, last_event_kind, last_event_at, terminal)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
@@ -131,10 +131,20 @@ export class EnrolledTicketsStore {
       )
       .run(input.ticketId, input.workflow, input.state, input.delegate, now, now, "enroll", now);
 
-    // Ensure a re-enroll of a previously-terminal ticket un-flags it.
-    this.db
-      .prepare(`UPDATE enrolled_tickets SET terminal = 0 WHERE ticket_id = ?`)
-      .run(input.ticketId);
+    // Re-enroll of a previously-terminal ticket is a genuine revival — bring
+    // the WHOLE row forward (state/delegate/timestamps), not just terminal=0.
+    // The old behavior (blind un-flag) resurrected closed tickets with their
+    // stale pre-terminal state, which downstream consumers (first-action
+    // watchdog) then treated as live stalls. A live row is left untouched.
+    if (inserted.changes === 0) {
+      this.db
+        .prepare(
+          `UPDATE enrolled_tickets
+           SET workflow = ?, state = ?, delegate = ?, entered_state_at = ?, last_event_kind = 'revived', last_event_at = ?, terminal = 0
+           WHERE ticket_id = ? AND terminal = 1`,
+        )
+        .run(input.workflow, input.state, input.delegate, now, now, input.ticketId);
+    }
   }
 
   /** AC1: Record a proxy-applied state transition. */

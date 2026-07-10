@@ -39,6 +39,7 @@ import { getRegisteredCrons } from "./cron/registry.js";
 import { getRescueSweepState } from "./rescue-sweep-state.js";
 import { registerFirstActionWatchdogCron } from "./first-action-watchdog.js";
 import { getFirstActionWatchdogState } from "./first-action-watchdog-state.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 import { getCapabilityPolicy } from "./escalation-gate.js";
 import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
 import { onAlert as onConfigHealthAlert } from "./config-health.js";
@@ -1212,13 +1213,60 @@ if (isEntryPoint) {
       await reconciliationWakeFn(agent, ticket);
       return { admitted: true };
     },
+    // On breach, verify the mirror row against authoritative Linear state
+    // before firing any rung. Done/canceled/deleted/demoted tickets are healed
+    // in the mirror and their ladders dropped — a stale row must never surface
+    // as "delegate unreachable". A live ticket whose state label drifted from
+    // the mirror is corrected; the fresh entered_state_at re-arms a clean
+    // ladder on the next sweep.
+    crossCheck: async (t) => {
+      const query = `query($id: String!) { issue(id: $id) { id state { type } labels { nodes { name } } } }`;
+      let issue: { state?: { type?: string } | null; labels?: { nodes?: Array<{ name: string }> } } | null;
+      try {
+        const res = await fetch(LINEAR_API_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: reconciliationAuthToken },
+          body: JSON.stringify({ query, variables: { id: t.ticket } }),
+        });
+        const data = (await res.json()) as { data?: { issue?: typeof issue } };
+        if (data.data === undefined) return "unknown"; // auth/transport error — fail open
+        issue = data.data?.issue ?? null;
+      } catch {
+        return "unknown";
+      }
+      if (!issue) {
+        enrolledTicketsStore.markTerminal(t.ticket, "watchdog-crosscheck-deleted");
+        return "stale";
+      }
+      const labels = issue.labels?.nodes ?? [];
+      const stateType = issue.state?.type;
+      const stateLabel = labels.find((l) => l.name.startsWith("state:"))?.name.slice("state:".length);
+      if (stateType === "completed" || stateType === "canceled" || stateLabel === "done") {
+        enrolledTicketsStore.markTerminal(t.ticket, "watchdog-crosscheck-terminal");
+        return "stale";
+      }
+      if (!labels.some((l) => l.name.startsWith("wf:"))) {
+        enrolledTicketsStore.demoteEnrolled(t.ticket);
+        return "stale";
+      }
+      if (stateLabel && stateLabel !== t.state) {
+        enrolledTicketsStore.recordTransition({
+          ticketId: t.ticket,
+          toState: stateLabel,
+          delegate: t.delegate,
+          eventKind: "watchdog-reconciled",
+        });
+        return "stale";
+      }
+      return "live";
+    },
     // Rung 2: alert the ops channel with ticket/state/delegate for the on-call.
     notify: (alert) =>
       notify({
         severity: "warning",
         source: "first-action-watchdog",
         title: alert.title,
-        detail: `${alert.ticket} (${alert.state}) — delegate ${alert.delegate} unreachable after ${alert.history.length} rung(s)`,
+        detail: `${alert.ticket} (${alert.state}) — delegate ${alert.delegate} unreachable after ${alert.rungsFired} rung(s)`,
         dedupKey: `first-action-watchdog|${alert.ticket}|${alert.state}`,
       }),
     // Rung 3: re-route to the fallback body by waking it directly. The delegate
