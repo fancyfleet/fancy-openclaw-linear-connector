@@ -203,6 +203,14 @@ describe("AC4.1 — applies write atomically (temp + rename)", () => {
         } catch {
           observed.add("READ-ERROR"); // ENOENT during a rename gap is itself a torn-read failure
         }
+        // AI-2039 (Igor, implementer): yield to the event loop each iteration.
+        // The original loop was a tight *synchronous* while() with no await, which
+        // starves the event loop so the awaited async applyProposal below never
+        // runs — the test deadlocks before the apply is even invoked (verified:
+        // hangs under a correct impl too). A per-iteration yield makes the reader
+        // genuinely concurrent with the apply while fully preserving the assertion:
+        // a non-atomic (truncate+write) impl would still expose a torn read here.
+        await new Promise<void>((resolve) => setImmediate(resolve));
       }
     })();
 
