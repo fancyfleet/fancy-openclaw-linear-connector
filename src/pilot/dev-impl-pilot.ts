@@ -23,17 +23,22 @@
  * tests assert are the graded contract — escalate to Ai if any is untestable as
  * written rather than quietly changing it.
  */
-import type { ObservationStore, ReasonCode } from "../store/observation-store.js";
+import {
+  UNCLASSIFIED_REASON_CODE,
+  type ObservationStore,
+  type ReasonCode,
+} from "../store/observation-store.js";
 import type { ProposalStore } from "../store/proposal-store.js";
-import type { GenerationContext } from "../proposal/proposal-generator.js";
-import type { MetricsBaseline } from "../proposal/apply-pipeline.js";
+import {
+  generateProposals,
+  type FailureCluster,
+  type GenerationContext,
+} from "../proposal/proposal-generator.js";
+import { persistGeneratedProposals } from "../proposal/generated-proposal-adapter.js";
+import { applyProposal, type ApplyDeps, type MetricsBaseline } from "../proposal/apply-pipeline.js";
 
-class NotImplemented extends Error {
-  constructor(what: string) {
-    super(`AI-2041 pilot harness not implemented: ${what}`);
-    this.name = "NotImplemented";
-  }
-}
+/** Distillation threshold default, mirroring the P4-C3 distillation job. */
+const DEFAULT_THRESHOLD = 3;
 
 // ── AC6.4 — human sign-off ───────────────────────────────────────────────────
 
@@ -76,15 +81,28 @@ export interface SyntheticSeedRow {
  * synthetic (AC6.3). Returns the inserted observation ids.
  */
 export function seedSyntheticObservations(
-  _store: ObservationStore,
-  _rows: SyntheticSeedRow[],
+  store: ObservationStore,
+  rows: SyntheticSeedRow[],
 ): number[] {
-  throw new NotImplemented("seedSyntheticObservations");
+  return rows.map((row) =>
+    store.append({
+      ticket: row.ticket,
+      workflow: row.workflow,
+      step: row.step,
+      fromBody: row.fromBody,
+      reviewerBody: row.reviewerBody,
+      reasonCode: row.reasonCode,
+      freeText: row.freeText ?? null,
+      timestamp: row.timestamp,
+      // AC6.3: every seeded row is written EXPLICITLY flagged synthetic.
+      synthetic: true,
+    }),
+  );
 }
 
 /** The set of observation ids currently flagged synthetic in the store (AC6.3). */
-export function syntheticObservationIds(_store: ObservationStore): Set<number> {
-  throw new NotImplemented("syntheticObservationIds");
+export function syntheticObservationIds(store: ObservationStore): Set<number> {
+  return store.syntheticIds();
 }
 
 // ── AC6.2 — before/after same-category comparison ────────────────────────────
@@ -105,11 +123,37 @@ export interface CategoryComparison {
  * data, given the baseline window captured at apply (AC6.2).
  */
 export function compareBeforeAfter(
-  _store: ObservationStore,
-  _baseline: MetricsBaseline,
-  _key: { workflow: string; step: string; reasonCode: string },
+  store: ObservationStore,
+  baseline: MetricsBaseline,
+  key: { workflow: string; step: string; reasonCode: string },
 ): CategoryComparison {
-  throw new NotImplemented("compareBeforeAfter");
+  const { since, until } = baseline.window;
+
+  // Same-category rows only — a different reasonCode in the same step must not
+  // count toward this comparison. Pull them all once, then partition by the
+  // captured window (ISO timestamps sort lexically).
+  const rows = store.query({
+    workflow: key.workflow,
+    step: key.step,
+    reasonCode: key.reasonCode as ReasonCode,
+    limit: 1000,
+  });
+
+  let before = 0;
+  let after = 0;
+  for (const row of rows) {
+    if (row.createdAt >= since && row.createdAt <= until) before += 1;
+    else if (row.createdAt > until) after += 1;
+  }
+
+  return {
+    workflow: key.workflow,
+    step: key.step,
+    reasonCode: key.reasonCode,
+    before,
+    after,
+    window: { since, until },
+  };
 }
 
 // ── AC6.1 — the pilot orchestrator ───────────────────────────────────────────
@@ -150,6 +194,110 @@ export interface PilotResult {
  * (AC6.3). On success, returns the applied proposal's version, commit, and the
  * baseline observation window captured at apply (AC6.2).
  */
-export async function runDevImplPilot(_deps: PilotDeps): Promise<PilotResult> {
-  throw new NotImplemented("runDevImplPilot");
+export async function runDevImplPilot(deps: PilotDeps): Promise<PilotResult> {
+  // ── AC6.4 — elevated stakes level 0: a HUMAN sign-off gates the whole run.
+  // Checked FIRST, before any distillation, persist, write, commit or version
+  // bump, so an AI self-sign-off (or none) leaves the config root untouched.
+  if (!deps.signOff || deps.signOff.kind !== "human") {
+    throw new SignOffRequiredError();
+  }
+
+  // ── AC6.3 — the accumulation contingency. If this run is fed synthetic seed
+  // data, a real-data verification follow-up ticket MUST be on record, or we
+  // refuse rather than call the AC met on synthetic data with no follow-up.
+  const synthetic = deps.synthetic === true;
+  const realDataFollowupTicket = deps.realDataFollowupTicket ?? null;
+  if (synthetic && !realDataFollowupTicket) {
+    throw new Error(
+      "AI-2041 AC6.3: synthetic seed data requires a real-data verification follow-up ticket before the pilot may proceed",
+    );
+  }
+
+  const { observationStore, proposalStore, generationContext, configRoot, now } = deps;
+  const threshold = deps.threshold ?? DEFAULT_THRESHOLD;
+
+  // ── AC6.1 (distill) — generate a proposal FROM observation-store data, not a
+  // hand-built cluster. This mirrors the P4-C3 distillation job: read the metric
+  // rollup, bridge each threshold-crossing (workflow, step, reason) pattern to a
+  // FailureCluster, and feed the deterministic generation engine.
+  const metrics = observationStore.metrics({ threshold });
+  const clusters: FailureCluster[] = metrics.items
+    .filter((item) => item.exceedsThreshold && item.reasonCode !== UNCLASSIFIED_REASON_CODE)
+    .map((item) => ({
+      workflow: item.workflow,
+      step: item.step,
+      reasonCode: item.reasonCode,
+      count: item.count,
+      exceedsThreshold: true,
+      ticketIds: item.tickets,
+    }));
+
+  const generated = generateProposals(clusters, generationContext);
+  if (generated.length === 0) {
+    throw new Error(
+      "AI-2041 AC6.1: no proposal was generated from observation-store data — " +
+        `no (workflow, step, reason) pattern crossed threshold=${threshold} with an editable surface`,
+    );
+  }
+
+  // Persist through the C4 adapter so the proposal surfaces in the
+  // `/admin/api/proposals` console queue and is applyable by idempotency key.
+  const [proposal] = persistGeneratedProposals(proposalStore, generated);
+
+  // ── AC6.2 — capture a defined baseline observation window at apply. `since`
+  // is the start of the step's accumulation, `until` is the apply moment; both
+  // ISO, and `since ≤ until` by construction, so the window never runs backward.
+  const primary = generated[0];
+  const stepRows = observationStore.query({
+    workflow: primary.workflowId,
+    step: primary.stateId,
+    limit: 1000,
+  });
+  const until = new Date(now()).toISOString();
+  const earliest = stepRows.map((r) => r.createdAt).sort()[0];
+  const since = earliest && earliest <= until ? earliest : until;
+  const baseline: MetricsBaseline = {
+    snapshot: {
+      workflow: primary.workflowId,
+      step: primary.stateId,
+      counts: primary.evidenceCluster.counts,
+      failureCount: primary.failureCount,
+    },
+    window: { since, until },
+  };
+
+  // ── AC6.1 (apply) — apply to dev-impl guidance: versioned + git-committed,
+  // atomic and TOCTOU-guarded. The baseline window is captured at apply and
+  // durably attached to the applied record (AC6.2). The unified ProposalStore
+  // doubles as the apply pipeline's idempotency store.
+  const applyDeps: ApplyDeps = {
+    configRoot,
+    store: proposalStore,
+    captureMetrics: () => baseline,
+    reloadWorkflowDefs: deps.reloadWorkflowDefs ?? (() => {}),
+    now,
+  };
+
+  const result = await applyProposal(proposal, applyDeps);
+  if (result.status !== "applied") {
+    throw new Error(
+      `AI-2041 AC6.1: apply did not land (status=${result.status}` +
+        (result.staleTargets ? `, stale=${result.staleTargets.join(",")}` : "") +
+        (result.error ? `, error=${result.error}` : "") +
+        ")",
+    );
+  }
+  if (result.version === undefined || result.commit === undefined) {
+    throw new Error("AI-2041 AC6.1: apply reported neither version nor commit");
+  }
+
+  return {
+    proposalId: proposal.id,
+    status: "applied",
+    version: result.version,
+    commit: result.commit,
+    baseline: result.metricsBaseline ?? baseline,
+    synthetic,
+    realDataFollowupTicket,
+  };
 }
