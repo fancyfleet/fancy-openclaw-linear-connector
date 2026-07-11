@@ -6,15 +6,18 @@
  */
 
 import { ObservationStore } from "../store/observation-store.js";
-import { runDistillation } from "./p4-metrics-distillation.js";
+import { ProposalStore } from "../store/proposal-store.js";
+import { runDistillation, createProdGenerationContext } from "./p4-metrics-distillation.js";
 
 async function main() {
-  console.log("🧠 P4-3: Running metrics distillation into skill-workshop proposals\n");
+  console.log("🧠 P4-C3: Running metrics distillation into the unified proposal store\n");
 
   try {
-    // Initialize observation store (reads from data/observations.db)
-    console.log("📊 Loading observation store...");
+    // Initialize the stores (read from data/*.db) and the prod generation context.
+    console.log("📊 Loading observation + proposal stores...");
     const observationStore = new ObservationStore();
+    const proposalStore = new ProposalStore();
+    const ctx = createProdGenerationContext();
 
     // Run distillation
     const threshold = process.env.P4_DISTILL_THRESHOLD
@@ -22,7 +25,7 @@ async function main() {
       : undefined;
 
     console.log(`🔍 Checking for patterns exceeding threshold=${threshold ?? "default (3)"}`);
-    const result = await runDistillation(observationStore, threshold);
+    const result = await runDistillation(observationStore, proposalStore, ctx, { threshold });
 
     // Output results
     console.log(`\n✅ Distillation complete:`);
@@ -43,6 +46,7 @@ async function main() {
     }
 
     observationStore.close();
+    proposalStore.close();
     process.exit(0);
   } catch (err) {
     console.error(`\n❌ Fatal error: ${err instanceof Error ? err.message : String(err)}`);
