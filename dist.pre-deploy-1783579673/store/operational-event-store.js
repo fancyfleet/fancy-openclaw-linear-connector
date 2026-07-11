@@ -1,0 +1,210 @@
+import Database from "better-sqlite3";
+import fs from "node:fs";
+import path from "node:path";
+export const OPERATIONAL_EVENT_OUTCOMES = ["received", "signature-rejected", "duplicate", "normalized", "terminal-pruned", "no-route", "no-route-human", "routed", "dedup-suppressed", "bag-added", "delivered", "dispatch-accepted", "dispatched", "queued", "delivery-failed", "delivery-unconfirmed", "session-ended", "stale-resignaled", "startup-replayed", "startup-pruned", "no-activity-warn", "no-activity-failed", "deferred-at-capacity", "deferred-capacity-rearm", "stuck-delegate-reprompt", "stale-c4-repoke", "stale-c4-repoke-failed", "engagement-thinking", "engagement-doing", "engagement-todo", "bootstrap-bootstrapped", "bootstrap-demoted", "bootstrap-wake-dispatched", "bootstrap-wake-delivered", "bootstrap-wake-failed", "enrollment-healed", "break-glass-used", "hold-retry-dispatch", "no-activity-redispatch", "delegation-reconciled", "delegation-reconciliation-failed", "watchdog-resignal", "comment-post-failed", "def-state-migrated", "def-state-migration-failed", "suppressed-duplicate", "dropped-stale", "transition-write-failed"];
+function parseEnvInt(name, defaultVal) {
+    const raw = process.env[name];
+    const parsed = raw !== undefined ? parseInt(raw, 10) : NaN;
+    return isNaN(parsed) || parsed <= 0 ? defaultVal : parsed;
+}
+const PRUNE_EVERY_N_WRITES = 100;
+const SECRET_KEY_PATTERN = /(token|secret|password|authorization|signature|cookie|api[-_]?key|x[-_]?api[-_]?key|client[-_]?secret|access[-_]?token|refresh[-_]?token|linear[-_]?signature)/i;
+const MAX_DETAIL_BYTES = 4096;
+const MAX_ERROR_BYTES = 512;
+const SECRET_VALUE_PATTERNS = [
+    [/\b((?:authorization|proxy-authorization)\s*:\s*(?:bearer|basic)\s+)[^\s,;]+/ig, "$1[REDACTED]"],
+    [/\b((?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+/ig, "$1[REDACTED]"],
+    [/\b((?:api[-_ ]?key|x[-_ ]?api[-_ ]?key)\s*[:=]\s*)[^\s,;]+/ig, "$1[REDACTED]"],
+    [/\b((?:linear[-_ ]?signature|signature)\s*[:=]\s*)[^\s,;]+/ig, "$1[REDACTED]"],
+    [/\bsk_(?:live|test|proj)?_[A-Za-z0-9_-]+\b/ig, "[REDACTED]"],
+    [/\blin_wh_[A-Za-z0-9_-]+\b/ig, "[REDACTED]"],
+    [/\b[^\s,;]*?(?:token|secret|password|authorization|api[-_]?key)[^\s,;]*\b/ig, "[REDACTED]"],
+];
+const SUCCESS_OUTCOMES = new Set(["received", "normalized", "routed", "bag-added", "delivered", "dispatch-accepted", "queued", "session-ended", "stale-resignaled", "startup-replayed", "startup-pruned", "deferred-capacity-rearm", "enrollment-healed"]);
+const ERROR_OUTCOMES = new Set(["signature-rejected", "delivery-failed", "no-route", "no-activity-warn", "no-activity-failed", "deferred-at-capacity"]);
+function redactText(value) {
+    return SECRET_VALUE_PATTERNS.reduce((output, [pattern, replacement]) => output.replace(pattern, replacement), value);
+}
+function truncateUtf8(value, maxBytes) {
+    if (Buffer.byteLength(value, "utf8") <= maxBytes)
+        return value;
+    let output = "";
+    for (const char of value) {
+        if (Buffer.byteLength(`${output}${char}…`, "utf8") > maxBytes)
+            break;
+        output += char;
+    }
+    return `${output}…`;
+}
+function sanitizeValue(value, seen = new WeakSet()) {
+    if (value === null || value === undefined)
+        return value;
+    if (typeof value === "string")
+        return truncateUtf8(redactText(value), MAX_DETAIL_BYTES);
+    if (typeof value === "number" || typeof value === "boolean")
+        return value;
+    if (value instanceof Error)
+        return { name: value.name, message: truncateUtf8(redactText(value.message), MAX_ERROR_BYTES) };
+    if (Array.isArray(value))
+        return value.slice(0, 50).map((item) => sanitizeValue(item, seen));
+    if (typeof value === "object") {
+        if (seen.has(value))
+            return "[Circular]";
+        seen.add(value);
+        const output = {};
+        for (const [key, child] of Object.entries(value)) {
+            output[key] = SECRET_KEY_PATTERN.test(key) ? "[REDACTED]" : sanitizeValue(child, seen);
+        }
+        return output;
+    }
+    return String(value);
+}
+export function redactOperationalDetail(detail) {
+    const sanitized = sanitizeValue(detail);
+    let json = JSON.stringify(sanitized ?? {});
+    if (Buffer.byteLength(json, "utf8") <= MAX_DETAIL_BYTES)
+        return sanitized ?? {};
+    json = truncateUtf8(json, MAX_DETAIL_BYTES);
+    return { truncated: true, json };
+}
+function parseDetail(value) {
+    try {
+        return JSON.parse(value);
+    }
+    catch {
+        return { parseError: "Stored detail was invalid JSON" };
+    }
+}
+function rowToEvent(row) {
+    return {
+        id: Number(row.id),
+        occurredAt: String(row.occurred_at),
+        outcome: row.outcome,
+        type: row.event_type ?? null,
+        agent: row.agent ?? null,
+        key: row.subject_key ?? null,
+        deliveryMode: row.delivery_mode ?? null,
+        attemptCount: row.attempt_count === null || row.attempt_count === undefined ? null : Number(row.attempt_count),
+        runId: row.run_id ?? null,
+        sessionKey: row.session_key ?? null,
+        errorSummary: row.error_summary ?? null,
+        detail: parseDetail(String(row.detail_json ?? "{}")),
+        workflowState: row.workflow_state ?? null,
+        plane: row.plane ?? null,
+        wakeId: row.wake_id ?? null,
+    };
+}
+export class OperationalEventStore {
+    constructor(dbPath) {
+        this.writeCount = 0;
+        this.maxAgeDays = parseEnvInt("OPERATIONAL_EVENT_MAX_AGE_DAYS", 30);
+        this.maxRows = parseEnvInt("OPERATIONAL_EVENT_MAX_ROWS", 10000);
+        const resolvedPath = dbPath ?? path.join(process.env.DATA_DIR ?? path.join(process.cwd(), "data"), "operational-events.db");
+        const dir = path.dirname(resolvedPath);
+        if (!fs.existsSync(dir))
+            fs.mkdirSync(dir, { recursive: true });
+        this.db = new Database(resolvedPath);
+        this.db.pragma("journal_mode = WAL");
+        this.migrate();
+        this.prune();
+    }
+    migrate() {
+        this.db.exec(`
+      CREATE TABLE IF NOT EXISTS operational_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        occurred_at TEXT NOT NULL DEFAULT (datetime('now')),
+        outcome TEXT NOT NULL,
+        event_type TEXT,
+        agent TEXT,
+        subject_key TEXT,
+        delivery_mode TEXT,
+        attempt_count INTEGER,
+        run_id TEXT,
+        session_key TEXT,
+        error_summary TEXT,
+        detail_json TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS idx_operational_events_agent_time ON operational_events(agent, occurred_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_operational_events_key_time ON operational_events(subject_key, occurred_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_operational_events_outcome_time ON operational_events(outcome, occurred_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_operational_events_type_time ON operational_events(event_type, occurred_at DESC);
+    `);
+        // AI-1799: add enrichment columns (additive migration for existing databases).
+        const addColumnIfMissing = (col, def) => {
+            const exists = this.db.prepare(`SELECT COUNT(*) AS c FROM pragma_table_info('operational_events') WHERE name = ?`).get(col);
+            if (exists.c === 0) {
+                this.db.exec(`ALTER TABLE operational_events ADD COLUMN ${col} ${def}`);
+            }
+        };
+        addColumnIfMissing("workflow_state", "TEXT");
+        addColumnIfMissing("plane", "TEXT");
+        addColumnIfMissing("wake_id", "TEXT");
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idx_operational_events_wake_id ON operational_events(wake_id)`);
+    }
+    prune() {
+        const ageResult = this.db.prepare(`DELETE FROM operational_events WHERE occurred_at < datetime('now', ?)`).run(`-${this.maxAgeDays} days`);
+        const capResult = this.db.prepare(`DELETE FROM operational_events WHERE id NOT IN (SELECT id FROM operational_events ORDER BY occurred_at DESC, id DESC LIMIT ?)`).run(this.maxRows);
+        const removed = ageResult.changes + capResult.changes;
+        if (removed > 0) {
+            console.info(`[operational-event-store] pruned ${removed} row(s) (age: ${ageResult.changes}, cap: ${capResult.changes})`);
+        }
+        return removed;
+    }
+    append(input) {
+        if (!OPERATIONAL_EVENT_OUTCOMES.includes(input.outcome))
+            throw new Error(`Unsupported operational event outcome: ${input.outcome}`);
+        const result = this.db.prepare(`
+      INSERT INTO operational_events (occurred_at, outcome, event_type, agent, subject_key, delivery_mode, attempt_count, run_id, session_key, error_summary, detail_json, workflow_state, plane, wake_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(input.occurredAt ?? new Date().toISOString(), input.outcome, input.type ?? null, input.agent ?? null, input.key ?? input.sessionKey ?? null, input.deliveryMode ?? null, input.attemptCount ?? null, input.runId ?? null, input.sessionKey ?? input.key ?? null, input.errorSummary ? truncateUtf8(redactText(input.errorSummary), MAX_ERROR_BYTES) : null, JSON.stringify(redactOperationalDetail(input.detail)), input.workflowState ?? null, input.plane ?? null, input.wakeId ?? null);
+        this.writeCount++;
+        if (this.writeCount % PRUNE_EVERY_N_WRITES === 0)
+            this.prune();
+        return Number(result.lastInsertRowid);
+    }
+    query(query = {}) {
+        const clauses = [];
+        const params = [];
+        if (query.agent) {
+            clauses.push("agent = ?");
+            params.push(query.agent);
+        }
+        if (query.key) {
+            clauses.push("subject_key = ?");
+            params.push(query.key);
+        }
+        if (query.outcome) {
+            clauses.push("outcome = ?");
+            params.push(query.outcome);
+        }
+        if (query.type) {
+            clauses.push("event_type = ?");
+            params.push(query.type);
+        }
+        if (query.since) {
+            clauses.push("occurred_at >= ?");
+            params.push(query.since);
+        }
+        if (query.until) {
+            clauses.push("occurred_at <= ?");
+            params.push(query.until);
+        }
+        const limit = Math.min(Math.max(query.limit ?? 100, 1), 500);
+        const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+        const rows = this.db.prepare(`SELECT id, occurred_at, outcome, event_type, agent, subject_key, delivery_mode, attempt_count, run_id, session_key, error_summary, detail_json, workflow_state, plane, wake_id FROM operational_events ${where} ORDER BY occurred_at DESC, id DESC LIMIT ?`).all(...params, limit);
+        return rows.map(rowToEvent);
+    }
+    snapshot(query) {
+        const lifecycle = this.query({ key: query.key, agent: query.agent, limit: query.limit ?? 50 });
+        return { key: query.key, agent: query.agent, lastSuccess: lifecycle.find((event) => SUCCESS_OUTCOMES.has(event.outcome)), lastError: lifecycle.find((event) => ERROR_OUTCOMES.has(event.outcome) || event.errorSummary), lifecycle };
+    }
+    close() { this.db.close(); }
+    /** AI-1799: query all events sharing a dispatch-cycle wake_id. */
+    queryByWakeId(wakeId) {
+        const rows = this.db
+            .prepare(`SELECT id, occurred_at, outcome, event_type, agent, subject_key, delivery_mode, attempt_count, run_id, session_key, error_summary, detail_json, workflow_state, plane, wake_id FROM operational_events WHERE wake_id = ? ORDER BY occurred_at ASC, id ASC`)
+            .all(wakeId);
+        return rows.map(rowToEvent);
+    }
+}
+//# sourceMappingURL=operational-event-store.js.map

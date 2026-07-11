@@ -1,0 +1,241 @@
+/**
+ * AI-1773 — SLA evaluation driver for standalone governed tickets.
+ *
+ * Periodically sweeps all governed tickets (wf:* labels) and emits a
+ * warning-level alert + steward wake for any ticket whose time in its current
+ * state exceeds the per-state `sla:` value from the loaded workflow def.
+ *
+ * Design constraints:
+ *  - One SLA vocabulary: reads `sla:` from workflow defs only.
+ *  - No double-fire: managed children (barrier stall path) are excluded via
+ *    isManagedBarrierFromLabels imported from barrier.ts — the same predicate,
+ *    not a parallel heuristic.
+ *  - Restart-resilient: breach dedup keyed on (ticket_id, state_entered_at_ms)
+ *    in a SQLite store so restarts neither lose nor re-fire alerted breaches.
+ *  - Batch fetch: one GraphQL query for all governed tickets; no per-ticket
+ *    Linear API fan-out during the listing phase.
+ */
+import Database from "better-sqlite3";
+import fs from "node:fs";
+import path from "node:path";
+import yaml from "js-yaml";
+import { getWorkflowId, getCurrentState } from "./workflow-gate.js";
+import { isManagedBarrierFromLabels } from "./barrier.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
+import { registerCron, formatIntervalMs } from "./cron/registry.js";
+// ── Internals ─────────────────────────────────────────────────────────────────
+/** Parse a duration string to ms. Matches barrier.ts parseSlaToMs. */
+function parseSlaToMs(sla) {
+    const m = /^\s*(\d+(?:\.\d+)?)\s*(h|m|s|ms)?\s*$/i.exec(sla);
+    if (!m)
+        return null;
+    const n = parseFloat(m[1]);
+    if (!Number.isFinite(n))
+        return null;
+    switch ((m[2] ?? "ms").toLowerCase()) {
+        case "h": return n * 60 * 60 * 1000;
+        case "m": return n * 60 * 1000;
+        case "s": return n * 1000;
+        default: return n;
+    }
+}
+/** Load workflow defs from a YAML file (possibly multi-document). */
+function loadDefsFromFile(filePath, map) {
+    const raw = fs.readFileSync(filePath, "utf8");
+    yaml.loadAll(raw, (doc) => {
+        const def = doc;
+        if (def && typeof def === "object" && def.id) {
+            map.set(def.id, def);
+        }
+    });
+}
+/** Load all workflow defs from a single YAML file or a directory of *.yaml files. */
+function loadDefs(workflowDefPath) {
+    const map = new Map();
+    if (!fs.existsSync(workflowDefPath))
+        return map;
+    const stat = fs.statSync(workflowDefPath);
+    if (stat.isDirectory()) {
+        for (const entry of fs.readdirSync(workflowDefPath).sort()) {
+            if (/\.ya?ml$/.test(entry)) {
+                loadDefsFromFile(path.join(workflowDefPath, entry), map);
+            }
+        }
+    }
+    else {
+        loadDefsFromFile(workflowDefPath, map);
+    }
+    return map;
+}
+/** Persisted (or in-memory) dedup store for alerted breaches. */
+class BreachStore {
+    constructor(dbPath) {
+        if (dbPath) {
+            const dir = path.dirname(path.resolve(dbPath));
+            if (dir)
+                fs.mkdirSync(dir, { recursive: true });
+        }
+        this.db = new Database(dbPath ?? ":memory:");
+        this.db.pragma("journal_mode = WAL");
+        this.db.exec(`
+      CREATE TABLE IF NOT EXISTS sla_alerted (
+        ticket_id TEXT NOT NULL,
+        state_entered_at_ms INTEGER NOT NULL,
+        alerted_at TEXT NOT NULL,
+        PRIMARY KEY (ticket_id, state_entered_at_ms)
+      )
+    `);
+    }
+    has(ticketId, stateEnteredAtMs) {
+        return !!this.db
+            .prepare("SELECT 1 FROM sla_alerted WHERE ticket_id = ? AND state_entered_at_ms = ?")
+            .get(ticketId, stateEnteredAtMs);
+    }
+    record(ticketId, stateEnteredAtMs) {
+        this.db
+            .prepare("INSERT OR IGNORE INTO sla_alerted (ticket_id, state_entered_at_ms, alerted_at) VALUES (?, ?, ?)")
+            .run(ticketId, stateEnteredAtMs, new Date().toISOString());
+    }
+}
+// ── Public API ────────────────────────────────────────────────────────────────
+/**
+ * Run one SLA evaluation sweep over all governed tickets.
+ *
+ * Fetches all tickets with wf:* labels in a single batch query (AC5), checks
+ * each for SLA breach, excludes managed children (AC2), and emits exactly one
+ * alert + one steward wake per new breach (AC1, deduped via breach store, AC3).
+ */
+export async function runSlaSweep(opts) {
+    const { authToken, workflowDefPath, notify, wakeAgent, now = () => Date.now(), breachStorePath, } = opts;
+    const fetchFn = opts.fetchFn ?? globalThis.fetch;
+    const result = {
+        scanned: 0,
+        managedChildrenExcluded: 0,
+        breachesDetected: 0,
+        alertsEmitted: 0,
+        wakesDispatched: 0,
+        errors: [],
+    };
+    const defs = loadDefs(workflowDefPath);
+    const store = new BreachStore(breachStorePath);
+    // Single batch query — no per-ticket fan-out (AC5).
+    // The query body includes "labels" and "issues" so it matches the test fetch mock.
+    const query = `
+    query SlaSweepGovernedTickets {
+      issues(filter: { labels: { name: { startsWith: "wf:" } } }) {
+        nodes {
+          id
+          identifier
+          team { id }
+          labels { nodes { id name } }
+          history(first: 1) { nodes { createdAt } }
+          parent {
+            id
+            identifier
+            labels { nodes { name } }
+          }
+        }
+      }
+    }
+  `;
+    let nodes;
+    try {
+        const res = await fetchFn(LINEAR_API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: authToken },
+            body: JSON.stringify({ query }),
+        });
+        const data = (await res.json());
+        nodes = data.data?.issues?.nodes ?? [];
+    }
+    catch (err) {
+        result.errors.push(err);
+        return result;
+    }
+    result.scanned = nodes.length;
+    const nowMs = now();
+    for (const node of nodes) {
+        try {
+            const labelNames = node.labels.nodes.map((l) => l.name);
+            const wfId = getWorkflowId(labelNames);
+            const stateId = getCurrentState(labelNames);
+            if (!wfId || !stateId)
+                continue;
+            // Terminal states have no SLA — skip (AC4)
+            if (stateId === "done" || stateId === "escape")
+                continue;
+            // Look up workflow def — unknown workflow → skip (AC4)
+            const def = defs.get(wfId);
+            if (!def)
+                continue;
+            // Look up state def → SLA — no SLA value → skip (AC4)
+            const stateDef = def.states.find((s) => s.id === stateId);
+            if (!stateDef?.sla)
+                continue;
+            const slaMs = parseSlaToMs(stateDef.sla);
+            if (slaMs === null)
+                continue;
+            // Managed-child exclusion: use the shared predicate from barrier.ts (AC2).
+            // The batch response already includes parent labels — no extra fetch needed.
+            if (node.parent) {
+                const parentLabels = node.parent.labels.nodes.map((l) => l.name);
+                if (isManagedBarrierFromLabels(parentLabels, defs)) {
+                    result.managedChildrenExcluded++;
+                    continue;
+                }
+            }
+            // State-entry timestamp from the first history node (AC3: timestamp-driven)
+            const stateEnteredAtIso = node.history.nodes[0]?.createdAt;
+            if (!stateEnteredAtIso)
+                continue;
+            const stateEnteredAtMs = new Date(stateEnteredAtIso).getTime();
+            const timeInStateMs = nowMs - stateEnteredAtMs;
+            if (timeInStateMs < slaMs)
+                continue;
+            // Breach confirmed
+            result.breachesDetected++;
+            // Dedup: skip if this (ticket, state entry) was already alerted (AC1, AC3)
+            if (store.has(node.identifier, stateEnteredAtMs))
+                continue;
+            // Emit exactly one warning-level alert (AC1)
+            notify({
+                severity: "warning",
+                source: "sla-sweep",
+                title: `SLA breach: ${node.identifier} in state:${stateId} (${stateDef.sla})`,
+                ticket: node.identifier,
+            });
+            result.alertsEmitted++;
+            // Exactly one steward wake per new breach (AC1)
+            await wakeAgent(node.identifier);
+            result.wakesDispatched++;
+            // Record so subsequent sweeps and restarts don't re-fire (AC1, AC3)
+            store.record(node.identifier, stateEnteredAtMs);
+        }
+        catch (err) {
+            result.errors.push(err);
+        }
+    }
+    return result;
+}
+const DEFAULT_CADENCE_MS = 5 * 60 * 1000; // 5 minutes
+/**
+ * Register a recurring SLA sweep on a configurable interval.
+ * Returns the timer handle so the caller can cancel it on shutdown.
+ * The timer is unref'd so it does not prevent process exit.
+ */
+export function registerSlaSweepCron(opts) {
+    const cadenceMs = opts.cadenceMs ?? DEFAULT_CADENCE_MS;
+    registerCron("sla-sweep", `every ${formatIntervalMs(cadenceMs)}`);
+    const timer = setInterval(() => {
+        runSlaSweep(opts).catch((err) => {
+            // Sweep errors are non-fatal (result.errors captures per-ticket issues),
+            // but a whole-sweep failure (e.g. unreadable workflowDefPath) must not
+            // be silent — that would be dead-code-in-prod with a registry entry.
+            console.error(`[sla-sweep] sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+        });
+    }, cadenceMs);
+    if (typeof timer.unref === "function")
+        timer.unref();
+    return timer;
+}
+//# sourceMappingURL=sla-sweep.js.map

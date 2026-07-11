@@ -1,0 +1,68 @@
+/**
+ * GraphQL proxy — Phase 0B (transparent pass-through) + Phase 2 slice 1
+ * (inbound command enforcement) + Phase 3 B1 (workflow-def-driven validation)
+ * + Phase 3 B2 (atomic state-label transition application)
+ * + Layer 2 raw mutation interception (AI-1387)
+ * + AI-1402 default-deny + needs-human block + unknown-caller fail-closed,
+ * design.md §4.2, §4.6, §11, §13, §16.
+ * + Phase 6.5 / H-1 fail-closed + break-glass + config-health (AI-1476).
+ *
+ * Enforcement order (defense in depth):
+ *   1. Phase 2 escalation-gate — capability rule table (needs-human steward-only).
+ *   2. Phase 3 B1 workflow-gate — full legal-move validation against dev-impl.yaml,
+ *      including delegate-only enforcement (AI-1397).
+ *   3. Layer 2 raw mutation interception (AI-1387) — blocks direct status/assignee
+ *      changes on workflow tickets that bypass the intent-header path.
+ *   4. Phase 6.5 config-health — rejects wf:* commands when config is degraded (§16.0).
+ * All must pass for the request to be forwarded.
+ *
+ * Break-glass (§4.4 lifted): X-Openclaw-Break-Glass header allows a steward to
+ * bypass enforcement when config is degraded, preventing permanent queue wedging.
+ *
+ * After a successful forward, Phase 3 B2 applies the state:* label transition
+ * atomically (single issueUpdate mutation). Seam: proxy-side, not CLI-side — the
+ * state change is coupled to the validated forward so an agent cannot skip it.
+ * Transition failures are fail-open: logged but never propagate to the response.
+ *
+ * AI-1397 version floor: workflow mutations from CLIs below MIN_WORKFLOW_CLI_VERSION
+ * are rejected. Missing version header is warned but allowed (backward compat).
+ */
+import type { Request, Response } from "express";
+import type { ObservationStore } from "./store/observation-store.js";
+import type { OperationalEventStore } from "./store/operational-event-store.js";
+import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
+import type { MutationAuditStore } from "./store/mutation-audit-store.js";
+import type { NoActivityDetector } from "./bag/no-activity-detector.js";
+export interface CommandAuthSnapshot {
+    /** The caller's Linear user ID snapshotted at command start (used as effective delegateId). */
+    snapshotDelegateId: string | null;
+    expiresAt: number;
+}
+export interface ProxyDeps {
+    /** Optional observation store for recording feedback observations (P4-1). */
+    observationStore?: ObservationStore;
+    /** Optional operational event store for audit events (G-13a). */
+    operationalEventStore?: OperationalEventStore;
+    /** AI-1664: Optional no-activity detector — proxy calls with a resolvable ticket ID satisfy the timer. */
+    noActivityDetector?: NoActivityDetector;
+    /** AI-1799: enrolled-tickets mirror — transitions write to the board mirror. */
+    enrolledTicketsStore?: EnrolledTicketsStore;
+    /** AI-1838: mutation audit store — proxy-forwarded mutations recorded for out-of-band reconcile. */
+    mutationAuditStore?: MutationAuditStore;
+    /**
+     * AI-1860: per-app authorization snapshot map for multi-step governed commands.
+     * Keyed by `${agentId}:${issueId}:${intent}` — stores the caller's Linear user ID
+     * verified as delegate at command start. Subsequent mutations reuse this snapshot
+     * instead of re-fetching, preventing self-blocking after a post-transition delegate change.
+     */
+    commandAuthSnapshots?: Map<string, CommandAuthSnapshot>;
+    /**
+     * Called on the first proxy call from an agent for a ticket — auto-acknowledges the
+     * dispatch so the watchdog doesn't re-signal an agent that is actively working but
+     * hasn't sent an explicit pull-ack (e.g. during sessions_yield). The callback is
+     * idempotent; calling it multiple times for the same agent+ticket is harmless.
+     */
+    onProxyCall?: (agentId: string, ticketId: string) => void;
+}
+export declare function handleProxyRequest(req: Request, res: Response, deps?: ProxyDeps): Promise<void>;
+//# sourceMappingURL=proxy.d.ts.map
