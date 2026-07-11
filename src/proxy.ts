@@ -495,7 +495,26 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       const snapshotKey = issueId && intent ? `${agentId}:${issueId}:${intent}` : null;
       let snapshotDelegateId: string | null | undefined = undefined;
       let snapshotState: string | null | undefined = undefined;
-      if (snapshotKey && deps?.commandAuthSnapshots) {
+      // AI-2115 Bug 1: the snapshot key is only agent+issue+RAW-intent, so two
+      // SEPARATE governed commands sharing a raw intent (every forward step is
+      // `continue-workflow`) collide within the 10-min TTL. On GEN-33 the intake
+      // `continue-workflow` (request → routing) stored snapshotState="intake",
+      // then the routing `continue-workflow <worker>` HIT that stale snapshot and
+      // re-resolved to intake's singleton `request` verb — force-assigning astrid
+      // and rejecting the real (delegate-only) worker, so routing→doing could
+      // never delegate to a non-head worker.
+      //
+      // The snapshot exists to protect the FOLLOW-UP mutations of ONE command
+      // (comment/delegate re-gated against the command's own post-transition
+      // state — the AI-1848/1872/1924 repros). Those follow-ups carry NO state:*
+      // label delta. The FIRST mutation of a command — the one that actually
+      // flips the state:* label — carries a label delta and is, by definition,
+      // the start of a NEW command that must resolve/gate against LIVE state.
+      // So only reuse the snapshot for label-delta-free follow-up mutations; a
+      // transition-carrying request always falls through to a fresh live-state
+      // capture below (which also refreshes the snapshot for ITS own follow-ups).
+      const requestCarriesTransition = carriesLabelDelta(body);
+      if (snapshotKey && deps?.commandAuthSnapshots && !requestCarriesTransition) {
         const existing = deps.commandAuthSnapshots.get(snapshotKey);
         if (existing && Date.now() < existing.expiresAt) {
           snapshotDelegateId = existing.snapshotDelegateId;

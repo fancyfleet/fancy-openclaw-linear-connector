@@ -2814,25 +2814,44 @@ export async function applyStateTransition(
   }
 
   // ── Idempotency check (AI-1490 hardened) ────────────────────────────────
-  // If the ticket is already in the target state, verify the state:* label
-  // is actually present. If it's missing (CLI partial failure, race condition),
-  // re-stamp it. Previously this was a blind no-op, which meant a lost label
+  // If the ticket is already in the target state, verify the state:* labels are
+  // clean: exactly one, and it is the target. Re-stamp on ANY drift — a missing
+  // target label (CLI partial failure, race condition) OR coexisting stale
+  // state:* labels. Previously this was a blind no-op, which meant a lost label
   // would never be recovered.
   // AI-1534: this branch is state-preserving (source === destination), so it
   // intentionally neither records nor clears the applied-state cache — any
   // existing entry already holds this same state, and its absence is harmless.
+  // AI-2115 Bug 2: the no-op previously fired whenever the target label was
+  // present, without checking for coexisting stale `state:*` labels. On GEN-33 a
+  // ticket carrying a stale `state:routing` alongside the escape-target label
+  // took the silent no-op path, so `escape` (whose whole job is to purge a
+  // corrupt/stale state and re-enter at intake) left the stale label in place
+  // and the ticket stayed wedged. Escape — and every transition — must never
+  // silently leave more than one `state:*` label: no-op ONLY when the labels are
+  // already clean, otherwise re-stamp to exactly one `state:<target>`.
   if (currentStateName === toStateName) {
     const targetLabelName = `state:${toStateName}`;
-    const hasTargetLabel = issue.labels.some((l) => l.name === targetLabelName);
-    if (hasTargetLabel) {
+    const stateLabels = issue.labels.filter((l) => l.name.startsWith("state:"));
+    const hasTargetLabel = stateLabels.some((l) => l.name === targetLabelName);
+    const staleStateLabels = stateLabels
+      .filter((l) => l.name !== targetLabelName)
+      .map((l) => l.name);
+    // Genuine no-op: exactly the single target state label, nothing stale.
+    if (hasTargetLabel && staleStateLabels.length === 0) {
       log.info(
-        `workflow-gate: B2 apply: ${issueId} already in state '${toStateName}' with label present — no-op`,
+        `workflow-gate: B2 apply: ${issueId} already in state '${toStateName}' with clean label — no-op`,
       );
       return { status: "noop", code: "already-in-state", from: currentStateName, to: toStateName };
     }
-    // Label is missing despite being in the correct state — re-stamp.
+    // Drift detected — re-stamp to exactly one clean state:<target> label. Fail
+    // loudly (log) rather than silently no-op. Covers a missing target label and
+    // stale coexisting state:* labels (AI-2115 Bug 2).
     log.warn(
-      `workflow-gate: B2 apply: ${issueId} is in state '${toStateName}' but label '${targetLabelName}' is missing — re-stamping`,
+      `workflow-gate: B2 apply: ${issueId} in state '${toStateName}' but state labels drifted ` +
+        `(target ${hasTargetLabel ? "present" : "MISSING"}` +
+        (staleStateLabels.length > 0 ? `, stale: ${staleStateLabels.join(", ")}` : "") +
+        `) — re-stamping to a single clean '${targetLabelName}'`,
     );
     const newLabelId = await findOrCreateLabel(
       issue.teamId,
