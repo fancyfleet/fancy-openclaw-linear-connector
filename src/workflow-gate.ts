@@ -1750,25 +1750,47 @@ export async function checkWorkflowRules(
     );
   }
   if (callerLinearUserId && delegateId && callerLinearUserId !== delegateId) {
-    // AI-1936 Defect 2: steward break-glass exception — the delegate-only gate must
-    // allow the recovery steward (workflow:break-glass) to advance a stranded ticket
-    // without becoming the current delegate first. Without this exception, the steward
-    // must use raw escape (full spine restart via intake) for every forward recovery,
-    // losing all ticket context and forcing re-verification. Check break-glass capability
-    // before blocking so the steward can use continue-workflow / request-revision directly.
-    const hasBreakGlass = await bodyHasCapability(bodyId, "workflow:break-glass");
-    if (!hasBreakGlass) {
-      log.warn(`workflow-gate: delegate-only block agent=${bodyId} intent=${intent} ticket=${issueId}`);
-      const wdState = getCurrentState(labels);
-      const wdNode = wdState ? def.states.find((s) => s.id === wdState) : undefined;
-      const legalMoves = [...(wdNode?.transitions?.map((t) => cliVerbFor(t)) ?? []), breakGlassCommand].join(", ");
-      return (
-        `[Proxy] '${intent}' blocked: ${bodyId} is not the current delegate for ${issueId}. ` +
-        `Only the ticket delegate may mutate its state. ` +
-        `Legal moves: ${legalMoves}.`
-      );
+    // Designated-approver exception (Matt directive 2026-07-12, via Astrid): when
+    // the workflow def names a `requires_capability` on the EXACT transition being
+    // invoked, a caller holding that capability may fire that transition without
+    // being the current delegate. This is how a def nominates a sign-off authority
+    // for a ticket delegated to the work's author (e.g. Ai holding sprint:signoff
+    // on sprint-spawner's determining-scope → launching), preserving
+    // author-cannot-self-bless without requiring a human. Scoped to the matched
+    // transition only — every other intent still requires the delegate — and the
+    // requires_capability gate below re-verifies the grant on the same def lookup.
+    const daState =
+      typeof snapshotState === "string" && snapshotState.length > 0
+        ? snapshotState
+        : getCurrentState(labels);
+    const daNode = daState ? def.states.find((s) => s.id === daState) : undefined;
+    const daTx = daNode?.transitions?.find((t) => t.command === intent);
+    const isDesignatedApprover = !!(
+      daTx?.requires_capability && (await bodyHasCapability(bodyId, daTx.requires_capability))
+    );
+    if (isDesignatedApprover) {
+      log.info(`workflow-gate: designated-approver delegate bypass agent=${bodyId} intent=${intent} ticket=${issueId} (holds '${daTx?.requires_capability}' named on the transition, not current delegate)`);
+    } else {
+      // AI-1936 Defect 2: steward break-glass exception — the delegate-only gate must
+      // allow the recovery steward (workflow:break-glass) to advance a stranded ticket
+      // without becoming the current delegate first. Without this exception, the steward
+      // must use raw escape (full spine restart via intake) for every forward recovery,
+      // losing all ticket context and forcing re-verification. Check break-glass capability
+      // before blocking so the steward can use continue-workflow / request-revision directly.
+      const hasBreakGlass = await bodyHasCapability(bodyId, "workflow:break-glass");
+      if (!hasBreakGlass) {
+        log.warn(`workflow-gate: delegate-only block agent=${bodyId} intent=${intent} ticket=${issueId}`);
+        const wdState = getCurrentState(labels);
+        const wdNode = wdState ? def.states.find((s) => s.id === wdState) : undefined;
+        const legalMoves = [...(wdNode?.transitions?.map((t) => cliVerbFor(t)) ?? []), breakGlassCommand].join(", ");
+        return (
+          `[Proxy] '${intent}' blocked: ${bodyId} is not the current delegate for ${issueId}. ` +
+          `Only the ticket delegate may mutate its state. ` +
+          `Legal moves: ${legalMoves}.`
+        );
+      }
+      log.info(`workflow-gate: break-glass delegate bypass agent=${bodyId} intent=${intent} ticket=${issueId} (workflow:break-glass holder, not current delegate)`);
     }
-    log.info(`workflow-gate: break-glass delegate bypass agent=${bodyId} intent=${intent} ticket=${issueId} (workflow:break-glass holder, not current delegate)`);
   }
 
   // AI-1860: prefer the command-start source-state snapshot for the transition-legality
