@@ -583,12 +583,6 @@ describe("AC1: executeFanout per-entry child_workflow", () => {
 
 describe("AC2: validateFanoutSpec rejects unregistered per-entry workflow ids", () => {
   it("returns ok:false when a finding's child_workflow is not in registeredWorkflows", () => {
-    const findings: Finding[] = [
-      { title: "Scope", child_workflow: "wf:sprint-arm-scope", delegate: "igor" },
-      { title: "Bad arm", child_workflow: "wf:NONEXISTENT", delegate: "someone" },
-      { title: "UX", child_workflow: "wf:sprint-arm-ux", delegate: "signe" },
-    ];
-
     const config = {
       spec_source: "Structured",
       child_workflow: "wf:sprint-arm-scope",
@@ -603,7 +597,7 @@ describe("AC2: validateFanoutSpec rejects unregistered per-entry workflow ids", 
       registeredWorkflows?: Set<string>,
     ) => { ok: true; findings: Finding[] } | { ok: false; reason: string };
 
-    const result = validate(PER_ENTRY_SPEC, config, registeredWorkflows);
+    const result = validate(UNREGISTERED_SPEC, config, registeredWorkflows);
 
     expect(result.ok).toBe(false);
     if (!result.ok) {

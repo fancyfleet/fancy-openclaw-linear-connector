@@ -53,6 +53,19 @@ export interface Finding {
    * authored id field.
    */
   id?: string;
+  /**
+   * AI-2199: per-entry child workflow override. When set, this finding's
+   * children are labeled with this workflow id instead of the fanout config's
+   * `child_workflow` default. Parsed from the `[wf:sprint-arm-ux → signe]`
+   * marker in the spec entry title.
+   */
+  child_workflow?: string;
+  /**
+   * AI-2199: per-entry delegate override. When set, this finding's child is
+   * delegated to this body id instead of the fanout config's `initial_delegate`.
+   * Parsed from the `[wf:sprint-arm-ux → signe]` marker (the part after →).
+   */
+  delegate?: string;
 }
 
 /**
@@ -256,14 +269,35 @@ export function extractSpecFindings(
     "i",
   );
   const sectionMatch = sectionRegex.exec(description);
+  /**
+   * AI-2199: regex for per-entry child workflow marker in spec bullet titles.
+   * Matches: [wf:sprint-arm-ux → signe] or [wf:sprint-arm-ux]
+   * The arrow (→ or ->) separates workflow id from optional delegate.
+   */
+  const PER_ENTRY_MARKER_RE = /^\[wf:([^\]\s]+)(?:\s*[→>-]\s*(\S+))?\]\s*/;
+
   if (sectionMatch) {
     const sectionBody = sectionMatch[1];
     const lineRegex = /[-*]\s+\*\*(.+?)\*\*(?:[:\s-]+(.*))?|[-*]\s+(.+?)(?:\n|$)|\d+\.\s+(.+?)(?:\n|$)/g;
     let match: RegExpExecArray | null;
     while ((match = lineRegex.exec(sectionBody)) !== null) {
-      const title = (match[1] ?? match[3] ?? match[4] ?? "").trim();
+      let title = (match[1] ?? match[3] ?? match[4] ?? "").trim();
       const desc = (match[2] ?? "").trim();
-      if (title) findings.push({ title, description: desc || undefined });
+      if (title) {
+        // AI-2199: check for per-entry child workflow marker
+        const markerMatch = PER_ENTRY_MARKER_RE.exec(title);
+        const finding: Finding = {
+          title: markerMatch ? title.slice(markerMatch[0].length) : title,
+          description: desc || undefined,
+        };
+        if (markerMatch) {
+          finding.child_workflow = `wf:${markerMatch[1]}`;
+          if (markerMatch[2]) {
+            finding.delegate = markerMatch[2];
+          }
+        }
+        findings.push(finding);
+      }
     }
   }
 
@@ -336,6 +370,7 @@ export function dedupeSpawnSpec(
 export function validateFanoutSpec(
   description: string | null | undefined,
   config: FanoutConfig,
+  registeredWorkflows?: Set<string>,
 ): { ok: true; findings: Finding[] } | { ok: false; reason: string } {
   if (!config || !/^wf:.+/.test(config.child_workflow ?? "")) {
     return {
@@ -351,6 +386,25 @@ export function validateFanoutSpec(
         `fan-out spec is empty or unparseable: no '${config.spec_source}' entries found in the ticket description. ` +
         `Add a '## ${config.spec_source}' section with at least one bullet (e.g. "- **Title**: detail") and retry the spawn.`,
     };
+  }
+  // AI-2199: validate per-entry child workflow ids against the registry.
+  // When registeredWorkflows is provided, every finding with child_workflow
+  // set must reference a registered workflow id. Fail-closed: one unregistered
+  // entry refuses the entire transition (no partial spawn).
+  if (registeredWorkflows) {
+    for (const f of findings) {
+      if (f.child_workflow) {
+        // Strip the 'wf:' prefix to get the raw def id
+        const defId = f.child_workflow.startsWith("wf:") ? f.child_workflow.slice(3) : f.child_workflow;
+        if (!registeredWorkflows.has(f.child_workflow) && !registeredWorkflows.has(defId)) {
+          return {
+            ok: false,
+            reason: `fan-out spec entry "${f.title}" references unregistered child workflow '${f.child_workflow}' — no workflow definition found. ` +
+              `Register the workflow def or remove the entry and retry.`,
+          };
+        }
+      }
+    }
   }
   return { ok: true, findings };
 }
@@ -750,33 +804,23 @@ export async function executeFanout(
     }
   }
 
-  // 3. Ensure required labels exist — the child workflow label is config-driven
-  //    (AC2: no longer the hardcoded wf:dev-impl).
-  const wfLabelId = await ensureLabel(parentCtx.teamId, childWorkflowLabel, authToken);
+  // 3. Ensure the state:intake label exists (shared by all children).
   const stateLabelId = await ensureLabel(parentCtx.teamId, "state:intake", authToken);
-
-  if (!wfLabelId || !stateLabelId) {
+  if (!stateLabelId) {
     result.errors.push({
       findingIndex: -1,
-      message: `Failed to resolve required labels (${childWorkflowLabel}: ${wfLabelId ?? "missing"}, state:intake: ${stateLabelId ?? "missing"})`,
+      message: `Failed to resolve required label state:intake`,
     });
     return result;
   }
 
-  const labelIds = [wfLabelId, stateLabelId];
-
-  // 4. Create children — one per finding
-  // The parent's internal UUID was resolved by fetchIssueTeamAndParent above.
-  // No additional API call needed — we already have parentCtx.internalId.
-  const parentInternalId = parentCtx.internalId;
-
-  // AI-1992: optional initial delegate (config-driven). Resolve once; children
-  // are all delegated to the same body id when configured. Fail-open.
-  let initialDelegateId: string | null = null;
+  // AI-1992: optional initial delegate from config (used as default when
+  // per-entry delegate is not set). Resolve once for reuse.
+  let configDelegateId: string | null = null;
   if (config.initial_delegate) {
-    initialDelegateId = await resolveInitialDelegate(config.initial_delegate);
-    if (!initialDelegateId) {
-      log.warn(`fanout: initial_delegate '${config.initial_delegate}' did not resolve to a Linear user — spawning children undelegated`);
+    configDelegateId = await resolveInitialDelegate(config.initial_delegate);
+    if (!configDelegateId) {
+      log.warn(`fanout: initial_delegate '${config.initial_delegate}' did not resolve to a Linear user — defaulting to undelegated`);
     }
   }
 
@@ -787,6 +831,26 @@ export async function executeFanout(
   for (let i = 0; i < toSpawn.length; i++) {
     const finding = toSpawn[i];
     const childTitle = finding.title;
+
+    // AI-2199: per-entry child workflow override. Falls back to config default.
+    const findingWorkflow = finding.child_workflow ?? childWorkflowLabel;
+    const wfLabelId = await ensureLabel(parentCtx.teamId, findingWorkflow, authToken);
+    if (!wfLabelId) {
+      result.errors.push({
+        findingIndex: i,
+        message: `Failed to resolve workflow label '${findingWorkflow}' for finding "${childTitle}"`,
+      });
+      continue;
+    }
+    const labelIds = [wfLabelId, stateLabelId];
+
+    // AI-2199: per-entry delegate override. Falls back to config default.
+    const delegateId = finding.delegate
+      ? await resolveInitialDelegate(finding.delegate)
+      : configDelegateId;
+    if (finding.delegate && !delegateId) {
+      log.warn(`fanout: per-entry delegate '${finding.delegate}' for finding "${childTitle}" did not resolve — spawning undelegated`);
+    }
 
     // Build child description: parent reference + a machine-readable spec-entry
     // marker (AI-1994) so a later re-entry can match this child back to its spec
@@ -802,10 +866,10 @@ export async function executeFanout(
       parentCtx.teamId,
       childTitle,
       childDescription,
-      parentInternalId,
+      parentCtx.internalId,
       labelIds,
       authToken,
-      initialDelegateId,
+      delegateId,
     );
 
     if (child) {
