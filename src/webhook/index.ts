@@ -401,8 +401,15 @@ export function createWebhookRouter(
                 hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
                 hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
                 hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
-                gatewayUrl: process.env.OPENCLAW_GATEWAY_URL,
-                gatewayToken: process.env.OPENCLAW_GATEWAY_TOKEN,
+                // NB: no global gatewayUrl/gatewayToken here. The gateway API
+                // delivery path (deliver.ts) is preferred whenever both are set,
+                // but OPENCLAW_GATEWAY_URL only ever points at ONE gateway (the
+                // host), which knows only host-local agents (grover/main). There
+                // is no per-agent gatewayUrl override in AgentConfig, so injecting
+                // the global here made every container agent (astrid@18822,
+                // igor@18820, …) unreachable — "Unknown agent" — while silently
+                // bypassing the correct per-agent hooksUrl. Delivery routes via
+                // per-agent hooksUrl/hooksToken from agents.json instead.
               };
               try {
                 if (throttle) {
@@ -747,8 +754,11 @@ export function createWebhookRouter(
           hooksToken: process.env.OPENCLAW_HOOKS_TOKEN,
           hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
           hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
-          gatewayUrl: process.env.OPENCLAW_GATEWAY_URL,
-          gatewayToken: process.env.OPENCLAW_GATEWAY_TOKEN,
+          // No global gatewayUrl/gatewayToken — see note at the wakeDeliveryConfig
+          // above. wakeConfigForAgent (below) overrides hooksUrl/hooksToken per
+          // agent but NOT gatewayUrl, so a global gateway here would win the
+          // delivery-path preference and strand every container agent. Route via
+          // per-agent hooks instead.
           timeoutMs: process.env.NODE_ENV === "test" ? 50 : undefined,
           maxRetries: process.env.NODE_ENV === "test" ? 0 : undefined,
         };
@@ -855,8 +865,9 @@ export function createWebhookRouter(
         hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
         hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
         hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
-        gatewayUrl: process.env.OPENCLAW_GATEWAY_URL,
-        gatewayToken: process.env.OPENCLAW_GATEWAY_TOKEN,
+        // No global gatewayUrl/gatewayToken — see note at the wakeDeliveryConfig
+        // earlier in this file. Routes via per-agent hooksUrl/hooksToken so
+        // container agents are reachable.
       };
       try {
         if (throttle) {
