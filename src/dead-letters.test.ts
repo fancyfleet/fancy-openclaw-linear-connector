@@ -292,7 +292,16 @@ describe("dead-letters API — AI-1772", () => {
 
   // ── AC5: web/dist rebuilt ─────────────────────────────────────────────────
 
-  test("AC5: web/dist/index.html exists and references dead-letters in the built bundle", () => {
+  // AI-2175: skipped. This asserts on web/dist, a build artifact that is
+  // .gitignore'd (see .gitignore: `dist/`) and is NOT produced by the backend
+  // jest job — CI runs `npm ci` → `tsc` → `jest` with no web SPA build step, so
+  // web/dist can never exist during this run and the test is red on every CI run
+  // on main. The web SPA build/bundle is owned by AI-2156 (Done); the dead-letters
+  // feature itself is fully covered by the 16 supertest cases above. Re-enable only
+  // if the jest job is given a web build step (or the check is moved to a job that
+  // builds the SPA). Leaving it live degrades the merge gate to a manual waiver on
+  // every PR.
+  test.skip("AC5: web/dist/index.html exists and references dead-letters in the built bundle", () => {
     // This test reads the ACTUAL built dist in the repo (not the test mock),
     // verifying that web/dist was rebuilt after web/src gained the dead-letters page.
     // It will be RED until Igor adds the page and rebuilds.
