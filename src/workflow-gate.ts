@@ -2932,7 +2932,16 @@ export async function applyStateTransition(
     : shouldTriggerFanout(def, currentStateName ?? "", intent);
   if (fanoutConfig) {
     const specDescription = await fetchFanoutSpecDescription(issueId, authToken);
-    const validation = validateFanoutSpec(specDescription, fanoutConfig);
+    // AI-2199: load registry to validate per-entry child workflow ids.
+    // Fail-open: if registry load fails, skip per-entry validation (backward compat).
+    let registeredWorkflows: Set<string> | undefined;
+    try {
+      const registry = await loadWorkflowRegistry();
+      registeredWorkflows = new Set(registry.keys());
+    } catch (err) {
+      log.warn(`workflow-gate: AI-2199: failed to load workflow registry for per-entry validation: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const validation = validateFanoutSpec(specDescription, fanoutConfig, registeredWorkflows);
     if (!validation.ok) {
       log.warn(
         `workflow-gate: AI-1992: fan-out spec REFUSED for ${issueId} (state '${currentStateName}' → '${toStateName}'): ${validation.reason}`,
