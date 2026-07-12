@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import yaml from "js-yaml";
-import { getAgents, getAccessToken, type AgentConfig } from "./agents.js";
+import { getAgents, getAccessToken, getTokenStatus, getAllTokenStatuses, recordTokenFailure, type AgentConfig } from "./agents.js";
 import type { AgentQueue } from "./queue/index.js";
 import type { PendingWorkBag, BagEntry } from "./bag/index.js";
 import type { SessionTracker } from "./bag/index.js";
@@ -1361,6 +1361,35 @@ export function createAdminRouter(deps: AdminDeps): Router {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ success: false, error: msg });
+    }
+  });
+
+  // ── AI-1908 / AI-2139 #2: per-agent token status ───────────────────────
+  // Exposes the persisted token state (lastRefreshOkAt, expiresAt, lastFailure,
+  // derived state) for the console fleet-management panel (AI-1955 AC3).
+  router.get("/api/tokens", (_req: Request, res: Response) => {
+    res.json({ tokens: getAllTokenStatuses() });
+  });
+
+  // AI-1908 / AI-2139 #3: manually trigger a token refresh for one agent.
+  router.post("/api/tokens/:name/refresh", async (req: Request, res: Response) => {
+    const name = req.params.name;
+    const agent = getAgents().find((a) => a.name === name);
+    if (!agent) {
+      res.status(404).json({ ok: false, error: `No agent found with name "${name}"` });
+      return;
+    }
+
+    try {
+      // Dynamic import to avoid pulling token-refresh dependencies at bundle time
+      const { refreshAgent } = await import("./token-refresh.js");
+      await refreshAgent(agent);
+      res.json({ ok: true, token: getTokenStatus(name) });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   });
 

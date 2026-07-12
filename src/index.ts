@@ -47,7 +47,7 @@ import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
 import { onAlert as onConfigHealthAlert } from "./config-health.js";
 import { startRegistryPolicyCheck } from "./registry-policy.js";
 import { resolveStartupCommit } from "./startup-commit.js";
-import { getAccessToken, getAgent, getLinearUserIdForAgent } from "./agents.js";
+import { getAccessToken, getAgent, getLinearUserIdForAgent, getAllTokenStatuses } from "./agents.js";
 import { loadUniversalCanon, getCanonLiveness } from "./policy/universal-canon.js";
 import { loadRoster, getRoutingFunctionaryLiveness } from "./department-roster.js";
 import { createGuidanceRouter, getDocsLiveness } from "./docs/guidance-router.js";
@@ -310,6 +310,11 @@ export function createApp(options?: CreateAppOptions) {
       // check ran on load (migratedCount 0 allowed), observable at ac-validate
       // without waiting for a def change.
       workflowMigrations: getDefStateMigrationLiveness(),
+      // AI-1908 AC5: per-agent OAuth token status. Exposes lastRefreshOkAt,
+      // expiresAt (from the real expires_in, not assumed ~24h), lastFailure,
+      // and a computed state (healthy/stale/expired/failing). Powers the
+      // console token panel (AI-1955 AC3) and operator triage without log access.
+      tokens: getAllTokenStatuses(),
     });
   });
 

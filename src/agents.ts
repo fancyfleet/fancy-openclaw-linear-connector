@@ -45,6 +45,24 @@ export interface AgentConfig {
   hooksToken?: string;
   /** Maximum concurrent sessions this agent can handle. Overrides the global default. */
   maxConcurrent?: number;
+  /**
+   * ISO-8601 timestamp of when the current access token expires.
+   * Computed from `expires_in` on the OAuth refresh response and persisted
+   * through updateTokens so the /health block and console token panel can
+   * surface real deadlines, not assumed ~24h. (AI-1908 AC4)
+   */
+  expiresAt?: string;
+  /** ISO-8601 timestamp of the last successful token refresh. */
+  lastRefreshOkAt?: string;
+  /** Details of the last failed token refresh attempt, if any. */
+  lastFailure?: TokenFailure;
+}
+
+export interface TokenFailure {
+  at: string;
+  status: number;
+  retriable: boolean;
+  reason: string;
 }
 
 interface AgentsFile {
@@ -303,17 +321,96 @@ export function getLinearUserIdForAgent(openclawAgentId: string): string | undef
 }
 
 /** Update tokens for an agent and persist to disk */
+export interface TokenStatus {
+  agentId: string;
+  lastRefreshOkAt: string | null;
+  expiresAt: string | null;
+  lastFailure: {
+    at: string;
+    status: number;
+    retriable: boolean;
+    reason: string;
+  } | null;
+  state: "healthy" | "stale" | "expired" | "failing";
+}
+
 export function updateTokens(
   agentName: string,
   accessToken: string,
   refreshToken: string,
+  expiresIn?: number,
 ): void {
+  const now = new Date().toISOString();
+  const expiresAt = expiresIn != null
+    ? new Date(Date.now() + expiresIn * 1000).toISOString()
+    : undefined;
+
   _agents = _agents.map((a) =>
-    a.name === agentName ? { ...a, accessToken, refreshToken } : a,
+    a.name === agentName
+      ? {
+          ...a,
+          accessToken,
+          refreshToken,
+          ...(expiresAt ? { expiresAt } : {}),
+          lastRefreshOkAt: now,
+          // Clear any previous failure on success
+          lastFailure: undefined,
+        }
+      : a,
   );
   save(_agents);
   syncWorkspaceSecrets(agentName, accessToken);
   log.info(`Tokens updated for ${agentName}: ${accessToken.slice(0, 20)}...`);
+}
+
+export function recordTokenFailure(
+  agentName: string,
+  status: number,
+  retriable: boolean,
+  reason: string,
+): void {
+  const now = new Date().toISOString();
+  _agents = _agents.map((a) =>
+    a.name === agentName
+      ? { ...a, lastFailure: { at: now, status, retriable, reason } }
+      : a,
+  );
+  save(_agents);
+}
+
+export function getTokenStatus(agentName: string): TokenStatus | undefined {
+  const agent = _agents.find((a) => a.name === agentName);
+  if (!agent) return undefined;
+
+  const now = Date.now();
+  const expiresAt = agent.expiresAt ? new Date(agent.expiresAt).getTime() : null;
+
+  let state: TokenStatus["state"];
+  if (agent.lastFailure && !agent.lastRefreshOkAt) {
+    // Never successfully refreshed — always failing
+    state = "failing";
+  } else if (expiresAt != null && now >= expiresAt) {
+    state = "expired";
+  } else if (agent.lastFailure) {
+    // Has a failure but also has a recent successful refresh
+    state = expiresAt != null && now >= expiresAt - 2 * 60 * 60 * 1000
+      ? "stale"
+      : "healthy";
+  } else {
+    state = "healthy";
+  }
+
+  return {
+    agentId: agentName,
+    lastRefreshOkAt: agent.lastRefreshOkAt ?? null,
+    expiresAt: agent.expiresAt ?? null,
+    lastFailure: agent.lastFailure ?? null,
+    state,
+  };
+}
+
+export function getAllTokenStatuses(): TokenStatus[] {
+  return _agents.map((a) => getTokenStatus(a.name)!).filter(Boolean);
 }
 
 /** Sync access token to the agent's workspace secrets file */

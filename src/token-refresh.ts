@@ -11,7 +11,7 @@
  * visible alert once every attempt has failed.
  */
 
-import { getAgents, updateTokens, isAgentLocal } from "./agents.js";
+import { getAgents, updateTokens, recordTokenFailure, isAgentLocal } from "./agents.js";
 import type { AgentConfig } from "./agents.js";
 import { createLogger, componentLogger } from "./logger.js";
 import { notify } from "./alerts/alert-bus.js";
@@ -83,19 +83,22 @@ async function refreshAgentOnce(
       // 4xx (except 429) is a hard failure — bad/revoked refresh token, retrying
       // won't help. 5xx and 429 are transient upstream conditions worth a retry.
       const retriable = res.status >= 500 || res.status === 429;
+      recordTokenFailure(agent.name, res.status, retriable, `HTTP ${res.status} ${text}`);
       return { ok: false, retriable, reason: `HTTP ${res.status} ${text}` };
     }
 
     const data = (await res.json()) as TokenResponse;
-    updateTokens(agent.name, data.access_token, data.refresh_token ?? agent.refreshToken);
+    updateTokens(agent.name, data.access_token, data.refresh_token ?? agent.refreshToken, data.expires_in);
     log.info(`Token refresh OK for ${agent.name}: ${data.access_token.slice(0, 20)}...`);
     return { ok: true };
   } catch (err) {
     // Network/parse errors are transient — retry.
+    const reason = err instanceof Error ? err.message : String(err);
+    recordTokenFailure(agent.name, 0, true, reason);
     return {
       ok: false,
       retriable: true,
-      reason: err instanceof Error ? err.message : String(err),
+      reason,
     };
   }
 }
@@ -142,15 +145,22 @@ async function refreshAgent(agent: AgentConfig, opts: RefreshOptions = {}): Prom
     }
   }
 
-  // Every attempt failed. This now means a real token-expiry risk within ~24h,
-  // so escalate to a visible alert (not just the historical warning).
+  // Every attempt failed. Record the final failure and escalate.
+  // Also record non-retriable failures that broke the loop early.
+  recordTokenFailure(agent.name, 0, last.retriable, last.reason);
   log.error(
     `Token refresh exhausted all ${maxAttempts} attempts for ${agent.name}: ${last.ok ? "" : last.reason}`,
   );
+
+  const agentCfg = getAgents().find((a) => a.name === agent.name);
+  const deadline = agentCfg?.expiresAt
+    ? ` — token expires at ${agentCfg.expiresAt}`
+    : " — no expiry recorded (token may already be expired or was never refreshed)";
+
   notify({
     severity: "critical",
     source: "token-refresh",
-    title: `Linear OAuth refresh failed for ${agent.name} after ${maxAttempts} attempts — proxied Linear calls will 401 once the current token expires (~24h)`,
+    title: `Linear OAuth refresh failed for ${agent.name} after ${maxAttempts} attempts${deadline}`,
     detail: last.ok ? undefined : last.reason,
     agent: agent.name,
   });
@@ -173,4 +183,4 @@ export function startTokenRefresh(): void {
 }
 
 // Exported for tests.
-export { refreshAgent, refreshAll, refreshAgentOnce, backoffMs };
+export { refreshAgent, refreshAll, refreshAgentOnce, backoffMs, type TokenResponse };
