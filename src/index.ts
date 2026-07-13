@@ -28,6 +28,7 @@ import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState
 import { checkLinearIssueRouting } from "./linear-actionable.js";
 import { assertDispatchTargetFetchable } from "./delivery/index.js";
 import { markDispatchIntegrityGateActive, getDispatchIntegrityState } from "./dispatch-integrity-state.js";
+import { getCircuitBreakerHealth } from "./dispatch-circuit-breaker.js";
 import { registerDistillationCron, createProdGenerationContext } from "./cron/p4-metrics-distillation.js";
 import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
@@ -365,6 +366,10 @@ export function createApp(options?: CreateAppOptions) {
       // check ran on load (migratedCount 0 allowed), observable at ac-validate
       // without waiting for a def change.
       workflowMigrations: getDefStateMigrationLiveness(),
+      // AI-2178: dispatch circuit breaker health — tracks per-ticket breaker
+      // state, tripped count, and config. Observable at /health without waiting
+      // for a dispatch loop to occur.
+      dispatchCircuitBreaker: getCircuitBreakerHealth(),
     });
   });
 
