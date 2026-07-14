@@ -33,6 +33,7 @@ import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
 import { registerBootstrapReconciliationCron } from "./bootstrap-reconciliation-sweep.js";
 import { registerDelegationReconciliationCron, runDelegationReconciliationSweep } from "./delegation-reconciliation-sweep.js";
+import { registerRegistryIntegrityCron } from "./registry-integrity-cron.js";
 import { getAlertBus } from "./alerts/alert-bus.js";
 import { registerSlaSweepCron } from "./sla-sweep.js";
 import { registerOobReconcileCron } from "./oob-reconcile-sweep.js";
@@ -49,7 +50,7 @@ import { LINEAR_API_URL } from "./linear-helpers.js";
 import { getCapabilityPolicy } from "./escalation-gate.js";
 import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
 import { onAlert as onConfigHealthAlert } from "./config-health.js";
-import { startRegistryPolicyCheck } from "./registry-policy.js";
+import { getRegistryPolicyStatus, startRegistryPolicyCheck } from "./registry-policy.js";
 import { resolveStartupCommit } from "./startup-commit.js";
 import { getAccessToken, getAgent, getLinearUserIdForAgent, getAllTokenStatuses, isPolledForLinear } from "./agents.js";
 import { loadUniversalCanon, getCanonLiveness } from "./policy/universal-canon.js";
@@ -361,6 +362,9 @@ export function createApp(options?: CreateAppOptions) {
         delegateChangeCleared: idempotencyStore.counters.delegateChangeCleared,
         ttlExpiredAdmits: idempotencyStore.counters.ttlExpiredAdmits,
       },
+      // AI-2359: registry⇄policy cross-check — surfaces unregistered bodies
+      // at /health so a steward can detect agent-drop gaps without log access.
+      registryPolicy: getRegistryPolicyStatus(),
       // AI-1872: workflow registry liveness — exposes the loaded workflow defs
       // (id → {version, states}) so ac-validate can confirm the updated def
       // is live without waiting for a dispatch trigger.
@@ -1157,6 +1161,14 @@ export function createApp(options?: CreateAppOptions) {
     operationalEventStore,
     wakeFn: migrationWakeFn,
   });
+
+  // AI-2359: registry⇄policy cross-check at createApp() time — surfaces
+  // unregistered bodies at /health and alerts on every registry hot-reload.
+  startRegistryPolicyCheck();
+
+  // AI-2359: periodic registry-integrity check — runs daily, cross-checks
+  // capability-policy bodies against agents.json entries and alerts on mismatches.
+  registerRegistryIntegrityCron();
 
   return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore };
 }
