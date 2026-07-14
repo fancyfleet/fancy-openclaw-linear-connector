@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.js.map
+*.d.ts.map
+.env
+.env.*
+!.env.example
+config/connector.yaml
+*.tsbuildinfo
+coverage/
+.DS_Store
+*.log
+data/
+agents.json
+# node_modules
