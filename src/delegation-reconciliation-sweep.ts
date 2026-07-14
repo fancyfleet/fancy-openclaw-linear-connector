@@ -28,7 +28,7 @@ import {
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { registerCron, formatIntervalMs } from "./cron/registry.js";
 import { OperationalEventStore, type OperationalEventStore as OperationalEventStoreType } from "./store/operational-event-store.js";
-import type { SessionTracker } from "./bag/session-tracker.js";
+import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 
 const log = componentLogger(
   createLogger(process.env.LOG_LEVEL ?? "info"),
@@ -59,6 +59,8 @@ export interface DelegationReconciliationOptions {
   until?: string;
   /** Override for Date.now() — used in tests for deterministic timing. */
   now?: () => Date;
+  /** AI-2350: durable dispatch lease store — prevent re-dispatches. */
+  dispatchLeaseStore?: DispatchLeaseStore;
 }
 
 export interface DelegationReconciliationResult {
@@ -169,6 +171,81 @@ async function queryGovernedTickets(
 }
 
 // ── Idempotency check ─────────────────────────────────────────────────────────
+
+/**
+ * Query Linear issue history for the most recent delegate-change event.
+ *
+ * Returns the ISO-8601 timestamp of when the current (or most recent) delegate
+ * was set, or null if no delegate-change event is found.
+ *
+ * AI-2350: fixes the compounding defect where ticket.updatedAt (which changes
+ * on any mutation — state, label, comment) was passed as the delegation
+ * timestamp to hasDispatchSinceDelegation, causing the guard to fail.
+ */
+async function queryDelegateSetTimestamp(
+  issueId: string,
+  authToken: string,
+  fetchFn: typeof fetch,
+): Promise<string | null> {
+  const query = `
+    query TicketDelegateHistory($issueId: String!) {
+      issue(id: $issueId) {
+        history(first: 50, orderBy: createdAt) {
+          nodes {
+            __typename
+            createdAt
+            toAssignee { id }
+            fromAssignee { id }
+          }
+        }
+      }
+    }
+  `;
+
+  try {
+    const res = await fetchFn(LINEAR_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: authToken,
+      },
+      body: JSON.stringify({ query, variables: { issueId } }),
+    });
+
+    type DelegateHistoryResp = {
+      data?: {
+        issue?: {
+          history: {
+            nodes: Array<{
+              __typename: string;
+              createdAt: string;
+              toAssignee?: { id: string } | null;
+              fromAssignee?: { id: string } | null;
+            }>;
+          };
+        };
+      };
+    };
+
+    const body = (await res.json()) as DelegateHistoryResp;
+    const historyNodes = body.data?.issue?.history?.nodes ?? [];
+
+    // Find the most recent delegate-change event (toAssignee was set)
+    // Use reverse chronological order.
+    for (const h of historyNodes.reverse()) {
+      if (h.toAssignee?.id || h.fromAssignee?.id) {
+        return h.createdAt;
+      }
+    }
+
+    return null;
+  } catch (err) {
+    log.warn(
+      `Failed to query delegate-set timestamp for ${issueId}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
+  }
+}
 
 /**
  * Check if the given delegate has been dispatched for this ticket since the
@@ -406,18 +483,52 @@ export async function runDelegationReconciliationSweep(
     // ── AC1: Enrolled ticket with delegate but no dispatch record ───────
     if (ticket.delegateId && ticket.delegateName && hasStateLabel(ticket.labels)) {
       // Check idempotency (AC4): has this delegate been dispatched since
-      // they were set?
+      // they were set? Use the real delegate-set timestamp from Linear
+      // history, NOT ticket.updatedAt (which changes on any mutation).
+      // AI-2350: fixes compounding defect from AI-2313.
+      let delegationTimestamp = ticket.updatedAt;
+      try {
+        const realTimestamp = await queryDelegateSetTimestamp(
+          ticket.id,
+          authToken,
+          fetchFn,
+        );
+        if (realTimestamp) {
+          delegationTimestamp = realTimestamp;
+        }
+      } catch {
+        // Fall through to use ticket.updatedAt as before
+      }
+
       if (
         hasDispatchSinceDelegation(
           operationalEventStore,
           ticket.delegateName,
           ticket.identifier,
-          ticket.updatedAt,
-          sessionTracker,
+          delegationTimestamp,
         )
       ) {
         result.skippedIdempotent++;
         continue;
+      }
+
+      // AI-2350: acquire dispatch lease before dispatching the wake.
+      // If a lease already exists (another path dispatched this ticket
+      // between our check and this point), skip the wake.
+      const leaseKey = `linear-${ticket.identifier}`;
+      if (opts.dispatchLeaseStore) {
+        const lease = opts.dispatchLeaseStore.acquire(
+          ticket.delegateName,
+          leaseKey,
+        );
+        if (lease.refused) {
+          log.info(
+            `delegation-reconciliation: lease refused for ${ticket.identifier} → ` +
+            `active lease exists for ${ticket.delegateName}, skipping wake`,
+          );
+          result.skippedIdempotent++;
+          continue;
+        }
       }
 
       // Heal: re-dispatch the delegation wake through the normal delivery path
@@ -524,6 +635,7 @@ export function registerDelegationReconciliationCron(opts: {
   wakeFn?: (agentName: string, ticketIdentifier: string) => Promise<void>;
   sessionTracker?: SessionTracker;
   fetchFn?: typeof fetch;
+  dispatchLeaseStore?: DispatchLeaseStore;
 }): NodeJS.Timeout {
   const intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
   registerCron(
@@ -544,6 +656,7 @@ export function registerDelegationReconciliationCron(opts: {
       wakeFn: opts.wakeFn ?? (() => Promise.resolve()),
       sessionTracker: opts.sessionTracker,
       fetchFn: opts.fetchFn,
+      dispatchLeaseStore: opts.dispatchLeaseStore,
     }).catch((err) => {
       log.error(
         `delegation-reconciliation: unexpected sweep failure: ${err instanceof Error ? err.message : String(err)}`,
