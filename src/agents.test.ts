@@ -10,6 +10,7 @@ import {
   recordTokenFailure,
   reloadAgents,
   safeReloadAgents,
+  mintProxyToken,
   updateTokens,
   upsertAgent,
   type AgentConfig,
@@ -199,12 +200,17 @@ describe("broker proxy-token model", () => {
     expect(env).not.toContain("real-secret-token");
   });
 
-  test("syncWorkspaceSecrets keeps legacy direct-token behavior when no proxy token is set", () => {
+  test("new agent with no proxyToken gets one minted and the real token never lands in env", () => {
     const secretsPath = path.join(dir, "linear.env");
-    upsertAgent({ ...makeAgent(secretsPath), accessToken: "real-secret-token" });
+    const result = upsertAgent({ ...makeAgent(secretsPath), accessToken: "real-secret-token" });
+    expect(result.isNew).toBe(true);
+
+    const agent = getAgents().find((a) => a.name === "charles")!;
+    expect(agent.proxyToken).toMatch(/^lpx_/);
 
     const env = fs.readFileSync(secretsPath, "utf8");
-    expect(env.trim()).toBe("LINEAR_OAUTH_TOKEN=real-secret-token");
+    expect(env).toContain(agent.proxyToken!);
+    expect(env).not.toContain("real-secret-token");
     expect(env).not.toContain("LINEAR_PROXY_URL");
   });
 
@@ -306,5 +312,88 @@ describe("getTokenStatus — credential state ladder (AI-2231)", () => {
     // lastFailure && !lastRefreshOkAt is caught by the earlier "failing" branch;
     // the unconfigured branch must not shadow it.
     expect(getTokenStatus("charles")!.state).toBe("failing");
+  });
+});
+
+describe("mintProxyToken — broker credential generation (AI-2308)", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "agents-mint-proxy-test-"));
+    process.env.AGENTS_FILE = path.join(dir, "agents.json");
+    delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
+    delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
+    delete process.env.SECRETS_DIR;
+    reloadAgents();
+  });
+
+  afterEach(() => {
+    delete process.env.AGENTS_FILE;
+    reloadAgents();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("mintProxyToken returns a non-empty lpx_-prefixed string", () => {
+    const token = mintProxyToken();
+    expect(token).toMatch(/^lpx_[a-f0-9]+$/);
+    expect(token.length).toBeGreaterThan("lpx_".length + 10);
+  });
+
+  test("mintProxyToken produces unique tokens on each call", () => {
+    const t1 = mintProxyToken();
+    const t2 = mintProxyToken();
+    expect(t1).not.toBe(t2);
+  });
+
+  test("upsertAgent mints a proxyToken for a new agent with none provided", () => {
+    const secretsPath = path.join(dir, "linear.env");
+    const result = upsertAgent({ ...makeAgent(secretsPath) });
+
+    expect(result.isNew).toBe(true);
+
+    const agent = getAgents().find((a) => a.name === "charles");
+    expect(agent).toBeDefined();
+    expect(agent!.proxyToken).toMatch(/^lpx_/);
+
+    // The env file must contain the proxy token, never the raw access token.
+    const env = fs.readFileSync(secretsPath, "utf8");
+    expect(env).toContain(agent!.proxyToken!);
+    expect(env).not.toContain("access-token");
+  });
+
+  test("upsertAgent does not overwrite an existing proxyToken on re-provision", () => {
+    const secretsPath = path.join(dir, "linear.env");
+    const originalToken = "lpx_preexisting_token_abc";
+
+    // First call with an explicit proxyToken
+    upsertAgent({
+      ...makeAgent(secretsPath),
+      proxyToken: originalToken,
+    });
+
+    const agent1 = getAgents().find((a) => a.name === "charles");
+    expect(agent1!.proxyToken).toBe(originalToken);
+
+    // Second call (update, not new) with no proxyToken in config
+    const result = upsertAgent({ ...makeAgent(secretsPath) });
+    expect(result.isNew).toBe(false);
+
+    // The original proxy token must survive; the mint must not fire.
+    const agent2 = getAgents().find((a) => a.name === "charles");
+    expect(agent2!.proxyToken).toBe(originalToken);
+  });
+
+  test("upsertAgent preserves an explicit proxyToken on the new-agent path", () => {
+    const secretsPath = path.join(dir, "linear.env");
+    const explicitToken = "lpx_explicitly_provided";
+
+    const result = upsertAgent({
+      ...makeAgent(secretsPath),
+      proxyToken: explicitToken,
+    });
+    expect(result.isNew).toBe(true);
+
+    const agent = getAgents().find((a) => a.name === "charles");
+    expect(agent!.proxyToken).toBe(explicitToken);
   });
 });
