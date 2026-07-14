@@ -266,6 +266,27 @@ describe("reconcileOobMutations", () => {
     expect(second.flagged).toBe(0);
   });
 
+  test("flagged mutations are resolved — second pass does not re-examine them (AI-2191)", async () => {
+    store.append({
+      source: "webhook",
+      ticket: "AI-2191",
+      changeType: "state",
+      field: "state:done",
+      recordedAt: "2026-07-05T20:30:00.000Z",
+    });
+
+    // First pass: flag the out-of-band mutation
+    const first = await reconcileOobMutations(store, { nowMs: NOW, graceMs: 60_000 });
+    expect(first.flagged).toBe(1);
+    expect(first.examined).toBe(1);
+
+    // Second pass: should see 0 — the flagged record was marked resolved
+    const second = await reconcileOobMutations(store, { nowMs: NOW, graceMs: 60_000 });
+    expect(second.examined).toBe(0);
+    expect(second.correlated).toBe(0);
+    expect(second.flagged).toBe(0);
+  });
+
   test("writes operational events for flagged mutations", async () => {
     const opStore = fakeOpStore();
 

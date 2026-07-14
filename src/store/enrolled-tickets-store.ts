@@ -41,7 +41,7 @@ export interface ReconcileInput {
 }
 
 export interface ReconcileResult {
-  action: "created" | "corrected" | "noop" | "demoted";
+  action: "created" | "corrected" | "noop" | "demoted" | "suspended" | "resumed";
 }
 
 export interface EnrolledTicketRow {
@@ -54,6 +54,9 @@ export interface EnrolledTicketRow {
   last_event_kind: string | null;
   last_event_at: string | null;
   terminal: number;
+  suspended: number;
+  suspended_at: string | null;
+  suspended_by: string | null;
 }
 
 /**
@@ -113,11 +116,27 @@ export class EnrolledTicketsStore {
         enrolled_at TEXT NOT NULL DEFAULT (datetime('now')),
         last_event_kind TEXT,
         last_event_at TEXT,
-        terminal INTEGER NOT NULL DEFAULT 0
+        terminal INTEGER NOT NULL DEFAULT 0,
+        suspended INTEGER NOT NULL DEFAULT 0,
+        suspended_at TEXT,
+        suspended_by TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_enrolled_terminal ON enrolled_tickets(terminal);
       CREATE INDEX IF NOT EXISTS idx_enrolled_workflow ON enrolled_tickets(workflow);
+      CREATE INDEX IF NOT EXISTS idx_enrolled_suspended ON enrolled_tickets(suspended);
     `);
+
+    // AI-2179: Migrate existing tables — add suspended columns if missing.
+    const tableInfo = this.db.pragma("table_info(enrolled_tickets)") as Array<{ name: string }>;
+    const hasSuspended = tableInfo.some((c) => c.name === "suspended");
+    if (!hasSuspended) {
+      this.db.exec(`
+        ALTER TABLE enrolled_tickets ADD COLUMN suspended INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE enrolled_tickets ADD COLUMN suspended_at TEXT;
+        ALTER TABLE enrolled_tickets ADD COLUMN suspended_by TEXT;
+        CREATE INDEX IF NOT EXISTS idx_enrolled_suspended ON enrolled_tickets(suspended);
+      `);
+    }
   }
 
   /** AC1: Enroll a ticket into the mirror (idempotent). */
@@ -125,8 +144,8 @@ export class EnrolledTicketsStore {
     const now = preciseTimestamp();
     const inserted = this.db
       .prepare(
-        `INSERT INTO enrolled_tickets (ticket_id, workflow, state, delegate, entered_state_at, enrolled_at, last_event_kind, last_event_at, terminal)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+        `INSERT INTO enrolled_tickets (ticket_id, workflow, state, delegate, entered_state_at, enrolled_at, last_event_kind, last_event_at, terminal, suspended)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
          ON CONFLICT(ticket_id) DO NOTHING`,
       )
       .run(input.ticketId, input.workflow, input.state, input.delegate, now, now, "enroll", now);
@@ -140,8 +159,19 @@ export class EnrolledTicketsStore {
       this.db
         .prepare(
           `UPDATE enrolled_tickets
-           SET workflow = ?, state = ?, delegate = ?, entered_state_at = ?, last_event_kind = 'revived', last_event_at = ?, terminal = 0
+           SET workflow = ?, state = ?, delegate = ?, entered_state_at = ?, last_event_kind = 'revived', last_event_at = ?, terminal = 0, suspended = 0
            WHERE ticket_id = ? AND terminal = 1`,
+        )
+        .run(input.workflow, input.state, input.delegate, now, now, input.ticketId);
+    }
+
+    // Also unsuspend if the ticket was suspended (resumed via re-enroll).
+    if (inserted.changes === 0) {
+      this.db
+        .prepare(
+          `UPDATE enrolled_tickets
+           SET workflow = ?, state = ?, delegate = ?, entered_state_at = ?, last_event_kind = 'resumed', last_event_at = ?, terminal = 0, suspended = 0, suspended_at = NULL, suspended_by = NULL
+           WHERE ticket_id = ? AND suspended = 1`,
         )
         .run(input.workflow, input.state, input.delegate, now, now, input.ticketId);
     }
@@ -153,7 +183,7 @@ export class EnrolledTicketsStore {
     const result = this.db
       .prepare(
         `UPDATE enrolled_tickets
-         SET state = ?, delegate = ?, entered_state_at = ?, last_event_kind = ?, last_event_at = ?, terminal = 0
+         SET state = ?, delegate = ?, entered_state_at = ?, last_event_kind = ?, last_event_at = ?, terminal = 0, suspended = 0, suspended_at = NULL, suspended_by = NULL
          WHERE ticket_id = ?`,
       )
       .run(input.toState, input.delegate, now, input.eventKind, now, input.ticketId);
@@ -191,6 +221,55 @@ export class EnrolledTicketsStore {
   }
 
   /**
+   * AI-2179: Suspend a ticket's workflow enrollment (routed to human).
+   * Labels and enrollment row are preserved; dispatch is paused.
+   */
+  suspend(ticketId: string, suspendedBy: string | null = null): void {
+    const now = preciseTimestamp();
+    this.db
+      .prepare(
+        `UPDATE enrolled_tickets
+         SET suspended = 1, suspended_at = ?, suspended_by = ?, last_event_kind = 'suspended', last_event_at = ?
+         WHERE ticket_id = ? AND terminal = 0`,
+      )
+      .run(now, suspendedBy, now, ticketId);
+  }
+
+  /**
+   * AI-2179: Resume a suspended ticket's workflow enrollment.
+   * Re-engages dispatch at the suspended state.
+   */
+  resume(ticketId: string): void {
+    const now = preciseTimestamp();
+    this.db
+      .prepare(
+        `UPDATE enrolled_tickets
+         SET suspended = 0, suspended_at = NULL, suspended_by = NULL, last_event_kind = 'resumed', last_event_at = ?
+         WHERE ticket_id = ? AND suspended = 1`,
+      )
+      .run(now, ticketId);
+  }
+
+  /**
+   * AI-2179: Returns true if the ticket is currently suspended.
+   */
+  isSuspended(ticketId: string): boolean {
+    const row = this.db
+      .prepare(`SELECT suspended FROM enrolled_tickets WHERE ticket_id = ?`)
+      .get(ticketId) as { suspended: number } | undefined;
+    return row?.suspended === 1;
+  }
+
+  /**
+   * AI-2179: Return all suspended tickets.
+   */
+  getSuspended(): EnrolledTicketRow[] {
+    return this.db
+      .prepare(`SELECT * FROM enrolled_tickets WHERE suspended = 1 ORDER BY suspended_at DESC`)
+      .all() as EnrolledTicketRow[];
+  }
+
+  /**
    * AI-2091 §3 (AI-2015 AC2): PURGE a ticket from the mirror entirely.
    *
    * Deletion (ticket removed from Linear, or moved out of an enrolled team) must
@@ -212,10 +291,19 @@ export class EnrolledTicketsStore {
     return row ?? null;
   }
 
-  /** Return all enrolled tickets (including terminal). */
+  /** Return all enrolled tickets (including terminal and suspended). */
   getAll(): EnrolledTicketRow[] {
     return this.db
       .prepare(`SELECT * FROM enrolled_tickets ORDER BY entered_state_at DESC`)
+      .all() as EnrolledTicketRow[];
+  }
+
+  /**
+   * Return non-terminal, non-suspended enrolled tickets (eligible for dispatch).
+   */
+  getActive(): EnrolledTicketRow[] {
+    return this.db
+      .prepare(`SELECT * FROM enrolled_tickets WHERE terminal = 0 AND suspended = 0 ORDER BY entered_state_at DESC`)
       .all() as EnrolledTicketRow[];
   }
 
@@ -236,7 +324,7 @@ export class EnrolledTicketsStore {
 
     // Ticket has no wf:* label — it left the workflow.
     if (!wf) {
-      if (!existing || existing.terminal === 1) return { action: "noop" };
+      if (!existing || existing.terminal === 1 || existing.suspended === 1) return { action: "noop" };
       this.demoteEnrolled(ticketId);
       return { action: "demoted" };
     }
@@ -266,6 +354,11 @@ export class EnrolledTicketsStore {
         delegate: input.delegate,
       });
       return { action: "created" };
+    }
+
+    // AI-2179: suspended row with valid labels — leave suspended, don't correct.
+    if (existing.suspended === 1) {
+      return { action: "noop" };
     }
 
     // Correct stale state or delegate.

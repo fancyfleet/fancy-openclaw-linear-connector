@@ -18,6 +18,7 @@
  */
 
 import { componentLogger, createLogger } from "./logger.js";
+import { resolve } from "./alerts/alert-bus.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "config-health");
 
@@ -47,7 +48,9 @@ export interface ConfigHealthStatus {
 
 // ── Alert callback type ────────────────────────────────────────────────────
 
-export type AlertCallback = (status: ConfigHealthStatus) => void;
+export type DegradedCallback = (status: ConfigHealthStatus) => void;
+/** Fired when ALL artifacts return to healthy. */
+export type HealedCallback = () => void;
 
 // ── Singleton state ────────────────────────────────────────────────────────
 
@@ -78,7 +81,9 @@ const artifactState: Record<ArtifactKind, ArtifactHealth> = {
   },
 };
 
-let alertCallbacks: AlertCallback[] = [];
+let alertCallbacks: DegradedCallback[] = [];
+let healedCallbacks: (() => void)[] = [];
+let wasPreviouslyUnhealthy = false;
 
 // ── Public API ─────────────────────────────────────────────────────────────
 
@@ -95,6 +100,11 @@ export function recordSuccess(kind: ArtifactKind): void {
 
   if (isHealthy()) {
     log.info(`config-health: ${kind} loaded successfully — all artifacts healthy`);
+    if (wasPreviouslyUnhealthy) {
+      // AI-2190: all artifacts healthy again — fire healed callbacks.
+      wasPreviouslyUnhealthy = false;
+      fireHealed();
+    }
   } else {
     log.warn(`config-health: ${kind} loaded successfully but other artifacts are degraded`);
   }
@@ -117,6 +127,7 @@ export function recordFailure(kind: ArtifactKind, error: string): void {
   const status = getStatus();
 
   if (wasHealthy) {
+    wasPreviouslyUnhealthy = true;
     log.error(`config-health: ${kind} transitioned to UNHEALTHY: ${error}`);
     fireAlerts(status);
   } else if (artifact.consecutiveFailures % 5 === 0) {
@@ -150,10 +161,21 @@ export function isHealthy(): boolean {
  * from healthy to unhealthy (and on periodic re-alerts).
  * Returns an unsubscribe function.
  */
-export function onAlert(callback: AlertCallback): () => void {
+export function onAlert(callback: DegradedCallback): () => void {
   alertCallbacks.push(callback);
   return () => {
     alertCallbacks = alertCallbacks.filter((cb) => cb !== callback);
+  };
+}
+
+/**
+ * Register a callback for when config health transitions from unhealthy to
+ * fully healthy. Useful for sending resolve notifications (AI-2190).
+ */
+export function onHealed(callback: () => void): () => void {
+  healedCallbacks.push(callback);
+  return () => {
+    healedCallbacks = healedCallbacks.filter((cb) => cb !== callback);
   };
 }
 
@@ -172,6 +194,8 @@ export function resetConfigHealth(): void {
     };
   }
   alertCallbacks = [];
+  healedCallbacks = [];
+  wasPreviouslyUnhealthy = false;
 }
 
 // ── Internal ───────────────────────────────────────────────────────────────
@@ -182,6 +206,16 @@ function fireAlerts(status: ConfigHealthStatus): void {
       cb(status);
     } catch (err) {
       log.error(`config-health: alert callback threw: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+}
+
+function fireHealed(): void {
+  for (const cb of healedCallbacks) {
+    try {
+      cb();
+    } catch (err) {
+      log.error(`config-health: healed callback threw: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 }

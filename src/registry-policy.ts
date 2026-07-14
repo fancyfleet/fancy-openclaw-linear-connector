@@ -22,7 +22,7 @@
 
 import { getAgents, onAgentsReloaded, type AgentConfig } from "./agents.js";
 import { getPolicyBodies, type PolicyBody } from "./escalation-gate.js";
-import { notify } from "./alerts/alert-bus.js";
+import { notify, resolve } from "./alerts/alert-bus.js";
 import { componentLogger, createLogger } from "./logger.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "registry-policy");
@@ -127,6 +127,15 @@ export async function runRegistryPolicyCheck(trigger: string): Promise<RegistryP
         dedupKey: "registry-policy|drift",
       });
     } else {
+      // AI-2190: resolve the drift alert when the check runs clean.
+      // This produces a ✓ CLEARED notification instead of silence.
+      // Uses explicit dedupKey so title doesn't need to match exactly.
+      resolve({
+        severity: "warning",
+        source: "registry-policy",
+        title: "all registry⇄policy checks clean",
+        dedupKey: "registry-policy|drift",
+      });
       log.info(`registry⇄policy check clean (${trigger}): ${bodies.length} bodies asserted` +
         (notes.length ? ` — notes: ${notes.join("; ")}` : ""));
     }

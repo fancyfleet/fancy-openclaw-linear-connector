@@ -1967,6 +1967,36 @@ export async function checkWorkflowRules(
   }
 
   const transitions = stateNode.transitions ?? [];
+
+  // AI-2179: 'needs-human' is a system verb, not a workflow-state transition.
+  // It suspends enrollment and sets human assignee without advancing workflow state.
+  // Bypass transition matching — the B2 apply handler handles the concrete behavior.
+  if (intent === "needs-human") {
+    // Capability check: needs-human requires human:escalate.
+    if (isCallerKnown) {
+      const allowed = await bodyHasCapability(bodyId, "human:escalate");
+      if (!allowed) {
+        return (
+          `[Proxy] 'needs-human' requires the 'human:escalate' capability; ` +
+          `handoff to Ai (the human gateway) to escalate. ` +
+          `Legal moves: ${[...transitions.map((t) => t.command), breakGlassCommand].join(", ")}.`
+        );
+      }
+    }
+    // Delegate-only check: caller must be the current delegate (or hold break-glass).
+    // needs-human clears the delegate, but the caller must be the delegate to initiate it.
+    const hasBreakGlass = await bodyHasCapability(bodyId, "workflow:break-glass");
+    if (callerLinearUserId && delegateId && callerLinearUserId !== delegateId && !hasBreakGlass) {
+      return (
+        `[Proxy] 'needs-human' blocked: ${bodyId} is not the current delegate for ${issueId}. ` +
+        `Only the ticket delegate may escalate it to a human. ` +
+        `Legal moves: ${[...transitions.map((t) => t.command), breakGlassCommand].join(", ")}.`
+      );
+    }
+    // Pass through — B2 handles suspend + label retention.
+    return null;
+  }
+
   const match = transitions.find((t) => t.command === intent);
 
   if (!match) {
@@ -2918,6 +2948,20 @@ export async function applyStateTransition(
       `workflow-gate: B2 apply: ${issueId} demoted to __ad_hoc__ — removed state:* and wf:* labels`,
     );
     return { status: "applied", code: "demoted-ad-hoc", from: currentStateName, to: "__ad_hoc__" };
+  }
+
+  // ── AI-2179: needs-human (suspend, not eject) ────────────────────────────
+  // When an agent escalates a ticket to a human, suspend enrollment instead of
+  // ejecting. Labels (wf:*, state:*) are retained so the human sees the ticket
+  // in its workflow state, and resume re-engages dispatch without manual heal.
+  if (intent === "needs-human" && currentStateName) {
+    // The forwarded mutation already set assignee + cleared delegate.
+    // Suspend enrollment — keep labels, mark row suspended.
+    options?.enrolledTicketsStore?.suspend(issueId, options?.bodyId ?? null);
+    log.info(
+      `workflow-gate: B2 apply: ${issueId} needs-human — suspended enrollment (labels retained, state='${currentStateName}')`,
+    );
+    return { status: "applied", code: "needs-human-suspended", from: currentStateName, to: currentStateName };
   }
 
   // ── AI-1992: Pre-transition fan-out spec gate (AC5) ──────────────────────

@@ -262,6 +262,21 @@ export class MutationAuditStore {
   }
 
   /**
+   * Mark a flagged (out-of-band) webhook record as resolved.
+   * Prevents the reconcile sweep from re-examining it on subsequent passes.
+   * Unlike correlate(), this is called when NO proxy match exists — the mutation
+   * is genuinely out-of-band but has already been flagged and alerted, so it
+   * should not be counted again.
+   */
+  markFlaggedResolved(webhookId: number, resolvedAt?: string): void {
+    const ts = resolvedAt ?? new Date().toISOString();
+    this.db.prepare(`
+      UPDATE mutation_audit SET correlated = 1, correlated_at = ?
+      WHERE id = ? AND source = 'webhook'
+    `).run(ts, webhookId);
+  }
+
+  /**
    * Find proxy records for a given ticket/change_type within a time window.
    * Matches on exact ticket OR ticket_uuid to handle the UUID⇄identifier gap
    * (proxy often only has the UUID; webhook has the human-readable identifier).
@@ -294,6 +309,10 @@ export class MutationAuditStore {
    * Return webhook-observed state/label/delegate mutations that are still
    * uncorrelated and older than the grace window. These are the candidates
    * for out-of-band detection.
+   *
+   * Mutations that were flagged in a previous pass are excluded because
+   * markFlaggedResolved() sets correlated=1. This prevents monotonically
+   * growing counts across hourly sweep passes (AI-2191).
    */
   uncorrelatedWebhookMutations(
     changeTypes: ChangeType[],
