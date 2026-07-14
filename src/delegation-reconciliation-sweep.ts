@@ -28,6 +28,7 @@ import {
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { registerCron, formatIntervalMs } from "./cron/registry.js";
 import { OperationalEventStore, type OperationalEventStore as OperationalEventStoreType } from "./store/operational-event-store.js";
+import type { SessionTracker } from "./bag/session-tracker.js";
 import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 
 const log = componentLogger(
