@@ -172,7 +172,27 @@ interface MakeLabelFetchOpts {
   issueError?: boolean;
   updateError?: boolean;
   issueUpdateSuccess?: boolean;
+  /**
+   * Identifier returned by the IssueContext fetch. Pass `null` to simulate an
+   * issue whose identifier could not be resolved (the gate then falls back to
+   * the raw issueId it was handed).
+   */
+  identifier?: string | null;
 }
+
+/**
+ * The two key spaces the applied-state store straddles — kept deliberately
+ * DISTINCT so the suite exercises production keying.
+ *
+ * Production writes to the store under the HUMAN identifier
+ * (applyStateTransition → recordAppliedState(issue.identifier, ...)), but
+ * checkWorkflowRules is handed `issueId` = extractIssueId(body), which on the
+ * issueUpdate mutation path is a UUID. An earlier version of this suite used one
+ * literal for both, so the lookup always hit and the tests passed against a fix
+ * that was a no-op in production. Never collapse these two constants.
+ */
+const TEST_IDENTIFIER = "AI-2357";
+const ISSUE_UUID = "11111111-2222-3333-4444-555555555555";
 
 const teamId = "team-uuid";
 const teamLabels: Array<{ id: string; name: string }> = [
@@ -212,6 +232,10 @@ function makeLabelFetch(labels: string[], opts: MakeLabelFetchOpts = {}) {
           data: {
             issue: {
               id: "internal-uuid",
+              // Linear resolves the human identifier regardless of whether the
+              // request supplied a UUID or an identifier. This is the store's
+              // true key.
+              identifier: opts.identifier === undefined ? TEST_IDENTIFIER : opts.identifier,
               team: { id: teamId },
               labels: { nodes: issueLabels },
               delegate: null,
@@ -308,42 +332,42 @@ describe("AI-2357: stale-label/state-projection drift — self-heal in checkWork
   // ─── AC1/AC2: self-heal on stale labels via applied-state store ────────
 
   it("'approve' passes despite stale 'state:implementation' label (engine state = code-review)", async () => {
-    recordAppliedState("issue-uuid", "code-review");
+    recordAppliedState(TEST_IDENTIFIER, "code-review");
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
-    const result = await checkWorkflowRules("approve", "issue-uuid", "Bearer tok", "cra");
+    const result = await checkWorkflowRules("approve", ISSUE_UUID, "Bearer tok", "cra");
     expect(result).toBeNull();
   });
 
   it("'submit' passes despite stale 'state:code-review' label (engine state = implementation)", async () => {
-    recordAppliedState("issue-uuid", "implementation");
+    recordAppliedState(TEST_IDENTIFIER, "implementation");
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
-    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles");
+    const result = await checkWorkflowRules("submit", ISSUE_UUID, "Bearer tok", "charles");
     expect(result).toBeNull();
   });
 
   it("'deploy' passes despite stale 'state:done' label (engine state = deployment)", async () => {
-    recordAppliedState("issue-uuid", "deployment");
+    recordAppliedState(TEST_IDENTIFIER, "deployment");
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:done"]);
-    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
+    const result = await checkWorkflowRules("deploy", ISSUE_UUID, "Bearer tok", "hanzo");
     expect(result).toBeNull();
   });
 
   it("passes normally when labels are accurate (no regression)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
-    expect(await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles")).toBeNull();
+    expect(await checkWorkflowRules("submit", ISSUE_UUID, "Bearer tok", "charles")).toBeNull();
 
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
-    expect(await checkWorkflowRules("approve", "issue-uuid", "Bearer tok", "cra")).toBeNull();
+    expect(await checkWorkflowRules("approve", ISSUE_UUID, "Bearer tok", "cra")).toBeNull();
 
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
-    expect(await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+    expect(await checkWorkflowRules("deploy", ISSUE_UUID, "Bearer tok", "hanzo")).toBeNull();
   });
 
   it("blocks a genuinely illegal verb when no engine state override exists", async () => {
     // No applied-state store — labels are authoritative. deploy from
     // code-review is illegal with accurate labels.
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
-    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "cra");
+    const result = await checkWorkflowRules("deploy", ISSUE_UUID, "Bearer tok", "cra");
     expect(result).not.toBeNull();
     expect(result).toContain("[Proxy]");
   });
@@ -351,14 +375,14 @@ describe("AI-2357: stale-label/state-projection drift — self-heal in checkWork
   it("escape still works with stale labels", async () => {
     // escape is break-glass and is handled before the normal transition check
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
-    const result = await checkWorkflowRules("escape", "issue-uuid", "Bearer tok", "astrid");
+    const result = await checkWorkflowRules("escape", ISSUE_UUID, "Bearer tok", "astrid");
     expect(result).toBeNull();
   });
 
   it("'request-changes' passes despite stale 'state:implementation' label (engine state = code-review)", async () => {
-    recordAppliedState("issue-uuid", "code-review");
+    recordAppliedState(TEST_IDENTIFIER, "code-review");
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
-    const result = await checkWorkflowRules("request-changes", "issue-uuid", "Bearer tok", "cra");
+    const result = await checkWorkflowRules("request-changes", ISSUE_UUID, "Bearer tok", "cra");
     expect(result).toBeNull();
   });
 
@@ -366,25 +390,80 @@ describe("AI-2357: stale-label/state-projection drift — self-heal in checkWork
     // No applied state — request-changes from implementation is NOT legal
     _resetAppliedStateStore();
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
-    const result = await checkWorkflowRules("request-changes", "issue-uuid", "Bearer tok", "cra");
+    const result = await checkWorkflowRules("request-changes", ISSUE_UUID, "Bearer tok", "cra");
     expect(result).not.toBeNull();
     expect(result).toContain("[Proxy]");
   });
 
   it("'accept' passes despite stale 'state:implementation' label (engine state = intake)", async () => {
-    recordAppliedState("issue-uuid", "intake");
+    recordAppliedState(TEST_IDENTIFIER, "intake");
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
-    const result = await checkWorkflowRules("accept", "issue-uuid", "Bearer tok", "astrid");
+    const result = await checkWorkflowRules("accept", ISSUE_UUID, "Bearer tok", "astrid");
     expect(result).toBeNull();
   });
 
   it("capability gate still fires after self-heal", async () => {
     // deploy requires deploy:execute — cra doesn't have it
-    recordAppliedState("issue-uuid", "deployment");
+    recordAppliedState(TEST_IDENTIFIER, "deployment");
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
-    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "cra");
+    const result = await checkWorkflowRules("deploy", ISSUE_UUID, "Bearer tok", "cra");
     expect(result).not.toBeNull();
     expect(result).toContain("requires");
+  });
+});
+
+describe("AI-2357: applied-state store keying — read key must be the human identifier", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; _resetAppliedStateStore(); });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  // The regression this class of test exists for: the store is written under the
+  // human identifier but the gate is handed a UUID. If the gate reads the store
+  // with that UUID, the lookup misses, it falls through to the stale label, and
+  // the verb declines — the bug AI-2357 exists to close, passing its own suite.
+
+  it("self-heals when the store was written under the identifier and the gate is called with a UUID", async () => {
+    // Exactly what production does: applyStateTransition recorded 'code-review'
+    // under 'AI-2357'; the inbound issueUpdate mutation carries a UUID.
+    recordAppliedState(TEST_IDENTIFIER, "code-review");
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+
+    const result = await checkWorkflowRules("approve", ISSUE_UUID, "Bearer tok", "cra");
+
+    expect(result).toBeNull();
+  });
+
+  it("does NOT consult a store entry written under the UUID (identifier is the only key)", async () => {
+    // Nothing in production writes under the UUID. If this ever passes, the gate
+    // is reading a key space that the writer never populates.
+    recordAppliedState(ISSUE_UUID, "code-review");
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+
+    const result = await checkWorkflowRules("approve", ISSUE_UUID, "Bearer tok", "cra");
+
+    // No identifier-keyed entry → stale label stands → approve is illegal there.
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+  });
+
+  it("falls back to the raw issueId when the identifier cannot be resolved (CLI path)", async () => {
+    // On the CLI path issueId may itself already be the identifier, and a failed
+    // identifier resolve must not regress the pre-existing behavior.
+    recordAppliedState(TEST_IDENTIFIER, "code-review");
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"], { identifier: null });
+
+    const result = await checkWorkflowRules("approve", TEST_IDENTIFIER, "Bearer tok", "cra");
+
+    expect(result).toBeNull();
+  });
+
+  it("store lookup is case-insensitive across key forms (normalizeKey uppercases)", async () => {
+    recordAppliedState("ai-2357", "code-review");
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+
+    const result = await checkWorkflowRules("approve", ISSUE_UUID, "Bearer tok", "cra");
+
+    expect(result).toBeNull();
   });
 });
 
@@ -395,19 +474,19 @@ describe("AI-2357: stale-label self-heal — stuck-delegate suggestion alignment
 
   it("commands suggested by buildRePrompt for the true state pass checkWorkflowRules with engine state", async () => {
     // Simulate ticket at code-review with stale label (says implementation)
-    recordAppliedState("issue-uuid", "code-review");
+    recordAppliedState(TEST_IDENTIFIER, "code-review");
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
     // approve is a code-review command — should pass
-    expect(await checkWorkflowRules("approve", "issue-uuid", "Bearer tok", "cra")).toBeNull();
+    expect(await checkWorkflowRules("approve", ISSUE_UUID, "Bearer tok", "cra")).toBeNull();
     // request-changes is also a code-review command
-    expect(await checkWorkflowRules("request-changes", "issue-uuid", "Bearer tok", "cra")).toBeNull();
+    expect(await checkWorkflowRules("request-changes", ISSUE_UUID, "Bearer tok", "cra")).toBeNull();
   });
 
   it("without engine state, labels are authoritative — non-matching verbs still rejected", async () => {
     // No applied-state store — label (code-review) is the source of truth
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
     // submit is NOT in code-review's transitions and no engine state override
-    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "cra");
+    const result = await checkWorkflowRules("submit", ISSUE_UUID, "Bearer tok", "cra");
     expect(result).not.toBeNull();
     expect(result).toContain("[Proxy]");
   });
@@ -419,20 +498,20 @@ describe("AI-2357: integration — applyStateTransition after self-heal", () => 
   afterEach(() => { globalThis.fetch = originalFetch; });
 
   it("desync labels → self-heal gate → pass — approve transitions cleanly", async () => {
-    recordAppliedState("issue-uuid", "code-review");
+    recordAppliedState(TEST_IDENTIFIER, "code-review");
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
-    expect(await checkWorkflowRules("approve", "issue-uuid", "Bearer tok", "cra")).toBeNull();
+    expect(await checkWorkflowRules("approve", ISSUE_UUID, "Bearer tok", "cra")).toBeNull();
   });
 
   it("desync labels → self-heal gate → pass — submit transitions cleanly", async () => {
-    recordAppliedState("issue-uuid", "implementation");
+    recordAppliedState(TEST_IDENTIFIER, "implementation");
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
-    expect(await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles")).toBeNull();
+    expect(await checkWorkflowRules("submit", ISSUE_UUID, "Bearer tok", "charles")).toBeNull();
   });
 
   it("request-changes self-heals from stale implementation label when engine says code-review", async () => {
-    recordAppliedState("issue-uuid", "code-review");
+    recordAppliedState(TEST_IDENTIFIER, "code-review");
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
-    expect(await checkWorkflowRules("request-changes", "issue-uuid", "Bearer tok", "cra")).toBeNull();
+    expect(await checkWorkflowRules("request-changes", ISSUE_UUID, "Bearer tok", "cra")).toBeNull();
   });
 });
