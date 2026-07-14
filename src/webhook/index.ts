@@ -9,6 +9,7 @@ import type { OperationalEventInput, OperationalEventStore } from "../store/oper
 import type { EnrolledTicketsStore } from "../store/enrolled-tickets-store.js";
 import type { MutationAuditStore } from "../store/mutation-audit-store.js";
 import type { DispatchIdempotencyStore } from "../store/dispatch-idempotency-store.js";
+import type { DispatchLeaseStore } from "../store/dispatch-lease-store.js";
 import { extractWebhookMutations } from "./mutation-extraction.js";
 import { routeEvent, routeEventAll, unresolvedRoutingCandidates } from "../router.js";
 import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
@@ -160,6 +161,7 @@ export function createWebhookRouter(
   enrolledTicketsStore?: EnrolledTicketsStore,
   mutationAuditStore?: MutationAuditStore,
   idempotencyStore?: DispatchIdempotencyStore,
+  dispatchLeaseStore?: DispatchLeaseStore,
 ): Router {
   const router = Router();
 
@@ -318,6 +320,24 @@ export function createWebhookRouter(
       }
 
       acknowledgeAgentAuthoredActivity(event, onAgentActivity);
+
+      // AI-2350: Renew dispatch lease on agent activity (comment posted,
+      // agent session event). This extends the lease TTL so long-running
+      // sessions don't lose their re-dispatch protection.
+      if (dispatchLeaseStore && (event.type === "Comment" || event.type === "AgentSessionEvent")) {
+        const actorId = event.actor?.id;
+        if (actorId) {
+          const agentName = buildAgentMap()[actorId];
+          if (agentName) {
+            const leaseAgentId = getOpenclawAgentName(agentName);
+            const leaseIdentifier = issueIdentifierFromEvent(event);
+            if (leaseIdentifier) {
+              const leaseTicketKey = normalizeSessionKey(leaseIdentifier);
+              dispatchLeaseStore.renew(leaseAgentId, leaseTicketKey);
+            }
+          }
+        }
+      }
 
       // AI-1584: Enrollment gap repair — heal wf:* tickets that lack state:* label.
       // Fires on every Issue event (create or update). Fail-open: never blocks routing.
@@ -587,6 +607,33 @@ export function createWebhookRouter(
             sessionKey: ticketId,
             workflowState: stateName,
             plane: "connector",
+          });
+          return;
+        }
+      }
+
+      // ── AI-2350: Durable dispatch lease check ─────────────────────────
+      // Before dispatching, acquire a lease for (agent, ticket). If an unexpired
+      // lease exists, refuse the dispatch — regardless of whether this is the
+      // sweep path or the webhook path (AI-2343 / AI-2344).
+      if (dispatchLeaseStore) {
+        const lease = dispatchLeaseStore.acquire(
+          route.agentId,
+          route.sessionKey,
+        );
+        if (lease.refused) {
+          log.info(
+            `Dispatch lease: refused for ${route.agentId} [${route.sessionKey}] ` +
+            `— unexpired lease exists (expires ${lease.existingLease?.expires_at})`,
+          );
+          appendOperationalEvent(operationalEventStore, {
+            outcome: "suppressed-duplicate" as never,
+            type: event.type,
+            agent: route.agentId,
+            key: route.sessionKey,
+            sessionKey: route.sessionKey,
+            plane: "connector",
+            detail: { reason: "dispatch-lease-active", existingExpiresAt: lease.existingLease?.expires_at },
           });
           return;
         }
