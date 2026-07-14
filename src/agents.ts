@@ -421,6 +421,20 @@ export function getAllTokenStatuses(): TokenStatus[] {
   return _agents.map((a) => getTokenStatus(a.name)!).filter(Boolean);
 }
 
+/**
+ * Symlink target of `p`, or null if `p` is absent or a regular file.
+ * lstat, not stat: stat resolves the link and would report the target's type.
+ */
+function readSymlinkTarget(p: string): string | null {
+  try {
+    if (!fs.lstatSync(p).isSymbolicLink()) return null;
+    return fs.readlinkSync(p);
+  } catch {
+    // ENOENT (nothing there yet) is the normal first-write case.
+    return null;
+  }
+}
+
 /** Sync access token to the agent's workspace secrets file */
 function syncWorkspaceSecrets(agentName: string, accessToken: string): void {
   const agent = _agents.find((a) => a.name === agentName);
@@ -454,12 +468,72 @@ function syncWorkspaceSecrets(agentName: string, accessToken: string): void {
     contents = `LINEAR_OAUTH_TOKEN=${accessToken}\n`;
   }
 
+  // Publish atomically. This runs on every token refresh while readers (the */30
+  // liveness cron among them) are reading the same file, so a truncate-then-write
+  // in place would hand them an empty or half-written env — no `lpx_` line, a
+  // silent credential downgrade, and a 401 that looks like a revoked token.
+  // Write a temp file in the SAME directory (rename(2) is only atomic within one
+  // filesystem), fix its mode to 0600 on the fd before the name is resolvable, then
+  // rename it over the target. A reader then sees either the whole old file or the
+  // whole new one — and never a world-readable one. (AI-2288)
+  const dir = path.dirname(secretsPath);
+  const tmpPath = path.join(dir, `.${path.basename(secretsPath)}.${process.pid}.${crypto.randomUUID()}.tmp`);
   try {
-    fs.mkdirSync(path.dirname(secretsPath), { recursive: true });
-    fs.writeFileSync(secretsPath, contents, "utf8");
-    fs.chmodSync(secretsPath, 0o600);
+    fs.mkdirSync(dir, { recursive: true });
+    let fd: number | undefined;
+    try {
+      // "wx" fails rather than clobbers if the temp name somehow exists.
+      fd = fs.openSync(tmpPath, "wx", 0o600);
+      fs.writeFileSync(fd, contents, "utf8");
+      // Explicit fchmod: the open(2) mode argument is masked by umask, so it alone
+      // cannot guarantee 0600.
+      fs.fchmodSync(fd, 0o600);
+      fs.fsyncSync(fd);
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+    }
+
+    // A symlink at a canonical `.secrets/linear.env` is never legitimate, and it is
+    // actively dangerous: writeFileSync follows symlinks, so the old in-place write
+    // published this agent's token *through* the link into whatever it pointed at.
+    // That fired in production on 2026-07-14 — an off-by-one relative link resolved
+    // grover's linear.env onto main's, and grover's proxy token was written into
+    // main's credential file (AI-2289).
+    //
+    // The rename below inherently reclaims the path (rename(2) replaces the link
+    // itself, never its target), so the clobber cannot recur. But a silent reclaim
+    // would erase the only evidence that something is creating these links, so shout
+    // first. Reclaim rather than bail: refusing to write would leave the agent
+    // holding the bad symlink and locked out of Linear — the very outage being fixed.
+    const linkTarget = readSymlinkTarget(secretsPath);
+    if (linkTarget !== null) {
+      const resolved = path.resolve(dir, linkTarget);
+      log.error(
+        `SECURITY: ${secretsPath} was a symlink -> ${linkTarget} (resolves to ${resolved}). ` +
+          `Credential paths must be regular files; reclaiming it as one. ` +
+          `Any token previously synced for "${agentName}" may have been written through this link into ${resolved}.`,
+      );
+      notify({
+        severity: "critical",
+        source: "agents",
+        title: `Symlinked credential path reclaimed for "${agentName}"`,
+        detail:
+          `${secretsPath} was a symlink to ${resolved}. The pre-rename writer followed it, so ${resolved} ` +
+          `may hold "${agentName}"'s token. Rotate if so, and find what created the link (AI-2297).`,
+        dedupKey: `agents|symlinked-secrets|${agentName}`,
+      });
+    }
+
+    fs.renameSync(tmpPath, secretsPath);
     log.info(`Synced ${agent.proxyToken ? "proxy token" : "token"} to ${secretsPath}`);
   } catch (err) {
+    // Fail closed: leave whatever credentials were already in place untouched and
+    // valid, rather than a partial file that no reader can use.
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      // Nothing to clean up.
+    }
     log.error(`Failed to sync token to ${secretsPath}: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
