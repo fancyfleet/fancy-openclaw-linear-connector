@@ -57,6 +57,12 @@ export interface DelegationReconciliationOptions {
   until?: string;
   /** Override for Date.now() — used in tests for deterministic timing. */
   now?: () => Date;
+  /**
+   * AI-2313: session tracker for live-session guard. When provided, the
+   * sweep checks whether the (agent, ticket) already has a live session
+   * before deciding to re-dispatch. Prevents concurrent-session clobbering.
+   */
+  sessionTracker?: { isActiveForTicket: (agent: string, ticketKey: string) => boolean };
 }
 
 export interface DelegationReconciliationResult {
@@ -178,7 +184,19 @@ function hasDispatchSinceDelegation(
   agentName: string,
   ticketIdentifier: string,
   delegationTimestamp: string,
+  sessionTracker?: { isActiveForTicket: (agent: string, ticketKey: string) => boolean },
 ): boolean {
+  // ── AI-2313: session-tracker guard ────────────────────────────────────────
+  // If the (agent, ticket) already has a live session, treat the ticket as
+  // having been dispatched — even if no dispatch-accepted/delivered event is
+  // found in the event store. This prevents the sweep from re-dispatching a
+  // ticket that is being actively worked by a long-running session whose stale
+  // timeout (>25 min) may have cleaned up the session-tracker entry but whose
+  // OpenClaw session is still alive.
+  if (sessionTracker?.isActiveForTicket(agentName, `linear-${ticketIdentifier}`)) {
+    return true;
+  }
+
   const events = operationalEventStore.query({
     key: `linear-${ticketIdentifier}`,
     limit: 100,
@@ -392,13 +410,15 @@ export async function runDelegationReconciliationSweep(
     // ── AC1: Enrolled ticket with delegate but no dispatch record ───────
     if (ticket.delegateId && ticket.delegateName && hasStateLabel(ticket.labels)) {
       // Check idempotency (AC4): has this delegate been dispatched since
-      // they were set?
+      // they were set? (AI-2313: sessionTracker is passed when available,
+      // providing an additional live-session guard against re-dispatch.)
       if (
         hasDispatchSinceDelegation(
           operationalEventStore,
           ticket.delegateName,
           ticket.identifier,
           ticket.updatedAt,
+          opts.sessionTracker,
         )
       ) {
         result.skippedIdempotent++;

@@ -33,7 +33,7 @@ import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
 import { registerBootstrapReconciliationCron } from "./bootstrap-reconciliation-sweep.js";
 import { registerDelegationReconciliationCron, runDelegationReconciliationSweep } from "./delegation-reconciliation-sweep.js";
-import { getAlertBus } from "./alerts/alert-bus.js";
+import { getAlertBus, initAlertBus } from "./alerts/alert-bus.js";
 import { registerSlaSweepCron } from "./sla-sweep.js";
 import { registerOobReconcileCron } from "./oob-reconcile-sweep.js";
 import { MutationAuditStore } from "./store/mutation-audit-store.js";
@@ -46,8 +46,8 @@ import { registerFirstActionWatchdogCron } from "./first-action-watchdog.js";
 import { getFirstActionWatchdogState } from "./first-action-watchdog-state.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
 import { getCapabilityPolicy } from "./escalation-gate.js";
-import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
-import { onAlert as onConfigHealthAlert } from "./config-health.js";
+import { notify, resolve, type AlertSeverity } from "./alerts/alert-bus.js";
+import { onAlert as onConfigHealthAlert, onHealed as onConfigHealthHealed } from "./config-health.js";
 import { startRegistryPolicyCheck } from "./registry-policy.js";
 import { resolveStartupCommit } from "./startup-commit.js";
 import { getAccessToken, getAgent, getLinearUserIdForAgent, getAllTokenStatuses } from "./agents.js";
@@ -61,6 +61,11 @@ import path from "path";
 const log = componentLogger(createLogger(), "server");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3100;
 const DEPLOYMENT_NAME = process.env.DEPLOYMENT_NAME ?? "fancymatt";
+
+// ── Alert bus: explicit init for startup buffer + early config ─────────
+// Must happen before any code path that calls notify(). The startup buffer
+// catches criticals that fire before the push chain is wired (AI-2190).
+initAlertBus();
 
 // ── Startup commit (exposed via /health for deploy verification) ─────
 let startupCommit: string = "unknown";
@@ -1116,6 +1121,16 @@ export function createApp(options?: CreateAppOptions) {
     getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
   const migrationWakeFn = async (agentName: string, ticketIdentifier: string) => {
     const sessionKey = normalizeSessionKey(ticketIdentifier);
+
+    // ── AI-2313: session-tracker guard ──────────────────────────────────────
+    // Before re-dispatching via def-state migration, check if the (agent, ticket)
+    // already has a live session. Prevents concurrent-session clobbering when
+    // a migration triggers a re-dispatch while the original session is still active.
+    if (sessionTracker.isActiveForTicket(agentName, sessionKey)) {
+      log.info(`Migration wake skipped: ${agentName} [${sessionKey}] — session already active`);
+      return;
+    }
+
     const agentCfg = getAgent(agentName);
     const deliveryConfig: DeliveryConfig = {
       nodeBin: process.execPath,
@@ -1248,6 +1263,21 @@ if (isEntryPoint) {
     getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
   const reconciliationWakeFn = async (agentName: string, ticketIdentifier: string) => {
     const sessionKey = normalizeSessionKey(ticketIdentifier);
+
+    // ── AI-2313: session-tracker guard ──────────────────────────────────────
+    // Before re-dispatching via sweep, check if the (agent, ticket) already has
+    // a live session. A long-running session that exceeds the tracker's stale
+    // timeout (25 min) will have its tracker entry cleaned up, so this guard
+    // covers the concurrent-dispatch race where the original session is still
+    // alive but the tracker thinks it ended. Skip re-dispatch when the session
+    // demonstrably exists — the existing session handles the ticket, and the
+    // NoActivityDetector / DispatchAckTracker retry path re-signals if the
+    // original dispatch genuinely died.
+    if (sessionTracker.isActiveForTicket(agentName, sessionKey)) {
+      log.info(`Reconciliation wake skipped: ${agentName} [${sessionKey}] — session already active`);
+      return;
+    }
+
     const agentCfg = getAgent(agentName);
     const deliveryConfig: DeliveryConfig = {
       nodeBin: process.execPath,
@@ -1520,6 +1550,16 @@ if (isEntryPoint) {
     });
   });
 
+  // AI-2190: resolve the config-health alert when all artifacts return to healthy.
+  onConfigHealthHealed(() => {
+    resolve({
+      severity: "critical",
+      source: "config-health",
+      title: "config artifact unhealthy — engine is fail-closed for workflow tickets",
+      dedupKey: "config-health|unhealthy",
+    });
+  });
+
   // Crash-path visibility. Behavior is unchanged (uncaught exceptions still
   // terminate; systemd restarts us) — we just make the death rattle audible.
   process.on("uncaughtException", (err) => {
@@ -1559,6 +1599,11 @@ if (isEntryPoint) {
     }).catch((err) => {
       log.error(`Startup replay failed: ${err instanceof Error ? err.message : String(err)}`);
     });
+
+    // AI-2190: flush the startup buffer now that the server is listening.
+    // This guarantees any critical alerts that fired before push channel init
+    // (e.g. "empty agent roster") are pushed rather than silently dropped.
+    getAlertBus().flushStartupBuffer();
   });
 
   // Graceful shutdown — drain in-flight connections before exit
