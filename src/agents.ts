@@ -468,6 +468,24 @@ function syncWorkspaceSecrets(agentName: string, accessToken: string): void {
     contents = `LINEAR_OAUTH_TOKEN=${accessToken}\n`;
   }
 
+  // Backstop: an empty token is never a credential, so publishing `LINEAR_OAUTH_TOKEN=`
+  // can only ever destroy access — it cannot grant it. Callers reach here with a blank
+  // token by merging a partial record over a good one (admin.ts did exactly that:
+  // AI-2309), and the write would then land an empty env over a live linear.env and
+  // brick the agent. Whatever is already on disk is strictly better than nothing, so
+  // fail closed and leave it alone. This guards *every* caller, not just the one we
+  // know about — a fixed caller is one fix, a writer that refuses to self-harm is a
+  // property.
+  const tokenToWrite = agent.proxyToken || accessToken;
+  if (!tokenToWrite?.trim()) {
+    log.error(
+      `Refusing to write an empty credential to ${secretsPath} for "${agentName}" — ` +
+        `no proxyToken and no accessToken. This is a provisioning bug in the caller; ` +
+        `leaving any existing credential file untouched.`,
+    );
+    return;
+  }
+
   // Publish atomically. This runs on every token refresh while readers (the */30
   // liveness cron among them) are reading the same file, so a truncate-then-write
   // in place would hand them an empty or half-written env — no `lpx_` line, a
