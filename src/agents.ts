@@ -535,6 +535,20 @@ export function getAllTokenStatuses(): TokenStatus[] {
   return _agents.map((a) => getTokenStatus(a.name)!).filter(Boolean);
 }
 
+/**
+ * Symlink target of `p`, or null if `p` is absent or a regular file.
+ * lstat, not stat: stat resolves the link and would report the target's type.
+ */
+function readSymlinkTarget(p: string): string | null {
+  try {
+    if (!fs.lstatSync(p).isSymbolicLink()) return null;
+    return fs.readlinkSync(p);
+  } catch {
+    // ENOENT (nothing there yet) is the normal first-write case.
+    return null;
+  }
+}
+
 /** Sync access token to the agent's workspace secrets file */
 function syncWorkspaceSecrets(agentName: string, accessToken: string): void {
   const agent = _agents.find((a) => a.name === agentName);
@@ -592,6 +606,38 @@ function syncWorkspaceSecrets(agentName: string, accessToken: string): void {
     } finally {
       if (fd !== undefined) fs.closeSync(fd);
     }
+
+    // A symlink at a canonical `.secrets/linear.env` is never legitimate, and it is
+    // actively dangerous: writeFileSync follows symlinks, so the old in-place write
+    // published this agent's token *through* the link into whatever it pointed at.
+    // That fired in production on 2026-07-14 — an off-by-one relative link resolved
+    // grover's linear.env onto main's, and grover's proxy token was written into
+    // main's credential file (AI-2289).
+    //
+    // The rename below inherently reclaims the path (rename(2) replaces the link
+    // itself, never its target), so the clobber cannot recur. But a silent reclaim
+    // would erase the only evidence that something is creating these links, so shout
+    // first. Reclaim rather than bail: refusing to write would leave the agent
+    // holding the bad symlink and locked out of Linear — the very outage being fixed.
+    const linkTarget = readSymlinkTarget(secretsPath);
+    if (linkTarget !== null) {
+      const resolved = path.resolve(dir, linkTarget);
+      log.error(
+        `SECURITY: ${secretsPath} was a symlink -> ${linkTarget} (resolves to ${resolved}). ` +
+          `Credential paths must be regular files; reclaiming it as one. ` +
+          `Any token previously synced for "${agentName}" may have been written through this link into ${resolved}.`,
+      );
+      notify({
+        severity: "critical",
+        source: "agents",
+        title: `Symlinked credential path reclaimed for "${agentName}"`,
+        detail:
+          `${secretsPath} was a symlink to ${resolved}. The pre-rename writer followed it, so ${resolved} ` +
+          `may hold "${agentName}"'s token. Rotate if so, and find what created the link (AI-2297).`,
+        dedupKey: `agents|symlinked-secrets|${agentName}`,
+      });
+    }
+
     fs.renameSync(tmpPath, secretsPath);
     log.info(`Synced ${agent.proxyToken ? "proxy token" : "token"} to ${secretsPath}`);
   } catch (err) {
