@@ -186,4 +186,86 @@ describe("AI-2288 — atomic secrets write", () => {
     expect(fs.readFileSync(secretsPath, "utf8")).toBe(before);
     expect(fs.readdirSync(secretsDir)).toEqual(["linear.env"]);
   });
+
+  /**
+   * AI-2289 §2 — the symlink-follow clobber.
+   *
+   * The pre-rename writer called writeFileSync on the *resolved* path, and
+   * writeFileSync follows symlinks. On 2026-07-14 an off-by-one relative link
+   * (`../../` where `../../../` was meant) pointed grover's linear.env at main's,
+   * and grover's proxy token was published straight through it into main's
+   * credential file — a cross-agent credential overwrite, confirmed by matching
+   * sha256(token) across both files.
+   *
+   * rename(2) replaces the *link itself*, never its target, so publishing by rename
+   * closes this by construction. These tests pin that, and pin that the reclaim is
+   * loud — a silent one would destroy the only evidence that something is still
+   * creating these links.
+   */
+  describe("symlinked credential path (AI-2289 §2)", () => {
+    /** A symlinked linear.env pointing at another agent's real credential file. */
+    function plantSymlinkTo(victimPath: string): void {
+      fs.mkdirSync(secretsDir, { recursive: true });
+      fs.writeFileSync(victimPath, "LINEAR_OAUTH_TOKEN=lin_oauth_main_untouched\n", "utf8");
+      fs.chmodSync(victimPath, 0o600);
+      fs.symlinkSync(victimPath, secretsPath);
+    }
+
+    test("never publishes a token through the link — the victim's file is untouched", () => {
+      const victimPath = path.join(dir, "victim-main.env");
+      plantSymlinkTo(victimPath);
+
+      provision();
+
+      // The whole point: main's credential file must not have been overwritten.
+      expect(fs.readFileSync(victimPath, "utf8")).toBe("LINEAR_OAUTH_TOKEN=lin_oauth_main_untouched\n");
+    });
+
+    test("reclaims the path as a regular 0600 file holding this agent's own token", () => {
+      const victimPath = path.join(dir, "victim-main.env");
+      plantSymlinkTo(victimPath);
+
+      provision();
+
+      expect(fs.lstatSync(secretsPath).isSymbolicLink()).toBe(false);
+      expect(fs.lstatSync(secretsPath).isFile()).toBe(true);
+      expect(fs.lstatSync(secretsPath).mode & 0o777).toBe(0o600);
+
+      const env = fs.readFileSync(secretsPath, "utf8");
+      expect(env).toContain(`LINEAR_OAUTH_TOKEN=${PROXY.proxyToken}`);
+      expect(env).toContain(`LINEAR_PROXY_URL=${PROXY.proxyUrl}`);
+      // The victim's contents must not have been inherited into the reclaimed file.
+      expect(env).not.toContain("lin_oauth_main_untouched");
+    });
+
+    test("shouts — a reclaim is never silent, and names the path the token may have leaked to", () => {
+      const victimPath = path.join(dir, "victim-main.env");
+      plantSymlinkTo(victimPath);
+
+      const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+      provision();
+
+      const shouted = errSpy.mock.calls
+        .map(([line]) => String(line))
+        .filter((line) => line.includes("SECURITY"));
+
+      expect(shouted).toHaveLength(1);
+      // Must name where the credential may already have been written, or the alert
+      // is not actionable — that path is what has to be rotated.
+      expect(shouted[0]).toContain(victimPath);
+    });
+
+    test("does not cry wolf on the ordinary case — a regular file is reclaimed silently", () => {
+      const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+      provision(); // no symlink planted; plain first write
+      updateTokens("charles", "rotated-real-token", "rotated-refresh"); // and a refresh
+
+      const shouted = errSpy.mock.calls
+        .map(([line]) => String(line))
+        .filter((line) => line.includes("SECURITY"));
+
+      expect(shouted).toEqual([]);
+    });
+  });
 });
