@@ -262,6 +262,69 @@ describe("§2 delivery-time fetchability gate (AI-2015 AC1/AC3)", () => {
     // the AC3 hard error (fail-open / retry, not a swallowed phantom).
     expect(decision.severity).not.toBe("error");
   });
+
+  // ── AI-2389: fetchable ≠ dispatchable — terminal-state drop ────────────────
+  it("AI-2389: a fetchable but Done ticket → drop at delivery (no re-poke of a completed ticket)", async () => {
+    const assertDispatchTargetFetchable = await requireNewExport(
+      "./delivery/index.js",
+      "assertDispatchTargetFetchable",
+    );
+
+    // AI-2313 anatomy: the ticket reads back non-null (fetchable) but is Done.
+    // Existence-only gating dispatched it every hour; the state check drops it.
+    const decision = (await assertDispatchTargetFetchable({
+      ticketId: "AI-2313",
+      fetchable: true,
+      terminalNotFound: false,
+      liveState: { name: "Done", type: "completed" },
+    })) as { dispatch: boolean; severity: string };
+
+    expect(decision.dispatch).toBe(false);
+    // A legitimate drop of a closed ticket — NOT the AC3 phantom hard error.
+    expect(decision.severity).toBe("warn");
+  });
+
+  it("AI-2389: a fetchable Canceled ticket → drop; a live (started) ticket still dispatches", async () => {
+    const assertDispatchTargetFetchable = await requireNewExport(
+      "./delivery/index.js",
+      "assertDispatchTargetFetchable",
+    );
+
+    const canceled = (await assertDispatchTargetFetchable({
+      ticketId: "AI-2313",
+      fetchable: true,
+      terminalNotFound: false,
+      liveState: { name: "Canceled", type: "canceled" },
+    })) as { dispatch: boolean };
+    expect(canceled.dispatch).toBe(false);
+
+    const live = (await assertDispatchTargetFetchable({
+      ticketId: "AI-2313",
+      fetchable: true,
+      terminalNotFound: false,
+      liveState: { name: "Doing", type: "started" },
+    })) as { dispatch: boolean; severity: string };
+    expect(live.dispatch).toBe(true);
+    expect(live.severity).toBe("ok");
+  });
+
+  it("AI-2389: liveState omitted ⇒ existence-only behavior preserved (fail-open, still dispatches)", async () => {
+    const assertDispatchTargetFetchable = await requireNewExport(
+      "./delivery/index.js",
+      "assertDispatchTargetFetchable",
+    );
+
+    // A caller that cannot cheaply read the live state must not regress the
+    // prior contract: fetchable + no liveState ⇒ dispatch ok.
+    const decision = (await assertDispatchTargetFetchable({
+      ticketId: "AI-2313",
+      fetchable: true,
+      terminalNotFound: false,
+    })) as { dispatch: boolean; severity: string };
+
+    expect(decision.dispatch).toBe(true);
+    expect(decision.severity).toBe("ok");
+  });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
