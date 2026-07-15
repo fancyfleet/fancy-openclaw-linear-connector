@@ -440,6 +440,14 @@ export function resetWorkflowCache(): void {
 }
 
 /**
+ * AI-2359: Alias for resetWorkflowCache() used by the singleton-fail-closed
+ * test to clear the workflow registry between cases.
+ */
+export function resetWorkflowRegistry(): void {
+  _registryCache = null;
+}
+
+/**
  * AI-1872: Workflow registry liveness for /health.
  *
  * Returns a compact map of `{ [workflowId]: { version, states[] } }` derived
@@ -1102,6 +1110,39 @@ export async function resolveTransitionDelegate(
   }
 
   return undefined;
+}
+
+/**
+ * AI-2359 — Singleton delegate resolution with fail-closed on missing linearUserId.
+ *
+ * Resolves a singleton role body to a linearUserId. Returns a fail-closed result
+ * when the body has no linearUserId (not just a warning — the transition must
+ * abort). Exported for unit testing.
+ *
+ * @returns resolvedDelegateId when the single body has a linearUserId;
+ *          { failed: true, code, detail } when resolution fails.
+ */
+export function resolveSingletonDelegate(
+  roleBodies: string[],
+  destOwnerRole: string,
+): { resolvedDelegateId?: string; failed?: boolean; code?: string; detail?: string } {
+  if (roleBodies.length !== 1) {
+    return {
+      failed: true,
+      code: 'not-a-singleton',
+      detail: `role '${destOwnerRole}' has ${roleBodies.length} bodies (expected 1 for singleton resolution)`,
+    };
+  }
+
+  const agent = getAgent(roleBodies[0]);
+  if (agent?.linearUserId) {
+    return { resolvedDelegateId: agent.linearUserId };
+  }
+  return {
+    failed: true,
+    code: 'delegate-unresolved',
+    detail: `singleton body '${roleBodies[0]}' has no linearUserId`,
+  };
 }
 
 export function getWorkflowId(labels: string[]): string | null {
@@ -3357,13 +3398,21 @@ export async function applyStateTransition(
         try {
           const roleBodies = await resolveBodiesForRole(destOwnerRole!);
           if (roleBodies.length === 1) {
-            const agent = getAgent(roleBodies[0]);
-            if (agent?.linearUserId) {
-              resolvedDelegateId = agent.linearUserId;
+            const singletonResult = resolveSingletonDelegate(roleBodies, destOwnerRole!);
+            if (singletonResult.resolvedDelegateId) {
+              resolvedDelegateId = singletonResult.resolvedDelegateId;
             } else {
-              log.warn(
-                `workflow-gate: B2 apply: singleton body '${roleBodies[0]}' for role '${destOwnerRole}' has no linearUserId — skipping auto-delegate`,
+              log.error(
+                `workflow-gate: B2 apply: FAIL-CLOSED — singleton body '${roleBodies[0]}' for role '${destOwnerRole}' has no linearUserId. Transition aborted.`,
               );
+              if (issueId) {
+                await postComment(
+                  issueId,
+                  `[Connector] Transition blocked: singleton body '${roleBodies[0]}' for role '${destOwnerRole}' has no linearUserId in agents.json. Register the agent's Linear user ID to proceed.`,
+                  authToken,
+                );
+              }
+              return { status: "failed", code: "delegate-unresolved", detail: singletonResult.detail ?? "singleton body has no linearUserId", from: currentStateName, to: toStateName };
             }
           } else if (roleBodies.length > 1) {
             log.error(
