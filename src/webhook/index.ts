@@ -692,21 +692,37 @@ export function createWebhookRouter(
         return;
       }
 
-      // ── 9b. Nudge deduplication + coalescing ─────────────────────────────
+      // ── 9b. Nudge deduplication + coalescing (atomic) ────────────────────
       // Suppress rapid-fire duplicate events for the same agent+ticket.
+      // Uses acquireNudgeSlot for an atomic read-check-write within a single
+      // SQLite transaction — eliminates the TOCTOU race between the old
+      // getCoalesceInfo + recordNudge/recordCoalesced two-step (AI-2376).
       if (NUDGE_DEDUP_WINDOW_MS > 0 && nudgeStore) {
-        const info = nudgeStore.getCoalesceInfo(route.agentId, ticketId, NUDGE_DEDUP_WINDOW_MS);
-        if (info.suppressed) {
-          log.info(`Nudge dedup: coalescing delivery for ${route.agentId} [${ticketId}] — within ${NUDGE_DEDUP_WINDOW_MS}ms window`);
-          nudgeStore.recordCoalesced(route.agentId, ticketId, event.type, "action" in event ? event.action : undefined);
+        const { suppressed, coalescedCount } = nudgeStore.acquireNudgeSlot(
+          route.agentId,
+          ticketId,
+          NUDGE_DEDUP_WINDOW_MS,
+          event.type,
+          "action" in event ? event.action : undefined,
+        );
+
+        if (suppressed) {
+          // The nudge slot was NOT acquired — an existing suppression window
+          // is still active, and this event was merged into the coalesced
+          // counter. Return without delivering; the coalesced count will be
+          // passed to the next delivery that refreshes the window.
+          log.info(`Nudge dedup (atomic): coalescing delivery for ${route.agentId} [${ticketId}] — coalescedCount=${coalescedCount}`);
           appendOperationalEvent(operationalEventStore, { outcome: "dedup-suppressed", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "nudge-dedup" });
           return;
         }
-        // Window expired — drain coalesced count before delivering
-        const coalescedCount = nudgeStore.drainCoalescedCount(route.agentId, ticketId);
-        nudgeStore.recordNudge(route.agentId, ticketId);
+
+        // Slot acquired: the suppression window was absent or expired.
+        // acquireNudgeSlot refreshed the nudge timestamp and zeroed the DB
+        // coalesced_count. Any coalescedCount > 0 means events were merged
+        // into the previous window and are now drained — the caller should
+        // carry that as a signal of dropped events.
         if (coalescedCount > 0) {
-          log.info(`Nudge dedup: delivering for ${route.agentId} [${ticketId}] with ${coalescedCount} coalesced event(s)`);
+          log.info(`Nudge dedup (atomic): delivering for ${route.agentId} [${ticketId}] with ${coalescedCount} coalesced event(s) from prior window`);
           route.coalescedCount = coalescedCount;
         }
       }
