@@ -511,6 +511,13 @@ export function createApp(options?: CreateAppOptions) {
         // the ticket as gone; a bare null read here is treated as transient
         // (fail-open) so a Linear hiccup can't strand a live stall.
         terminalNotFound: false,
+        // AI-2389: thread the live state so a Done/Canceled ticket is dropped at
+        // delivery. `linearState` is the recovery read taken above; `.state`
+        // carries {name, type}. This is the stale C4 re-poke path — the one
+        // delivery path lacking the AI-2295 terminal-state liveness drop, and the
+        // exact path whose re-poke of a Done AI-2313 sustained the hourly replay
+        // (its rePokeMsg string below matched the 00:52Z specimen verbatim).
+        liveState: linearState?.state ?? null,
       });
 
       // AI-2091 §1 (G1, AI-2042): resolve the recipient at DELIVERY time against
