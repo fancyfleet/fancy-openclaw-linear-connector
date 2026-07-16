@@ -29,6 +29,7 @@ import {
   buildStateTransitionReminder,
   resetWorkflowCache,
   validateNativeStateMappings,
+  validateGateAnchorDefs,
   resolveStakesLevel,
   resolveNativeStateId,
   resetNativeStateCache,
@@ -60,12 +61,13 @@ capabilities:
   - id: human:escalate
   - id: workflow:break-glass
   - id: deploy:execute
+  - id: infra:ssh
 
 containers:
   - id: dev
     grants: [linear:transition]
   - id: deployment
-    grants: [linear:transition, deploy:execute]
+    grants: [linear:transition, deploy:execute, infra:ssh]
   - id: steward
     grants: [linear:transition, human:escalate, workflow:break-glass]
   - id: code-review
@@ -714,38 +716,76 @@ describe("checkWorkflowRules — code-review state", () => {
 
 // ── Deploy capability gate (Hanzo-only) ────────────────────────────────────
 
-describe("checkWorkflowRules — deploy capability gate (deployment state)", () => {
+// ── AI-2476: v14 merge state capability gate ──────────────────────────
+// In v14, the old `deployment` state was split into `merge` (requires
+// deploy:execute for forward `continue`) and `deploy` (requires infra:ssh).
+// Hanzo has deploy:execute; Charles and Astrid do not.
+// Uses the canonical dev-impl fixture (v10+) which has merge/deploy states.
+
+describe("checkWorkflowRules — deploy:execute capability gate (merge state)", () => {
+  let originalWorkflowPath: string | undefined;
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeAll(() => {
+    originalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    process.env.WORKFLOW_DEF_PATH = CANONICAL_FIXTURE;
+    resetWorkflowCache();
+  });
+  afterAll(() => {
+    if (originalWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = originalWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
+    resetWorkflowCache();
+  });
+
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("allows 'continue' from Hanzo (deployment body) in merge state", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"]);
+    expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+  });
+
+  it("blocks 'continue' from Charles (dev body, no deploy:execute) in merge state", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"]);
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("deploy:execute");
+  });
+
+  it("blocks 'continue' from Astrid (steward body, no deploy:execute) in merge state", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"]);
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "astrid");
+    expect(result).not.toBeNull();
+    expect(result).toContain("deploy:execute");
+  });
+
+  it("blocks illegal command 'submit' in merge state even for Hanzo", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"]);
+    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("merge");
+    expect(result).toContain("continue");
+  });
+});
+
+// ── done state (terminal) ───────────────────────────────────────────────────
+
+describe("checkWorkflowRules — done state (terminal)", () => {
   let originalFetch: typeof globalThis.fetch;
   beforeEach(() => { originalFetch = globalThis.fetch; });
   afterEach(() => { globalThis.fetch = originalFetch; });
 
-  it("allows 'deploy' from Hanzo (deployment body) in deployment state", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
-    expect(await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+  it("blocks any non-escape command in done state (terminal)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:done"]);
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("done");
   });
 
-  it("blocks 'deploy' from Charles (dev body, no deploy:execute) in deployment state", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
-    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "charles");
-    expect(result).not.toBeNull();
-    expect(result).toContain("[Proxy]");
-    expect(result).toContain("deploy:execute");
-    expect(result).toContain("deployment");
-  });
-
-  it("blocks 'deploy' from Astrid (steward body, no deploy:execute) in deployment state", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
-    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "astrid");
-    expect(result).not.toBeNull();
-    expect(result).toContain("deploy:execute");
-  });
-
-  it("blocks illegal command 'submit' in deployment state even for Hanzo", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
-    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "hanzo");
-    expect(result).not.toBeNull();
-    expect(result).toContain("deployment");
-    expect(result).toContain("deploy");
+  it("escape is still legal in done state (§4.4)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:done"]);
+    expect(await checkWorkflowRules("escape", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
   });
 });
 
@@ -1094,20 +1134,18 @@ describe("applyStateTransition — AI-1490: idempotency re-stamp when label is m
 
   it("re-stamps state:* label when in target state but label is missing", async () => {
     // Scenario: CLI set native state correctly but failed to apply the label.
-    // Ticket is in deployment state (per getCurrentState from labels) but
-    // actually missing the state:deployment label. B2 should re-stamp it.
+    // Ticket is in merge state (per getCurrentState from labels) but
+    // actually missing the state:merge label. B2 should re-stamp it.
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
-        { id: "state-lbl", name: "state:deployment" },
+        { id: "state-lbl", name: "state:merge" },
       ],
-      // Override: simulate the case where state:deployment IS present
-      // (this is the normal idempotent case with label present).
     });
     globalThis.fetch = mock;
     await applyStateTransition("approve", "issue-uuid", "Bearer tok");
-    // approve: code-review → deployment. Current state is deployment.
-    // Label state:deployment is present. So no-op.
+    // approve: code-review → merge. Current state is merge.
+    // Label state:merge is present. So no-op.
     expect(calls.some((c) => (c.body.query ?? "").includes("ApplyStateTransition"))).toBe(false);
   });
 
@@ -1569,9 +1607,9 @@ describe("buildStateTransitionReminder — Layer 1 (AI-1387)", () => {
   });
 
   it("returns null for terminal state (done)", async () => {
-    // After "deploy" (deployment → done), the destination is terminal.
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
-    const result = await buildStateTransitionReminder("deploy", "ABC-123", "Bearer tok");
+    // After "validated" (ac-validate → done), the destination is terminal.
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:ac-validate"]);
+    const result = await buildStateTransitionReminder("validated", "ABC-123", "Bearer tok");
     expect(result).toBeNull();
   });
 
@@ -1614,28 +1652,54 @@ describe("buildStateTransitionReminder — Layer 1 (AI-1387)", () => {
 
 // ── AI-1475 Defect 1: Done gate — branch/PR verification before deploy→done ──────
 
-describe("checkWorkflowRules — AI-1475 D1: done gate (branch/PR verification)", () => {
+// ── AI-2476: Re-armed merged-PR release gate (branch/PR verification) ──
+// The v8 predicate (intent === 'deploy' || intent === 'handoff-host-deploy') was
+// deleted by AI-1872 (v10). Tests now use v14's state+intent: forward exits from
+// `merge` or `deploy` state with `continue` intent. The `deployment` state no
+// longer exists in the v10+ canonical dev-impl fixture.
+
+describe("checkWorkflowRules — AI-2476: merged-PR release gate (branch/PR verification)", () => {
+  let originalWorkflowPath: string | undefined;
   let originalFetch: typeof globalThis.fetch;
+
+  beforeAll(() => {
+    originalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    process.env.WORKFLOW_DEF_PATH = CANONICAL_FIXTURE;
+    resetWorkflowCache();
+  });
+  afterAll(() => {
+    if (originalWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = originalWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
+    resetWorkflowCache();
+  });
+
   beforeEach(() => { originalFetch = globalThis.fetch; });
   afterEach(() => { globalThis.fetch = originalFetch; });
 
-  it("allows 'deploy' → done when branch exists and PR exists", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: true, hasPR: true });
-    expect(await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+  it("allows 'continue' from merge state when branch exists and PR exists", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"], { hasBranch: true, hasPR: true });
+    expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+  });
+
+  it("allows 'continue' from deploy state when branch exists and PR exists", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deploy"], { hasBranch: true, hasPR: true });
+    expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
   });
 
   // AI-1797: branch/PR status comes from GitHub PR attachments; a PR attachment
   // implies a pushed branch, so branch-only / PR-only partial evidence no longer
   // exists and an open (unmerged) PR passes, matching prior branch+PR semantics.
-  it("allows 'deploy' → done with an open PR attachment (PR implies pushed branch, AI-1797)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: false, hasPR: true });
-    expect(await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+  it("allows 'continue' from merge state with an open PR attachment (PR implies pushed branch, AI-1797)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"], { hasBranch: false, hasPR: true });
+    expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
   });
 
-  // AI-1797 regression: the original query used Issue.branch/pullRequests, which
-  // are not in Linear's public schema — every call returned a GRAPHQL_VALIDATION_FAILED
-  // errors payload, silently parsed as null, and the gate fail-opened with no signal.
-  // Errors payloads must fail-open loudly: warn log + deduped warning alert.
+  it("allows 'continue' from deploy state with an open PR attachment (PR implies pushed branch, AI-1797)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deploy"], { hasBranch: false, hasPR: true });
+    expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+  });
+
+  // AI-1797 regression: schema-level errors payload → fail-open with alert.
   it("emits a deduped warning alert when the gate query returns GraphQL errors (AI-1797)", async () => {
     _resetAlertBusForTests();
     const alertStore = new AlertStore(":memory:");
@@ -1645,7 +1709,7 @@ describe("checkWorkflowRules — AI-1475 D1: done gate (branch/PR verification)"
         const bodyText = typeof init?.body === "string" ? init.body : "";
         if (bodyText.includes("IssueContext") || bodyText.includes("delegate")) {
           return new Response(JSON.stringify({
-            data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:deployment" }] }, delegate: null } },
+            data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:deploy" }] }, delegate: null } },
           }), { status: 200, headers: { "Content-Type": "application/json" } });
         }
         if (bodyText.includes("IssueBranchAndPR")) {
@@ -1655,7 +1719,7 @@ describe("checkWorkflowRules — AI-1475 D1: done gate (branch/PR verification)"
         }
         throw new Error(`unexpected fetch call: ${bodyText.slice(0, 60)}`);
       };
-      const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
+      const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
       expect(result).toBeNull(); // fail-open — but no longer silent
       const alerts = alertStore.query({ source: "done-gate" });
       expect(alerts.length).toBeGreaterThanOrEqual(1);
@@ -1670,26 +1734,29 @@ describe("checkWorkflowRules — AI-1475 D1: done gate (branch/PR verification)"
   });
 
   // AI-1497: Complete absence of evidence is now fail-open — data likely lost to auto-delete.
-  it("allows 'deploy' → done when neither branch nor PR exist (AI-1497 fail-open)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: false, hasPR: false });
-    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
+  it("allows 'continue' from merge state when neither branch nor PR exist (AI-1497 fail-open)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"], { hasBranch: false, hasPR: false });
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).toBeNull(); // fail-open: data likely lost to auto-delete
+  });
+
+  it("allows 'continue' from deploy state when neither branch nor PR exist (AI-1497 fail-open)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deploy"], { hasBranch: false, hasPR: false });
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
     expect(result).toBeNull(); // fail-open: data likely lost to auto-delete
   });
 
   // AI-1497: null after retry is now fail-open to avoid stranding tickets.
-  it("fail-open: allows 'deploy' → done when branch/PR fetch returns null twice (API error, AI-1497)", async () => {
-    // Simulate: label fetch works, but branch/PR fetch returns no data twice
+  it("fail-open: allows 'continue' from deploy state when branch/PR fetch returns null twice (API error, AI-1497)", async () => {
     let fetchCallCount = 0;
     globalThis.fetch = async (_url, init) => {
       fetchCallCount++;
       const bodyText = typeof init?.body === "string" ? init.body : "";
-      // Label fetch works
       if (bodyText.includes("IssueContext")) {
         return new Response(JSON.stringify({
-          data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:deployment" }] }, delegate: null } },
+          data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:deploy" }] }, delegate: null } },
         }), { status: 200, headers: { "Content-Type": "application/json" } });
       }
-      // Branch/PR fetch returns null-like data (no issue) — both times
       if (bodyText.includes("IssueBranchAndPR")) {
         return new Response(JSON.stringify({ data: { issue: null } }), {
           status: 200, headers: { "Content-Type": "application/json" },
@@ -1697,26 +1764,52 @@ describe("checkWorkflowRules — AI-1475 D1: done gate (branch/PR verification)"
       }
       throw new Error(`unexpected fetch call: ${bodyText.slice(0, 60)}`);
     };
-    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
     expect(result).toBeNull(); // fail-open after retry
     expect(fetchCallCount).toBeGreaterThanOrEqual(3); // label fetch + 2 branch/PR fetches
   });
 
-  it("done gate does NOT fire for non-deploy commands (reject in deployment state)", async () => {
-    // 'reject' goes deployment → implementation, not to done
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: false, hasPR: false });
-    expect(await checkWorkflowRules("reject", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+  it("gate does NOT fire for non-forward commands in merge state (reject)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"], { hasBranch: false, hasPR: false });
+    const result = await checkWorkflowRules("reject", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, true);
+    // reject from merge requires a comment; once that's satisfied, the done gate
+    // should NOT fire (it only fires on forward 'continue' intents).
+    expect(result).toBeNull();
+  });
+
+  it("gate does NOT fire for non-forward commands in deploy state (reject)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deploy"], { hasBranch: false, hasPR: false });
+    const result = await checkWorkflowRules("reject", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, true);
+    expect(result).toBeNull();
+  });
+
+  it("gate does NOT fire for 'submit' from non-merge/deploy states (implementation → code-review)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"], { hasBranch: false, hasPR: false });
+    // 'submit' is the forward command from implementation; it should not trigger
+    // the done gate (which only fires from merge/deploy states).
+    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles", null, null, null, false, false, true);
+    expect(result).toBeNull();
   });
 
   // AI-1492 regression: branch auto-deleted after squash merge — merged PR must still pass.
-  it("allows 'deploy' → done when PR is merged but branch is deleted (AI-1492)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: false, hasPR: true, hasMergedPR: true });
-    expect(await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+  it("allows 'continue' from merge state when PR is merged but branch is deleted (AI-1492)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"], { hasBranch: false, hasPR: true, hasMergedPR: true });
+    expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
   });
 
-  it("allows 'deploy' → done when PR is merged and branch still exists (AI-1492)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: true, hasPR: true, hasMergedPR: true });
-    expect(await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+  it("allows 'continue' from deploy state when PR is merged but branch is deleted (AI-1492)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deploy"], { hasBranch: false, hasPR: true, hasMergedPR: true });
+    expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+  });
+
+  it("allows 'continue' from merge state when PR is merged and branch still exists (AI-1492)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"], { hasBranch: true, hasPR: true, hasMergedPR: true });
+    expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+  });
+
+  it("allows 'continue' from deploy state when PR is merged and branch still exists (AI-1492)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deploy"], { hasBranch: true, hasPR: true, hasMergedPR: true });
+    expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
   });
 
 });
@@ -1750,69 +1843,129 @@ describe("checkWorkflowRules — AI-1475 D2: submit self-review prevention", () 
 
 // ── AI-1475 D1: applyStateTransition done gate defense-in-depth ──────────
 
-describe("applyStateTransition — AI-1475 D1: done gate defense-in-depth", () => {
+describe("applyStateTransition — AI-2476: merged-PR release gate defense-in-depth", () => {
+  let originalWorkflowPath: string | undefined;
   let originalFetch: typeof globalThis.fetch;
+
+  beforeAll(() => {
+    originalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    process.env.WORKFLOW_DEF_PATH = CANONICAL_FIXTURE;
+    resetWorkflowCache();
+  });
+  afterAll(() => {
+    if (originalWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = originalWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
+    resetWorkflowCache();
+  });
+
   beforeEach(() => { originalFetch = globalThis.fetch; });
   afterEach(() => { globalThis.fetch = originalFetch; });
 
-  // AI-1797: status is attachment-derived (hasBranch ≡ hasPR), so the old
-  // partial-evidence block cases (branch-only / PR-only) are unrepresentable.
-  // An open PR now passes B2 — same outcome as the prior branch+PR pass case.
-  it("allows label swap to done with an open PR attachment (PR implies branch, AI-1797)", async () => {
+  // AI-2476 re-arm: uses v14 state+intent (merge/deploy + continue) instead of
+  // v8 literal verb (deploy/handoff-host-deploy). Both merge→deploy and
+  // deploy→ac-validate forward carries trigger the gate.
+
+  it("allows label swap from merge state with open PR attachment (PR implies branch, AI-1797)", async () => {
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
-        { id: "state-lbl", name: "state:deployment" },
+        { id: "state-lbl", name: "state:merge" },
       ],
-      teamLabels: [{ id: "done-lbl", name: "state:done" }],
+      teamLabels: [{ id: "dep-lbl", name: "state:deploy" }],
       branchStatus: { hasBranch: false, hasPR: true },
     });
     globalThis.fetch = mock;
-    await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
+    await applyStateTransition("continue", "issue-uuid", "Bearer tok");
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+  });
+
+  it("allows label swap from deploy state with open PR attachment (PR implies branch, AI-1797)", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:deploy" },
+      ],
+      teamLabels: [{ id: "acv-lbl", name: "state:ac-validate" }],
+      branchStatus: { hasBranch: false, hasPR: true },
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("continue", "issue-uuid", "Bearer tok");
     const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
   });
 
   // AI-1797 regression: a schema-level errors payload (the silent fail-open bug)
   // must fail-open in B2 too — the ticket is past code review; do not strand it.
+  // AI-2476: re-keyed to v14 state+intent (deploy state, continue intent).
   it("fails open in B2 when the gate query returns GraphQL errors (AI-1797)", async () => {
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
-        { id: "state-lbl", name: "state:deployment" },
+        { id: "state-lbl", name: "state:deploy" },
       ],
-      teamLabels: [{ id: "done-lbl", name: "state:done" }],
+      teamLabels: [{ id: "acv-lbl", name: "state:ac-validate" }],
       branchStatus: "graphql-error",
     });
     globalThis.fetch = mock;
-    await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
+    await applyStateTransition("continue", "issue-uuid", "Bearer tok");
     const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
   });
 
-  it("allows label swap to done when branch + PR exist", async () => {
+  it("allows label swap from merge state when branch + PR exist", async () => {
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
-        { id: "state-lbl", name: "state:deployment" },
+        { id: "state-lbl", name: "state:merge" },
       ],
-      teamLabels: [{ id: "done-lbl", name: "state:done" }],
+      teamLabels: [{ id: "dep-lbl", name: "state:deploy" }],
       branchStatus: { hasBranch: true, hasPR: true },
     });
     globalThis.fetch = mock;
-    await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
+    await applyStateTransition("continue", "issue-uuid", "Bearer tok");
     const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
   });
 
-  it("done gate does not block non-deploy transitions", async () => {
+  it("allows label swap from deploy state when branch + PR exist", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:deploy" },
+      ],
+      teamLabels: [{ id: "acv-lbl", name: "state:ac-validate" }],
+      branchStatus: { hasBranch: true, hasPR: true },
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("continue", "issue-uuid", "Bearer tok");
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+  });
+
+  it("gate does NOT block non-forward transitions (reject) from merge state", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:merge" },
+      ],
+      teamLabels: [{ id: "impl-lbl", name: "state:implementation" }],
+      branchStatus: { hasBranch: false, hasPR: false },
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("reject", "issue-uuid", "Bearer tok");
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+  });
+
+  it("gate does NOT block 'submit' from non-merge/deploy states (implementation → code-review)", async () => {
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
         { id: "state-lbl", name: "state:implementation" },
       ],
       teamLabels: [{ id: "cr-lbl", name: "state:code-review" }],
-      branchStatus: { hasBranch: false, hasPR: false }, // Should not matter for submit
+      branchStatus: { hasBranch: false, hasPR: false },
     });
     globalThis.fetch = mock;
     await applyStateTransition("submit", "issue-uuid", "Bearer tok");
@@ -1821,49 +1974,110 @@ describe("applyStateTransition — AI-1475 D1: done gate defense-in-depth", () =
   });
 
   // AI-1492 regression: merged PR passes B2 defense-in-depth even when branch is deleted.
-  it("allows label swap to done when PR is merged but branch is deleted (AI-1492)", async () => {
+  it("allows label swap from merge state when PR is merged but branch is deleted (AI-1492)", async () => {
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
-        { id: "state-lbl", name: "state:deployment" },
+        { id: "state-lbl", name: "state:merge" },
       ],
-      teamLabels: [{ id: "done-lbl", name: "state:done" }],
+      teamLabels: [{ id: "dep-lbl", name: "state:deploy" }],
       branchStatus: { hasBranch: false, hasPR: true, hasMergedPR: true },
     });
     globalThis.fetch = mock;
-    await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
+    await applyStateTransition("continue", "issue-uuid", "Bearer tok");
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+  });
+
+  it("allows label swap from deploy state when PR is merged but branch is deleted (AI-1492)", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:deploy" },
+      ],
+      teamLabels: [{ id: "acv-lbl", name: "state:ac-validate" }],
+      branchStatus: { hasBranch: false, hasPR: true, hasMergedPR: true },
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("continue", "issue-uuid", "Bearer tok");
     const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
   });
 
   // AI-1497: complete absence of evidence is fail-open in B2 too.
-  it("allows label swap to done when neither branch nor PR exist (AI-1497 fail-open)", async () => {
+  it("allows label swap from merge state when neither branch nor PR exist (AI-1497 fail-open)", async () => {
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
-        { id: "state-lbl", name: "state:deployment" },
+        { id: "state-lbl", name: "state:merge" },
       ],
-      teamLabels: [{ id: "done-lbl", name: "state:done" }],
+      teamLabels: [{ id: "dep-lbl", name: "state:deploy" }],
       branchStatus: { hasBranch: false, hasPR: false },
     });
     globalThis.fetch = mock;
-    await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
+    await applyStateTransition("continue", "issue-uuid", "Bearer tok");
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+  });
+
+  it("allows label swap from deploy state when neither branch nor PR exist (AI-1497 fail-open)", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:deploy" },
+      ],
+      teamLabels: [{ id: "acv-lbl", name: "state:ac-validate" }],
+      branchStatus: { hasBranch: false, hasPR: false },
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("continue", "issue-uuid", "Bearer tok");
     const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
   });
 
   // AI-1497: null after retry is fail-open in B2.
-  it("allows label swap to done when branch/PR fetch throws both times (AI-1497 fail-open)", async () => {
+  it("allows label swap from deploy state when branch/PR fetch throws both times (AI-1497 fail-open)", async () => {
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
-        { id: "state-lbl", name: "state:deployment" },
+        { id: "state-lbl", name: "state:deploy" },
       ],
-      teamLabels: [{ id: "done-lbl", name: "state:done" }],
+      teamLabels: [{ id: "acv-lbl", name: "state:ac-validate" }],
       branchStatus: null, // simulates fetch error on every attempt
     });
     globalThis.fetch = mock;
-    await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
+    await applyStateTransition("continue", "issue-uuid", "Bearer tok");
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+  });
+
+  // Gate does NOT fire for non-forward intents from merge/deploy
+  it("does NOT block 'reject' from merge state (not a forward transition)", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:merge" },
+      ],
+      teamLabels: [{ id: "impl-lbl", name: "state:implementation" }],
+      branchStatus: { hasBranch: false, hasPR: true },
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("reject", "issue-uuid", "Bearer tok");
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+  });
+
+  it("does NOT block 'reject' from deploy state (not a forward transition)", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:deploy" },
+      ],
+      teamLabels: [{ id: "impl-lbl", name: "state:implementation" }],
+      branchStatus: { hasBranch: false, hasPR: true },
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("reject", "issue-uuid", "Bearer tok");
     const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
   });
@@ -1892,8 +2106,8 @@ describe("checkWorkflowRules — AI-1402: needs-human blocked when forward path 
     expect(result).toContain("needs-human");
   });
 
-  it("blocks needs-human in deployment (forward path: deploy, reject)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
+  it("blocks needs-human in deploy state (forward path: continue, reject)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deploy"]);
     const result = await checkWorkflowRules("needs-human", "issue-uuid", "Bearer tok", "astrid");
     expect(result).not.toBeNull();
     expect(result).toContain("needs-human");
@@ -1910,7 +2124,7 @@ describe("checkWorkflowRules — AI-1402: needs-human blocked when forward path 
   });
 
   it("break-glass (escape) is still legal from every state (§4.4)", async () => {
-    for (const state of ["intake", "implementation", "code-review", "deployment", "done"]) {
+    for (const state of ["intake", "implementation", "code-review", "merge", "deploy", "done"]) {
       resetWorkflowCache();
       globalThis.fetch = makeLabelFetch(["wf:dev-impl", `state:${state}`]);
       const result = await checkWorkflowRules("escape", "issue-uuid", "Bearer tok", "charles");
@@ -4451,7 +4665,7 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
       resetPolicyCache();
     });
 
-    it("sprint-owner (soren) blocked from deploy on dev-impl child", async () => {
+    it("sprint-owner (soren) blocked from continue on dev-impl merge state", async () => {
       const devImplFixture = path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml");
       process.env.WORKFLOW_DEF_PATH = devImplFixture;
       resetWorkflowCache();
@@ -4461,8 +4675,8 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
       process.env.CAPABILITY_POLICY_PATH = devImplPolicyFile;
       resetPolicyCache();
 
-      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
-      const result = await checkWorkflowRules("deploy", "AI-3001", "Bearer tok", "soren");
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"]);
+      const result = await checkWorkflowRules("continue", "AI-3001", "Bearer tok", "soren");
       expect(result).not.toBeNull();
       // soren is blocked — either as unknown caller or by deploy:execute capability gate.
       // Both reasons are structurally sound: the sprint owner cannot deploy.
@@ -5681,6 +5895,72 @@ describe("validateNativeStateMappings (AI-1490)", () => {
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain("done");
     expect(warnings[0]).toContain("no native_state field");
+  });
+});
+
+// ── AI-2476: Drift guard for merged-PR release gate-anchor states ────────
+
+describe("validateGateAnchorDefs (AI-2476 drift guard)", () => {
+  it("canonical dev-impl fixture passes drift guard (has merge + deploy states)", () => {
+    const raw = fs.readFileSync(CANONICAL_FIXTURE, "utf8");
+    const def = yaml.load(raw) as any;
+    const errors = validateGateAnchorDefs(def);
+    expect(errors).toEqual([]);
+  });
+
+  it("non-dev-impl workflows always pass the drift guard", () => {
+    const uxAudit = yaml.load(fs.readFileSync(CANONICAL_UX_AUDIT_FIXTURE, "utf8")) as any;
+    expect(validateGateAnchorDefs(uxAudit)).toEqual([]);
+
+    const sprint = yaml.load(fs.readFileSync(CANONICAL_SPRINT_FIXTURE, "utf8")) as any;
+    expect(validateGateAnchorDefs(sprint)).toEqual([]);
+  });
+
+  it("flags missing 'merge' state in dev-impl", () => {
+    const def = {
+      id: "dev-impl",
+      version: 10,
+      states: [
+        { id: "intake" },
+        { id: "deploy" },  // has deploy but not merge
+        { id: "done", kind: "terminal" },
+      ],
+    };
+    const errors = validateGateAnchorDefs(def);
+    expect(errors.length).toBeGreaterThanOrEqual(1);
+    expect(errors.some((e) => e.includes("merge"))).toBe(true);
+    expect(errors.some((e) => e.includes("deploy"))).toBe(false);
+  });
+
+  it("flags missing 'deploy' state in dev-impl", () => {
+    const def = {
+      id: "dev-impl",
+      version: 10,
+      states: [
+        { id: "intake" },
+        { id: "merge" },  // has merge but not deploy
+        { id: "done", kind: "terminal" },
+      ],
+    };
+    const errors = validateGateAnchorDefs(def);
+    expect(errors.length).toBeGreaterThanOrEqual(1);
+    expect(errors.some((e) => e.includes("deploy"))).toBe(true);
+    expect(errors.some((e) => e.includes("merge"))).toBe(false);
+  });
+
+  it("flags both missing states", () => {
+    const def = {
+      id: "dev-impl",
+      version: 10,
+      states: [
+        { id: "intake" },
+        { id: "done", kind: "terminal" },
+      ],
+    };
+    const errors = validateGateAnchorDefs(def);
+    expect(errors.length).toBe(2);
+    expect(errors.some((e) => e.includes("merge"))).toBe(true);
+    expect(errors.some((e) => e.includes("deploy"))).toBe(true);
   });
 });
 

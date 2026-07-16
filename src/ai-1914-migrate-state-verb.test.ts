@@ -78,6 +78,21 @@ states:
     transitions:
       - command: submit
         to: ac-validate
+  - id: merge
+    owner_role: deployment
+    native_state: doing
+    transitions:
+      - command: continue
+        to: deploy
+        generic: continue
+        requires_capability: deploy:execute
+  - id: deploy
+    owner_role: host-deploy
+    native_state: doing
+    transitions:
+      - command: continue
+        to: ac-validate
+        generic: continue
   - id: ac-validate
     owner_role: steward
     native_state: doing

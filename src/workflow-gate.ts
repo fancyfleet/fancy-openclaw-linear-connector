@@ -381,6 +381,15 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
         if (removalErrors.length > 0) {
           throw new Error(removalErrors.join("; "));
         }
+        // AI-2476: Drift guard — assert that gate-anchor states referenced by
+        // the merged-PR release gate predicates exist in the def. If a subsequent
+        // def rename removes or renames `merge` or `deploy`, the gate goes dead
+        // silently (same class as the v8→v10 fossil-predicate bug this closes).
+        // Only dev-impl has gate-anchor states; other workflows are unaffected.
+        const driftErrors = validateGateAnchorDefs(def);
+        if (driftErrors.length > 0) {
+          throw new Error(driftErrors.join("; "));
+        }
         registry.set(def.id, def);
       } catch (err) {
         // AC2: one bad def fails that def only — exclude it, keep the rest.
@@ -406,6 +415,11 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
       const removalErrors = validateDefStateRemovals(prevSnapshot[def.id] ?? [], def);
       if (removalErrors.length > 0) {
         throw new Error(removalErrors.join("; "));
+      }
+      // AI-2476: Drift guard for single-file path (same check as dir path above).
+      const driftErrors = validateGateAnchorDefs(def);
+      if (driftErrors.length > 0) {
+        throw new Error(driftErrors.join("; "));
       }
       registry.set(def.id, def);
       recordSuccess("workflow-def");
@@ -554,6 +568,52 @@ export function validateNativeStateMappings(def: WorkflowDef): string[] {
     }
   }
   return warnings;
+}
+
+/**
+ * AI-2476: Drift guard for gate-anchor states.
+ *
+ * The merged-PR release gate predicates (`checkWorkflowRules` and
+ * `applyStateTransition`) key on the state ids `'merge'` and `'deploy'` in the
+ * `dev-impl` workflow. If a future def rename renames or removes either state,
+ * the gate goes dead silently — exactly the class of bug that allowed the v8→v10
+ * fossil predicates to live for 10 days without detection.
+ *
+ * This function is called at registry load time (after the def is otherwise
+ * validated and activated). A non-empty return causes the def to be excluded
+ * from the registry (same fail-closed pattern as validateDefStateRemovals and
+ * validateNativeStateMappings).
+ *
+ * Non-dev-impl workflows are unrelated to this gate and always pass.
+ */
+export function validateGateAnchorDefs(def: WorkflowDef): string[] {
+  // Only dev-impl v10+ has gate-anchor states (merge/deploy) for the
+  // merged-PR release gate. Earlier dev-impl versions (v1-v9) used the old
+  // `deployment` single state and are unaffected.
+  if (def.id !== "dev-impl") return [];
+  if ((def.version ?? 0) < 10) return [];
+
+  const errors: string[] = [];
+  const stateIds = new Set(def.states.map((s) => s.id));
+
+  if (!stateIds.has("merge")) {
+    errors.push(
+      `[AI-2476 drift guard] dev-impl v${def.version} workflow is missing state 'merge' — ` +
+      `the release gate predicates checkWorkflowRules/applyStateTransition both key ` +
+      `on this state. If the rename is intentional, update the drift guard and gate ` +
+      `predicates together.`,
+    );
+  }
+  if (!stateIds.has("deploy")) {
+    errors.push(
+      `[AI-2476 drift guard] dev-impl v${def.version} workflow is missing state 'deploy' — ` +
+      `the release gate predicates checkWorkflowRules/applyStateTransition both key ` +
+      `on this state. If the rename is intentional, update the drift guard and gate ` +
+      `predicates together.`,
+    );
+  }
+
+  return errors;
 }
 
 /**
@@ -2133,25 +2193,33 @@ export async function checkWorkflowRules(
   // Resolve destination state for subsequent gates.
   const destStateNode = def.states.find((s) => s.id === match.to);
 
-  // AI-1475 Defect 1 + AI-1492 + AI-1497: Merged-PR release gate (§5.6) — a
-  // wf:dev-impl ticket must not leave the deployment state forward without
+  // ── AI-2476: Merged-PR release gate re-armed (§5.6) ──────────────────
+  // A wf:dev-impl ticket must not leave merge or deploy states forward without
   // evidence that the implementation was pushed, reviewed, and merged.
-  // v8: deployment now has two forward exits — `deploy` (→ ac-validate, CI
-  // auto-deploys) and `handoff-host-deploy` (→ host-deploy, bare-metal action).
-  // The PR merge happens in `deployment` before either, so the gate fires on
-  // both. (`done` is now reached later via `validated`, after ac-validate.)
-  // Other workflows (ux-audit) have their own gate paths (parent-AC gate).
+  //
+  // v8 → v14 evolution: the old gate checked for literal `deploy` and
+  // `handoff-host-deploy` commands — v8 verbs deleted by AI-1872 (v10). In v14,
+  // the forward exits from both merge and deploy states use the generic `continue`
+  // intent (resolved from continue-workflow by resolveMetaIntent). The gate now
+  // keys on (currentState+intent) rather than a literal intent string, so a
+  // workflow def rename of these states is caught by the drift guard at registry
+  // load (AI-2476).
   //
   // AI-1492 fix: A merged PR satisfies the gate even when the source branch was
   // auto-deleted by GitHub after a squash merge.
   //
   // AI-1497 fix: When branch+PR data are completely absent (both false), this is
   // indistinguishable from a successfully-merged ticket whose data was lost to
-  // auto-delete. Since the ticket is in 'deployment' state (reachable only after
-  // code-review approval), fail-open rather than stranding the ticket. Only block
-  // when partial evidence exists (has branch but no PR = pushed but never reviewed).
-  // Also fail-open on null (transient API failure) after one retry.
-  if (intent === 'deploy' || intent === 'handoff-host-deploy') {
+  // auto-delete. Since the ticket is in merge or deploy state (reachable only
+  // after code-review approval), fail-open rather than stranding the ticket. Only
+  // block when partial evidence exists (has branch but no PR = pushed but never
+  // reviewed). Also fail-open on null (transient API failure) after one retry.
+  //
+  // NOTE(AI-2476): The AI-1795 no-CI-auto-deploy guard (below) keys on
+  // `intent === "deploy"` and is also dead. It needs independent redesign
+  // (separate ticket) — its premise of a choice between two forward exits no
+  // longer exists in v14.
+  if ((currentState === 'merge' || currentState === 'deploy') && intent === 'continue') {
     let branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
     // AI-1497: retry once on null — transient Linear API failure during
     // Hanzo merge+deploy quick succession.
@@ -2161,13 +2229,13 @@ export async function checkWorkflowRules(
     }
     if (!branchStatus) {
       // Two consecutive nulls — transient API failure. Fail-open to avoid
-      // stranding tickets; deployment state is already past code review.
+      // stranding tickets; merge/deploy state is already past code review.
       log.warn(`workflow-gate: done gate: could not verify branch/PR status for ${issueId} after retry — failing open`);
     } else if (branchStatus.hasMergedPR) {
       log.info(`workflow-gate: done gate: ${issueId} passed (merged PR confirmed)`);
     } else if (!branchStatus.hasBranch && !branchStatus.hasPR) {
       // AI-1497: Complete absence of evidence — likely lost to auto-delete.
-      // Fail-open: a ticket in deployment state has already passed code review,
+      // Fail-open: a ticket in merge/deploy state has already passed code review,
       // so the PR almost certainly existed and was merged.
       log.info(`workflow-gate: done gate: ${issueId} passed (no branch/PR evidence — treating as merged, data likely lost to auto-delete)`);
       // AI-1797: with no GitHub integration installed, EVERY ticket takes this
@@ -2177,7 +2245,7 @@ export async function checkWorkflowRules(
         severity: "warning",
         source: "done-gate",
         title: "done gate passed with no branch/PR evidence (GitHub integration missing?)",
-        detail: `Ticket ${issueId} passed '${intent}' with zero GitHub attachments. If this fires for every deploy, the Linear GitHub integration is not installed and the merged-PR gate is verifying nothing.`,
+        detail: `Ticket ${issueId} passed '${intent}' with zero GitHub attachments. If this fires for every forward move, the Linear GitHub integration is not installed and the merged-PR gate is verifying nothing.`,
         ticket: issueId,
         dedupKey: "done-gate|no-evidence",
       });
@@ -3124,19 +3192,21 @@ export async function applyStateTransition(
     return { status: "failed", code: "atomic-mutation-failed", detail: `re-stamp of '${targetLabelName}' did not apply`, from: currentStateName, to: toStateName };
   }
 
-  // ── AI-1475 Defect 1 + AI-1492 + AI-1497: Merged-PR release gate defense-in-depth (§5.6) ─
-  // Block the forward label swap out of deployment if the branch/PR gate is not
-  // satisfied. Defense-in-depth: checkWorkflowRules is the primary gate, but
-  // applyStateTransition also blocks to prevent any bypass path.
-  // v8: fires on both forward exits from deployment — `deploy` and
-  // `handoff-host-deploy` (the merge precedes either).
+  // ── AI-2476: Merged-PR release gate defense-in-depth (§5.6) ────────
+  // Block the forward label swap out of merge or deploy if the branch/PR gate
+  // is not satisfied. Defense-in-depth: checkWorkflowRules is the primary gate,
+  // but applyStateTransition also blocks to prevent any bypass path.
+  //
+  // AI-2476 re-arm: v8's literal verb predicate (`'deploy'`, `'handoff-host-deploy'`)
+  // was deleted by AI-1872 (v10). The gate now keys on (currentStateName+intent)
+  // to match the v14 generic-verb architecture.
   //
   // AI-1492: A merged PR satisfies the gate even without a branch (auto-deleted
   // after squash merge).
   //
   // AI-1497: Fail-open on null (after retry) and on complete absence of evidence
   // (no branch + no PR). Only block on partial evidence (branch exists but no PR).
-  if (intent === 'deploy' || intent === 'handoff-host-deploy') {
+  if ((currentStateName === 'merge' || currentStateName === 'deploy') && intent === 'continue') {
     let branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
     if (!branchStatus) {
       await new Promise((r) => setTimeout(r, 1000));
