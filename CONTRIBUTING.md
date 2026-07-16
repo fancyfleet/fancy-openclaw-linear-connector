@@ -5,7 +5,7 @@ Thanks for your interest in contributing to fancy-openclaw-linear-connector!
 ## Local Setup
 
 ```bash
-git clone https://github.com/fancymatt/fancy-openclaw-linear-connector.git
+git clone https://github.com/fancyfleet/fancy-openclaw-linear-connector.git
 cd fancy-openclaw-linear-connector
 npm install
 npm run build

@@ -40,7 +40,7 @@ For reference or when the wizard isn't available. The wizard above automates mos
 
 1. **Clone and install:**
    ```bash
-   git clone https://github.com/fancymatt/fancy-openclaw-linear-connector.git
+   git clone https://github.com/fancyfleet/fancy-openclaw-linear-connector.git
    cd fancy-openclaw-linear-connector
    npm install
    npm run build
@@ -202,7 +202,7 @@ Use this for a fresh OpenClaw + connector installation on a different server.
 
 **Steps:**
 1. Install OpenClaw on new machine
-2. Clone connector repo: `git clone https://github.com/fancymatt/fancy-openclaw-linear-connector.git`
+2. Clone connector repo: `git clone https://github.com/fancyfleet/fancy-openclaw-linear-connector.git`
 3. Copy `agents.json.example` to `agents.json` and configure all agents
 4. Set up nginx reverse proxy for `/linear-webhook` → `http://localhost:3100/`
 5. Update Linear webhook URL to point to your new domain
@@ -258,7 +258,7 @@ Linear webhook → nginx reverse proxy → connector (port 3100)
                                            └── Close agent session when agent process exits
 ```
 
-**Companion skill:** [fancy-openclaw-linear-skill](https://github.com/fancymatt/fancy-openclaw-linear-skill) — `linear` CLI that agents use to interact with Linear.
+**Companion skill:** [fancy-openclaw-linear-skill](https://github.com/fancyfleet/fancy-openclaw-linear-skill) — `linear` CLI that agents use to interact with Linear.
 
 ## Adding a New Agent (Playbook)
 
