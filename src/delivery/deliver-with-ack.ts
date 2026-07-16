@@ -34,8 +34,10 @@ export interface DeliverWithAckParams {
   /** Gateway/host the delegate lives on (e.g. "grover"). */
   gateway?: string;
   /**
-   * Stable dispatch id. Reused verbatim across every retry so the receiving
-   * side can dedup (idempotent) — a retried wake never double-executes.
+   * Stable dispatch id, reused verbatim across every retry. Carried only by
+   * delivery paths that forward it; the gateway path does not send it today, so
+   * it confers no receiver-side dedup — do not assume a retried wake is
+   * idempotent (AI-2437).
    */
   dispatchId: string;
   /** The single-attempt delivery primitive. Injected for testability. */
