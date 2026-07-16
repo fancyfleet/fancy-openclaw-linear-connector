@@ -60,6 +60,26 @@ T=$(new_fixture)
 [ "$(git -C "$T" status --porcelain | grep -v ' bystander.txt$' | grep -c .)" = "0" ] && ok "no foreign staged residue (besides the preserved WIP)" || no "unexpected residue: $(git -C "$T" status --porcelain | tr '\n' '|')"
 rm -rf "$T"
 
+echo "== ACCEPTANCE (INF-17): atomic restore is SCOPED — a concurrent STAGED edit survives =="
+# Mirror of the unstaged case. Session A has a STAGED edit to a file the yank does
+# NOT swap. checkout carries that staged edit across, so it lands in the staged
+# delta vs HEAD alongside the swap — but it is NOT in the swap set (head_old..
+# head_new). The scoped restore must leave it staged and intact. Restoring the whole
+# staged delta (the pre-fix behavior) destroys it with no recoverable ref — the exact
+# regression this AC closes.
+T=$(new_fixture)
+( cd "$T"
+  echo shared > bystander.txt; git add bystander.txt; git commit -qm add-bystander
+  echo changed > marker.txt;   git add marker.txt;    git commit -qm change-marker
+  TARGET=$(git rev-parse HEAD~1)                  # old marker + identical bystander
+  echo SESSION-A-STAGED > bystander.txt; git add bystander.txt   # concurrent STAGED edit
+  git checkout --detach "$TARGET" >/dev/null 2>&1 # vetoed + auto-restored (scoped)
+)
+[ "$(git -C "$T" show :bystander.txt 2>/dev/null)" = "SESSION-A-STAGED" ] && ok "scoped restore PRESERVED concurrent STAGED edit (index)" || no "scoped restore DESTROYED concurrent staged edit (INF-17 regression)"
+[ "$(cat "$T/bystander.txt")" = "SESSION-A-STAGED" ] && ok "concurrent staged edit intact in worktree" || no "concurrent staged edit lost from worktree"
+[ "$(cat "$T/marker.txt")" = "changed" ] && ok "swapped file restored to HEAD (staged sibling preserved)" || no "swapped file NOT restored"
+rm -rf "$T"
+
 echo "== amend must be ALLOWED =="
 T=$(new_fixture)
 ( cd "$T"; echo x >> marker.txt; git add marker.txt; git commit --amend --no-edit -q >/dev/null 2>&1 )

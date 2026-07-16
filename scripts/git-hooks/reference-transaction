@@ -39,13 +39,20 @@
 # Net effect: HEAD never moved AND the index + working tree are exactly as before.
 # The veto is atomic.
 #
-# The restore is SCOPED to the staged delta (not a blanket `git restore .`) on
-# purpose: a concurrent session's UNSTAGED edit to an unrelated file must never be
-# clobbered. `git checkout` refuses to run over dirty tracked files, so the staged
-# delta is exactly this checkout's own swap and nothing else — an unstaged-only
-# edit (worktree≠index, index==HEAD) is not in the delta and is left untouched. If
-# the auto-restore itself fails, the veto message prints the manual command and we
-# are no worse off than the old non-atomic behavior.
+# The restore is SCOPED to the paths THIS checkout swapped — the set of files that
+# differ between old HEAD and the target commit (`git diff head_old head_new`),
+# intersected with the current staged delta — NOT a blanket `git restore .` and NOT
+# the whole staged delta. Two concurrent-session hazards this scoping avoids:
+#   - an UNSTAGED edit to an unrelated file (worktree≠index, index==HEAD) is not in
+#     the staged delta at all, so it is never touched;
+#   - a pre-existing STAGED edit to a file the target ref does NOT touch is carried
+#     across by checkout and appears in the staged delta, but is NOT in the swap set,
+#     so it is left alone. Restoring the whole delta destroyed that staged work with
+#     no recoverable ref (INF-17 regression) — the AI-2475 clobber class via the
+#     staged door. `git checkout` refuses to run over a locally-modified file it must
+#     swap, so no pre-existing work ever rides on a swap-set path. If the auto-restore
+#     itself fails, the veto message prints the manual command and we are no worse off
+#     than the old non-atomic behavior.
 #
 # WHY NOT MAKE THE PRIMARY TREE FULLY READ-ONLY (INF-17 AC, considered & rejected):
 # commits and ff-pulls on the current branch are legitimate primary-tree operations
@@ -130,19 +137,49 @@ is_yank || exit 0
 
 if [ "$state" = "aborted" ]; then
   # The prepared-phase veto already aborted the HEAD move — HEAD is intact. git
-  # swapped the index + working tree to the target BEFORE the ref txn, so undo
-  # EXACTLY those paths (the staged delta vs HEAD) back to HEAD, and no others.
-  # Scoping to the staged delta guarantees a concurrent session's UNSTAGED edit to
-  # an unrelated file is never touched (see header). This runs after git released
-  # the index lock, and `git restore` moves no ref, so it does not re-enter here.
-  mapfile -t swapped < <(git diff --cached --name-only -z HEAD 2>/dev/null | tr '\0' '\n')
-  if [ "${#swapped[@]}" -eq 0 ]; then exit 0; fi
+  # swapped the index + working tree to the target BEFORE the ref txn; undo EXACTLY
+  # the paths THIS checkout swapped, back to HEAD, and no others.
+  #
+  # The swap set is NOT the whole staged delta. A concurrent session may have a
+  # pre-existing STAGED edit to a file the target ref does not touch; checkout
+  # carries that staged edit across untouched, so it shows up in `git diff --cached
+  # HEAD` alongside the swap. Restoring the whole delta destroys that staged work
+  # with no recoverable ref (INF-17 regression Ai found: the veto that was supposed
+  # to *protect* the shared clone silently ate another session's staged edit and
+  # printed "nothing was left staged" while doing it — the AI-2475 clobber class via
+  # the staged door).
+  #
+  # The swap set is knowable exactly and independently of the staged delta: it is
+  # the paths that differ between old HEAD and the target commit (head_new — its
+  # object exists even though the ref move was vetoed). We restore only (swap set ∩
+  # staged delta): the checkout's own swap, and never a file the session had staged
+  # before the yank. A swap-set path can only be in the staged delta because checkout
+  # put it there — checkout refuses to run over a locally-modified file it must swap,
+  # so no pre-existing work rides on those. This runs after git released the index
+  # lock, and `git restore` moves no ref, so it does not re-enter here.
+  #
+  # Use LIVE `HEAD` as the base, NOT the stdin head_old: in the aborted phase git
+  # reports head_old as all-zeros for a detaching HEAD move, so `git diff $head_old`
+  # would be empty and restore nothing. The move was aborted, so HEAD still resolves
+  # to the true old commit — that is the correct, reliable base.
+  base="$(git rev-parse --verify -q HEAD 2>/dev/null || echo "")"
+  [ -n "$base" ] || exit 0                            # unborn HEAD — nothing to restore against
+  [ "$head_new" = "$ZERO" ] && exit 0                 # no target object to diff — leave as-is (non-atomic fallback)
+  git rev-parse --verify -q "${head_new}^{commit}" >/dev/null 2>&1 || exit 0   # target object gone — same fallback
+  declare -A in_swap=()
+  while IFS= read -r -d '' p; do in_swap["$p"]=1; done \
+    < <(git diff --name-only -z "$base" "$head_new" 2>/dev/null)
+  restore=()
+  while IFS= read -r -d '' p; do
+    [ -n "${in_swap[$p]:-}" ] && restore+=("$p")
+  done < <(git diff --cached --name-only -z HEAD 2>/dev/null)
+  if [ "${#restore[@]}" -eq 0 ]; then exit 0; fi
   err="$(git rev-parse --git-dir 2>/dev/null)/reftxn-restore.$$.err"
-  if git restore --staged --worktree --source=HEAD -- "${swapped[@]}" 2>"$err"; then
-    echo "  [reference-transaction] auto-restored ${#swapped[@]} path(s) to HEAD — index + working tree are clean; nothing was left staged." >&2
+  if git restore --staged --worktree --source=HEAD -- "${restore[@]}" 2>"$err"; then
+    echo "  [reference-transaction] auto-restored ${#restore[@]} path(s) that the vetoed checkout swapped, back to HEAD. Anything you had staged before the checkout is untouched." >&2
     rm -f "$err"
   else
-    echo "  [reference-transaction] AUTO-RESTORE FAILED — the tree is still swapped to foreign content. Restore it by hand:" >&2
+    echo "  [reference-transaction] AUTO-RESTORE FAILED — the tree is still swapped to foreign content. Restore it by hand (this reverts ALL staged+worktree changes; check 'git status' first if you had staged work):" >&2
     echo "      git restore --staged --worktree ." >&2
     sed 's/^/      /' "$err" >&2 2>/dev/null || true
     rm -f "$err"
