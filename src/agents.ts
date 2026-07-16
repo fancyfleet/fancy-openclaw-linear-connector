@@ -735,20 +735,27 @@ export function upsertAgent(config: AgentConfig): { isNew: boolean } {
     // Reconcile the merged entry, not the incoming patch: a partial upsert that
     // omits refreshToken must not read as "no credential" when the stored entry
     // has one.
-    _agents = _agents.map((a) =>
-      a === existing
-        ? reconcileStatusWithCredential({ ...a, ...config })
-        : a
-    );
+    _agents = _agents.map((a) => {
+      if (a !== existing) return a;
+      const merged = reconcileStatusWithCredential({ ...a, ...config });
+      // An agent onboarded partially (no upstream token yet) has no proxy token
+      // to mint against; when its real token finally arrives on this update
+      // path, mint then — otherwise syncWorkspaceSecrets falls back to
+      // publishing the raw upstream token, the exact leak AI-2308 closes.
+      if (needsProxyToken(merged)) {
+        merged.proxyToken = mintProxyToken();
+      }
+      return merged;
+    });
     save(_agents);
     syncWorkspaceSecrets(config.name, config.accessToken);
     return { isNew: false };
   }
-  // Mint a proxy token for every new agent before it hits disk so that
+  // Mint a proxy token for a new agent before it hits disk so that
   // syncWorkspaceSecrets always has a `lpx_` credential to write — never
   // the raw upstream `lin_oauth_` token (AI-2308). Already-provisioned
   // agents with an existing proxyToken are untouched.
-  if (!config.proxyToken) {
+  if (needsProxyToken(config)) {
     config.proxyToken = mintProxyToken();
   }
 
@@ -756,4 +763,17 @@ export function upsertAgent(config: AgentConfig): { isNew: boolean } {
   save(_agents);
   syncWorkspaceSecrets(config.name, config.accessToken);
   return { isNew: true };
+}
+
+/**
+ * Mint only when there is a real upstream token to broker.
+ *
+ * A proxy token is a stand-in for a vaulted `accessToken`; minting one for an
+ * agent that has no upstream credential yet would publish a linear.env that
+ * reads as provisioned but brokers nothing — the "configured-but-broken"
+ * credential file AI-2309 exists to prevent. With no token on either side,
+ * syncWorkspaceSecrets' empty-credential guard declines to write at all.
+ */
+function needsProxyToken(config: AgentConfig): boolean {
+  return !config.proxyToken && Boolean(config.accessToken?.trim());
 }

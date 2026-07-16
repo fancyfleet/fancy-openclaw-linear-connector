@@ -119,12 +119,18 @@ describe("AI-2309 — empty token must never overwrite a good credential", () =>
 
   test("re-running the onboard endpoint does not publish an empty credential over the live linear.env", async () => {
     upsertAgent(partiallyOnboarded());
-    expect(fs.readFileSync(secretsPath, "utf8")).toContain(`LINEAR_OAUTH_TOKEN=${GOOD_TOKEN}`);
+    // AI-2308 brokers the upstream token: what lands in linear.env is the minted
+    // `lpx_` proxy token, never GOOD_TOKEN itself. The credential this test
+    // protects is therefore the proxy token — the anti-clobber contract is
+    // unchanged, only the identity of the credential being protected.
+    const before = fs.readFileSync(secretsPath, "utf8");
+    expect(before).toMatch(/LINEAR_OAUTH_TOKEN=lpx_/);
+    expect(before).not.toContain(GOOD_TOKEN);
 
     await postOnboard();
 
     const env = fs.readFileSync(secretsPath, "utf8");
-    expect(env).toContain(`LINEAR_OAUTH_TOKEN=${GOOD_TOKEN}`);
+    expect(env).toBe(before); // the live credential survives the partial re-onboard
     expect(env).not.toMatch(/LINEAR_OAUTH_TOKEN=\s*$/m); // the bricking write
   });
 
@@ -135,9 +141,11 @@ describe("AI-2309 — empty token must never overwrite a good credential", () =>
     // A caller that blanks the token anyway — the pre-fix admin.ts, or any future one.
     reOnboard({ accessToken: "", refreshToken: "" });
 
-    // The live credential file must be untouched, not emptied.
+    // The live credential file must be untouched, not emptied. Post-AI-2308 the
+    // live credential is the minted proxy token (the raw GOOD_TOKEN is brokered,
+    // never published), so that is what must survive a blanking caller.
     expect(fs.readFileSync(secretsPath, "utf8")).toBe(before);
-    expect(fs.readFileSync(secretsPath, "utf8")).toContain(GOOD_TOKEN);
+    expect(fs.readFileSync(secretsPath, "utf8")).toMatch(/LINEAR_OAUTH_TOKEN=lpx_/);
   });
 
   test("a whitespace-only token is treated as empty, not written as a credential", () => {
