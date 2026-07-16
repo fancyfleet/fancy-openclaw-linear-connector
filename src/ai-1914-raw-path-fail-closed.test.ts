@@ -35,18 +35,29 @@ break_glass:
   to: escape
   owner_role: steward
 states:
+  # AI-2476: gate anchor states must exist for registry load (drift guard).
+  # These are minimal stubs — the test checks that state:deployment (a defunct
+  # state not in this set) is rejected by checkRawMutationInterception.
+  - id: merge
+    owner_role: deployment
+    native_state: doing
+    transitions:
+      - command: continue
+        to: deploy
+        generic: continue
+  - id: deploy
+    owner_role: host-deploy
+    native_state: doing
+    transitions:
+      - command: continue
+        to: ac-validate
+        generic: continue
   - id: intake
     owner_role: steward
     native_state: todo
     transitions:
       - command: accept
-        to: implementation
-  - id: implementation
-    owner_role: dev
-    native_state: doing
-    transitions:
-      - command: submit
-        to: ac-validate
+        to: merge
   - id: ac-validate
     owner_role: steward
     native_state: doing

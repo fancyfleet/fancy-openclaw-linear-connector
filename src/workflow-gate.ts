@@ -371,15 +371,20 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
           continue;
         }
         // AC3: refuse to activate a def version that silently removes a state
-        // relative to its last-activated version. Throwing here routes through
-        // the same per-def fail-closed path as a native_state failure: the def
-        // is excluded from the registry and config-health goes unhealthy, while
-        // every other valid def still loads. The operator's remedy is to add a
-        // migrations mapping or a strand_acknowledged entry — which is exactly
-        // the sanctioned, non-lossy path AC1/AC2 provide.
+        // relative to its last-activated version.
         const removalErrors = validateDefStateRemovals(prevSnapshot[def.id] ?? [], def);
         if (removalErrors.length > 0) {
           throw new Error(removalErrors.join("; "));
+        }
+        // AI-2476: Drift guard for gate anchor states. Ensures that any def
+        // version ≥ 10 for dev-impl contains `merge` and `deploy` states (the
+        // states the gate predicates in §5.6 key on). If a future refactor
+        // renames or removes either, the def is excluded at registry load —
+        // same fail-closed pattern as the removal guard above — preventing
+        // the silent-gate-death class of bug from recurring.
+        const gateErrors = validateGateAnchorDefs(def);
+        if (gateErrors.length > 0) {
+          throw new Error(gateErrors.join("; "));
         }
         registry.set(def.id, def);
       } catch (err) {
@@ -406,6 +411,11 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
       const removalErrors = validateDefStateRemovals(prevSnapshot[def.id] ?? [], def);
       if (removalErrors.length > 0) {
         throw new Error(removalErrors.join("; "));
+      }
+      // AI-2476: Drift guard for gate anchor states (same as multi-def path above).
+      const gateErrors = validateGateAnchorDefs(def);
+      if (gateErrors.length > 0) {
+        throw new Error(gateErrors.join("; "));
       }
       registry.set(def.id, def);
       recordSuccess("workflow-def");
@@ -554,6 +564,43 @@ export function validateNativeStateMappings(def: WorkflowDef): string[] {
     }
   }
   return warnings;
+}
+
+/**
+ * AI-2476: Validate gate anchor states for dev-impl v10+ workflow defs.
+ *
+ * The re-armed merge/deploy gate predicates (checkWorkflowRules §5.6,
+ * applyStateTransition B2) key on state name (`merge`, `deploy`). If a future
+ * refactor renames or removes either state, the gates silently go dead again.
+ *
+ * This drift guard asserts that for dev-impl defs at version ≥ 10, both `merge`
+ * and `deploy` states exist. Called at registry load right after the AC3
+ * state-removal check, with the same fail-closed pattern: the def is excluded
+ * from the registry when the guard fails.
+ */
+const GATE_ANCHOR_STATES = ['merge', 'deploy'];
+const GATE_ANCHOR_WORKFLOW_IDS = ['dev-impl'];
+const GATE_ANCHOR_MIN_VERSION = 10;
+
+export function validateGateAnchorDefs(def: WorkflowDef): string[] {
+  const errors: string[] = [];
+
+  // Only applies to dev-impl v10+.
+  if (!GATE_ANCHOR_WORKFLOW_IDS.includes(def.id)) return errors;
+  const version = def.version ?? 0;
+  if (version < GATE_ANCHOR_MIN_VERSION) return errors;
+
+  const stateIds = new Set(def.states.map((s) => s.id));
+  for (const anchor of GATE_ANCHOR_STATES) {
+    if (!stateIds.has(anchor)) {
+      errors.push(
+        `AI-2476 gate anchor drift: dev-impl v${version} is missing required state '${anchor}'. ` +
+        `Gate predicates key on this state name; removing it would silence the merged-PR release gate. ` +
+        `If the state was intentionally renamed, update the GATE_ANCHOR_STATES list and both gate predicates.`
+      );
+    }
+  }
+  return errors;
 }
 
 /**
@@ -2134,24 +2181,29 @@ export async function checkWorkflowRules(
   const destStateNode = def.states.find((s) => s.id === match.to);
 
   // AI-1475 Defect 1 + AI-1492 + AI-1497: Merged-PR release gate (§5.6) — a
-  // wf:dev-impl ticket must not leave the deployment state forward without
+  // wf:dev-impl ticket must not leave the merge or deploy state forward without
   // evidence that the implementation was pushed, reviewed, and merged.
-  // v8: deployment now has two forward exits — `deploy` (→ ac-validate, CI
-  // auto-deploys) and `handoff-host-deploy` (→ host-deploy, bare-metal action).
-  // The PR merge happens in `deployment` before either, so the gate fires on
-  // both. (`done` is now reached later via `validated`, after ac-validate.)
-  // Other workflows (ux-audit) have their own gate paths (parent-AC gate).
+  // v10+ (AI-1872, AI-2476): merge and deploy are two separate states exited via the
+  // generic `continue` verb. The PR merge happens in `merge`, and the deploy
+  // artifact is pushed in `deploy`. Both exits require merged-PR evidence.
+  // v8 compat: also accepts the old `deployment` state name for synthetic
+  // test harnesses and any migrated in-flight tickets.
+  //
+  // AI-2476 fix: re-keyed from verb name (`'deploy'` / `'handoff-host-deploy'`)
+  // to source state (`merge`, `deploy`, `deployment`) so the guard survives
+  // future verb renames. The verb-based keys were dead code since AI-1872.
   //
   // AI-1492 fix: A merged PR satisfies the gate even when the source branch was
   // auto-deleted by GitHub after a squash merge.
   //
   // AI-1497 fix: When branch+PR data are completely absent (both false), this is
   // indistinguishable from a successfully-merged ticket whose data was lost to
-  // auto-delete. Since the ticket is in 'deployment' state (reachable only after
+  // auto-delete. Since the ticket is in 'merge'/'deploy' state (reachable only after
   // code-review approval), fail-open rather than stranding the ticket. Only block
   // when partial evidence exists (has branch but no PR = pushed but never reviewed).
   // Also fail-open on null (transient API failure) after one retry.
-  if (intent === 'deploy' || intent === 'handoff-host-deploy') {
+  const isDeployStateExit = currentState === 'merge' || currentState === 'deploy' || currentState === 'deployment';
+  if (isDeployStateExit) {
     let branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
     // AI-1497: retry once on null — transient Linear API failure during
     // Hanzo merge+deploy quick succession.
@@ -2201,32 +2253,38 @@ export async function checkWorkflowRules(
     }
   }
 
-  // AI-1795: no-CI-auto-deploy guard. On repos flagged `ci_auto_deploy: false`
-  // in the instance deploy policy, `deploy` (merge → ac-validate directly) is
-  // rejected: merge alone leaves the running service on the old build, and
+  // AI-1795: no-CI-auto-deploy guard. On repos flagged `ci_auto_deploy: false`,
+  // forward exit from `deploy` to `ac-validate` (continue) is rejected:
+  // the service was already deployed before the v10 split — forward-exiting deploy
+  // means "no deploy needed" (CI auto-deploy), but if that guarantee is absent,
   // ac-validate would verify a stale artifact (recurred twice on AI-1775).
-  // The legal exit for such repos is `handoff-host-deploy` → host-deploy,
-  // which is never blocked here. Repo resolution: `repo:*` labels + GitHub
+  // The legal exit for such repos is handoff to a host deployer who can push the
+  // artifact before validation. Repo resolution: `repo:*` labels + GitHub
   // attachments; unresolvable or unflagged repos pass (guard is opt-in per
   // repo). Break-glass is exempt (steward recovery path, identity-gated).
-  if (intent === "deploy" && !breakGlassOverride) {
+  // AI-2476 fix: re-keyed from verb `'deploy'` (dead since AI-1872) to source
+  // state `deploy`/`deployment`. Fires only on forward forward exit from `deploy`
+  // state (matched by currentState and dest being ac-validate or forward-adjacent).
+  const isDeployExitForward = match.to === 'ac-validate' && (currentState === 'deploy' || currentState === 'deployment');
+  if (isDeployExitForward && !breakGlassOverride) {
     const repoRefs = await resolveTicketRepoRefs(labels, issueId, authToken);
     const flagged = reposWithoutCiAutoDeploy(repoRefs);
     if (flagged.length > 0) {
       const repoList = flagged.join("', '");
-      log.warn(`workflow-gate: AI-1795 no-CI-auto-deploy guard blocked 'deploy' on ${issueId} (repo '${repoList}', agent=${bodyId})`);
+      log.warn(`workflow-gate: AI-1795 no-CI-auto-deploy guard blocked 'continue' from 'deploy' on ${issueId} (repo '${repoList}', agent=${bodyId})`);
       notify({
         severity: "warning",
         source: "deploy-policy",
-        title: `no-CI-auto-deploy guard blocked 'deploy' (repo: ${flagged.join(", ")})`,
-        detail: `Ticket ${issueId}: 'deploy' would advance to ac-validate without the merged artifact running. Agent must use 'handoff-host-deploy' → host-deploy instead.`,
+        title: `no-CI-auto-deploy guard blocked forward exit from 'deploy' (repo: ${flagged.join(", ")})`,
+        detail: `Ticket ${issueId}: forward exit from 'deploy' would advance to ac-validate without the merged artifact running. Agent must handoff to a host deployer instead.`,
         agent: bodyId,
         ticket: issueId,
       });
-      const legalMoves = [...transitions.filter((t) => t.command !== "deploy").map((t) => cliVerbFor(t)), breakGlassCommand].join(", ");
+      const legalMoves = [...transitions.map((t) => t.command), breakGlassCommand].join(", ");
       return (
-        `[Proxy] 'deploy' blocked: repo '${repoList}' has no CI auto-deploy — merging alone leaves the running service on the old build, ` +
-        `and AC validation would verify a stale artifact. Use 'handoff-host-deploy' to route through host-deploy instead. ` +
+        `[Proxy] Forward exit from 'deploy' blocked: repo '${repoList}' has no CI auto-deploy — ` +
+        `advancing from 'deploy' to 'ac-validate' would verify a stale artifact. ` +
+        `Handoff to a host deployer to push the artifact before validation, or use 'reject' to return to implementation. ` +
         `Legal moves: ${legalMoves}.`
       );
     }
@@ -3125,18 +3183,19 @@ export async function applyStateTransition(
   }
 
   // ── AI-1475 Defect 1 + AI-1492 + AI-1497: Merged-PR release gate defense-in-depth (§5.6) ─
-  // Block the forward label swap out of deployment if the branch/PR gate is not
+  // Block the forward label swap out of merge/deploy if the branch/PR gate is not
   // satisfied. Defense-in-depth: checkWorkflowRules is the primary gate, but
   // applyStateTransition also blocks to prevent any bypass path.
-  // v8: fires on both forward exits from deployment — `deploy` and
-  // `handoff-host-deploy` (the merge precedes either).
+  // AI-2476 fix: re-keyed from verb name to source state (`merge`, `deploy`,
+  // `deployment`) so the guard survives future verb renames.
   //
   // AI-1492: A merged PR satisfies the gate even without a branch (auto-deleted
   // after squash merge).
   //
   // AI-1497: Fail-open on null (after retry) and on complete absence of evidence
   // (no branch + no PR). Only block on partial evidence (branch exists but no PR).
-  if (intent === 'deploy' || intent === 'handoff-host-deploy') {
+  const b2DeployStates = ['merge', 'deploy', 'deployment'];
+  if (currentStateName && b2DeployStates.includes(currentStateName)) {
     let branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
     if (!branchStatus) {
       await new Promise((r) => setTimeout(r, 1000));
