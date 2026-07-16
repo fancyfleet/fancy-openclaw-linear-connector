@@ -889,11 +889,21 @@ export function createAdminRouter(deps: AdminDeps): Router {
     }];
 
     // AI-2008 AC4: per-ticket dispatch timeline. Project delivery-lifecycle
-    // events into normalized statuses (delivered / failed / retrying /
-    // undeliverable) so the console shows how each dispatch actually landed —
-    // not just raw event summaries.
+    // events into normalized statuses (delivered / pending-ack / failed /
+    // retrying / undeliverable) so the console shows how each dispatch actually
+    // landed — not just raw event summaries.
+    //
+    // AI-2474: an outcome absent from this map is dropped by the filter below,
+    // not rendered as unknown — so any new delivery outcome must be added here
+    // or it silently vanishes from the timeline. `pending-ack` is its own
+    // status rather than folded into an existing bucket: the connection was
+    // established and an ack expectation registered, but the response was never
+    // confirmed (AI-2437). It is not `delivered`, not a failure, and not
+    // `retrying` — post-AI-2437 that path does not retry. This matches how
+    // store/operational-event-store.ts classifies it: a normal queued outcome.
     const DISPATCH_STATUS: Record<string, string> = {
       delivered: "delivered",
+      "delivery-pending-ack": "pending-ack",
       "delivery-failed": "failed",
       "delivery-unconfirmed": "retrying",
       "dispatch-undeliverable": "undeliverable",
