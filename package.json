@@ -5,6 +5,7 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
+    "prebuild": "node scripts/guard-runtime-build.mjs",
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
     "prebuild": "node scripts/guard-build-location.js",
     "build": "tsc",
