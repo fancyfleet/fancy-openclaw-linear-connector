@@ -220,12 +220,17 @@ describe("broker proxy-token model", () => {
     expect(env).not.toContain("real-secret-token");
   });
 
-  test("syncWorkspaceSecrets keeps legacy direct-token behavior when no proxy token is set", () => {
+  test("new agent with no proxyToken gets one minted and the real token never lands in env", () => {
     const secretsPath = path.join(dir, "linear.env");
-    upsertAgent({ ...makeAgent(secretsPath), accessToken: "real-secret-token" });
+    const result = upsertAgent({ ...makeAgent(secretsPath), accessToken: "real-secret-token" });
+    expect(result.isNew).toBe(true);
+
+    const agent = getAgents().find((a) => a.name === "charles")!;
+    expect(agent.proxyToken).toMatch(/^lpx_/);
 
     const env = fs.readFileSync(secretsPath, "utf8");
-    expect(env.trim()).toBe("LINEAR_OAUTH_TOKEN=real-secret-token");
+    expect(env).toContain(agent.proxyToken!);
+    expect(env).not.toContain("real-secret-token");
     expect(env).not.toContain("LINEAR_PROXY_URL");
   });
 
