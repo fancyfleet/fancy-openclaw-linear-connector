@@ -2151,7 +2151,16 @@ export async function checkWorkflowRules(
   // code-review approval), fail-open rather than stranding the ticket. Only block
   // when partial evidence exists (has branch but no PR = pushed but never reviewed).
   // Also fail-open on null (transient API failure) after one retry.
-  if (intent === 'deploy' || intent === 'handoff-host-deploy') {
+  // AI-2473 (v10 fix): state-keyed guard. In v8 this checked `intent === 'deploy' ||
+  // intent === 'handoff-host-deploy'`, but AI-1872 renamed those verbs to `continue`
+  // (generic). The guard cares about the *state* being exited: `merge` (PR merge
+  // should have happened) and `deploy` (artifact should have been pushed).
+  // Keying on state id survives verb renames. The v8 name `deployment` is kept
+  // in the predicate alongside `deploy` so defs on older versions still fire
+  // (the test harness and any migrated-in-flight tickets).
+  const mergeDeployStates = new Set(['merge', 'deploy', 'deployment']);
+  const forwardTargetStates = new Set(['deploy', 'ac-validate', 'done']);
+  if (mergeDeployStates.has(currentState) && forwardTargetStates.has(match.to)) {
     let branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
     // AI-1497: retry once on null — transient Linear API failure during
     // Hanzo merge+deploy quick succession.
@@ -2161,14 +2170,13 @@ export async function checkWorkflowRules(
     }
     if (!branchStatus) {
       // Two consecutive nulls — transient API failure. Fail-open to avoid
-      // stranding tickets; deployment state is already past code review.
+      // stranding tickets; both states are already past code review.
       log.warn(`workflow-gate: done gate: could not verify branch/PR status for ${issueId} after retry — failing open`);
     } else if (branchStatus.hasMergedPR) {
       log.info(`workflow-gate: done gate: ${issueId} passed (merged PR confirmed)`);
     } else if (!branchStatus.hasBranch && !branchStatus.hasPR) {
       // AI-1497: Complete absence of evidence — likely lost to auto-delete.
-      // Fail-open: a ticket in deployment state has already passed code review,
-      // so the PR almost certainly existed and was merged.
+      // Fail-open: a ticket past code review almost certainly had a merged PR.
       log.info(`workflow-gate: done gate: ${issueId} passed (no branch/PR evidence — treating as merged, data likely lost to auto-delete)`);
       // AI-1797: with no GitHub integration installed, EVERY ticket takes this
       // path — an evidence-free gate. Constant dedup key: one folded alert row,
@@ -2177,7 +2185,7 @@ export async function checkWorkflowRules(
         severity: "warning",
         source: "done-gate",
         title: "done gate passed with no branch/PR evidence (GitHub integration missing?)",
-        detail: `Ticket ${issueId} passed '${intent}' with zero GitHub attachments. If this fires for every deploy, the Linear GitHub integration is not installed and the merged-PR gate is verifying nothing.`,
+        detail: `Ticket ${issueId} passed forward exit from '${currentState}' with zero GitHub attachments. If this fires for every deploy, the Linear GitHub integration is not installed and the merged-PR gate is verifying nothing.`,
         ticket: issueId,
         dedupKey: "done-gate|no-evidence",
       });
@@ -2202,31 +2210,36 @@ export async function checkWorkflowRules(
   }
 
   // AI-1795: no-CI-auto-deploy guard. On repos flagged `ci_auto_deploy: false`
-  // in the instance deploy policy, `deploy` (merge → ac-validate directly) is
-  // rejected: merge alone leaves the running service on the old build, and
-  // ac-validate would verify a stale artifact (recurred twice on AI-1775).
-  // The legal exit for such repos is `handoff-host-deploy` → host-deploy,
-  // which is never blocked here. Repo resolution: `repo:*` labels + GitHub
-  // attachments; unresolvable or unflagged repos pass (guard is opt-in per
-  // repo). Break-glass is exempt (steward recovery path, identity-gated).
-  if (intent === "deploy" && !breakGlassOverride) {
+  // in the instance deploy policy, leaving `deploy` state forward (`continue` →
+  // `ac-validate`) is rejected: merge alone leaves the running service on the
+  // old build, and ac-validate would verify a stale artifact (recurred twice on
+  // AI-1775). The old `handoff-host-deploy` verb (v8) is gone in v10, so the
+  // legal exit from `deploy` state for such repos is `reject` → rework, or an
+  // explicit host-side deploy cycle outside the workflow. Repo resolution:
+  // `repo:*` labels + GitHub attachments; unresolvable or unflagged repos pass
+  // (guard is opt-in per repo). Break-glass is exempt.
+  // AI-2473: re-keyed from verb `deploy` to state `deploy` + forward exit.
+  // Pre-v10 this checked `intent === 'deploy'`. AI-1872 (v10) renamed `deploy`
+  // verb to generic `continue`; the intent no longer exists.
+  if (currentState === 'deploy' && match.to === 'ac-validate' && !breakGlassOverride) {
     const repoRefs = await resolveTicketRepoRefs(labels, issueId, authToken);
     const flagged = reposWithoutCiAutoDeploy(repoRefs);
     if (flagged.length > 0) {
       const repoList = flagged.join("', '");
-      log.warn(`workflow-gate: AI-1795 no-CI-auto-deploy guard blocked 'deploy' on ${issueId} (repo '${repoList}', agent=${bodyId})`);
+      log.warn(`workflow-gate: AI-1795 no-CI-auto-deploy guard blocked forward exit from deploy on ${issueId} (repo '${repoList}', agent=${bodyId})`);
       notify({
         severity: "warning",
         source: "deploy-policy",
-        title: `no-CI-auto-deploy guard blocked 'deploy' (repo: ${flagged.join(", ")})`,
-        detail: `Ticket ${issueId}: 'deploy' would advance to ac-validate without the merged artifact running. Agent must use 'handoff-host-deploy' → host-deploy instead.`,
+        title: `no-CI-auto-deploy guard blocked forward exit from deploy (repo: ${flagged.join(", ")})`,
+        detail: `Ticket ${issueId}: forward exit from 'deploy' state would advance to ac-validate without the merged artifact running. Use an explicit host-side deploy cycle instead.`,
         agent: bodyId,
         ticket: issueId,
       });
-      const legalMoves = [...transitions.filter((t) => t.command !== "deploy").map((t) => cliVerbFor(t)), breakGlassCommand].join(", ");
+      const legalMoves = [...transitions.filter((t) => t.command !== "continue").map((t) => cliVerbFor(t)), breakGlassCommand].join(", ");
       return (
-        `[Proxy] 'deploy' blocked: repo '${repoList}' has no CI auto-deploy — merging alone leaves the running service on the old build, ` +
-        `and AC validation would verify a stale artifact. Use 'handoff-host-deploy' to route through host-deploy instead. ` +
+        `[Proxy] forward exit from 'deploy' blocked: repo '${repoList}' has no CI auto-deploy — ` +
+        `merging alone leaves the running service on the old build, and AC validation would verify a stale artifact. ` +
+        `Use 'reject' to return to implementation or escape to exit the workflow. ` +
         `Legal moves: ${legalMoves}.`
       );
     }
@@ -3124,42 +3137,50 @@ export async function applyStateTransition(
     return { status: "failed", code: "atomic-mutation-failed", detail: `re-stamp of '${targetLabelName}' did not apply`, from: currentStateName, to: toStateName };
   }
 
-  // ── AI-1475 Defect 1 + AI-1492 + AI-1497: Merged-PR release gate defense-in-depth (§5.6) ─
-  // Block the forward label swap out of deployment if the branch/PR gate is not
+  // ── AI-1475 Defect 1 + AI-1492 + AI-1497 + AI-2473: Merged-PR release gate defense-in-depth (§5.6) ─
+  // Block the forward label swap out of merge/deploy if the branch/PR gate is not
   // satisfied. Defense-in-depth: checkWorkflowRules is the primary gate, but
   // applyStateTransition also blocks to prevent any bypass path.
-  // v8: fires on both forward exits from deployment — `deploy` and
+  // v8: fired on both forward exits from deployment — `deploy` and
   // `handoff-host-deploy` (the merge precedes either).
+  // v10 (AI-1872): those verbs renamed to generic `continue`. The guard now keys
+  // on the *state* being exited (AI-2473 fix).
   //
   // AI-1492: A merged PR satisfies the gate even without a branch (auto-deleted
   // after squash merge).
   //
   // AI-1497: Fail-open on null (after retry) and on complete absence of evidence
   // (no branch + no PR). Only block on partial evidence (branch exists but no PR).
-  if (intent === 'deploy' || intent === 'handoff-host-deploy') {
-    let branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
-    if (!branchStatus) {
-      await new Promise((r) => setTimeout(r, 1000));
-      branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
-    }
-    const hasMergedPR = branchStatus?.hasMergedPR === true;
-    const hasBranchAndPR = branchStatus?.hasBranch && branchStatus?.hasPR;
-    const noEvidenceAtAll = branchStatus && !branchStatus.hasBranch && !branchStatus.hasPR;
-    if (!hasMergedPR && !hasBranchAndPR && !noEvidenceAtAll) {
-      // Block: either null after retry (branchStatus is null → noEvidenceAtAll is false)
-      // or partial evidence (has branch but no PR).
-      // But AI-1497: if null after retry, fail-open instead of blocking.
+  // AI-2473: state-keyed predicate; also accepts v8 name `deployment` for backward
+  // compatibility with synthetic tests and migrated in-flight tickets.
+  if (currentStateName && toStateName) {
+    const mergeDeployStates = new Set(['merge', 'deploy', 'deployment']);
+    const forwardTargetStates = new Set(['deploy', 'ac-validate', 'done']);
+    if (mergeDeployStates.has(currentStateName) && forwardTargetStates.has(toStateName)) {
+      let branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
       if (!branchStatus) {
-        log.warn(`workflow-gate: B2 apply: done gate could not verify status for ${issueId} after retry — failing open`);
-      } else {
-        const missing: string[] = [];
-        if (!branchStatus.hasBranch) missing.push('branch not pushed to origin');
-        if (!branchStatus.hasPR) missing.push('no pull request associated');
-        log.warn(`workflow-gate: B2 apply: done gate blocked for ${issueId} — ${missing.join('; ')}`);
-        return { status: "blocked", code: "release-gate", detail: missing.join('; '), from: currentStateName, to: toStateName }; // Block the transition
+        await new Promise((r) => setTimeout(r, 1000));
+        branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
       }
-    } else if (noEvidenceAtAll) {
-      log.info(`workflow-gate: B2 apply: done gate for ${issueId} — no branch/PR evidence, treating as merged (AI-1497 fail-open)`);
+      const hasMergedPR = branchStatus?.hasMergedPR === true;
+      const hasBranchAndPR = branchStatus?.hasBranch && branchStatus?.hasPR;
+      const noEvidenceAtAll = branchStatus && !branchStatus.hasBranch && !branchStatus.hasPR;
+      if (!hasMergedPR && !hasBranchAndPR && !noEvidenceAtAll) {
+        // Block: either null after retry (branchStatus is null → noEvidenceAtAll is false)
+        // or partial evidence (has branch but no PR).
+        // But AI-1497: if null after retry, fail-open instead of blocking.
+        if (!branchStatus) {
+          log.warn(`workflow-gate: B2 apply: done gate could not verify status for ${issueId} after retry — failing open`);
+        } else {
+          const missing: string[] = [];
+          if (!branchStatus.hasBranch) missing.push('branch not pushed to origin');
+          if (!branchStatus.hasPR) missing.push('no pull request associated');
+          log.warn(`workflow-gate: B2 apply: done gate blocked for ${issueId} — ${missing.join('; ')}`);
+          return { status: "blocked", code: "release-gate", detail: missing.join('; '), from: currentStateName, to: toStateName }; // Block the transition
+        }
+      } else if (noEvidenceAtAll) {
+        log.info(`workflow-gate: B2 apply: done gate for ${issueId} — no branch/PR evidence, treating as merged (AI-1497 fail-open)`);
+      }
     }
   }
 
