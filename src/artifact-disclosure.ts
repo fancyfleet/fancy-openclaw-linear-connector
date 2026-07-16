@@ -95,11 +95,25 @@ async function fetchRecentComments(issueId: string, authToken: string): Promise<
   }
 }
 
-function mostRecentMarkerFromAnotherUser(comments: DisclosureComment[], callerLinearUserId: string): CodeArtifact | null {
+/**
+ * The most recent declaration that was handed TO this caller by someone else.
+ *
+ * Two filters, both load-bearing:
+ *
+ * - `to === callerLinearUserId`: a declaration obliges only its recipient. A
+ *   marker addressed to someone else must not stop the scan and must never
+ *   oblige a bystander — that was the AC4 failure Ai refused on.
+ * - author `!== callerLinearUserId`: your own declaration can never be the thing
+ *   you are measured against. This is also what stops laundering — an agent
+ *   cannot re-address the obligation to itself with a fresh self-handoff and
+ *   walk away clean, because its own marker is skipped and the original one
+ *   addressed to it is still found underneath.
+ */
+function mostRecentRecordHandedTo(comments: DisclosureComment[], callerLinearUserId: string): CodeArtifact | null {
   for (const comment of comments) {
     if (comment.user?.id === callerLinearUserId) continue;
-    const markers = parseArtifactMarkers(comment.body);
-    if (markers.length > 0) return markers[0];
+    const mine = parseArtifactMarkers(comment.body).find((r) => r.to === callerLinearUserId);
+    if (mine) return mine;
   }
   return null;
 }
@@ -123,10 +137,32 @@ export async function checkArtifactDisclosure(
     return null;
   }
 
+  // ⚠️ Delegating to YOURSELF is accepting work, not handing it on. Skip it.
+  //
+  // This guard hangs off `!intent`, and "intent-less delegate write" is a strict
+  // SUPERSET of "handoff". The full set of intent-less delegate writers in the
+  // CLI is exactly three — `consider-work` and `manage-work` (both
+  // `delegateToSelf: true`, neither with a setProxyIntent call site) and
+  // `handoff-work`. Without this line the first two are refused the moment any
+  // declaration exists on the ticket: the validator is blocked at its FIRST
+  // command, told to re-run with a `--code-artifact` flag that `consider-work`
+  // does not have, and the ticket strands with no forward exit. That is the same
+  // "blocked the only forward exit + named an illegal verb ⇒ infinite retry"
+  // class this ticket was filed about, reproduced by its own fix. Caught by Ai's
+  // refusal on AI-2479 with an e2e repro; `manage-work` was a third victim the
+  // refusal did not name.
+  //
+  // Self-delegation cannot be a substitution: you are taking delivery, not
+  // passing anything on. The obligation is checked on the way OUT, where the
+  // caller hands a named artifact to someone else.
+  if (typeof inputDelegateId === "string" && inputDelegateId === callerLinearUserId) {
+    return null;
+  }
+
   const comments = await fetchRecentComments(issueId, authToken);
   if (!comments) return null;
 
-  const recorded = mostRecentMarkerFromAnotherUser(comments, callerLinearUserId);
+  const recorded = mostRecentRecordHandedTo(comments, callerLinearUserId);
   if (!recorded) return null;
 
   const declared = declaredHeader ? parseCodeArtifact(declaredHeader) : null;

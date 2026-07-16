@@ -5,13 +5,24 @@
  * than shared: the two packages ship independently, and the parse here reads an
  * UNTRUSTED header, so it returns null where the CLI's throws on a bad operand.
  *
- * A record names only a branch and sha — never the declaring agent. Identity is
- * resolved from the OAuth token, which the caller cannot forge; a self-reported
- * author would be an honour system with extra steps.
+ * A record names a branch, a sha, and the RECIPIENT it was handed to — never the
+ * declaring agent. Author identity is resolved from the OAuth token, which the
+ * caller cannot forge; a self-reported author would be an honour system with
+ * extra steps.
+ *
+ * `to` is what makes the guard targetable: a declaration obliges the agent it
+ * was handed to, and nobody else. Keying on "a declaration exists on this
+ * ticket" instead fires on third parties who were handed nothing (Ai's AI-2479
+ * refusal).
  */
 export interface CodeArtifact {
   branch: string;
   sha: string;
+}
+
+/** A declaration read back off the ticket, addressed to a specific agent. */
+export interface ArtifactRecord extends CodeArtifact {
+  to: string;
 }
 
 const SHA_RE = /^[0-9a-f]{7,40}$/i;
@@ -35,8 +46,21 @@ export function parseCodeArtifact(operand: string): CodeArtifact | null {
   return { branch, sha: sha.toLowerCase() };
 }
 
-export function parseArtifactMarkers(body: string): CodeArtifact[] {
-  const out: CodeArtifact[] = [];
+/**
+ * Parse every artifact record out of a comment body.
+ *
+ * The sha is validated with the SAME `SHA_RE` the CLI enforces on write. Reading
+ * laxer than the writer is how a comparison quietly stops comparing: bodies here
+ * are agent-writable untrusted input, and `shasMatch` prefix-compares on the
+ * shorter operand — so a recorded sha of `"9"` matched EVERY declared sha
+ * starting with 9 (Ai's AI-2479 refusal). A sha that cannot be a sha is not a
+ * weaker record; it is not a record.
+ *
+ * A record without a `to` is dropped: it names an obligation with no one to owe
+ * it. Nothing has shipped, so no such marker exists in the wild.
+ */
+export function parseArtifactMarkers(body: string): ArtifactRecord[] {
+  const out: ArtifactRecord[] = [];
   const markerRe = /<!--\s*artifact-disclosure:\s*(\{.*?\})\s*-->/g;
 
   for (const match of body.matchAll(markerRe)) {
@@ -44,9 +68,10 @@ export function parseArtifactMarkers(body: string): CodeArtifact[] {
       const parsed = JSON.parse(match[1]) as unknown;
       if (!parsed || typeof parsed !== "object") continue;
       const rec = parsed as Record<string, unknown>;
-      if (typeof rec.branch !== "string" || typeof rec.sha !== "string") continue;
-      if (!rec.branch || !rec.sha) continue;
-      out.push({ branch: rec.branch, sha: rec.sha.toLowerCase() });
+      if (typeof rec.branch !== "string" || !rec.branch) continue;
+      if (typeof rec.sha !== "string" || !SHA_RE.test(rec.sha)) continue;
+      if (typeof rec.to !== "string" || !rec.to) continue;
+      out.push({ branch: rec.branch, sha: rec.sha.toLowerCase(), to: rec.to });
     } catch {
       // Historical corrupt markers must not make a ticket permanently ungateable.
     }

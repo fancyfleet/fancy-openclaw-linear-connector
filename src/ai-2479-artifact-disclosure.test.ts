@@ -47,11 +47,20 @@ states:
 `;
 
 const ISSUE_ID = "issue-uuid";
-const MARKER_IGOR = '<!-- artifact-disclosure: {"branch":"feature/x","sha":"b777e17"} -->';
-const MARKER_IGOR_LONG = '<!-- artifact-disclosure: {"branch":"feature/x","sha":"b777e171234567890abcdef"} -->';
-const MARKER_CALLER = '<!-- artifact-disclosure: {"branch":"feature/own","sha":"abc1234"} -->';
+/** Igor's declarations are addressed TO the caller (aidev) — it is aidev that owes the next disclosure. */
+const MARKER_IGOR = '<!-- artifact-disclosure: {"branch":"feature/x","sha":"b777e17","to":"u-aidev"} -->';
+const MARKER_IGOR_LONG = '<!-- artifact-disclosure: {"branch":"feature/x","sha":"b777e171234567890abcdef","to":"u-aidev"} -->';
+/** Authored BY the caller — must never become the record the caller is measured against. */
+const MARKER_CALLER = '<!-- artifact-disclosure: {"branch":"feature/own","sha":"abc1234","to":"u-hanzo"} -->';
 /** Igor's SECOND, newer declaration — e.g. after a force-push/rebase. */
-const MARKER_IGOR_NEWER = '<!-- artifact-disclosure: {"branch":"feature/x","sha":"dd11cc2"} -->';
+const MARKER_IGOR_NEWER = '<!-- artifact-disclosure: {"branch":"feature/x","sha":"dd11cc2","to":"u-aidev"} -->';
+/**
+ * Igor's declaration addressed to a THIRD party — the caller was handed nothing
+ * by it. Its sha is deliberately DISTINCT from every marker addressed to the
+ * caller: with a shared sha, a guard that ignored `to` entirely would produce a
+ * byte-identical refusal and the scan tests could not discriminate.
+ */
+const MARKER_TO_OTHER = '<!-- artifact-disclosure: {"branch":"feature/x","sha":"77aa33b","to":"u-kana"} -->';
 
 function writeAgents(d: string): string {
   const file = path.join(d, "agents.json");
@@ -131,6 +140,22 @@ function handoffBody(delegateId = "u-igor") {
       issueUpdate(id: $id, input: $input) { success }
     }`,
     variables: { id: ISSUE_ID, input: { delegateId } },
+  };
+}
+
+/**
+ * The exact mutation shape `executeTransition` sends for the CLI's two
+ * self-delegating, intent-less verbs: `consider-work` and `manage-work`
+ * (`delegateToSelf: true` + `clearAssignee` + a target state, and no
+ * setProxyIntent call site on either).
+ */
+function selfDelegateBody(opName: string, selfId = "u-aidev") {
+  return {
+    operationName: opName,
+    query: `mutation ${opName}($id: String!, $input: IssueUpdateInput!) {
+      issueUpdate(id: $id, input: $input) { success }
+    }`,
+    variables: { id: ISSUE_ID, input: { delegateId: selfId, stateId: "state-thinking", assigneeId: null } },
   };
 }
 
@@ -349,5 +374,111 @@ describe("proxy — AI-2479 artifact disclosure guard", () => {
 
     expect(res.body.errors?.[0]?.message).toMatch(/<branch>@<sha>/);
     expect(forwardedMutations(mf.calls)).toBe(0);
+  });
+
+  // ── Trigger shape (Ai's AI-2479 refusal) ──────────────────────────────────
+  //
+  // The guard hangs off `!intent`, and "intent-less delegate write" is a strict
+  // SUPERSET of "handoff". These tests pin the two narrowing conditions that
+  // make the trigger mean "handoff" and nothing else. If they go red, fix the
+  // trigger — do NOT relax the assertion: every one of them is a live strand of
+  // the workflow this feature exists to serve.
+  describe("fires on handing work ON, not on taking work IN", () => {
+    const igorDeclared = [{ body: MARKER_IGOR, userId: "u-igor" }];
+
+    // The headline strand: Igor hands to Ai declaring an artifact, and Ai — the
+    // validator this whole feature is built to police — cannot accept the
+    // delegation. consider-work has no --code-artifact flag (index.ts), so the
+    // remedy the refusal names is unreachable: the agent retries, gets the same
+    // refusal, and the ticket has no forward exit.
+    it("consider-work by the validator is allowed once a declaration exists", async () => {
+      const mf = makeFetch({ comments: igorDeclared });
+      globalThis.fetch = mf.fetch;
+
+      const res = await send(selfDelegateBody("ConsiderWork"));
+
+      expect(res.body.errors).toBeUndefined();
+      expect(forwardedMutations(mf.calls)).toBe(1);
+    });
+
+    // manage-work is the third intent-less delegate writer. Ai's refusal named
+    // consider-work only; enumerating the predicate rather than the reported
+    // symptom is what surfaced this one (AI-2358's lesson).
+    it("manage-work is allowed once a declaration exists", async () => {
+      const mf = makeFetch({ comments: igorDeclared });
+      globalThis.fetch = mf.fetch;
+
+      const res = await send(selfDelegateBody("ManageWork"));
+
+      expect(res.body.errors).toBeUndefined();
+      expect(forwardedMutations(mf.calls)).toBe(1);
+    });
+
+    // A self-delegation skip must not become a laundering route: the caller
+    // still owes a disclosure on the way OUT to a real recipient.
+    it("still refuses an undeclared handoff to someone else after a self-delegation", async () => {
+      const mf = makeFetch({ comments: igorDeclared });
+      globalThis.fetch = mf.fetch;
+
+      expect((await send(selfDelegateBody("ConsiderWork"))).body.errors).toBeUndefined();
+      const res = await send(handoffBody("u-hanzo"));
+
+      expect(res.body.errors?.[0]?.message).toMatch(/declares none/);
+      expect(forwardedMutations(mf.calls)).toBe(1); // the consider-work only
+    });
+  });
+
+  describe("obliges the recipient of a declaration, not every bystander", () => {
+    // AC4, Ai's second victim: a declaration addressed to Kana must not oblige
+    // the caller, who was handed nothing and reviewed nothing. Before the `to`
+    // field the ONLY way past this refusal was to name an artifact you never
+    // reviewed — a guard whose sole escape is echoing a string to get unstuck
+    // teaches precisely the reflex this ticket exists to punish.
+    it("allows an undeclared re-route by an agent the artifact was not handed to", async () => {
+      const mf = makeFetch({ comments: [{ body: MARKER_TO_OTHER, userId: "u-igor" }] });
+      globalThis.fetch = mf.fetch;
+
+      const res = await send(handoffBody("u-kana"));
+
+      expect(res.body.errors).toBeUndefined();
+      expect(forwardedMutations(mf.calls)).toBe(1);
+    });
+
+    // The scan must not stop at the newest marker: a declaration addressed to
+    // someone else sits ABOVE the caller's own obligation in the timeline, and
+    // skipping past it is what keeps the guard armed for the real recipient.
+    it("keeps scanning past a newer declaration addressed to a third party", async () => {
+      const mf = makeFetch({
+        comments: [
+          { body: MARKER_TO_OTHER, userId: "u-igor" },
+          { body: MARKER_IGOR, userId: "u-igor" },
+        ],
+      });
+      globalThis.fetch = mf.fetch;
+
+      const res = await send(handoffBody("u-hanzo"));
+
+      expect(res.body.errors?.[0]?.message).toMatch(/feature\/x@b777e17/);
+      expect(forwardedMutations(mf.calls)).toBe(0);
+    });
+
+    // Laundering: an agent must not be able to clear its obligation by
+    // re-addressing the artifact to itself. Its own marker is skipped, so Igor's
+    // original declaration underneath is still the one that binds.
+    it("ignores a self-authored declaration addressed to self", async () => {
+      const selfAddressed = '<!-- artifact-disclosure: {"branch":"feature/own","sha":"abc1234","to":"u-aidev"} -->';
+      const mf = makeFetch({
+        comments: [
+          { body: selfAddressed, userId: "u-aidev" },
+          { body: MARKER_IGOR, userId: "u-igor" },
+        ],
+      });
+      globalThis.fetch = mf.fetch;
+
+      const res = await send(handoffBody("u-hanzo"), { "X-Openclaw-Code-Artifact": "feature/own@abc1234" });
+
+      expect(res.body.errors?.[0]?.message).toMatch(/substitution-reason/);
+      expect(forwardedMutations(mf.calls)).toBe(0);
+    });
   });
 });
