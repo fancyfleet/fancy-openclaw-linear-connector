@@ -280,7 +280,48 @@ export class NoActivityDetector {
     const result: NoActivityCycleResult = { warned: 0, failed: 0, alreadyEnded: 0, deferredAtCapacity: 0 };
 
     // Get all currently tracked dispatches that are still pending/unconfirmed
-    const pending = ackTracker.getPendingTimedOut(0); // 0ms → all pending
+    let pending = ackTracker.getPendingTimedOut(0); // 0ms → all pending
+
+    // === Terminal-state prune ===
+    // Before any warn/fail escalation, prune ack entries whose tickets are
+    // Done/Canceled — they should never emit no-activity events. Batched:
+    // deduplicate by (agentId, ticketId) so one unique ticket gets at most
+    // one Linear read per cycle, regardless of how many ack rows exist.
+    // Reuses the same isLinearIssueActionable function as the resignal path
+    // (AI-2389 pattern: isTerminalIssueState).
+    // Fail-open: isLinearIssueActionable returns true on auth/network errors,
+    // so the prune is safely skipped during a Linear outage.
+    if (pending.length > 0) {
+      const seen = new Set<string>();
+      const unique: Array<{ agentId: string; ticketId: string }> = [];
+      for (const e of pending) {
+        const key = `${e.agentId}:${e.ticketId}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          unique.push({ agentId: e.agentId, ticketId: e.ticketId });
+        }
+      }
+
+      const isTicketActionable = this.deps.resignalOptions?.isTicketActionable ?? isLinearIssueActionable;
+      for (const { agentId, ticketId } of unique) {
+        if (!(await isTicketActionable(ticketId, agentId))) {
+          // Terminal ticket: end the dead session and acknowledge the ack
+          const sessionKey = ticketId;
+          sessionTracker.endSession(agentId, sessionKey);
+          ackTracker.acknowledge(agentId, ticketId);
+          this.clearWarned(agentId, sessionKey);
+          log.info(
+            `No-activity: pruned terminal-state ticket ${ticketId} for ${agentId}` +
+            ` (Done/Canceled) — acknowledged and removed from no-activity ladder`,
+          );
+        }
+      }
+
+      // Re-fetch pending after pruning so the warn/fail loop doesn't iterate
+      // over entries that were just acknowledged.
+      pending = ackTracker.getPendingTimedOut(0);
+    }
+
     const now = Date.now();
 
     for (const entry of pending) {
@@ -393,7 +434,7 @@ export class NoActivityDetector {
    * Returns true if the ticket was deferred (agent alive but at capacity), false for hard failure.
    */
   private async handleFailure(
-    entry: { agentId: string; ticketId: string; attemptCount: number; dispatchedAt: string; lastSignalAt: string },
+    entry: { agentId: string; ticketId: string; attemptCount: number; dispatchedAt: string; lastSignalAt: string; failureCount?: number },
     sessionKey: string,
   ): Promise<boolean> {
     const { agentId, ticketId, attemptCount } = entry;
@@ -448,59 +489,25 @@ export class NoActivityDetector {
       return true;
     }
 
-    // 2. Log operational event (hard failure)
-    operationalEventStore.append({
-      outcome: "no-activity-failed",
-      agent: agentId,
-      key: sessionKey,
-      sessionKey,
-      deliveryMode: "no-activity-detector",
-      attemptCount,
-      detail: {
-        dispatchedAt: entry.dispatchedAt,
-        ageMs,
-        failThresholdMs: this.config.failMs,
-      },
-    });
-
-    // 3. Post comment on the Linear ticket
-    const comment = `⚠️ **Dispatch failure detected** — session for this ticket produced no activity after ${Math.round(ageMs / 60_000)} minutes.\n\nThe gateway accepted the dispatch but the agent never started working. This usually indicates a gateway-side error (e.g., model unavailable, auth failure).\n\nRe-dispatching (attempt ${attemptCount + 1}).`;
-    if (this.deps.postLinearComment) {
-      try {
-        await this.deps.postLinearComment(agentId, sessionKey, comment);
-      } catch (err) {
-        log.error(`Failed to post Linear comment for ${sessionKey}: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-
-    // 4. Check if retries are exhausted (delegate to existing escalation logic)
-    // The DispatchAckTracker's attempt_count is already tracking this.
     const maxResignals = parseInt(process.env.WATCHDOG_MAX_RESIGNALS ?? "3", 10);
+    const maxDeliveryFailures = parseInt(process.env.WATCHDOG_MAX_DELIVERY_FAILURES ?? "3", 10);
+
+    // 2. Retries exhausted (agent repeatedly accepts wakes but never works).
+    // Escalate BEFORE re-dispatching or commenting — no "attempt N" noise.
+    // "Manual intervention required" must actually reach a human — the 🔴 comment
+    // only helps if someone reads that ticket (audit #14: hours of re-dispatch
+    // loops before anyone notices a broken agent).
     if (attemptCount >= maxResignals) {
-      ackTracker.markEscalated(agentId, ticketId);
-      // "Manual intervention required" must actually reach a human — the 🔴
-      // comment below only helps if someone reads that ticket (audit #14:
-      // hours of re-dispatch loops before anyone notices a broken agent).
-      notify({
-        severity: "warning",
-        source: "dispatch",
-        title: `dispatch exhausted after ${attemptCount} attempts — agent accepts wakes but produces no activity (model down? auth broken?)`,
-        agent: agentId,
-        ticket: ticketId,
-      });
-      // Post escalation comment
-      const escalationComment = `🔴 **Dispatch failure escalation** — ${attemptCount} attempt(s) exhausted for this ticket. Manual intervention required.\n\nThe gateway accepted the dispatch but the agent never produced any activity. This may indicate a persistent issue (model down, auth token expired, etc.).`;
-      if (this.deps.postLinearComment) {
-        try {
-          await this.deps.postLinearComment(agentId, sessionKey, escalationComment);
-        } catch (err) {
-          log.error(`Failed to post escalation comment for ${sessionKey}: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      }
+      await this.escalate(
+        entry,
+        sessionKey,
+        `${attemptCount} attempt(s) exhausted — the gateway accepted the dispatch but the agent never produced any activity (model down? auth token expired?)`,
+      );
       return false;
     }
 
-    // 5. Re-add to bag if needed and re-dispatch
+    // 3. Re-add to bag if needed, then prune if the ticket is no longer
+    // actionable (delegate cleared / Done). Pruning posts no comment.
     const pendingEntries = bag.getPendingTickets(agentId);
     const pendingIds = pendingEntries.map((e) => e.ticketId);
     if (!pendingIds.includes(ticketId)) {
@@ -517,6 +524,11 @@ export class NoActivityDetector {
       return false;
     }
 
+    // 4. Attempt the re-dispatch. The failure comment, the attempt bump, and the
+    // operational "failed" record are ALL tied to a re-dispatch that actually
+    // started. A delivery that fails must neither announce "attempt N" nor
+    // re-fire every poll — that unbounded, counter-frozen loop spammed GEN-88
+    // with 10 identical "attempt 2" comments in 5 minutes (AI-2118).
     const agentWakeConfig = wakeConfigForAgent ? wakeConfigForAgent(agentId) : wakeConfig;
     const results = await resignalPendingTickets(
       agentId,
@@ -530,8 +542,22 @@ export class NoActivityDetector {
     const pruned = results.some((r) => r.pruned);
 
     if (dispatched) {
+      // Re-dispatch admitted: a genuine fresh attempt. Bump the attempt counter,
+      // reset the clock (natural backoff of one full window), clear the
+      // delivery-failure streak, and post exactly one comment.
       ackTracker.markResignaled(agentId, ticketId);
-      log.info(`No-activity: re-dispatched ${agentId} [${ticketId}] (attempt ${attemptCount + 1})`);
+      const newAttempt = attemptCount + 1;
+      log.info(`No-activity: re-dispatched ${agentId} [${ticketId}] (attempt ${newAttempt})`);
+
+      operationalEventStore.append({
+        outcome: "no-activity-failed",
+        agent: agentId,
+        key: sessionKey,
+        sessionKey,
+        deliveryMode: "no-activity-detector",
+        attemptCount,
+        detail: { dispatchedAt: entry.dispatchedAt, ageMs, failThresholdMs: this.config.failMs },
+      });
       // Re-dispatches bypass the webhook router, so nothing else records them.
       // Without this event the retry loop is invisible in the operational
       // stream (AI-1759: had to read the ack sqlite directly to reconstruct).
@@ -541,17 +567,86 @@ export class NoActivityDetector {
         key: sessionKey,
         sessionKey,
         deliveryMode: "no-activity-detector",
-        attemptCount: attemptCount + 1,
+        attemptCount: newAttempt,
       });
-    } else if (pruned) {
-      // Ownership check in resignalPendingTickets determined the agent no longer owns this ticket.
-      // Acknowledge so the ackTracker stops tracking it and the detector doesn't re-add it on
-      // subsequent cycles.
+
+      const comment = `⚠️ **Dispatch failure detected** — session for this ticket produced no activity after ${Math.round(ageMs / 60_000)} minutes.\n\nThe gateway accepted the dispatch but the agent never started working. This usually indicates a gateway-side error (e.g., model unavailable, auth failure).\n\nRe-dispatched (attempt ${newAttempt}).`;
+      if (this.deps.postLinearComment) {
+        try {
+          await this.deps.postLinearComment(agentId, sessionKey, comment);
+        } catch (err) {
+          log.error(`Failed to post Linear comment for ${sessionKey}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      return false;
+    }
+
+    if (pruned) {
+      // Ownership check in resignalPendingTickets determined the agent no longer
+      // owns this ticket. Acknowledge so the ackTracker stops tracking it and the
+      // detector doesn't re-add it on subsequent cycles.
       ackTracker.acknowledge(agentId, ticketId);
       log.info(`No-activity: ticket ${ticketId} pruned (agent no longer owns it) — ack tracker cleared`);
-    } else {
-      log.error(`No-activity: re-dispatch failed for ${agentId} [${ticketId}]`);
+      return false;
+    }
+
+    // 5. Delivery failed (wake-up threw / deferred / skipped) — nothing was
+    // re-dispatched. Reset the clock to back off a full window instead of
+    // re-firing every poll, and count the delivery failure so a gateway that
+    // never accepts wakes escalates instead of looping forever. No Linear
+    // comment: there is no fresh attempt to announce.
+    ackTracker.markResignalFailed(agentId, ticketId);
+    const failureCount = (entry.failureCount ?? 0) + 1;
+    log.error(
+      `No-activity: re-dispatch DELIVERY failed for ${agentId} [${ticketId}] ` +
+      `(delivery failure ${failureCount}/${maxDeliveryFailures}) — backing off`,
+    );
+    operationalEventStore.append({
+      outcome: "no-activity-redispatch-failed",
+      agent: agentId,
+      key: sessionKey,
+      sessionKey,
+      deliveryMode: "no-activity-detector",
+      attemptCount,
+      detail: { dispatchedAt: entry.dispatchedAt, ageMs, failureCount, maxDeliveryFailures },
+    });
+    if (failureCount >= maxDeliveryFailures) {
+      await this.escalate(
+        entry,
+        sessionKey,
+        `${failureCount} re-dispatch deliver(ies) failed — the gateway is not accepting wakes for this agent (gateway down? hooks token invalid?)`,
+      );
     }
     return false;
+  }
+
+  /**
+   * AI-2118: terminal escalation for a stalled dispatch. Marks the ack row
+   * escalated (removing it from the pending set so the detector stops looping),
+   * fires an ops alert, and posts a single escalation comment. `reason` describes
+   * why automated recovery gave up.
+   */
+  private async escalate(
+    entry: { agentId: string; ticketId: string; attemptCount: number },
+    sessionKey: string,
+    reason: string,
+  ): Promise<void> {
+    const { agentId, ticketId, attemptCount } = entry;
+    this.deps.ackTracker.markEscalated(agentId, ticketId);
+    notify({
+      severity: "warning",
+      source: "dispatch",
+      title: `dispatch escalation on ${ticketId}: ${reason}`,
+      agent: agentId,
+      ticket: ticketId,
+    });
+    const escalationComment = `🔴 **Dispatch failure escalation** — ${reason}. Manual intervention required.\n\nAutomated recovery is exhausted after ${attemptCount} attempt(s); this ticket is no longer being auto-re-dispatched.`;
+    if (this.deps.postLinearComment) {
+      try {
+        await this.deps.postLinearComment(agentId, sessionKey, escalationComment);
+      } catch (err) {
+        log.error(`Failed to post escalation comment for ${sessionKey}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   }
 }

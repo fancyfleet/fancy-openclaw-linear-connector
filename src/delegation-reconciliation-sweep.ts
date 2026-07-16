@@ -28,6 +28,8 @@ import {
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { registerCron, formatIntervalMs } from "./cron/registry.js";
 import { OperationalEventStore, type OperationalEventStore as OperationalEventStoreType } from "./store/operational-event-store.js";
+import type { SessionTracker } from "./bag/session-tracker.js";
+import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 
 const log = componentLogger(
   createLogger(process.env.LOG_LEVEL ?? "info"),
@@ -49,6 +51,7 @@ export interface DelegationReconciliationOptions {
   operationalEventStore: OperationalEventStoreType;
   alertBus: AlertBus;
   wakeFn: (agentName: string, ticketIdentifier: string) => Promise<void>;
+  sessionTracker?: SessionTracker;
   fetchFn?: typeof fetch;
   /** AC5: single-ticket mode — reconcile only these identifiers. */
   ticketIdentifiers?: string[];
@@ -57,6 +60,8 @@ export interface DelegationReconciliationOptions {
   until?: string;
   /** Override for Date.now() — used in tests for deterministic timing. */
   now?: () => Date;
+  /** AI-2350: durable dispatch lease store — prevent re-dispatches. */
+  dispatchLeaseStore?: DispatchLeaseStore;
 }
 
 export interface DelegationReconciliationResult {
@@ -169,16 +174,111 @@ async function queryGovernedTickets(
 // ── Idempotency check ─────────────────────────────────────────────────────────
 
 /**
+ * Query Linear issue history for the most recent delegate-change event.
+ *
+ * Returns the ISO-8601 timestamp of when the current (or most recent) delegate
+ * was set, or null if no delegate-change event is found.
+ *
+ * AI-2350: fixes the compounding defect where ticket.updatedAt (which changes
+ * on any mutation — state, label, comment) was passed as the delegation
+ * timestamp to hasDispatchSinceDelegation, causing the guard to fail.
+ */
+async function queryDelegateSetTimestamp(
+  issueId: string,
+  authToken: string,
+  fetchFn: typeof fetch,
+): Promise<string | null> {
+  const query = `
+    query TicketDelegateHistory($issueId: String!) {
+      issue(id: $issueId) {
+        history(first: 50, orderBy: createdAt) {
+          nodes {
+            __typename
+            createdAt
+            toAssignee { id }
+            fromAssignee { id }
+          }
+        }
+      }
+    }
+  `;
+
+  try {
+    const res = await fetchFn(LINEAR_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: authToken,
+      },
+      body: JSON.stringify({ query, variables: { issueId } }),
+    });
+
+    type DelegateHistoryResp = {
+      data?: {
+        issue?: {
+          history: {
+            nodes: Array<{
+              __typename: string;
+              createdAt: string;
+              toAssignee?: { id: string } | null;
+              fromAssignee?: { id: string } | null;
+            }>;
+          };
+        };
+      };
+    };
+
+    const body = (await res.json()) as DelegateHistoryResp;
+    const historyNodes = body.data?.issue?.history?.nodes ?? [];
+
+    // Find the most recent delegate-change event (toAssignee was set)
+    // Use reverse chronological order.
+    for (const h of historyNodes.reverse()) {
+      if (h.toAssignee?.id || h.fromAssignee?.id) {
+        return h.createdAt;
+      }
+    }
+
+    return null;
+  } catch (err) {
+    log.warn(
+      `Failed to query delegate-set timestamp for ${issueId}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
+  }
+}
+
+/**
  * Check if the given delegate has been dispatched for this ticket since the
- * delegation timestamp. Returns true if a dispatch-accepted or delivered
- * event exists for the current agent after the delegate was set.
+ * delegation timestamp. Returns true if a dispatch-accepted, delivered, or
+ * delivery-pending-ack event exists for the current agent after the delegate
+ * was set.
+ *
+ * AI-2464: `delivery-pending-ack` (AI-2437) counts as dispatched. It means the
+ * connection was established and the wake is queued in the agent's hands, and
+ * deliver-with-ack registers the ack expectation on that path with the same
+ * `ackTracker.recordDispatch` call the `delivered` path uses. The dispatch
+ * watchdog therefore already owns retry for it, with backoff and escalation
+ * this sweep does not have. Counting it keeps the sweep from racing the
+ * watchdog to heal the same entry — the duplicate wake AI-2437 set out to stop.
  */
 function hasDispatchSinceDelegation(
   operationalEventStore: OperationalEventStore,
   agentName: string,
   ticketIdentifier: string,
   delegationTimestamp: string,
+  sessionTracker?: SessionTracker,
 ): boolean {
+  // AI-2313: if a live session exists for this (agent, ticket), treat it as "already dispatched"
+  // even if the event store doesn't have a dispatch-accepted event. This covers the gap where
+  // the session tracker's stale timeout cleaned up in-memory state but the session is still alive.
+  if (sessionTracker) {
+    const sessionKey = `linear-${ticketIdentifier}`;
+    if (sessionTracker.isActiveForTicket(agentName, sessionKey)) {
+      return true;
+    }
+  }
+
   const events = operationalEventStore.query({
     key: `linear-${ticketIdentifier}`,
     limit: 100,
@@ -187,7 +287,12 @@ function hasDispatchSinceDelegation(
   const delegationMs = new Date(delegationTimestamp).getTime();
 
   return events.some((e) => {
-    if (e.outcome !== "dispatch-accepted" && e.outcome !== "delivered") return false;
+    if (
+      e.outcome !== "dispatch-accepted" &&
+      e.outcome !== "delivered" &&
+      e.outcome !== "delivery-pending-ack"
+    )
+      return false;
     if (e.agent !== agentName) return false;
     const eventMs = new Date(e.occurredAt).getTime();
     return eventMs >= delegationMs;
@@ -210,6 +315,7 @@ export async function runDelegationReconciliationSweep(
   const alertBus = opts.alertBus;
   const operationalEventStore = opts.operationalEventStore;
   const wakeFn = opts.wakeFn;
+  const sessionTracker = opts.sessionTracker;
   const nowDate = opts.now ?? (() => new Date());
 
   const result: DelegationReconciliationResult = {
@@ -392,17 +498,55 @@ export async function runDelegationReconciliationSweep(
     // ── AC1: Enrolled ticket with delegate but no dispatch record ───────
     if (ticket.delegateId && ticket.delegateName && hasStateLabel(ticket.labels)) {
       // Check idempotency (AC4): has this delegate been dispatched since
-      // they were set?
+      // they were set? Use the real delegate-set timestamp from Linear
+      // history, NOT ticket.updatedAt (which changes on any mutation).
+      // AI-2350: fixes compounding defect from AI-2313.
+      let delegationTimestamp = ticket.updatedAt;
+      try {
+        const realTimestamp = await queryDelegateSetTimestamp(
+          ticket.id,
+          authToken,
+          fetchFn,
+        );
+        if (realTimestamp) {
+          delegationTimestamp = realTimestamp;
+        }
+      } catch {
+        // Fall through to use ticket.updatedAt as before
+      }
+
       if (
         hasDispatchSinceDelegation(
           operationalEventStore,
           ticket.delegateName,
           ticket.identifier,
-          ticket.updatedAt,
+          delegationTimestamp,
         )
       ) {
         result.skippedIdempotent++;
         continue;
+      }
+
+      // AI-2350: acquire dispatch lease before dispatching the wake.
+      // If a lease already exists (another path dispatched this ticket
+      // between our check and this point), skip the wake.
+      // Pass ticket.updatedAt so a legitimate re-dispatch for a newer
+      // state supersedes the old lease rather than being blocked.
+      const leaseKey = `linear-${ticket.identifier}`;
+      if (opts.dispatchLeaseStore) {
+        const lease = opts.dispatchLeaseStore.acquire(
+          ticket.delegateName,
+          leaseKey,
+          { updatedAt: ticket.updatedAt },
+        );
+        if (lease.refused) {
+          log.info(
+            `delegation-reconciliation: lease refused for ${ticket.identifier} → ` +
+            `active lease exists for ${ticket.delegateName}, skipping wake`,
+          );
+          result.skippedIdempotent++;
+          continue;
+        }
       }
 
       // Heal: re-dispatch the delegation wake through the normal delivery path
@@ -507,7 +651,9 @@ export function registerDelegationReconciliationCron(opts: {
   operationalEventStore?: OperationalEventStoreType;
   alertBus?: AlertBus;
   wakeFn?: (agentName: string, ticketIdentifier: string) => Promise<void>;
+  sessionTracker?: SessionTracker;
   fetchFn?: typeof fetch;
+  dispatchLeaseStore?: DispatchLeaseStore;
 }): NodeJS.Timeout {
   const intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
   registerCron(
@@ -526,7 +672,9 @@ export function registerDelegationReconciliationCron(opts: {
       operationalEventStore: store,
       alertBus: opts.alertBus ?? getAlertBus(),
       wakeFn: opts.wakeFn ?? (() => Promise.resolve()),
+      sessionTracker: opts.sessionTracker,
       fetchFn: opts.fetchFn,
+      dispatchLeaseStore: opts.dispatchLeaseStore,
     }).catch((err) => {
       log.error(
         `delegation-reconciliation: unexpected sweep failure: ${err instanceof Error ? err.message : String(err)}`,

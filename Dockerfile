@@ -1,4 +1,4 @@
-# --- Build stage ---
+# --- Backend build stage ---
 FROM node:22-alpine AS builder
 
 # Native addon compilation dependencies for better-sqlite3
@@ -11,8 +11,25 @@ COPY vendor/ vendor/
 RUN npm ci
 
 COPY tsconfig.json ./
+# `npm run build` fires the prebuild guards (scripts/guard-*.js|mjs); without
+# scripts/ the build dies on MODULE_NOT_FOUND before tsc runs.
+COPY scripts/ scripts/
 COPY src/ src/
 RUN npm run build
+
+# --- Web SPA build stage ---
+FROM node:22-alpine AS web-builder
+
+WORKDIR /app
+
+# Install ALL deps (including devDeps for TypeScript types)
+COPY web/package.json web/package-lock.json ./web/
+RUN npm install --prefix web
+
+COPY web/tsconfig.json web/vite.config.ts ./web/
+COPY web/src/ ./web/src/
+COPY web/index.html ./web/
+RUN npm run build --prefix web
 
 # --- Runtime stage ---
 FROM node:22-alpine
@@ -27,6 +44,7 @@ COPY vendor/ vendor/
 RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --from=builder /app/dist/ dist/
+COPY --from=web-builder /app/web/dist/ web/dist/
 
 # Create non-root user and ensure data dir exists
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup \

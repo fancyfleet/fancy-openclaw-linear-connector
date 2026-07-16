@@ -34,6 +34,10 @@ export interface DispatchAckEntry {
   lastSignalAt: string;
   ackStatus: AckStatus;
   attemptCount: number;
+  /** AI-2118: consecutive re-dispatch DELIVERY failures (wake-up threw / was
+   *  skipped). Distinct from attemptCount, which counts only re-dispatches that
+   *  actually started. Reset to 0 whenever a re-dispatch is admitted. */
+  failureCount: number;
 }
 
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -68,6 +72,16 @@ export class DispatchAckTracker {
       CREATE INDEX IF NOT EXISTS idx_dispatch_acks_agent
         ON dispatch_acks(agent_id);
     `);
+    // AI-2118: separate counter for consecutive re-dispatch DELIVERY failures.
+    // Guarded ADD COLUMN so pre-existing DBs migrate in place.
+    const cols = this.db
+      .prepare(`PRAGMA table_info(dispatch_acks)`)
+      .all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === "redispatch_failure_count")) {
+      this.db.exec(
+        `ALTER TABLE dispatch_acks ADD COLUMN redispatch_failure_count INTEGER NOT NULL DEFAULT 0`,
+      );
+    }
   }
 
   /**
@@ -168,7 +182,7 @@ export class DispatchAckTracker {
     if (timeoutMs <= 0) {
       // No timeout: every pending/unconfirmed entry is considered overdue
       query = `SELECT id, agent_id, ticket_id, dispatched_at, last_signal_at,
-                      ack_status, attempt_count
+                      ack_status, attempt_count, redispatch_failure_count
                FROM dispatch_acks
                WHERE ack_status IN ('pending', 'unconfirmed')
                ORDER BY last_signal_at ASC
@@ -181,7 +195,7 @@ export class DispatchAckTracker {
         .replace("T", " ")
         .replace(/\.\d{3}Z$/, "");
       query = `SELECT id, agent_id, ticket_id, dispatched_at, last_signal_at,
-                      ack_status, attempt_count
+                      ack_status, attempt_count, redispatch_failure_count
                FROM dispatch_acks
                WHERE ack_status IN ('pending', 'unconfirmed')
                  AND last_signal_at <= ?
@@ -198,6 +212,7 @@ export class DispatchAckTracker {
       last_signal_at: string;
       ack_status: string;
       attempt_count: number;
+      redispatch_failure_count: number;
     }>;
 
     return rows.map((r) => ({
@@ -208,6 +223,59 @@ export class DispatchAckTracker {
       lastSignalAt: r.last_signal_at,
       ackStatus: r.ack_status as AckStatus,
       attemptCount: r.attempt_count,
+      failureCount: r.redispatch_failure_count,
+    }));
+  }
+
+  /**
+   * Filtered dispatch history for the admin console (AI-2140).
+   * Supports optional agentId and/or ackStatus filters.
+   */
+  listFiltered(opts: { agentId?: string; ackStatus?: AckStatus; limit?: number } = {}): DispatchAckEntry[] {
+    const conditions: string[] = [];
+    const params: Array<string | number> = [];
+
+    if (opts.agentId) {
+      conditions.push('agent_id = ?');
+      params.push(opts.agentId);
+    }
+    if (opts.ackStatus) {
+      conditions.push('ack_status = ?');
+      params.push(opts.ackStatus);
+    }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const capped = Math.min(Math.max(opts.limit ?? 200, 1), 1000);
+    params.push(capped);
+
+    const rows = this.db
+      .prepare(
+        `SELECT id, agent_id, ticket_id, dispatched_at, last_signal_at,
+                ack_status, attempt_count, redispatch_failure_count
+         FROM dispatch_acks
+         ${where}
+         ORDER BY last_signal_at DESC
+         LIMIT ?`,
+      )
+      .all(...params) as Array<{
+        id: number;
+        agent_id: string;
+        ticket_id: string;
+        dispatched_at: string;
+        last_signal_at: string;
+        ack_status: string;
+        attempt_count: number;
+        redispatch_failure_count: number;
+      }>;
+    return rows.map((r) => ({
+      id: r.id,
+      agentId: r.agent_id,
+      ticketId: r.ticket_id,
+      dispatchedAt: r.dispatched_at,
+      lastSignalAt: r.last_signal_at,
+      ackStatus: r.ack_status as AckStatus,
+      attemptCount: r.attempt_count,
+      failureCount: r.redispatch_failure_count,
     }));
   }
 
@@ -220,7 +288,7 @@ export class DispatchAckTracker {
     const rows = this.db
       .prepare(
         `SELECT id, agent_id, ticket_id, dispatched_at, last_signal_at,
-                ack_status, attempt_count
+                ack_status, attempt_count, redispatch_failure_count
          FROM dispatch_acks
          ORDER BY last_signal_at DESC
          LIMIT ?`,
@@ -233,6 +301,7 @@ export class DispatchAckTracker {
         last_signal_at: string;
         ack_status: string;
         attempt_count: number;
+        redispatch_failure_count: number;
       }>;
     return rows.map((r) => ({
       id: r.id,
@@ -242,6 +311,7 @@ export class DispatchAckTracker {
       lastSignalAt: r.last_signal_at,
       ackStatus: r.ack_status as AckStatus,
       attemptCount: r.attempt_count,
+      failureCount: r.redispatch_failure_count,
     }));
   }
 
@@ -261,7 +331,28 @@ export class DispatchAckTracker {
          SET ack_status = 'unconfirmed',
              dispatched_at = datetime('now'),
              last_signal_at = datetime('now'),
-             attempt_count = attempt_count + 1
+             attempt_count = attempt_count + 1,
+             redispatch_failure_count = 0
+         WHERE agent_id = ? AND ticket_id = ?`,
+      )
+      .run(agentId, normalizedId);
+  }
+
+  /**
+   * AI-2118: record a re-dispatch whose DELIVERY failed (wake-up threw or was
+   * skipped without being pruned). Resets last_signal_at so the watchdog backs
+   * off a full no-activity window instead of re-firing every poll (~30s), and
+   * increments the consecutive delivery-failure streak so a gateway that never
+   * accepts wakes escalates instead of looping. Deliberately does NOT touch
+   * attempt_count — a delivery that never started is not a real attempt.
+   */
+  markResignalFailed(agentId: string, ticketId: string): void {
+    const normalizedId = normalizeSessionKey(ticketId);
+    this.db
+      .prepare(
+        `UPDATE dispatch_acks
+         SET last_signal_at = datetime('now'),
+             redispatch_failure_count = redispatch_failure_count + 1
          WHERE agent_id = ? AND ticket_id = ?`,
       )
       .run(agentId, normalizedId);
@@ -312,7 +403,7 @@ export class DispatchAckTracker {
     const rows = this.db
       .prepare(
         `SELECT id, agent_id, ticket_id, dispatched_at, last_signal_at,
-                ack_status, attempt_count
+                ack_status, attempt_count, redispatch_failure_count
          FROM dispatch_acks
          WHERE ack_status = 'deferred' AND last_signal_at <= ?
          ORDER BY last_signal_at ASC
@@ -326,6 +417,7 @@ export class DispatchAckTracker {
         last_signal_at: string;
         ack_status: string;
         attempt_count: number;
+        redispatch_failure_count: number;
       }>;
     return rows.map((r) => ({
       id: r.id,
@@ -335,6 +427,7 @@ export class DispatchAckTracker {
       lastSignalAt: r.last_signal_at,
       ackStatus: r.ack_status as AckStatus,
       attemptCount: r.attempt_count,
+      failureCount: r.redispatch_failure_count,
     }));
   }
 

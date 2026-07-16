@@ -9,22 +9,24 @@ import type { OperationalEventInput, OperationalEventStore } from "../store/oper
 import type { EnrolledTicketsStore } from "../store/enrolled-tickets-store.js";
 import type { MutationAuditStore } from "../store/mutation-audit-store.js";
 import type { DispatchIdempotencyStore } from "../store/dispatch-idempotency-store.js";
+import type { DispatchLeaseStore } from "../store/dispatch-lease-store.js";
 import { extractWebhookMutations } from "./mutation-extraction.js";
 import { routeEvent, routeEventAll, unresolvedRoutingCandidates } from "../router.js";
 import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
-import { deliverToAgent, DeliveryThrottle, type DeliveryConfig } from "../delivery/index.js";
+import { deliverToAgent, DeliveryThrottle, type DeliveryConfig, assertDispatchTargetFetchable } from "../delivery/index.js";
+import { markDispatchIntegrityGateActive } from "../dispatch-integrity-state.js";
 import type { RouteResult } from "../types.js";
 import { normalizeSessionKey } from "../session-key.js";
 import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgents } from "../agents.js";
 import { checkAgentLiveness, type LivenessConfig } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
 import { checkRoleGuardAndBlock, type LinearUserIdResolver } from "../routing-guard.js";
-import { fetchWorkflowLabels, enrollIfMissing } from "../workflow-gate.js";
+import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam } from "../workflow-gate.js";
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/index.js";
 import { type WakeUpConfig } from "../bag/wake-up.js";
 import { createLogger, componentLogger } from "../logger.js";
-import { isLinearIssueStillRoutedToAgent, isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
+import { checkLinearIssueRouting, isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
 import { onChildTerminal } from "../barrier.js";
 import { maybeBootstrapWorkflow } from "../workflow-bootstrap.js";
 import { notify } from "../alerts/alert-bus.js";
@@ -159,8 +161,20 @@ export function createWebhookRouter(
   enrolledTicketsStore?: EnrolledTicketsStore,
   mutationAuditStore?: MutationAuditStore,
   idempotencyStore?: DispatchIdempotencyStore,
+  dispatchLeaseStore?: DispatchLeaseStore,
 ): Router {
   const router = Router();
+
+  // AI-2091 §2/§9 (G2): the delivery-time fetchability gate is wired into the
+  // PRIMARY dispatch path (dispatchRoute → checkLinearIssueRouting →
+  // assertDispatchTargetFetchable) right here, not just the C4 re-poke path.
+  // Mark it live at the wiring site so /health.dispatchIntegrity reflects the
+  // real installation rather than a hardcoded bootstrap literal (the AI-1808
+  // dead-code guard).
+  markDispatchIntegrityGateActive(
+    "phantomFetchabilityGate",
+    "primary webhook dispatch path (dispatchRoute → assertDispatchTargetFetchable)",
+  );
 
   if (NUDGE_DEDUP_WINDOW_MS > 0) {
     log.info(`Nudge dedup enabled: ${NUDGE_DEDUP_WINDOW_MS}ms window`);
@@ -307,6 +321,24 @@ export function createWebhookRouter(
 
       acknowledgeAgentAuthoredActivity(event, onAgentActivity);
 
+      // AI-2350: Renew dispatch lease on agent activity (comment posted,
+      // agent session event). This extends the lease TTL so long-running
+      // sessions don't lose their re-dispatch protection.
+      if (dispatchLeaseStore && (event.type === "Comment" || event.type === "AgentSessionEvent")) {
+        const actorId = event.actor?.id;
+        if (actorId) {
+          const agentName = buildAgentMap()[actorId];
+          if (agentName) {
+            const leaseAgentId = getOpenclawAgentName(agentName);
+            const leaseIdentifier = issueIdentifierFromEvent(event);
+            if (leaseIdentifier) {
+              const leaseTicketKey = normalizeSessionKey(leaseIdentifier);
+              dispatchLeaseStore.renew(leaseAgentId, leaseTicketKey);
+            }
+          }
+        }
+      }
+
       // AI-1584: Enrollment gap repair — heal wf:* tickets that lack state:* label.
       // Fires on every Issue event (create or update). Fail-open: never blocks routing.
       if (event.type === "Issue") {
@@ -331,6 +363,30 @@ export function createWebhookRouter(
           }).catch((err) => {
             log.warn(`enrollIfMissing failed for ${enrollIssueId}: ${err instanceof Error ? err.message : String(err)}`);
           });
+
+          // AI-2469 AC1(a): Auto-enroll AI-team tickets into dev-impl at intake.
+          // Runs on every Issue event alongside enrollIfMissing. Skips tickets
+          // that already have a wf:* label (enrollIfMissing handles the gap where
+          // wf:* exists but state:* is missing; this handles the case where
+          // neither exists).
+          const enrollTeamKey = enrollData?.teamKey as string | undefined;
+          if (enrollTeamKey) {
+            autoEnrollByTeam(enrollIssueId, enrollTeamKey, enrollToken, undefined, (info) => {
+              appendOperationalEvent(operationalEventStore, {
+                outcome: "auto-enrolled",
+                type: event.type,
+                key: enrollIdentifier,
+                sessionKey: normalizeSessionKey(enrollIdentifier),
+                detail: { workflowId: info.workflowId, entryState: info.entryState, teamKey: info.teamKey },
+              });
+            }).then((result) => {
+              if (result.enrolled) {
+                log.info(`Auto-enrolled: stamped wf:dev-impl + state:${result.entryState} on ${enrollIssueId} (team=AI)`);
+              }
+            }).catch((err) => {
+              log.warn(`autoEnrollByTeam failed for ${enrollIssueId}: ${err instanceof Error ? err.message : String(err)}`);
+            });
+          }
         }
       }
 
@@ -401,6 +457,16 @@ export function createWebhookRouter(
                 hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
                 hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
                 hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+                // AI-2420: gateway-API target comes from the agent's OWN config
+                // (agents.json), never the global OPENCLAW_GATEWAY_URL. The global
+                // points at ONE gateway (the host, which knows only grover/main),
+                // so injecting it would strand every container agent (astrid@18822,
+                // igor@18820, …) as "Unknown agent" while bypassing the correct
+                // per-agent hooksUrl. With per-agent gatewayUrl+gatewayToken set,
+                // delivery prefers the x-openclaw-session-key path; otherwise it
+                // falls back to per-agent hooksUrl/hooksToken from agents.json.
+                gatewayUrl: agentCfg?.gatewayUrl,
+                gatewayToken: agentCfg?.gatewayToken,
               };
               try {
                 if (throttle) {
@@ -571,32 +637,117 @@ export function createWebhookRouter(
         }
       }
 
+      // ── AI-2350: Durable dispatch lease check ─────────────────────────
+      // Before dispatching, acquire a lease for (agent, ticket). If an unexpired
+      // lease exists, refuse the dispatch — regardless of whether this is the
+      // sweep path or the webhook path (AI-2343 / AI-2344).
+      //
+      // Pass updatedAt so that a legitimate re-dispatch for a newer state
+      // supersedes the old lease (AI-1969 / AI-1918 AC2) rather than being
+      // blocked. The AI-1918 idempotency check above already determined this
+      // is a legitimate re-dispatch (not stale, not a duplicate of the same
+      // state); the lease must honor the same signal.
+      if (dispatchLeaseStore) {
+        const data = event.data as Record<string, unknown> | null;
+        const updatedAt = (data?.updatedAt as string) ?? undefined;
+        const lease = dispatchLeaseStore.acquire(
+          route.agentId,
+          route.sessionKey,
+          { updatedAt },
+        );
+        if (lease.refused) {
+          log.info(
+            `Dispatch lease: refused for ${route.agentId} [${route.sessionKey}] ` +
+            `— unexpired lease exists (expires ${lease.existingLease?.expires_at})`,
+          );
+          appendOperationalEvent(operationalEventStore, {
+            outcome: "suppressed-duplicate" as never,
+            type: event.type,
+            agent: route.agentId,
+            key: route.sessionKey,
+            sessionKey: route.sessionKey,
+            plane: "connector",
+            detail: { reason: "dispatch-lease-active", existingExpiresAt: lease.existingLease?.expires_at },
+          });
+          return;
+        }
+      }
+
       // ── 9a. Stale-route guard ───────────────────────────────────────────
       // Linear webhook payloads are snapshots. Before waking an agent from a
       // delegate/assignee event, re-check Linear's current issue state so an
       // accidental delegation that was already corrected does not let the old
       // agent take ownership or mutate the ticket later.
       const ticketId = route.sessionKey;
-      if (!(await isLinearIssueStillRoutedToAgent(ticketId, route.agentId, route.routingReason))) {
+      const routingCheck = await checkLinearIssueRouting(ticketId, route.agentId, route.routingReason);
+
+      // ── AI-2091 §2 (G2): delivery-time fetchability gate on the PRIMARY path.
+      // A definitive not-found at delivery is a phantom — a dead identifier or a
+      // deleted ticket (AI-2014 at 16:45Z, the AI-2034 dead-identifier cluster).
+      // Abort loudly and ship ZERO delivery; never send a "workflow context
+      // unavailable" wake for a ticket that does not exist. A transient fetch
+      // failure is NOT a phantom (routingCheck.failOpen) and falls through to the
+      // normal fail-open path — a Linear hiccup must not be swallowed as a phantom.
+      if (routingCheck.terminalNotFound) {
+        const fetchability = assertDispatchTargetFetchable({
+          ticketId: ticketId.replace(/^linear-/, ""),
+          fetchable: false,
+          terminalNotFound: true,
+        });
+        if (!fetchability.dispatch) {
+          log.warn(
+            `phantom-dispatch-abort: ${ticketId} unfetchable at delivery — ${fetchability.reason}; aborting dispatch for ${route.agentId}`,
+          );
+          appendOperationalEvent(operationalEventStore, {
+            outcome: "phantom-dispatch-abort" as never,
+            type: event.type,
+            agent: route.agentId,
+            key: ticketId,
+            sessionKey: ticketId,
+            deliveryMode: "fetchability-gate",
+            errorSummary: fetchability.reason,
+            plane: "connector",
+          });
+          return;
+        }
+      }
+
+      if (!routingCheck.actionable) {
         appendOperationalEvent(operationalEventStore, { outcome: "dedup-suppressed", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "stale-route" });
         return;
       }
 
-      // ── 9b. Nudge deduplication + coalescing ─────────────────────────────
+      // ── 9b. Nudge deduplication + coalescing (atomic) ────────────────────
       // Suppress rapid-fire duplicate events for the same agent+ticket.
+      // Uses acquireNudgeSlot for an atomic read-check-write within a single
+      // SQLite transaction — eliminates the TOCTOU race between the old
+      // getCoalesceInfo + recordNudge/recordCoalesced two-step (AI-2376).
       if (NUDGE_DEDUP_WINDOW_MS > 0 && nudgeStore) {
-        const info = nudgeStore.getCoalesceInfo(route.agentId, ticketId, NUDGE_DEDUP_WINDOW_MS);
-        if (info.suppressed) {
-          log.info(`Nudge dedup: coalescing delivery for ${route.agentId} [${ticketId}] — within ${NUDGE_DEDUP_WINDOW_MS}ms window`);
-          nudgeStore.recordCoalesced(route.agentId, ticketId, event.type, "action" in event ? event.action : undefined);
+        const { suppressed, coalescedCount } = nudgeStore.acquireNudgeSlot(
+          route.agentId,
+          ticketId,
+          NUDGE_DEDUP_WINDOW_MS,
+          event.type,
+          "action" in event ? event.action : undefined,
+        );
+
+        if (suppressed) {
+          // The nudge slot was NOT acquired — an existing suppression window
+          // is still active, and this event was merged into the coalesced
+          // counter. Return without delivering; the coalesced count will be
+          // passed to the next delivery that refreshes the window.
+          log.info(`Nudge dedup (atomic): coalescing delivery for ${route.agentId} [${ticketId}] — coalescedCount=${coalescedCount}`);
           appendOperationalEvent(operationalEventStore, { outcome: "dedup-suppressed", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "nudge-dedup" });
           return;
         }
-        // Window expired — drain coalesced count before delivering
-        const coalescedCount = nudgeStore.drainCoalescedCount(route.agentId, ticketId);
-        nudgeStore.recordNudge(route.agentId, ticketId);
+
+        // Slot acquired: the suppression window was absent or expired.
+        // acquireNudgeSlot refreshed the nudge timestamp and zeroed the DB
+        // coalesced_count. Any coalescedCount > 0 means events were merged
+        // into the previous window and are now drained — the caller should
+        // carry that as a signal of dropped events.
         if (coalescedCount > 0) {
-          log.info(`Nudge dedup: delivering for ${route.agentId} [${ticketId}] with ${coalescedCount} coalesced event(s)`);
+          log.info(`Nudge dedup (atomic): delivering for ${route.agentId} [${ticketId}] with ${coalescedCount} coalesced event(s) from prior window`);
           route.coalescedCount = coalescedCount;
         }
       }
@@ -745,6 +896,11 @@ export function createWebhookRouter(
           hooksToken: process.env.OPENCLAW_HOOKS_TOKEN,
           hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
           hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+          // No global gatewayUrl/gatewayToken — see note at the wakeDeliveryConfig
+          // above. A global gateway URL points at ONE gateway and would win the
+          // delivery-path preference, stranding every container agent. AI-2420:
+          // wakeConfigForAgent (below) now sets gatewayUrl/gatewayToken per agent
+          // from agents.json; this base config stays gateway-less on purpose.
           timeoutMs: process.env.NODE_ENV === "test" ? 50 : undefined,
           maxRetries: process.env.NODE_ENV === "test" ? 0 : undefined,
         };
@@ -762,6 +918,9 @@ export function createWebhookRouter(
             ...wakeConfig,
             hooksUrl: cfg?.hooksUrl ?? wakeConfig.hooksUrl,
             hooksToken: cfg?.hooksToken ?? wakeConfig.hooksToken,
+            // AI-2420: per-agent gateway-API target (never a global URL).
+            gatewayUrl: cfg?.gatewayUrl,
+            gatewayToken: cfg?.gatewayToken,
             linearAuthToken,
           };
         };
@@ -851,6 +1010,13 @@ export function createWebhookRouter(
         hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
         hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
         hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+        // AI-2420: gateway-API target from the agent's OWN config (never the
+        // global OPENCLAW_GATEWAY_URL — see note at wakeDeliveryConfig earlier).
+        // With both set, delivery prefers the x-openclaw-session-key path; else
+        // it falls back to per-agent hooksUrl/hooksToken so container agents stay
+        // reachable.
+        gatewayUrl: agentCfg?.gatewayUrl,
+        gatewayToken: agentCfg?.gatewayToken,
       };
       try {
         if (throttle) {

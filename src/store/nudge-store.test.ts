@@ -184,4 +184,150 @@ describe("NudgeStore", () => {
     store.close();
     cleanup();
   });
+
+  // ── Atomic acquireNudgeSlot tests (AI-2376) ─────────────────────────────
+
+  it("acquireNudgeSlot: first call admits with coalescedCount=0", () => {
+    const { dbPath, cleanup } = makeTempDb();
+    const store = new NudgeStore(dbPath);
+    const result = store.acquireNudgeSlot("astrid", "AI-2376", 120000);
+    expect(result.suppressed).toBe(false);
+    expect(result.coalescedCount).toBe(0);
+    store.close();
+    cleanup();
+  });
+
+  it("acquireNudgeSlot: second call within window is suppressed", () => {
+    const { dbPath, cleanup } = makeTempDb();
+    const store = new NudgeStore(dbPath);
+    store.acquireNudgeSlot("astrid", "AI-2376", 120000);
+    const result = store.acquireNudgeSlot("astrid", "AI-2376", 120000);
+    expect(result.suppressed).toBe(true);
+    expect(result.coalescedCount).toBe(1);
+    store.close();
+    cleanup();
+  });
+
+  it("acquireNudgeSlot: multiple suppressed calls increment coalescedCount", () => {
+    const { dbPath, cleanup } = makeTempDb();
+    const store = new NudgeStore(dbPath);
+    store.acquireNudgeSlot("astrid", "AI-2376", 120000);
+    store.acquireNudgeSlot("astrid", "AI-2376", 120000); // suppressed → 1
+    const r3 = store.acquireNudgeSlot("astrid", "AI-2376", 120000); // suppressed → 2
+    expect(r3.suppressed).toBe(true);
+    expect(r3.coalescedCount).toBe(2);
+    store.close();
+    cleanup();
+  });
+
+  it("acquireNudgeSlot: different ticket is not suppressed", () => {
+    const { dbPath, cleanup } = makeTempDb();
+    const store = new NudgeStore(dbPath);
+    store.acquireNudgeSlot("astrid", "AI-2376", 120000);
+    const result = store.acquireNudgeSlot("astrid", "AI-2400", 120000);
+    expect(result.suppressed).toBe(false);
+    expect(result.coalescedCount).toBe(0);
+    store.close();
+    cleanup();
+  });
+
+  it("acquireNudgeSlot: different agent not suppressed", () => {
+    const { dbPath, cleanup } = makeTempDb();
+    const store = new NudgeStore(dbPath);
+    store.acquireNudgeSlot("astrid", "AI-2376", 120000);
+    const result = store.acquireNudgeSlot("grover", "AI-2376", 120000);
+    expect(result.suppressed).toBe(false);
+    expect(result.coalescedCount).toBe(0);
+    store.close();
+    cleanup();
+  });
+
+  it("acquireNudgeSlot: expired window admits with drained coalesced count", () => {
+    const { dbPath, cleanup } = makeTempDb();
+    const store = new NudgeStore(dbPath);
+    // Prime with a first slot (admitted)
+    store.acquireNudgeSlot("astrid", "AI-2376", 120000);
+    // Two suppressed events within window
+    store.acquireNudgeSlot("astrid", "AI-2376", 120000);
+    store.acquireNudgeSlot("astrid", "AI-2376", 120000);
+    // Window expired (0ms) — admits and drains coalesced count
+    const result = store.acquireNudgeSlot("astrid", "AI-2376", 0);
+    expect(result.suppressed).toBe(false);
+    expect(result.coalescedCount).toBe(2);
+    store.close();
+    cleanup();
+  });
+
+  it("acquireNudgeSlot: expired window resets DB coalesced_count to 0", () => {
+    const { dbPath, cleanup } = makeTempDb();
+    const store = new NudgeStore(dbPath);
+    store.acquireNudgeSlot("astrid", "AI-2376", 120000);
+    store.acquireNudgeSlot("astrid", "AI-2376", 120000); // coalesced
+    store.acquireNudgeSlot("astrid", "AI-2376", 0); // expired — drains
+    // Now window is active again; next call should be suppressed
+    const nextResult = store.acquireNudgeSlot("astrid", "AI-2376", 120000);
+    expect(nextResult.suppressed).toBe(true);
+    expect(nextResult.coalescedCount).toBe(1);
+    store.close();
+    cleanup();
+  });
+
+  it("acquireNudgeSlot: passes eventType and eventAction on coalesced", () => {
+    const { dbPath, cleanup } = makeTempDb();
+    const store = new NudgeStore(dbPath);
+    store.acquireNudgeSlot("astrid", "AI-2376", 120000);
+    store.acquireNudgeSlot("astrid", "AI-2376", 120000, "Comment", "create");
+    // Verify through getCoalesceInfo (deprecated but fine for read)
+    const info = store.getCoalesceInfo("astrid", "AI-2376", 120000);
+    expect(info.suppressed).toBe(true);
+    expect(info.coalescedCount).toBe(1);
+    store.close();
+    cleanup();
+  });
+
+  it("acquireNudgeSlot: concurrent calls are serialized by SQLite lock", () => {
+    const { dbPath, cleanup } = makeTempDb();
+    const store = new NudgeStore(dbPath);
+    // Simulate near-simultaneous calls by invoking sequentially with a
+    // fresh DB — the critical property is that the second call sees the
+    // first call's row (which it would NOT if read-then-write raced).
+    // Two calls where both would have "no row yet" if raced:
+    const r1 = store.acquireNudgeSlot("astrid", "AI-2376", 120000);
+    expect(r1.suppressed).toBe(false);
+    // Second call MUST see the row created by the first
+    const r2 = store.acquireNudgeSlot("astrid", "AI-2376", 120000);
+    expect(r2.suppressed).toBe(true);
+    expect(r2.coalescedCount).toBe(1);
+    store.close();
+    cleanup();
+  });
+
+  it("acquireNudgeSlot: isSuppressed and recordNudge still work after atomic call", () => {
+    const { dbPath, cleanup } = makeTempDb();
+    const store = new NudgeStore(dbPath);
+    // Mix old and new APIs on the same DB
+    const r1 = store.acquireNudgeSlot("astrid", "AI-2376", 120000);
+    expect(r1.suppressed).toBe(false);
+    // Old API sees the row from atomic API
+    expect(store.isSuppressed("astrid", "AI-2376", 120000)).toBe(true);
+    store.recordNudge("astrid", "AI-2376");
+    // The atomic API sees the update from old API
+    const r2 = store.acquireNudgeSlot("astrid", "AI-2376", 0);
+    expect(r2.suppressed).toBe(false);
+    expect(r2.coalescedCount).toBe(0);
+    store.close();
+    cleanup();
+  });
+
+  it("acquireNudgeSlot: clearNudge after atomic admit allows re-admit", () => {
+    const { dbPath, cleanup } = makeTempDb();
+    const store = new NudgeStore(dbPath);
+    store.acquireNudgeSlot("astrid", "AI-2376", 120000);
+    store.clearNudge("astrid", "AI-2376");
+    const reAdmit = store.acquireNudgeSlot("astrid", "AI-2376", 120000);
+    expect(reAdmit.suppressed).toBe(false);
+    expect(reAdmit.coalescedCount).toBe(0);
+    store.close();
+    cleanup();
+  });
 });

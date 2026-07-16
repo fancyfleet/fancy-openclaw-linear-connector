@@ -264,7 +264,9 @@ describe("NoActivityDetector", () => {
 
     const result = await detector.runCycle();
 
-    expect(result.failed).toBe(1);
+    // AI-2404: terminal-state prune handles non-actionable tickets at the top
+    // of runCycle, before the fail loop. Expected: 0 failed (silent prune).
+    expect(result.failed).toBe(0);
     // Should NOT have re-dispatched — ticket was pruned
     expect(dispatchedTickets).toHaveLength(0);
 
@@ -305,7 +307,9 @@ describe("NoActivityDetector", () => {
 
     const result = await detector.runCycle();
 
-    expect(result.failed).toBe(1);
+    // AI-2404: terminal-state prune handles Done/Canceled tickets at the top
+    // of runCycle, before the warn/fail loop. Expected: 0 failed (silent prune).
+    expect(result.failed).toBe(0);
     expect(dispatchedTickets).toHaveLength(0);
 
     // ackTracker must be acknowledged — not left as pending — so the detector
@@ -866,5 +870,134 @@ describe("NoActivityDetector", () => {
       ackTracker.close();
       operationalEventStore.close();
     });
+  });
+});
+
+/**
+ * AI-2118 — regression suite for the GEN-88 dispatch-failure spam loop.
+ *
+ * On GEN-88 the watchdog posted 10 identical "Re-dispatching (attempt 2)"
+ * comments in 5 minutes because: (1) the comment was posted unconditionally
+ * before the re-dispatch, (2) a FAILED re-dispatch delivery advanced neither
+ * last_signal_at nor attempt_count, so the same aging row re-fired every ~30s
+ * poll with the counter frozen at 2 forever, and (3) it only stopped when the
+ * ticket was re-routed away. These tests pin the fixed contract.
+ */
+describe("NoActivityDetector — AI-2118 dispatch-failure loop", () => {
+  let dir: string;
+  beforeEach(() => { dir = tempDir(); });
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
+
+  test("failed re-dispatch delivery posts NO comment and escalates after the cap instead of looping", async () => {
+    const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
+    const comments: Array<{ ticketId: string; message: string }> = [];
+
+    bag.add("grover", "linear-GEN-88", "Issue");
+    sessionTracker.startSession("grover", "linear-GEN-88");
+    ackTracker.recordDispatch("grover", "linear-GEN-88");
+
+    const detector = new NoActivityDetector(
+      {
+        sessionTracker,
+        ackTracker,
+        bag,
+        operationalEventStore,
+        wakeConfig,
+        resignalOptions: {
+          isTicketActionable: () => true,
+          // Delivery always fails (gateway rejecting wakes) — reproduces the loop.
+          sendWakeUp: async () => { throw new Error("gateway 500"); },
+        },
+        postLinearComment: async (_agentId, ticketId, message) => {
+          comments.push({ ticketId, message });
+          return true;
+        },
+      },
+      { warnMs: 0, failMs: 0, pollMs: 60_000 }, // failMs=0 → every cycle is past-fail
+    );
+
+    // Six cycles: without the fix this posts six "attempt 2" comments and never stops.
+    for (let i = 0; i < 6; i++) await detector.runCycle();
+
+    // Defect 1: NOT ONE "Dispatch failure detected — Re-dispatch(ing/ed)" comment,
+    // because no re-dispatch ever actually started.
+    expect(comments.filter((c) => c.message.includes("Dispatch failure detected"))).toHaveLength(0);
+
+    // Defect 3 → escalation: exactly one terminal escalation comment (cap=3 delivery failures).
+    const escalations = comments.filter((c) => c.message.includes("Dispatch failure escalation"));
+    expect(escalations).toHaveLength(1);
+
+    // The loop terminates: escalated rows leave the pending set.
+    expect(ackTracker.getPendingTimedOut(0)).toHaveLength(0);
+
+    // Delivery failures were recorded for observability; NOT one per poll unbounded.
+    const failedEvents = operationalEventStore.query({ outcome: "no-activity-redispatch-failed" });
+    expect(failedEvents).toHaveLength(3); // failures 1,2,3 then escalation on the 3rd
+
+    detector.stop();
+    bag.close();
+    sessionTracker.close();
+    ackTracker.close();
+    operationalEventStore.close();
+  });
+
+  test("successful re-dispatches increment the attempt counter — no frozen 'attempt 2'", async () => {
+    const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
+    const comments: Array<{ ticketId: string; message: string }> = [];
+
+    bag.add("grover", "linear-GEN-88", "Issue");
+    sessionTracker.startSession("grover", "linear-GEN-88");
+    ackTracker.recordDispatch("grover", "linear-GEN-88");
+
+    const detector = new NoActivityDetector(
+      {
+        sessionTracker,
+        ackTracker,
+        bag,
+        operationalEventStore,
+        wakeConfig,
+        resignalOptions: {
+          isTicketActionable: () => true,
+          sendWakeUp: async () => { /* delivery succeeds */ },
+        },
+        postLinearComment: async (_agentId, ticketId, message) => {
+          comments.push({ ticketId, message });
+          return true;
+        },
+      },
+      { warnMs: 0, failMs: 0, pollMs: 60_000 },
+    );
+
+    // Two cycles: each is a genuine successful re-dispatch.
+    await detector.runCycle();
+    await detector.runCycle();
+
+    const detected = comments.filter((c) => c.message.includes("Dispatch failure detected"));
+    // Defect 2: the counter advances (attempt 2, then attempt 3) — it is NOT stuck at 2.
+    expect(detected).toHaveLength(2);
+    expect(detected[0].message).toContain("Re-dispatched (attempt 2)");
+    expect(detected[1].message).toContain("Re-dispatched (attempt 3)");
+  });
+
+  test("markResignalFailed backs off the clock and increments only the delivery-failure counter", () => {
+    const ackTracker = new DispatchAckTracker(path.join(dir, "acks.db"));
+    ackTracker.recordDispatch("grover", "linear-GEN-88"); // attempt_count=1, failure=0
+
+    ackTracker.markResignalFailed("grover", "linear-GEN-88");
+    let row = ackTracker.getPendingTimedOut(0)[0];
+    expect(row.attemptCount).toBe(1);   // attempt counter untouched by a failed delivery
+    expect(row.failureCount).toBe(1);
+
+    ackTracker.markResignalFailed("grover", "linear-GEN-88");
+    row = ackTracker.getPendingTimedOut(0)[0];
+    expect(row.failureCount).toBe(2);
+
+    // A successful re-dispatch clears the failure streak and advances the attempt.
+    ackTracker.markResignaled("grover", "linear-GEN-88");
+    row = ackTracker.getPendingTimedOut(0)[0];
+    expect(row.attemptCount).toBe(2);
+    expect(row.failureCount).toBe(0);
+
+    ackTracker.close();
   });
 });

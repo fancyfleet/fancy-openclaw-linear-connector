@@ -5,6 +5,8 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
+    "prebuild": "node scripts/guard-build-location.js && node scripts/guard-runtime-build.mjs",
+    "check:json-keys": "node scripts/check-duplicate-json-keys.js",
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",

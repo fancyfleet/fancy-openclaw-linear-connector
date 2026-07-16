@@ -18,11 +18,26 @@ import { createLogger, componentLogger } from "./logger.js";
 const log = componentLogger(createLogger(), "router");
 
 /**
+ * Discriminated union returned by extractAgentTarget.
+ *
+ * - `{ name, reason }` — a routable agent was found
+ * - `{ suppressed: true }` — the AI-1573 guard or self-trigger filter
+ *   intentionally suppressed this event (should NOT fall through to
+ *   department-prefix / steward-escalation)
+ * - `null` — genuinely no route found (may fall through to department-prefix)
+ */
+export type AgentTargetResult =
+  | { name: string; reason: "delegate" | "assignee" | "mention" | "body-mention" }
+  | { suppressed: true }
+  | null;
+
+/**
  * Extract the target agent name from a webhook payload.
  * Checks delegate first (OAuth app actors), then assignee, then mentioned users.
- * Returns null if no agent target found or if it's a self-triggered event.
+ * Returns { suppressed: true } when the AI-1573 guard or self-trigger filter
+ * intentionally skips the event; null when no route was found at all.
  */
-export function extractAgentTarget(event: LinearEvent): { name: string; reason: "delegate" | "assignee" | "mention" | "body-mention" } | null {
+export function extractAgentTarget(event: LinearEvent): AgentTargetResult {
   const agentMap = buildAgentMap();
   if (Object.keys(agentMap).length === 0) {
     log.warn("No agents configured — skipping event");
@@ -62,7 +77,7 @@ export function extractAgentTarget(event: LinearEvent): { name: string; reason: 
       }
     }
     log.info("AgentSessionEvent: no owning agent resolvable from session payload — not waking anyone");
-    return null;
+    return { suppressed: true };
   }
 
   const data = "data" in event ? (event.data as Record<string, unknown> | undefined) : null;
@@ -92,7 +107,7 @@ export function extractAgentTarget(event: LinearEvent): { name: string; reason: 
           log.info(`No-change delegate but stateId changed — dispatching for same-agent workflow transition`);
         } else {
           log.info(`No-change delegate write — skipping dispatch (updatedFrom present, no delegate key, no state change)`);
-          target = null;
+          return { suppressed: true };
         }
       }
     }
@@ -146,7 +161,7 @@ export function extractAgentTarget(event: LinearEvent): { name: string; reason: 
   if (isActorOurAgent && !isStateTransition) {
     if (!target || agentMap[actorId!] === target) {
       log.info(`Skipping self-triggered event from ${actorId}`);
-      return null;
+      return { suppressed: true };
     }
     log.info(`Agent-to-agent delegation: ${agentMap[actorId!]} → ${target}`);
   }
@@ -353,11 +368,11 @@ function buildRouteResult(
 
 /**
  * Route a Linear event to an OpenClaw agent.
- * Returns a RouteResult if routing succeeded, null if no agent found.
+ * Returns a RouteResult if routing succeeded, null if no agent found or suppressed.
  */
 export function routeEvent(event: LinearEvent): RouteResult | null {
   const result = extractAgentTarget(event);
-  if (!result) return null;
+  if (!result || "suppressed" in result) return null;
   return buildRouteResult(result, event);
 }
 
@@ -369,6 +384,13 @@ export function routeEvent(event: LinearEvent): RouteResult | null {
  */
 export function routeEventAll(event: LinearEvent): RouteResult[] {
   const primary = extractAgentTarget(event);
+
+  // AI-2170: if the guard intentionally suppressed this event, return empty
+  // immediately — do NOT fall through to department-prefix/steward-escalation.
+  if (primary && "suppressed" in primary) {
+    return [];
+  }
+
   if (primary) {
     const routes = [buildRouteResult(primary, event)];
     for (const name of extractAdditionalMentionTargets(event, primary.name)) {
@@ -381,18 +403,38 @@ export function routeEventAll(event: LinearEvent): RouteResult[] {
   // AI-1479 (Phase 6.5 / H-4): routing functionary — a *fallback* consulted only
   // when nothing was explicitly delegated/assigned/mentioned (mechanical-first
   // ordering). A clean department-prefix match routes to the department default
-  // with no person in the loop. Anything else (no roster loaded, or a prefix that
-  // matches no department → steward escalation) falls through to the existing
-  // no-route paging path — we do not fabricate a route here, so mention fan-out
-  // and no-route paging (AI-1766 / AI-1900) are composed with, not reverted.
+  // with no person in the loop.
+  //
+  // AI-2017: a prefix that matches no department is a *steward escalation* — the
+  // match failed and now a person (the roster steward) takes over. This must
+  // reach the live dispatch path, not be computed and discarded. Compose with —
+  // do not revert — the existing no-route paths:
+  //   • no roster loaded → no steward to escalate to (the `if (roster)` guard).
+  //   • no issue identifier → nothing to escalate on; resolveRoute() still
+  //     returns steward-escalation for a null identifier, so we gate on the
+  //     identifier here rather than the decision reason (AI-1900 / no-route).
+  //   • AgentSessionEvent with no resolvable owner → a UI-widget event, not a
+  //     routable request; audit #16 (wake-nobody) forbids paging the steward for
+  //     it even though it carries an identifier.
   const roster = getCachedRoster();
   if (roster) {
-    const decision = resolveRoute(extractIssueIdentifier(event), event.type, roster, null);
+    const identifier = extractIssueIdentifier(event);
+    const decision = resolveRoute(identifier, event.type, roster, null);
     if (decision.reason === "department-prefix") {
       log.info(
-        `Department route: ${event.type} identifier=${extractIssueIdentifier(event)} → ${decision.target} (prefix=${decision.matchedPrefix})`,
+        `Department route: ${event.type} identifier=${identifier} → ${decision.target} (prefix=${decision.matchedPrefix})`,
       );
       return [buildRouteResult({ name: decision.target, reason: "department-prefix" }, event)];
+    }
+    if (
+      decision.reason === "steward-escalation" &&
+      identifier &&
+      event.type !== "AgentSessionEvent"
+    ) {
+      log.info(
+        `Steward escalation: ${event.type} identifier=${identifier} → ${decision.target} (prefix matched no department)`,
+      );
+      return [buildRouteResult({ name: decision.target, reason: "steward-escalation" }, event)];
     }
   }
   return [];

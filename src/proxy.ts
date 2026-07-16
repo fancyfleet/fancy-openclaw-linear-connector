@@ -271,10 +271,21 @@ function stripStateLabelDeltas(body: GraphQLRequestBody | null, stateLabelIds: S
 /**
  * AI-1857: Strip null delegateId/assigneeId from an intent-bearing issueUpdate input.
  * The proxy owns delegate management; CLIs must not directly null these fields.
+ *
+ * Exception: `needs-human` is the documented, sanctioned path for setting a human
+ * assignee AND clearing the agent delegate in a single atomic mutation (AI-2067).
+ * The `complete` verb is also exempt: both delegate and assignee are cleared for
+ * terminal transitions, and the CLI cannot rely on B2 alone (ad-hoc tickets have
+ * no workflow to drive B2).
  */
-function stripNullDelegateAssigneeFields(body: GraphQLRequestBody | null): void {
+function stripNullDelegateAssigneeFields(body: GraphQLRequestBody | null, effectiveIntent: string | null): void {
   const input = issueUpdateInput(body);
   if (!input) return;
+  // AI-2067: needs-human and complete legitimately send delegateId:null as
+  // part of their documented contract — don't block it.
+  if (effectiveIntent === 'needs-human' || effectiveIntent === 'complete') {
+    return;
+  }
   if (input.delegateId === null) delete input.delegateId;
   if (input.assigneeId === null) delete input.assigneeId;
 }
@@ -302,6 +313,17 @@ function extractCommentBody(body: GraphQLRequestBody | null): string | null {
   }
   if (typeof vars.body === "string" && (vars.body as string).length > 0) return vars.body as string;
   return null;
+}
+
+/**
+ * True when the mutation is a `commentCreate` — a mutation that posts a comment
+ * and can never change workflow state or delegate. Used to skip workflow
+ * enforcement (B1) on the intent path so a trailing commentCreate in a
+ * multi-step governed command is not re-gated against the post-transition state
+ * (AI-2472).
+ */
+function isCommentCreateMutation(body: GraphQLRequestBody | null): boolean {
+  return !!body?.query && /\bcommentCreate\s*\(/.test(body.query);
 }
 
 /**
@@ -336,6 +358,13 @@ export interface CommandAuthSnapshot {
   /** The caller's Linear user ID snapshotted at command start (used as effective delegateId). */
   snapshotDelegateId: string | null;
   /**
+   * The ticket's delegate (Linear user id) snapshotted at command start,
+   * distinct from the caller identity above. Used by the AI-1860 snapshot
+   * mechanism to avoid self-blocking after a post-transition delegate change.
+   * null when the delegate could not be read at command start (fail-open).
+   */
+  snapshotTicketDelegate: string | null;
+  /**
    * AI-1860: the ticket's workflow source state snapshotted at command start. Reused for
    * meta-intent resolution and transition-legality checks on subsequent mutations so a
    * multi-step governed command is not re-gated against its own post-transition state.
@@ -344,7 +373,6 @@ export interface CommandAuthSnapshot {
   snapshotState: string | null;
   expiresAt: number;
 }
-
 export interface ProxyDeps {
   /** Optional observation store for recording feedback observations (P4-1). */
   observationStore?: ObservationStore;
@@ -484,11 +512,29 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       const snapshotKey = issueId && intent ? `${agentId}:${issueId}:${intent}` : null;
       let snapshotDelegateId: string | null | undefined = undefined;
       let snapshotState: string | null | undefined = undefined;
-      if (snapshotKey && deps?.commandAuthSnapshots) {
+      // AI-2115 Bug 1: the auth snapshot is keyed only on the sticky intent header
+      // (`agentId:issueId:intent`), so two *separate* commands that share an intent
+      // (e.g. a second `continue-workflow` invoked from the next workflow state)
+      // are indistinguishable at this seam. Reusing the prior command's snapshot
+      // leaks its command-start state: a `continue-workflow` issued from `routing`
+      // re-uses the `intake` snapshotState, so resolveMetaIntent resolves the
+      // routing-state continue to intake's singleton `request` verb — force-assigning
+      // astrid and rejecting the real (delegate-only) worker target (the GEN-33 wedge).
+      //
+      // A state-changing `issueUpdate` mutation is always the START of a command and
+      // must re-derive its authorization from LIVE state; it never legitimately reuses
+      // a prior snapshot. AI-1860's within-command protection is preserved because the
+      // follow-up mutations it guards are `commentCreate` (non-issueUpdate), which
+      // still reuse the snapshot and thus are never re-gated against post-transition
+      // state.
+      const isTransitionMutation = isIssueUpdateMutation(body);
+      let snapshotTicketDelegate: string | null | undefined = undefined;
+      if (snapshotKey && deps?.commandAuthSnapshots && !isTransitionMutation) {
         const existing = deps.commandAuthSnapshots.get(snapshotKey);
         if (existing && Date.now() < existing.expiresAt) {
           snapshotDelegateId = existing.snapshotDelegateId;
           snapshotState = existing.snapshotState;
+          snapshotTicketDelegate = existing.snapshotTicketDelegate;
           log.info(`auth-snapshot-hit agent=${agentId} intent=${intent}${ticketCtx}`);
         }
       }
@@ -626,6 +672,19 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       const p3rejection = await checkWorkflowRules(effectiveIntent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride, intent !== effectiveIntent, requestHasComment, snapshotDelegateId, snapshotState);
       if (p3rejection) {
         log.warn(`workflow-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${p3rejection}`);
+
+        // AI-2091 G4 (re-scoped to B1): when the B1 delegate-only block fires
+        // ("is not the current delegate for"), emit the operational event so the
+        // stale-snapshot-mutation-rejected property is observable on the live path.
+        if (issueId && p3rejection.includes("is not the current delegate for")) {
+          deps?.operationalEventStore?.append({
+            outcome: "stale-snapshot-mutation-rejected" as never,
+            type: "delegate-enforcement",
+            agent: agentId,
+            key: issueId,
+            errorSummary: p3rejection,
+          });
+        }
         // AI-1857 AC4: include gate-verification snapshot so CLI can verify "no partial state was written"
         const gateDeclineResponse: Record<string, unknown> = { errors: [{ message: p3rejection }] };
         if (issueId) {
@@ -648,10 +707,17 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // snapshotState null so follow-up mutations fall back to the live state.
       if (snapshotKey && deps?.commandAuthSnapshots && snapshotDelegateId === undefined) {
         let capturedState: string | null = null;
+        let capturedTicketDelegate: string | null = null;
         if (issueId) {
           try {
-            const preLabels = await fetchWorkflowLabels(issueId, authorization);
-            capturedState = getCurrentState(preLabels) ?? null;
+            const verification = await fetchTicketVerification(issueId, authorization);
+            // AI-2094: resolve def-aware so a stale/duplicate state:* label on a
+            // drifted ticket can't snapshot the wrong (earlier) state and bind
+            // the follow-up meta-intent to the wrong forward edge (mis-route to assign).
+            const snapWfId = getWorkflowId(verification.labels);
+            const snapDef = snapWfId ? await loadWorkflowDefById(snapWfId) : null;
+            capturedState = getCurrentState(verification.labels, snapDef ?? undefined) ?? null;
+            capturedTicketDelegate = verification.delegateId;
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             log.warn(`auth-snapshot source-state capture failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
@@ -660,10 +726,12 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         deps.commandAuthSnapshots.set(snapshotKey, {
           snapshotDelegateId: callerLinearUserId ?? null,
           snapshotState: capturedState,
+          snapshotTicketDelegate: capturedTicketDelegate,
           expiresAt: Date.now() + COMMAND_AUTH_SNAPSHOT_TTL_MS,
         });
         snapshotState = capturedState;
-        log.info(`auth-snapshot-stored agent=${agentId} intent=${intent}${ticketCtx} state=${capturedState ?? "unknown"}`);
+        snapshotTicketDelegate = capturedTicketDelegate;
+        log.info(`auth-snapshot-stored agent=${agentId} intent=${intent}${ticketCtx} state=${capturedState ?? "unknown"} ticketDelegate=${capturedTicketDelegate ?? "none"}`);
       }
 
       // AI-1977: delegateOverride is computed inside the issueId block below
@@ -677,7 +745,11 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       if (issueId) {
         try {
           const preLabels = await fetchWorkflowLabels(issueId, authorization);
-          sourceStateOverride = getCurrentState(preLabels) ?? undefined;
+          // AI-2094: def-aware most-advanced resolution — see the auth-snapshot
+          // capture above. A stale state:* label must not become the source override.
+          const srcWfId = getWorkflowId(preLabels);
+          const srcDef = srcWfId ? await loadWorkflowDefById(srcWfId) : null;
+          sourceStateOverride = getCurrentState(preLabels, srcDef ?? undefined) ?? undefined;
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           log.warn(`source-state snapshot failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
@@ -709,8 +781,46 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         // AI-1857: Strip null delegateId/assigneeId from forwarded intent-bearing mutations.
         // The proxy manages delegates; partial semantic-verb application (e.g. complete)
         // bundles these null clears, which must not reach Linear directly.
+        // AI-2067: needs-human is exempt — it is the documented path for clearing delegate
+        // while setting a human assignee.
         if (isIssueUpdateMutation(body)) {
-          stripNullDelegateAssigneeFields(body);
+          stripNullDelegateAssigneeFields(body, effectiveIntent);
+        }
+
+        // AI-2417: Restore assignee-clear alongside a delegate SET so app-user
+        // delegates persist. The Linear API silently drops a delegateId write to
+        // an app/bot user unless assigneeId is carried in the SAME mutation
+        // (AI-1395: "silently rejects delegateId writes for app users unless
+        // assigneeId is [sent]"; the valid persistent shape is
+        // { delegateId: app_user, assigneeId: null }). Two paths converge on the
+        // bug for generic delegate-routing verbs (refuse-work, generic
+        // handoff-work, undelegate):
+        //   • refuse-work OMITS assigneeId entirely (the AI-1395 CLI guard leaves
+        //     it unset for app-user targets), so Linear drops the delegate back to
+        //     the caller — the "reverts to Ai" symptom on GEN-178.
+        //   • generic handoff-work DOES send assigneeId:null, but
+        //     stripNullDelegateAssigneeFields (AI-1857) just removed it above,
+        //     re-creating the same omit shape.
+        // When the CLI itself set a non-null delegateId and did not pin a specific
+        // assignee, inject assigneeId:null so the app-user delegate write persists.
+        // This runs BEFORE the AI-1977 delegate-pre-resolve block, so it only fires
+        // for verbs where the CLI wrote the delegate directly (the generic path);
+        // governed dev-impl verbs omit the CLI delegateId — the proxy's
+        // applyStateTransition owns their delegate/assignee — and are untouched.
+        // A delegate CLEAR (delegateId:null) is excluded, so the AI-1857 guard
+        // against ungoverned delegate self-clears is unaffected.
+        if (isIssueUpdateMutation(body)) {
+          const inputForDelegate = issueUpdateInput(body);
+          if (
+            inputForDelegate &&
+            inputForDelegate.delegateId != null &&
+            !("assigneeId" in inputForDelegate)
+          ) {
+            inputForDelegate.assigneeId = null;
+            log.info(
+              `app-user-delegate-assignee-clear agent=${agentId} intent=${effectiveIntent}${ticketCtx}: injected assigneeId:null alongside delegateId so the delegate persists (AI-2417)`,
+            );
+          }
         }
 
         // AI-1977: Pre-resolve the delegateId and inject it into the forwarded mutation
@@ -741,7 +851,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             if (wfId) {
               const def = await loadWorkflowDefById(wfId);
               if (def) {
-                const currentStateName = sourceStateOverride ?? getCurrentState(preLabels);
+                const currentStateName = sourceStateOverride ?? getCurrentState(preLabels, def); // AI-2094: def-aware
                 if (currentStateName) {
                   const stateNode = def.states.find((s) => s.id === currentStateName);
                   const matchedTransition = stateNode?.transitions?.find(
@@ -791,7 +901,6 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           return;
         }
       }
-
       let upstreamRes: globalThis.Response;
       try {
         upstreamRes = await fetch(LINEAR_API_URL, {
@@ -917,16 +1026,18 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
 
         // AI-2035 guard B (defense-in-depth): once a transition has successfully
         // landed on a TERMINAL state, invalidate the AI-1860 command-auth
-        // snapshot(s) for this issue so a trailing same-turn mutation under the
-        // same sticky intent header can no longer present a stale pre-terminal
-        // snapshotState to B1 (checkWorkflowRules). Without this the snapshot
-        // keeps satisfying B1's terminal rejection for the full 10-min TTL,
-        // letting the lag-prone gate read reopen the ticket. Guard A (the
-        // getAppliedState-backed terminal re-entry guard in applyStateTransition)
-        // is the lag-proof primary stop; this restores B1's live terminal
-        // rejection at the gate. We drop every snapshot for the issue (all
-        // intents), since a reviewer's close may carry >1 intent and any lingering
-        // pre-terminal snapshot could re-authorize a re-entrant write.
+        // snapshot for this issue except the current in-flight command's own
+        // snapshot. A trailing same-turn commentCreate under the same sticky
+        // intent header needs the pre-terminal snapshotState to resolve its
+        // meta-intent and pass B1; without it the re-resolution against the
+        // live terminal state rejects the comment and drops the body silently
+        // (AI-2472). The current command's snapshot is safe to preserve because
+        // issueUpdate mutations (isTransitionMutation=true) never reuse a
+        // snapshot — they always re-fetch. Only non-transition mutations like
+        // commentCreate reuse it. Guard A (getAppliedState-backed terminal
+        // re-entry guard in applyStateTransition) is the primary stop against
+        // re-open; dropping OTHER snapshots for the issue still catches the
+        // reviewer-close scenario where a different intent might follow.
         if (
           transitionResult?.status === "applied" &&
           transitionResult.to &&
@@ -936,7 +1047,10 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           const issueKeyFragment = issueId ? `:${issueId}:` : null;
           let dropped = 0;
           for (const key of [...deps.commandAuthSnapshots.keys()]) {
-            if (key === snapshotKey || (issueKeyFragment && key.includes(issueKeyFragment))) {
+            // AI-2472: preserve the current in-flight command's snapshot so a
+            // trailing commentCreate can reuse its pre-terminal snapshotState.
+            if (key === snapshotKey) continue;
+            if (issueKeyFragment && key.includes(issueKeyFragment)) {
               deps.commandAuthSnapshots.delete(key);
               dropped++;
             }

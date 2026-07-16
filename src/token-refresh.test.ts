@@ -11,14 +11,19 @@ import { jest, describe, it, expect, beforeEach } from "@jest/globals";
 
 // ── ESM-compatible mocks (declared before dynamic import) ───────────────────
 
-const mockUpdateTokens = jest.fn<(name: string, at: string, rt: string) => void>();
+const mockUpdateTokens = jest.fn<(name: string, at: string, rt: string, expiresIn?: number) => void>();
+const mockRecordTokenFailure = jest.fn<(name: string, status: number, retriable: boolean, reason: string) => void>();
+const mockGetAgents = jest.fn<() => { name: string; expiresAt?: string }[]>();
 const mockNotify = jest.fn<(alert: unknown) => void>();
 
 jest.unstable_mockModule("./agents.js", () => ({
   // isAgentLocal is called before any network work; make every test agent local.
   isAgentLocal: jest.fn().mockReturnValue(true),
+  // isPolledForLinear: all test agents are polled by default.
+  isPolledForLinear: jest.fn().mockReturnValue(true),
   updateTokens: mockUpdateTokens,
-  getAgents: jest.fn().mockReturnValue([]),
+  recordTokenFailure: mockRecordTokenFailure,
+  getAgents: mockGetAgents,
 }));
 
 jest.unstable_mockModule("./alerts/alert-bus.js", () => ({
@@ -72,6 +77,8 @@ const fixedRng = (): number => 0.5;
 
 beforeEach(() => {
   mockUpdateTokens.mockClear();
+  mockRecordTokenFailure.mockClear();
+  mockGetAgents.mockClear();
   mockNotify.mockClear();
 });
 
@@ -85,11 +92,14 @@ describe("token-refresh retry-with-backoff (AI-1911)", () => {
     await refreshAgent(makeAgent(), { fetchImpl, sleep: noSleep, rng: fixedRng });
 
     expect(fetchImpl).toHaveBeenCalledTimes(2); // retried once
-    expect(mockUpdateTokens).toHaveBeenCalledWith("igor", TOKEN_OK.access_token, TOKEN_OK.refresh_token);
+    expect(mockUpdateTokens).toHaveBeenCalledWith("igor", TOKEN_OK.access_token, TOKEN_OK.refresh_token, TOKEN_OK.expires_in);
     expect(mockNotify).not.toHaveBeenCalled(); // recovered → no alert
+    // 503 was recorded as failure; success cleared it
+    expect(mockRecordTokenFailure).toHaveBeenCalledWith("igor", 503, true, expect.stringContaining("503"));
   });
 
   it("AC1: refresh failure triggers at least one automatic retry with backoff", async () => {
+    mockGetAgents.mockReturnValue([]);
     const fetchImpl = jest.fn<typeof fetch>().mockResolvedValue(resp(503, "still down"));
     const sleep = jest.fn<(ms: number) => Promise<void>>().mockResolvedValue(undefined);
 
@@ -103,14 +113,18 @@ describe("token-refresh retry-with-backoff (AI-1911)", () => {
     const secondWait = sleep.mock.calls[1][0];
     expect(firstWait).toBeGreaterThan(0);
     expect(secondWait).toBeGreaterThan(firstWait);
+    // Each attempt recorded its failure (3 from refreshAgentOnce + 1 from exhausted path)
+    expect(mockRecordTokenFailure).toHaveBeenCalledTimes(4);
   });
 
   it("AC3: all retries exhausted logs a critical alert (real expiry risk)", async () => {
+    mockGetAgents.mockReturnValue([]);
     const fetchImpl = jest.fn<typeof fetch>().mockResolvedValue(resp(503, "down"));
 
     await refreshAgent(makeAgent(), { fetchImpl, sleep: noSleep, rng: fixedRng });
 
     expect(mockUpdateTokens).not.toHaveBeenCalled();
+    expect(mockRecordTokenFailure).toHaveBeenCalled();
     expect(mockNotify).toHaveBeenCalledTimes(1);
     const alert = mockNotify.mock.calls[0][0] as { severity: string; agent: string; source: string };
     expect(alert.severity).toBe("critical");
@@ -125,15 +139,18 @@ describe("token-refresh retry-with-backoff (AI-1911)", () => {
 
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(mockUpdateTokens).toHaveBeenCalledTimes(1);
+    expect(mockUpdateTokens).toHaveBeenCalledWith("igor", TOKEN_OK.access_token, TOKEN_OK.refresh_token, TOKEN_OK.expires_in);
     expect(mockNotify).not.toHaveBeenCalled();
   });
 
   it("non-retriable 4xx (revoked token) fails fast without retrying", async () => {
+    mockGetAgents.mockReturnValue([]);
     const fetchImpl = jest.fn<typeof fetch>().mockResolvedValue(resp(400, "invalid_grant"));
 
     await refreshAgent(makeAgent(), { fetchImpl, sleep: noSleep, rng: fixedRng });
 
     expect(fetchImpl).toHaveBeenCalledTimes(1); // no retry on hard failure
+    expect(mockRecordTokenFailure).toHaveBeenCalledWith("igor", 400, false, expect.stringContaining("400"));
     expect(mockNotify).toHaveBeenCalledTimes(1);
     const alert = mockNotify.mock.calls[0][0] as { severity: string };
     expect(alert.severity).toBe("critical");
@@ -148,7 +165,8 @@ describe("token-refresh retry-with-backoff (AI-1911)", () => {
     await refreshAgent(makeAgent(), { fetchImpl, sleep: noSleep, rng: fixedRng });
 
     expect(fetchImpl).toHaveBeenCalledTimes(2);
-    expect(mockUpdateTokens).toHaveBeenCalledTimes(1);
+    expect(mockRecordTokenFailure).toHaveBeenCalledWith("igor", 429, true, expect.stringContaining("429"));
+    expect(mockUpdateTokens).toHaveBeenCalledWith("igor", TOKEN_OK.access_token, TOKEN_OK.refresh_token, TOKEN_OK.expires_in);
     expect(mockNotify).not.toHaveBeenCalled();
   });
 
@@ -161,7 +179,8 @@ describe("token-refresh retry-with-backoff (AI-1911)", () => {
     await refreshAgent(makeAgent(), { fetchImpl, sleep: noSleep, rng: fixedRng });
 
     expect(fetchImpl).toHaveBeenCalledTimes(2);
-    expect(mockUpdateTokens).toHaveBeenCalledTimes(1);
+    expect(mockRecordTokenFailure).toHaveBeenCalledWith("igor", 0, true, expect.stringContaining("ECONNRESET"));
+    expect(mockUpdateTokens).toHaveBeenCalledWith("igor", TOKEN_OK.access_token, TOKEN_OK.refresh_token, TOKEN_OK.expires_in);
     expect(mockNotify).not.toHaveBeenCalled();
   });
 });

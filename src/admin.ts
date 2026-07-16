@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import yaml from "js-yaml";
-import { getAgents, getAccessToken, type AgentConfig } from "./agents.js";
+import { getAgents, getAccessToken, getTokenStatus, getAllTokenStatuses, recordTokenFailure, type AgentConfig } from "./agents.js";
 import type { AgentQueue } from "./queue/index.js";
 import type { PendingWorkBag, BagEntry } from "./bag/index.js";
 import type { SessionTracker } from "./bag/index.js";
@@ -16,11 +16,15 @@ import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import type { ObservationStore, ReasonCode, MetricSummary } from "./store/observation-store.js";
 import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forensics.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
-import { setStateAtomic, loadWorkflowRegistry } from "./workflow-gate.js";
+import { setStateAtomic, loadWorkflowRegistry, resetWorkflowCache } from "./workflow-gate.js";
+import { instanceConfigRoot } from "./instance-config.js";
+import { retryApply } from "./proposal/apply-pipeline.js";
+import type { ProposalStore } from "./store/proposal-store.js";
+import { toConsoleView } from "./proposal/proposal-console-view.js";
 import { parseSlaToMs } from "./barrier.js";
 import { computeDispatchHealth } from "./dispatch-health.js";
 import { getFirstActionLadder } from "./first-action-watchdog-state.js";
-import type { DispatchAckEntry } from "./bag/dispatch-ack-tracker.js";
+import type { DispatchAckEntry, AckStatus } from "./bag/dispatch-ack-tracker.js";
 import { recaptureAc } from "./ac-record-store.js";
 import type { MutationAuditStore } from "./store/mutation-audit-store.js";
 import { getStatus as getConfigHealthStatus } from "./config-health.js";
@@ -58,6 +62,8 @@ interface AdminDeps {
   forensicsDiagnosticsDir?: string;
   /** AI-1954: mutation audit log for admin ops attribution. */
   mutationAuditStore?: MutationAuditStore;
+  /** AI-2039: learning-loop proposal queue + apply-outcome store (C4/C5 console). */
+  proposalStore?: ProposalStore;
 }
 
 type Severity = "green" | "yellow" | "red" | "gray";
@@ -328,6 +334,7 @@ function buildDashboard(deps: AdminDeps) {
         linearUserId: agent.linearUserId ? `…${agent.linearUserId.slice(-8)}` : "Not mapped",
         openclawAgent: agent.openclawAgent ?? agent.name,
         host: agent.host ?? "local",
+        status: agent.status ?? "active",
       })),
       agentMappings: agentRows.map((agent) => ({
         name: agent.name,
@@ -511,6 +518,50 @@ export function createAdminRouter(deps: AdminDeps): Router {
       res.json({ workflows: [], error: err instanceof Error ? err.message : String(err) });
     }
   });
+  // ── AI-2039 (P4-C4/C5): learning-loop proposal review queue ──────────────
+  // GET lists the queue for the /admin/proposals console; POST retry-apply is
+  // the operator's retry affordance on an apply-failed proposal (AC4.8). Both
+  // return JSON; a missing store yields an empty queue rather than a 5xx so the
+  // console degrades gracefully before C3 begins writing proposals.
+  // Flatten each stored ProposalRow into the console SPA's flat wire shape
+  // (AI-2201): the SPA normalizer reads top-level title/workflowId/diffs/etc.
+  // that live nested under `proposal.*` in the store. The API owns the shape
+  // contract so the SPA stays ignorant of the store's internal nesting.
+  router.get("/api/proposals", (_req: Request, res: Response) => {
+    const store = deps.proposalStore;
+    res.json({ proposals: store ? store.list().map(toConsoleView) : [] });
+  });
+
+  router.post("/api/proposals/:id/retry-apply", async (req: Request, res: Response) => {
+    const store = deps.proposalStore;
+    if (!store) {
+      res.status(503).json({ ok: false, error: "proposal store is not configured" });
+      return;
+    }
+    const row = store.getById(req.params.id);
+    if (!row || !row.proposal) {
+      res.status(404).json({ ok: false, error: "unknown proposal" });
+      return;
+    }
+    try {
+      const configRoot = instanceConfigRoot();
+      const observationStore = deps.observationStore;
+      const result = await retryApply(row.proposal, {
+        configRoot,
+        store,
+        captureMetrics: () => ({
+          snapshot: observationStore ? observationStore.metrics({}) : {},
+          window: { since: row.updatedAt, until: new Date().toISOString() },
+        }),
+        reloadWorkflowDefs: resetWorkflowCache,
+        now: () => Date.now(),
+      });
+      res.status(result.status === "apply-failed" ? 502 : 200).json({ ok: result.status === "applied", ...result });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   // Alert feed from alerts.db (docs/alert-bus.md) — what has been pushed,
   // folded, or stored silently.
   router.get("/api/alerts", (req: Request, res: Response) => {
@@ -773,58 +824,24 @@ export function createAdminRouter(deps: AdminDeps): Router {
     res.json({ workflows, tickets });
   });
 
-  // AI-1800 AC4: Dispatches sub-view — grouped by wake_id.
-  router.get("/api/dispatches", (_req: Request, res: Response) => {
-    if (!deps.operationalEventStore) {
-      res.json({ label: "Dispatch cycles", cycles: [] });
+  // AI-2142: Filterable dispatch history — flat list from the ack tracker
+  // with optional agent/outcome/limit query params. Replaces the old
+  // wake_id-grouped cycles view (AI-1800 AC4).
+  router.get("/api/dispatches", (req: Request, res: Response) => {
+    if (!deps.ackTracker) {
+      res.json({ dispatches: [] });
       return;
     }
-    const allEvents = deps.operationalEventStore.query({ limit: 500 });
-    const byWakeId = new Map<string, { agent_id: string; dispatches: Array<{ ticket_id: string; dispatched_at: string; ack_status: string; attempt_count: number; canon_version?: string }> }>();
-
-    for (const ev of allEvents) {
-      if (!ev.wakeId) continue;
-      const ticketId = ev.key?.startsWith("linear-") ? ev.key.slice(7) : ev.key ?? '';
-      if (!byWakeId.has(ev.wakeId)) {
-        byWakeId.set(ev.wakeId, { agent_id: ev.agent ?? '', dispatches: [] });
-      }
-      const group = byWakeId.get(ev.wakeId)!;
-      if (!group.dispatches.some((d) => d.ticket_id === ticketId)) {
-        // AI-1848: extract canon version stamped into the dispatch record detail.
-        const detail = ev.detail as Record<string, unknown> | null;
-        const canonVersion = typeof detail?.canonVersion === "string" ? detail.canonVersion : undefined;
-        group.dispatches.push({
-          ticket_id: ticketId,
-          dispatched_at: ev.occurredAt,
-          ack_status: 'pending',
-          attempt_count: 1,
-          ...(canonVersion ? { canon_version: canonVersion } : {}),
-        });
-      }
-    }
-
-    // Cross-reference with ackTracker for accurate ack_status/attempt_count.
-    if (deps.ackTracker) {
-      const acks = deps.ackTracker.listRecent(500);
-      for (const group of byWakeId.values()) {
-        for (const d of group.dispatches) {
-          const match = acks.find((a) => a.ticketId === d.ticket_id && a.agentId === group.agent_id);
-          if (match) {
-            d.ack_status = match.ackStatus;
-            d.attempt_count = match.attemptCount;
-            d.dispatched_at = match.dispatchedAt;
-          }
-        }
-      }
-    }
-
-    const cycles = Array.from(byWakeId.entries()).map(([wake_id, group]) => ({
-      wake_id,
-      agent_id: group.agent_id,
-      dispatches: group.dispatches,
-    }));
-
-    res.json({ label: "Dispatch cycles", cycles });
+    const agentId = typeof req.query.agent === "string" ? req.query.agent : undefined;
+    const outcomeRaw = typeof req.query.outcome === "string" ? req.query.outcome : undefined;
+    const validStatuses = ["pending", "acknowledged", "unconfirmed", "escalated", "deferred"];
+    const ackStatus = outcomeRaw && validStatuses.includes(outcomeRaw)
+      ? (outcomeRaw as AckStatus)
+      : undefined;
+    const limitRaw = typeof req.query.limit === "string" ? Number.parseInt(req.query.limit, 10) : undefined;
+    const limit = Number.isFinite(limitRaw ?? NaN) && (limitRaw ?? 0) > 0 ? limitRaw : undefined;
+    const dispatches = deps.ackTracker.listFiltered({ agentId, ackStatus, limit });
+    res.json({ dispatches });
   });
 
   // AI-1800 AC5: Per-ticket detail — state transitions with wake cycles.
@@ -1317,6 +1334,249 @@ export function createAdminRouter(deps: AdminDeps): Router {
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ success: false, error: msg });
     }
+  });
+
+  // ── AI-1908 / AI-2139 #2: per-agent token status ───────────────────────
+  // Exposes the persisted token state (lastRefreshOkAt, expiresAt, lastFailure,
+  // derived state) for the console fleet-management panel (AI-1955 AC3).
+  router.get("/api/tokens", (_req: Request, res: Response) => {
+    res.json({ tokens: getAllTokenStatuses() });
+  });
+
+  // AI-1908 / AI-2139 #3: manually trigger a token refresh for one agent.
+  router.post("/api/tokens/:name/refresh", async (req: Request, res: Response) => {
+    const name = req.params.name;
+    const agent = getAgents().find((a) => a.name === name);
+    if (!agent) {
+      res.status(404).json({ ok: false, error: `No agent found with name "${name}"` });
+      return;
+    }
+
+    try {
+      // Dynamic import to avoid pulling token-refresh dependencies at bundle time
+      const { refreshAgent } = await import("./token-refresh.js");
+      await refreshAgent(agent);
+      res.json({ ok: true, token: getTokenStatus(name) });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+
+  // ── AI-2140 / AI-1955 #1: agent metadata write ──────────────────────────
+  // Editable registry metadata (display name, openclawAgent, host, identity
+  // mapping). Does NOT accept secrets/tokens. Rounds through the AES-v2
+  // save() path via updateAgentMetadata(). Returns the updated agent config
+  // and the current RegistryPolicyStatus for post-reload drift surfacing.
+  router.put("/api/agents/:name", async (req: Request, res: Response) => {
+    const body = parseJsonBody(req);
+    if (body === null) {
+      res.status(400).json({ ok: false, error: "Malformed JSON body" });
+      return;
+    }
+
+    const name = req.params.name;
+    if (!name) {
+      res.status(400).json({ ok: false, error: "Agent name is required" });
+      return;
+    }
+
+    const { updateAgentMetadata, getAgent } = await import("./agents.js");
+    const existing = getAgent(name);
+    if (!existing) {
+      res.status(404).json({ ok: false, error: `No agent found with name "${name}"` });
+      return;
+    }
+
+    const meta: {
+      openclawAgent?: string;
+      host?: "ishikawa" | "local";
+      linearUserId?: string;
+      displayName?: string;
+      status?: "active" | "off-linear" | "never-onboarded";
+    } = {};
+
+    if (typeof body.openclawAgent === "string") meta.openclawAgent = body.openclawAgent;
+    if (body.host === "ishikawa" || body.host === "local") meta.host = body.host;
+    if (typeof body.linearUserId === "string") meta.linearUserId = body.linearUserId;
+    if (typeof body.displayName === "string") meta.displayName = body.displayName;
+    if (body.status === "active" || body.status === "off-linear" || body.status === "never-onboarded") {
+      meta.status = body.status;
+    }
+
+    // Reject attempts to write token/secrets fields as a guard.
+    const FORBIDDEN = ["accessToken", "refreshToken", "clientId", "clientSecret", "proxyToken", "proxyUrl", "secretsPath"];
+    for (const key of FORBIDDEN) {
+      if (key in body) {
+        res.status(422).json({ ok: false, error: `Cannot write "${key}" via this endpoint; use the OAuth flow for credentials.` });
+        return;
+      }
+    }
+
+    const updated = updateAgentMetadata(name, meta);
+    if (!updated) {
+      res.status(404).json({ ok: false, error: `Agent "${name}" disappeared during update` });
+      return;
+    }
+
+    // Fetch the registry-policy status after the hot-reload fires.
+    const status = getRegistryPolicyStatus();
+
+    res.json({
+      ok: true,
+      agent: {
+        name: updated.name,
+        displayName: updated.displayName,
+        openclawAgent: updated.openclawAgent,
+        host: updated.host,
+        linearUserId: updated.linearUserId ? `…${updated.linearUserId.slice(-8)}` : null,
+        status: updated.status ?? "active",
+      },
+      registryPolicy: status,
+    });
+  });
+
+  // ── AI-2140 / AI-1955 #4: filterable dispatch ack history ───────────────
+  // Pulls from the dispatch-acks.db (DispatchAckTracker) with optional
+  // agent and/or ackStatus query-param filters, so the console can show
+  // e.g. only pending dispatches for a specific agent.
+  router.get("/api/dispatch-acks", (_req: Request, res: Response) => {
+    const ackStore = deps.ackTracker;
+    if (!ackStore) {
+      res.json({ dispatches: [] });
+      return;
+    }
+
+    const agentId = typeof _req.query.agent === "string" ? _req.query.agent.trim() : undefined;
+    const ackStatusParam = typeof _req.query.outcome === "string" ? _req.query.outcome.trim() : undefined;
+    const validStatuses = ["pending", "acknowledged", "unconfirmed", "escalated", "deferred"];
+    const ackStatus = ackStatusParam && validStatuses.includes(ackStatusParam)
+      ? (ackStatusParam as "pending" | "acknowledged" | "unconfirmed" | "escalated" | "deferred")
+      : undefined;
+    const limitRaw = typeof _req.query.limit === "string" ? Number.parseInt(_req.query.limit, 10) : undefined;
+    const limit = Number.isFinite(limitRaw ?? NaN) ? Math.min(limitRaw!, 1000) : undefined;
+
+    res.json({
+      dispatches: ackStore.listFiltered({ agentId, ackStatus, limit }),
+    });
+  });
+
+  // ── AI-2140 / AI-1955 #5: console-driven onboarding HTTP endpoints ─────
+  // Extends the CLI-only onboard-wizard with HTTP equivalents so the console
+  // can drive the agent setup flow end-to-end. POST /api/onboard/start
+  // creates a partial registry entry and returns the Linear authorize URL;
+  // GET /api/onboard/:name/status polls for token+linearUserId completion.
+  const ONBOARD_INPROGRESS = new Map<string, {
+    createdAt: number;
+    clientId: string;
+    clientSecret: string;
+    authorizeUrl: string;
+  }>();
+
+  router.post("/api/onboard/start", async (req: Request, res: Response) => {
+    const body = parseJsonBody(req);
+    if (body === null) {
+      res.status(400).json({ ok: false, error: "Malformed JSON body" });
+      return;
+    }
+
+    const agentName = typeof body.agentName === "string" ? body.agentName.trim() : "";
+    const clientId = typeof body.clientId === "string" ? body.clientId.trim() : "";
+    const clientSecret = typeof body.clientSecret === "string" ? body.clientSecret.trim() : "";
+    const openclawAgent = typeof body.openclawAgent === "string" ? body.openclawAgent.trim() : undefined;
+    const hostRaw = body.host === "ishikawa" ? "ishikawa" as const : body.host === "local" ? "local" as const : undefined;
+
+    if (!agentName) {
+      res.status(400).json({ ok: false, error: "agentName is required" });
+      return;
+    }
+    if (!clientId || !clientSecret) {
+      res.status(400).json({ ok: false, error: "clientId and clientSecret are required" });
+      return;
+    }
+
+    // Create a partial registry entry so the agent shows up in the dashboard
+    // (even before OAuth completes).
+    const { upsertAgent, getAgent } = await import("./agents.js");
+    const existing = getAgent(agentName);
+    if (existing && existing.accessToken && existing.linearUserId) {
+      res.status(409).json({ ok: false, error: `Agent "${agentName}" is already fully onboarded (has accessToken + linearUserId).` });
+      return;
+    }
+
+    // upsertAgent merges `{...existing, ...config}`, so every field named here
+    // overwrites what is already on the record. The 409 above only rejects a
+    // *fully* onboarded agent (accessToken AND linearUserId), so a partially
+    // onboarded one — access token issued, OAuth callback not yet returned a
+    // linearUserId — falls through to here. Blanking these unconditionally would
+    // overwrite its good access token with "", and syncWorkspaceSecrets would then
+    // publish an empty LINEAR_OAUTH_TOKEN= over its live linear.env, bricking the
+    // agent's Linear access. Carry existing values forward and only default to ""
+    // when there is genuinely nothing to preserve (matches onboard-wizard.ts).
+    upsertAgent({
+      name: agentName,
+      displayName: typeof body.displayName === "string" ? body.displayName : undefined,
+      linearUserId: existing?.linearUserId ?? "",
+      clientId,
+      clientSecret,
+      accessToken: existing?.accessToken ?? "",
+      refreshToken: existing?.refreshToken ?? "",
+      ...(openclawAgent ? { openclawAgent } : {}),
+      ...(hostRaw ? { host: hostRaw } : {}),
+    });
+
+    // Build the Linear OAuth authorize URL (mirrors onboard-wizard.ts).
+    const redirectUri = process.env.LINEAR_REDIRECT_URI ?? "http://localhost:3000/oauth/callback";
+    const stateNonce = crypto.randomBytes(16).toString("hex");
+    const authorizeUrl = `https://linear.app/oauth/authorize?${new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      response_type: "code",
+      state: stateNonce,
+      scope: ["read", "write", "issues:create", "admin"].join(","),
+    }).toString()}`;
+
+    ONBOARD_INPROGRESS.set(agentName, {
+      createdAt: Date.now(),
+      clientId,
+      clientSecret,
+      authorizeUrl,
+    });
+
+    // Cleanup stale sessions after 30 minutes
+    setTimeout(() => {
+      const session = ONBOARD_INPROGRESS.get(agentName);
+      if (session && Date.now() - session.createdAt > 30 * 60 * 1000) {
+        ONBOARD_INPROGRESS.delete(agentName);
+      }
+    }, 30 * 60 * 1000);
+
+    res.json({ ok: true, agentName, authorizeUrl });
+  });
+
+  router.get("/api/onboard/:name/status", async (_req: Request, res: Response) => {
+    const name = _req.params.name;
+    const { getAgent } = await import("./agents.js");
+    const agent = getAgent(name);
+    if (!agent) {
+      res.status(404).json({ ok: false, error: `No agent found with name "${name}"` });
+      return;
+    }
+
+    const hasToken = Boolean(agent.accessToken && agent.accessToken !== "");
+    const hasUserId = Boolean(agent.linearUserId && agent.linearUserId !== "");
+    const completed = hasToken && hasUserId;
+
+    res.json({
+      ok: true,
+      agentName: name,
+      completed,
+      hasToken,
+      hasUserId: agent.linearUserId ? `…${agent.linearUserId.slice(-8)}` : null,
+      inProgress: ONBOARD_INPROGRESS.has(name),
+    });
   });
 
   // ── AI-1986: self-service webhook management ─────────────────────────────

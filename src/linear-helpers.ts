@@ -22,6 +22,11 @@ export const LINEAR_API_URL = "https://api.linear.app/graphql";
 export interface LabelNode {
   id: string;
   name: string;
+  /** AI-2176: true when this label is a Linear label GROUP, not a regular label.
+   *  Only populated by queries that select it; undefined elsewhere. */
+  isGroup?: boolean;
+  /** AI-2176: the parent group of this label, when it is a group child. */
+  parent?: { id: string; name: string } | null;
 }
 
 export interface IssueWithLabels {
@@ -42,33 +47,64 @@ export async function findOrCreateLabel(
   labelName: string,
   authToken: string,
 ): Promise<string | null> {
+  // AI-2176: group-aware resolution + raw GraphQL error surfacing. See the twin
+  // implementation in workflow-gate.ts for the full rationale. A team may model
+  // `state:*` as a Linear label GROUP ("state") with bare-named children; a blind
+  // flat lookup misses the child and a flat create collides with the group-owned
+  // namespace and fail-closes. Fully backwards-compatible with flat colon labels.
+  const colonIdx = labelName.indexOf(":");
+  const groupName = colonIdx > 0 ? labelName.slice(0, colonIdx) : null;
+  const childName = colonIdx > 0 ? labelName.slice(colonIdx + 1) : labelName;
+
   // Look up existing
   const lookupQuery = `
     query TeamLabels($teamId: String!) {
       team(id: $teamId) {
-        labels { nodes { id name } }
+        labels(first: 250) { nodes { id name isGroup parent { id name } } }
       }
     }
   `;
+  let nodes: LabelNode[] = [];
   try {
     const lookupRes = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({ query: lookupQuery, variables: { teamId } }),
     });
-    type LookupResp = { data?: { team?: { labels: { nodes: Array<{ id: string; name: string }> } } } };
+    type LookupResp = { data?: { team?: { labels: { nodes: LabelNode[] } } }; errors?: unknown };
     const lookupData = (await lookupRes.json()) as LookupResp;
-    const existing = (lookupData.data?.team?.labels?.nodes ?? []).find(
-      (n) => n.name === labelName,
-    );
-    if (existing) return existing.id;
+    if (lookupData.errors) {
+      log.warn(`team label lookup GraphQL errors for team=${teamId} label='${labelName}': ${JSON.stringify(lookupData.errors)}`);
+    }
+    nodes = lookupData.data?.team?.labels?.nodes ?? [];
+    // (a) Flat exact match — unchanged behavior.
+    const flat = nodes.find((n) => n.name === labelName && !n.isGroup);
+    if (flat) return flat.id;
+    // (b) Group-child match.
+    if (groupName) {
+      const child = nodes.find(
+        (n) => !n.isGroup && n.parent?.name === groupName && n.name === childName,
+      );
+      if (child) return child.id;
+    }
   } catch (err) {
     log.error(`label lookup failed for ${labelName}: ${err instanceof Error ? err.message : String(err)}`);
     return null;
   }
 
-  // Create
-  const createMutation = `
+  // Create — as a group child when the namespace is group-owned, else flat.
+  const group = groupName ? nodes.find((n) => n.isGroup && n.name === groupName) : undefined;
+  const createName = group ? childName : labelName;
+  const createMutation = group
+    ? `
+    mutation CreateLabel($teamId: String!, $name: String!, $color: String!, $parentId: String!) {
+      issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color, parentId: $parentId }) {
+        success
+        issueLabel { id }
+      }
+    }
+  `
+    : `
     mutation CreateLabel($teamId: String!, $name: String!, $color: String!) {
       issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color }) {
         success
@@ -76,24 +112,76 @@ export async function findOrCreateLabel(
       }
     }
   `;
+  const createVars = group
+    ? { teamId, name: createName, color: "#94a3b8", parentId: group.id }
+    : { teamId, name: createName, color: "#94a3b8" };
   try {
     const createRes = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({
-        query: createMutation,
-        variables: { teamId, name: labelName, color: "#94a3b8" },
-      }),
+      body: JSON.stringify({ query: createMutation, variables: createVars }),
     });
     type CreateResp = {
       data?: { issueLabelCreate?: { success: boolean; issueLabel?: { id: string } } };
+      errors?: unknown;
     };
     const createData = (await createRes.json()) as CreateResp;
     const result = createData.data?.issueLabelCreate;
     if (result?.success && result.issueLabel) {
-      log.info(`created label '${labelName}' in team ${teamId}`);
+      log.info(`created label '${labelName}' in team ${teamId}${group ? ` (child of group '${groupName}')` : ""}`);
       return result.issueLabel.id;
     }
+    // AI-2177: surface the raw failure instead of swallowing it.
+    const errorBody = createData.errors ? JSON.stringify(createData.errors) : "none";
+    log.error(`label create FAIL-CLOSED for '${labelName}' in team ${teamId} (${group ? `child of group '${groupName}'` : "flat"}): success=${result?.success ?? "null"} errors=${errorBody}`);
+
+    // AI-2176 inherited-label fallback (see workflow-gate.ts twin for full rationale).
+    const isInheritedConflict = createData.errors &&
+      Array.isArray(createData.errors) &&
+      createData.errors.some((e: Record<string, unknown>) =>
+        typeof e.message === "string" && e.message.includes("conflicting inherited label"),
+      );
+    if (isInheritedConflict) {
+      log.info(`inherited-label fallback for '${labelName}' on team ${teamId}`);
+      try {
+        const teamsQuery = `query OrgTeams { teams { nodes { id } } }`;
+        const teamsRes = await fetch(LINEAR_API_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: authToken },
+          body: JSON.stringify({ query: teamsQuery }),
+        });
+        const teamsData = (await teamsRes.json()) as {
+          data?: { teams?: { nodes: Array<{ id: string }> } };
+        };
+        const teamIds = teamsData.data?.teams?.nodes?.map((t) => t.id).filter((id) => id !== teamId) ?? [];
+        for (const otherTeamId of teamIds) {
+          const otherLabelsQuery = `
+            query OtherTeamLabels($tid: String!) {
+              team(id: $tid) {
+                labels(first: 250) { nodes { id name } }
+              }
+            }
+          `;
+          const otherRes = await fetch(LINEAR_API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: authToken },
+            body: JSON.stringify({ query: otherLabelsQuery, variables: { tid: otherTeamId } }),
+          });
+          const otherData = (await otherRes.json()) as {
+            data?: { team?: { labels: { nodes: Array<{ id: string; name: string }> } } };
+          };
+          const match = otherData.data?.team?.labels?.nodes?.find((l) => l.name === labelName);
+          if (match) {
+            log.info(`inherited-label fallback found '${labelName}' as id=${match.id} on team ${otherTeamId} (usable on sub-team ${teamId})`);
+            return match.id;
+          }
+        }
+        log.warn(`inherited-label fallback found no org-wide match for '${labelName}' across ${teamIds.length} teams`);
+      } catch (fallbackErr) {
+        log.warn(`inherited-label fallback query failed: ${fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)}`);
+      }
+    }
+
     return null;
   } catch (err) {
     log.error(`label creation failed for ${labelName}: ${err instanceof Error ? err.message : String(err)}`);

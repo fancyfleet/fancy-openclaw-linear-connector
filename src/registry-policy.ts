@@ -20,8 +20,11 @@
  * either file still flip config-health via their own artifact kinds.
  */
 
+import fs from "node:fs";
+import yaml from "js-yaml";
 import { getAgents, onAgentsReloaded, type AgentConfig } from "./agents.js";
-import { getPolicyBodies, type PolicyBody } from "./escalation-gate.js";
+import { getPolicyBodies, type PolicyBody, type CapabilityPolicy } from "./escalation-gate.js";
+import { defaultCapabilityPolicyPath } from "./instance-config.js";
 import { notify } from "./alerts/alert-bus.js";
 import { componentLogger, createLogger } from "./logger.js";
 
@@ -143,8 +146,54 @@ export function getRegistryPolicyStatus(): RegistryPolicyStatus {
   return _status;
 }
 
-/** Wire the check to run now and again on every successful registry hot-reload. */
+/** Resolve the capability policy path (mirrors escalation-gate.ts policyPath()). */
+function syncPolicyPath(): string {
+  return process.env.CAPABILITY_POLICY_PATH ?? defaultCapabilityPolicyPath();
+}
+
+/**
+ * Synchronous startup check — reads the policy YAML synchronously so the
+ * result is available before createApp() returns and /health is queried.
+ * The async path (runRegistryPolicyCheck) remains for hot-reload callbacks.
+ * Never throws — a check failure must not take down the caller.
+ */
+export function runRegistryPolicyCheckSync(trigger: string): RegistryPolicyStatus {
+  try {
+    const policyFile = syncPolicyPath();
+    let bodies: PolicyBody[];
+    try {
+      const raw = fs.readFileSync(policyFile, "utf8");
+      const parsed = yaml.load(raw) as CapabilityPolicy;
+      bodies = parsed.bodies ?? [];
+    } catch {
+      bodies = [];
+    }
+    const { violations, notes } = crossCheckRegistryPolicy(getAgents(), bodies);
+    _status = { lastCheck: new Date().toISOString(), violations, notes };
+
+    if (violations.length > 0) {
+      log.error(`registry⇄policy drift (${trigger}): ${violations.join(" | ")}`);
+      notify({
+        severity: "warning",
+        source: "registry-policy",
+        title: `agents.json and capability-policy disagree — ${violations.length} violation(s)`,
+        detail: violations.join("\n"),
+        dedupKey: "registry-policy|drift",
+      });
+    } else if (bodies.length > 0) {
+      log.info(`registry⇄policy check clean (${trigger}): ${bodies.length} bodies asserted` +
+        (notes.length ? ` — notes: ${notes.join("; ")}` : ""));
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.error(`registry⇄policy check failed to run (${trigger}): ${msg}`);
+    _status = { lastCheck: new Date().toISOString(), violations: [`check failed to run: ${msg}`], notes: [] };
+  }
+  return _status;
+}
+
+/** Wire the check to run now (sync) and again on every successful registry hot-reload. */
 export function startRegistryPolicyCheck(): void {
-  void runRegistryPolicyCheck("startup");
+  runRegistryPolicyCheckSync("startup");
   onAgentsReloaded(() => void runRegistryPolicyCheck("agents.json reload"));
 }

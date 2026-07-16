@@ -12,7 +12,7 @@
 
 ```bash
 # 1. Clone and install
-git clone https://github.com/fancymatt/fancy-openclaw-linear-connector.git
+git clone https://github.com/fancyfleet/fancy-openclaw-linear-connector.git
 cd fancy-openclaw-linear-connector
 npm install
 

@@ -21,6 +21,8 @@ import fs from "node:fs";
 import yaml from "js-yaml";
 import { createLogger, componentLogger } from "./logger.js";
 import { defaultCapabilityPolicyPath } from "./instance-config.js";
+import { getLinearUserIdForAgent } from "./agents.js";
+import type { OperationalEventInput } from "./store/operational-event-store.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "rescue-sweep");
 
@@ -72,8 +74,9 @@ export interface RescueSweepOptions {
   workflowRegistry?: Map<string, WorkflowDef>;
   /** Capability policy path override for tests */
   capabilityPolicyPath?: string;
-  /** Operational event store for emitting rescue events (optional; skipped if absent) */
-  operationalEventStore?: { record(event: { outcome: string; type?: string; detail?: unknown }): unknown };
+  /** Operational event store for emitting rescue events (optional; skipped if absent).
+   * Structural subset of OperationalEventStore so tests can inject a lightweight mock. */
+  operationalEventStore?: { append(event: OperationalEventInput): unknown };
   /** Report issue identifier (e.g. "AI-1234") to post summary comment to */
   reportIssueIdentifier?: string;
   /**
@@ -87,6 +90,17 @@ export interface RescueSweepOptions {
    * for grace-window assertions.
    */
   nowMs?: number;
+  /**
+   * Resolver: given a capability-policy body id (a short agent name, e.g. "cra"), return the
+   * Linear user UUID for that body, or null if it cannot be resolved. Defaults to
+   * `getLinearUserIdForAgent` from agents.ts. Inject in tests for isolation.
+   *
+   * AI-1981: the sweep compares candidates against `ticket.delegateId` (a Linear UUID) and
+   * passes them straight to `setDelegate` (which requires a UUID). The capability policy keys
+   * bodies by short name, so without this translation every role-constrained ticket looks
+   * "drifted" and every corrective `setDelegate` is rejected with `delegateId must be a UUID`.
+   */
+  bodyIdToLinearUserId?: (bodyId: string) => string | null;
 }
 
 // ── Internal types ─────────────────────────────────────────────────────────
@@ -121,7 +135,9 @@ interface FetchedTicket extends SweepTicket {
  * @param labels            Label names on the ticket
  * @param delegateId        Current delegate Linear user ID, or null
  * @param workflowDef       The WorkflowDef for this ticket's wf:* workflow (already resolved)
- * @param roleBodiesForRole Resolver: given a role id, returns body ids that fill it
+ * @param roleBodiesForRole Resolver: given a role id, returns the valid delegate identifiers
+ *                          for that role — Linear user UUIDs in production (see
+ *                          buildRoleResolver), compared directly against `delegateId`.
  */
 export function classifyTicket(
   labels: string[],
@@ -162,11 +178,39 @@ function loadCapabilityPolicy(policyPath: string): CapabilityPolicy | null {
   }
 }
 
-function buildRoleResolver(policy: CapabilityPolicy | null): (roleId: string) => string[] {
+/**
+ * Build a resolver mapping a role id to the Linear user UUIDs of the bodies that fill it.
+ *
+ * AI-1981: the capability policy keys bodies by short name (e.g. "cra"), but the sweep
+ * compares against `ticket.delegateId` (a Linear UUID) and feeds candidates to `setDelegate`
+ * (which requires a UUID). So each body id is translated to its Linear user UUID here — once,
+ * at build time — rather than leaking short names into the classifier comparison or the
+ * mutation. A body that cannot be resolved falls back to its raw id (so a single unmapped body
+ * does not silently shrink a role and mis-classify its correctly-delegated siblings) and is
+ * WARN-logged, since delegate mutations for it will fail until the mapping is fixed.
+ */
+function buildRoleResolver(
+  policy: CapabilityPolicy | null,
+  bodyIdToLinearUserId: (bodyId: string) => string | null,
+): (roleId: string) => string[] {
   if (!policy?.bodies) return () => [];
   const bodies = policy.bodies;
+
+  // Resolve body id → Linear user UUID once. Warn on any unmapped body.
+  const resolved = new Map<string, string>();
+  for (const b of bodies) {
+    const uuid = bodyIdToLinearUserId(b.id);
+    if (!uuid) {
+      log.warn(
+        `rescue-sweep: no Linear user id for body "${b.id}"; falling back to raw id — ` +
+          `delegate mutations for this body will fail until it is mapped in agents config`,
+      );
+    }
+    resolved.set(b.id, uuid ?? b.id);
+  }
+
   return (roleId: string) =>
-    bodies.filter((b) => b.fills_roles?.includes(roleId)).map((b) => b.id);
+    bodies.filter((b) => b.fills_roles?.includes(roleId)).map((b) => resolved.get(b.id)!);
 }
 
 // ── Linear API helpers ─────────────────────────────────────────────────────
@@ -257,8 +301,13 @@ async function setDelegate(ticketId: string, delegateId: string, authToken: stri
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({ query: mutation, variables: { id: ticketId, delegateId } }),
     });
-    type Resp = { data?: { issueUpdate?: { success: boolean } } };
+    type Resp = { data?: { issueUpdate?: { success: boolean } }; errors?: Array<{ message: string }> };
     const data = (await res.json()) as Resp;
+    // GraphQL errors come back HTTP 200 with an `errors` array and no data — log them so the
+    // per-ticket failure reason (e.g. "delegateId must be a UUID") is visible in journald.
+    if (data.errors?.length) {
+      log.error(`setDelegate failed for ${ticketId} (delegateId=${delegateId}): ${data.errors.map((e) => e.message).join("; ")}`);
+    }
     return data.data?.issueUpdate?.success ?? false;
   } catch (err) {
     log.error(`setDelegate failed for ${ticketId}: ${err instanceof Error ? err.message : String(err)}`);
@@ -278,8 +327,11 @@ async function applyLabelIds(ticketId: string, labelIds: string[], authToken: st
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({ query: mutation, variables: { id: ticketId, labelIds } }),
     });
-    type Resp = { data?: { issueUpdate?: { success: boolean } } };
+    type Resp = { data?: { issueUpdate?: { success: boolean } }; errors?: Array<{ message: string }> };
     const data = (await res.json()) as Resp;
+    if (data.errors?.length) {
+      log.error(`applyLabelIds failed for ${ticketId}: ${data.errors.map((e) => e.message).join("; ")}`);
+    }
     return data.data?.issueUpdate?.success ?? false;
   } catch (err) {
     log.error(`applyLabelIds failed for ${ticketId}: ${err instanceof Error ? err.message : String(err)}`);
@@ -305,6 +357,7 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
     operationalEventStore,
     labelNameToId: injectedLabelNameToId,
     nowMs,
+    bodyIdToLinearUserId = (id: string) => getLinearUserIdForAgent(id) ?? null,
   } = options;
 
   const graceMsRaw = parseInt(process.env.RESCUE_MALFORMED_GRACE_MS ?? "300000", 10);
@@ -327,7 +380,7 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
     process.env.CAPABILITY_POLICY_PATH ??
     defaultCapabilityPolicyPath();
   const policy = loadCapabilityPolicy(resolvedPolicyPath);
-  const roleBodiesForRole = buildRoleResolver(policy);
+  const roleBodiesForRole = buildRoleResolver(policy, bodyIdToLinearUserId);
 
   // Fetch all wf:* tickets
   let rawTickets: FetchedTicket[] = [];
@@ -414,8 +467,8 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
 
     // Emit operational event for all outcomes — failed rescues are pillar-1 violations
     if (rescueAction.outcome === "rescued" || rescueAction.outcome === "ambiguous" || rescueAction.outcome === "failed") {
-      operationalEventStore?.record({
-        outcome: `rescue:${rescueAction.outcome}`,
+      operationalEventStore?.append({
+        outcome: `rescue:${rescueAction.outcome}` as OperationalEventInput["outcome"],
         type: "rescue",
         detail: {
           ticketId: ticket.id,

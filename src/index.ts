@@ -1,4 +1,4 @@
-import 'dotenv/config';
+import './bootstrap-env.js'; // AI-2263: load .env + seed state-dir defaults before any store module reads them
 import express, { Request, Response, NextFunction } from "express";
 import { createWebhookRouter } from "./webhook/index.js";
 import { handleProxyRequest } from "./proxy.js";
@@ -25,16 +25,22 @@ import { normalizeSessionKey } from "./session-key.js";
 import { applyEngagementStatus } from "./engagement-status.js";
 import { createAdminRouter } from "./admin.js";
 import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, STALE_CLASS_NAMES, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
-import { registerDistillationCron } from "./cron/p4-metrics-distillation.js";
+import { checkLinearIssueRouting } from "./linear-actionable.js";
+import { assertDispatchTargetFetchable } from "./delivery/index.js";
+import { markDispatchIntegrityGateActive, getDispatchIntegrityState } from "./dispatch-integrity-state.js";
+import { registerDistillationCron, createProdGenerationContext } from "./cron/p4-metrics-distillation.js";
 import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
 import { registerBootstrapReconciliationCron } from "./bootstrap-reconciliation-sweep.js";
 import { registerDelegationReconciliationCron, runDelegationReconciliationSweep } from "./delegation-reconciliation-sweep.js";
+import { registerRegistryIntegrityCron } from "./registry-integrity-cron.js";
 import { getAlertBus } from "./alerts/alert-bus.js";
 import { registerSlaSweepCron } from "./sla-sweep.js";
 import { registerOobReconcileCron } from "./oob-reconcile-sweep.js";
 import { MutationAuditStore } from "./store/mutation-audit-store.js";
 import { DispatchIdempotencyStore } from "./store/dispatch-idempotency-store.js";
+import { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
+import { ProposalStore } from "./store/proposal-store.js";
 import { clearAcRecordStore } from "./ac-record-store.js";
 import { getRegisteredCrons } from "./cron/registry.js";
 import { getRescueSweepState } from "./rescue-sweep-state.js";
@@ -44,15 +50,16 @@ import { LINEAR_API_URL } from "./linear-helpers.js";
 import { getCapabilityPolicy } from "./escalation-gate.js";
 import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
 import { onAlert as onConfigHealthAlert } from "./config-health.js";
-import { startRegistryPolicyCheck } from "./registry-policy.js";
+import { getRegistryPolicyStatus, startRegistryPolicyCheck } from "./registry-policy.js";
 import { resolveStartupCommit } from "./startup-commit.js";
-import { getAccessToken, getAgent, getLinearUserIdForAgent } from "./agents.js";
+import { getAccessToken, getAgent, getLinearUserIdForAgent, getAllTokenStatuses, isPolledForLinear } from "./agents.js";
 import { loadUniversalCanon, getCanonLiveness } from "./policy/universal-canon.js";
 import { loadRoster, getRoutingFunctionaryLiveness } from "./department-roster.js";
 import { createGuidanceRouter, getDocsLiveness } from "./docs/guidance-router.js";
 import type { StaleSessionDetail } from "./bag/session-tracker.js";
 import crypto from "crypto";
 import path from "path";
+import { resolveStatePath } from "./state-dir.js";
 
 const log = componentLogger(createLogger(), "server");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3100;
@@ -122,6 +129,51 @@ function parseJsonBody<T extends object>(req: Request): T | null {
   return null;
 }
 
+/**
+ * AI-2091 §1 (AI-2042 canonical) — delivery-time recipient guard for the C4
+ * stale re-poke.
+ *
+ * The re-signal path already re-resolves the delegate at delivery
+ * (`resignalPendingTickets` → `checkLinearIssueRouting`). The C4 stale re-poke
+ * (`processStaleSession` → `deliverMessageToAgent(stale.agentId, …)`) was the one
+ * delivery-time path that fired to the ARM-TIME agentId without rechecking the
+ * ticket's CURRENT delegate. If the delegate changes during a stall, the re-poke
+ * wakes an agent with no relationship to the ticket — the AI-1774→Igor live
+ * capture, and the AI-2042 wrong-agent class in general.
+ *
+ * This gate resolves the recipient against the ticket's current delegate at
+ * delivery: it returns false (drop the re-poke) whenever the stale agent is no
+ * longer the delegate — delegate changed, cleared/handed back, or the ticket is
+ * a phantom that no longer exists. A confirmed mismatch drops; a transient Linear
+ * error fails open (re-poke proceeds) so a hiccup can't silently strand a genuine
+ * stall. The `check` param is injectable for tests; production defaults to the
+ * shared `checkLinearIssueRouting` delegate resolution consulted exactly once.
+ */
+export async function staleRePokeRecipientValid(
+  sessionKey: string,
+  agentId: string,
+  check: (
+    sessionKey: string,
+    agentId: string,
+    routingReason: "delegate",
+  ) => Promise<boolean> = async (sk, aid, reason) =>
+    (await checkLinearIssueRouting(sk, aid, reason)).actionable,
+): Promise<boolean> {
+  try {
+    return await check(sessionKey, agentId, "delegate");
+  } catch (err) {
+    // Transient failure verifying the current delegate — fail open so a real
+    // stall re-poke isn't dropped by a Linear hiccup. A CONFIRMED mismatch
+    // (check resolves false) still drops the wrong-agent wake.
+    log.warn(
+      `stale re-poke delegate recheck errored for ${sessionKey} → ${agentId}; failing open: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return true;
+  }
+}
+
 export interface CreateAppOptions {
   /** Override PendingWorkBag database path (for testing). */
   bagDbPath?: string;
@@ -139,6 +191,10 @@ export interface CreateAppOptions {
   mutationAuditDbPath?: string;
   /** Override DispatchIdempotencyStore database path (for testing). AI-1918. */
   idempotencyDbPath?: string;
+  /** Override DispatchLeaseStore database path (for testing). AI-2350. */
+  dispatchLeaseDbPath?: string;
+  /** Override ProposalStore database path (for testing). AI-2039. */
+  proposalsDbPath?: string;
   /** Override forensics diagnostics base directory (for testing, AI-1953). */
   forensicsDiagnosticsDir?: string;
   /**
@@ -184,7 +240,7 @@ export function createApp(options?: CreateAppOptions) {
   // validation. ILL fleet runs the main branch and is unaffected.
   // AI-1860: per-app authorization snapshot map — fresh per createApp() call so
   // test isolation is guaranteed and snapshots never outlive the app instance.
-  const commandAuthSnapshots = new Map<string, { snapshotDelegateId: string | null; snapshotState: string | null; expiresAt: number }>();
+  const commandAuthSnapshots = new Map<string, { snapshotDelegateId: string | null; snapshotState: string | null; snapshotTicketDelegate: string | null; expiresAt: number }>();
 
   app.post("/proxy/graphql", (req, res) => handleProxyRequest(req, res, {
     observationStore,
@@ -261,6 +317,7 @@ export function createApp(options?: CreateAppOptions) {
       commit: getStartupCommit(),
       agents: agents.length,
       agentNames: agents.map((a) => a.name),
+      offLinearAgentNames: agents.filter((a) => !isPolledForLinear(a)).map((a) => a.name),
       // AI-1810: live scheduling state. Every periodic/background driver
       // registers at the moment its timer is created; an expected driver
       // missing from this list means it shipped without bootstrap wiring
@@ -289,6 +346,13 @@ export function createApp(options?: CreateAppOptions) {
       // the live dispatch path (routeEventAll), observable at ac-validate without
       // waiting for a webhook to arrive.
       routingFunctionary: getRoutingFunctionaryLiveness(),
+      // AI-2091 §9 (AI-1808 addendum): dispatch-integrity gate liveness. Each of
+      // the four gates (delivery-time recipient resolution, phantom fetchability,
+      // wake→session dedup, pre-mutation compare-and-swap) reports `active: true`
+      // only because createApp wired it onto the production dispatch path — never
+      // a hardcoded literal — so the wiring is observable at /health without
+      // waiting for a live misroute. Closes the AI-1808 dead-code-in-prod risk.
+      dispatchIntegrity: getDispatchIntegrityState(),
       // AI-1918: dispatch idempotency liveness — confirms the dedup/stale-guard
       // layer is active, observable at ac-validate without waiting for a real
       // duplicate event.
@@ -299,6 +363,9 @@ export function createApp(options?: CreateAppOptions) {
         delegateChangeCleared: idempotencyStore.counters.delegateChangeCleared,
         ttlExpiredAdmits: idempotencyStore.counters.ttlExpiredAdmits,
       },
+      // AI-2359: registry⇄policy cross-check — surfaces unregistered bodies
+      // at /health so a steward can detect agent-drop gaps without log access.
+      registryPolicy: getRegistryPolicyStatus(),
       // AI-1872: workflow registry liveness — exposes the loaded workflow defs
       // (id → {version, states}) so ac-validate can confirm the updated def
       // is live without waiting for a dispatch trigger.
@@ -307,6 +374,11 @@ export function createApp(options?: CreateAppOptions) {
       // check ran on load (migratedCount 0 allowed), observable at ac-validate
       // without waiting for a def change.
       workflowMigrations: getDefStateMigrationLiveness(),
+      // AI-1908 AC5: per-agent OAuth token status. Exposes lastRefreshOkAt,
+      // expiresAt (from the real expires_in, not assumed ~24h), lastFailure,
+      // and a computed state (healthy/stale/expired/failing). Powers the
+      // console token panel (AI-1955 AC3) and operator triage without log access.
+      tokens: getAllTokenStatuses(),
     });
   });
 
@@ -327,6 +399,11 @@ export function createApp(options?: CreateAppOptions) {
   const enrolledTicketsStore = new EnrolledTicketsStore(options?.enrolledTicketsDbPath);
   const mutationAuditStore = new MutationAuditStore(options?.mutationAuditDbPath);
   const idempotencyStore = new DispatchIdempotencyStore(options?.idempotencyDbPath);
+  const dispatchLeaseStore = new DispatchLeaseStore(options?.dispatchLeaseDbPath);
+  // AI-2039 (P4-C4): learning-loop proposal queue + apply-outcome store. Backs
+  // the /admin/api/proposals review console (C5) and the apply pipeline's
+  // idempotency/retry surface (AC4.8).
+  const proposalStore = new ProposalStore(options?.proposalsDbPath);
   const agentQueue = new AgentQueue(options?.agentQueueDbPath);
   const bag = new PendingWorkBag(options?.bagDbPath);
   const wakeConfig = {
@@ -348,6 +425,10 @@ export function createApp(options?: CreateAppOptions) {
       ...wakeConfig,
       hooksUrl: cfg?.hooksUrl ?? wakeConfig.hooksUrl,
       hooksToken: cfg?.hooksToken ?? wakeConfig.hooksToken,
+      // AI-2420: per-agent gateway-API target (never a global URL — multi-gateway
+      // fleet). When set, delivery prefers the x-openclaw-session-key path.
+      gatewayUrl: cfg?.gatewayUrl,
+      gatewayToken: cfg?.gatewayToken,
       linearAuthToken,
       // AI-2008: route every real workflow wake through the acknowledged
       // retry/loud-failure layer. Evaluated at dispatch time, so referencing the
@@ -427,20 +508,65 @@ export function createApp(options?: CreateAppOptions) {
       // rather than letting the ticket sit orphaned.
       const ticketId = snapshot.metadata.ticketId;
       const sessionKey = normalizeSessionKey(ticketId);
-      const rePokeMsg =
-        `Your session for ${ticketId.replace(/^linear-/, "")} stalled before producing output. ` +
-        `Resume now and run the pending transition verb to hand off. Do NOT reply HEARTBEAT_OK.`;
-      log.info(`Stale C4 re-poke: re-waking ${stale.agentId} for ${ticketId}`);
-      const delivered = await deliverMessageToAgent(stale.agentId, sessionKey, rePokeMsg, wakeConfigForAgent(stale.agentId));
-      operationalEventStore.append({
-        outcome: delivered.dispatched ? "stale-c4-repoke" : "stale-c4-repoke-failed",
-        agent: stale.agentId,
-        key: sessionKey,
-        sessionKey,
-        deliveryMode: "stale-c4-repoke",
-        attemptCount: 1,
-        errorSummary: delivered.dispatched ? null : "C4 re-poke delivery failed",
+
+      // AI-2091 §2 (G2, AI-2015/AI-2034): delivery-time fetchability preflight.
+      // `linearState` is the current ticket read taken above; a null read that is
+      // a terminal not-found means the ticket is gone — abort the re-poke rather
+      // than wake an agent on a phantom. A transient read failure fails open.
+      const fetchability = assertDispatchTargetFetchable({
+        ticketId: ticketId.replace(/^linear-/, ""),
+        fetchable: linearState != null,
+        // We only positively KNOW terminal-not-found when the recovery classified
+        // the ticket as gone; a bare null read here is treated as transient
+        // (fail-open) so a Linear hiccup can't strand a live stall.
+        terminalNotFound: false,
+        // AI-2389: thread the live state so a Done/Canceled ticket is dropped at
+        // delivery. `linearState` is the recovery read taken above; `.state`
+        // carries {name, type}. This is the stale C4 re-poke path — the one
+        // delivery path lacking the AI-2295 terminal-state liveness drop, and the
+        // exact path whose re-poke of a Done AI-2313 sustained the hourly replay
+        // (its rePokeMsg string below matched the 00:52Z specimen verbatim).
+        liveState: linearState?.state ?? null,
       });
+
+      // AI-2091 §1 (G1, AI-2042): resolve the recipient at DELIVERY time against
+      // the ticket's CURRENT delegate. The arm-time agentId (stale.agentId) may
+      // no longer own the ticket if the delegate changed during the stall —
+      // re-poking it would wake an agent with no relationship to the ticket.
+      const recipientValid = fetchability.dispatch
+        ? await staleRePokeRecipientValid(sessionKey, stale.agentId)
+        : false;
+
+      if (!fetchability.dispatch || !recipientValid) {
+        const reason = !fetchability.dispatch
+          ? fetchability.reason
+          : "delivery-time recipient guard: stale agent is not the current delegate";
+        log.warn(`Stale C4 re-poke DROPPED for ${ticketId} → ${stale.agentId}: ${reason}`);
+        operationalEventStore.append({
+          outcome: "stale-c4-repoke-dropped",
+          agent: stale.agentId,
+          key: sessionKey,
+          sessionKey,
+          deliveryMode: "stale-c4-repoke",
+          attemptCount: 0,
+          errorSummary: reason,
+        });
+      } else {
+        const rePokeMsg =
+          `Your session for ${ticketId.replace(/^linear-/, "")} stalled before producing output. ` +
+          `Resume now and run the pending transition verb to hand off. Do NOT reply HEARTBEAT_OK.`;
+        log.info(`Stale C4 re-poke: re-waking ${stale.agentId} for ${ticketId}`);
+        const delivered = await deliverMessageToAgent(stale.agentId, sessionKey, rePokeMsg, wakeConfigForAgent(stale.agentId));
+        operationalEventStore.append({
+          outcome: delivered.dispatched ? "stale-c4-repoke" : "stale-c4-repoke-failed",
+          agent: stale.agentId,
+          key: sessionKey,
+          sessionKey,
+          deliveryMode: "stale-c4-repoke",
+          attemptCount: 1,
+          errorSummary: delivered.dispatched ? null : "C4 re-poke delivery failed",
+        });
+      }
     }
 
     // 7. Re-signal pending tickets (if any)
@@ -469,6 +595,17 @@ export function createApp(options?: CreateAppOptions) {
     }
   });
   const throttle = new DeliveryThrottle();
+
+  // ── AI-2091 §9 (AI-1808 addendum): dispatch-integrity gate liveness ──────────
+  // Mark each gate active at the point its substrate is wired onto the production
+  // dispatch path, so /health.dispatchIntegrity proves the wiring without waiting
+  // for a live misroute. Never a hardcoded literal — set here, inside createApp,
+  // exactly because bootstrap installed the gate:
+  //  G1 — staleRePokeRecipientValid gates the C4 re-poke in processStaleSession
+  //       (the sessionTracker stale handler wired just above).
+  markDispatchIntegrityGateActive("deliveryTimeRecipientResolution", "C4 re-poke delegate recheck (processStaleSession → staleRePokeRecipientValid)");
+  markDispatchIntegrityGateActive("phantomFetchabilityGate", "delivery-time fetchability preflight (processStaleSession → assertDispatchTargetFetchable)");
+  markDispatchIntegrityGateActive("wakeSessionDedup", "one-wake→one-session claim (resignalPendingTickets → sessionTracker)");
 
   // ── v1.2: Dispatch acknowledgment tracking + early no-activity detection ──
   const ackTracker = new DispatchAckTracker(
@@ -765,7 +902,7 @@ export function createApp(options?: CreateAppOptions) {
   });
 
   // Management console (Phase 3): React SPA + JSON API, session or secret auth.
-  app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, ackTracker, deploymentName: DEPLOYMENT_NAME, enrolledTicketsStore, forensicsDiagnosticsDir: options?.forensicsDiagnosticsDir, mutationAuditStore, wakeConfigForAgent }));
+  app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, ackTracker, deploymentName: DEPLOYMENT_NAME, enrolledTicketsStore, forensicsDiagnosticsDir: options?.forensicsDiagnosticsDir, mutationAuditStore, wakeConfigForAgent, proposalStore }));
 
   app.use("/", createWebhookRouter(
     eventStore,
@@ -796,6 +933,7 @@ export function createApp(options?: CreateAppOptions) {
     enrolledTicketsStore,
     mutationAuditStore,
     idempotencyStore,
+    dispatchLeaseStore,
   ));
 
   // ── v1.1: Session-end callback endpoint ──────────────────────────────
@@ -964,6 +1102,14 @@ export function createApp(options?: CreateAppOptions) {
       }
     }
 
+    // AI-2350: Release dispatch leases for all session-end tickets.
+    if (dispatchLeaseStore) {
+      const released = dispatchLeaseStore.releaseAll(agentId);
+      if (released > 0) {
+        log.info(`Session-end: released ${released} dispatch lease(s) for ${agentId}`);
+      }
+    }
+
     res.json({ ok: true, pendingTickets: allPending.length });
   });
 
@@ -1000,6 +1146,13 @@ export function createApp(options?: CreateAppOptions) {
     getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
   const migrationWakeFn = async (agentName: string, ticketIdentifier: string) => {
     const sessionKey = normalizeSessionKey(ticketIdentifier);
+    // AI-2313: guard against re-dispatch when a session is already live for this (agent, ticket).
+    // The session tracker's stale timeout (25 min) can clean up in-memory state while the
+    // OpenClaw session is still working — a subsequent sweep tick then creates a second session.
+    if (sessionTracker.isActiveForTicket(agentName, sessionKey)) {
+      log.info(`AI-2313 re-dispatch skipped for ${agentName} [${sessionKey}]: session already active (migrationWakeFn)`);
+      return;
+    }
     const agentCfg = getAgent(agentName);
     const deliveryConfig: DeliveryConfig = {
       nodeBin: process.execPath,
@@ -1007,6 +1160,9 @@ export function createApp(options?: CreateAppOptions) {
       hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
       hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
       hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+      // AI-2420: per-agent gateway-API target (never a global URL).
+      gatewayUrl: agentCfg?.gatewayUrl,
+      gatewayToken: agentCfg?.gatewayToken,
     };
     const actionText = `${ticketIdentifier} was migrated to a new workflow state (its previous state was removed by a def change)`;
     const message =
@@ -1021,7 +1177,15 @@ export function createApp(options?: CreateAppOptions) {
     wakeFn: migrationWakeFn,
   });
 
-  return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore };
+  // AI-2359: registry⇄policy cross-check at createApp() time — surfaces
+  // unregistered bodies at /health and alerts on every registry hot-reload.
+  startRegistryPolicyCheck();
+
+  // AI-2359: periodic registry-integrity check — runs daily, cross-checks
+  // capability-policy bodies against agents.json entries and alerts on mismatches.
+  registerRegistryIntegrityCron();
+
+  return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore };
 }
 
 /**
@@ -1074,7 +1238,7 @@ if (isEntryPoint) {
   // the orchestrizer (systemd / Docker restart policy) doesn't keep reviving
   // a zombie instance.
   if (agents.length === 0) {
-    const agentsPath = process.env.AGENTS_FILE ?? path.resolve(process.cwd(), "agents.json");
+    const agentsPath = process.env.AGENTS_FILE ?? resolveStatePath("agents.json");
     const msg = `Fatal: agent roster is empty (AGENTS_FILE=${agentsPath}). Refusing to start — check that the agents file exists and is mounted correctly.`;
     log.error(msg);
     notify({
@@ -1112,12 +1276,15 @@ if (isEntryPoint) {
     startTokenRefresh();
   }
 
-  const { app, agentQueue, bag, sessionTracker, operationalEventStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, mutationAuditStore, enrolledTicketsStore, idempotencyStore } = createApp();
+  const { app, agentQueue, bag, sessionTracker, operationalEventStore, observationStore, proposalStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, mutationAuditStore, enrolledTicketsStore, idempotencyStore, dispatchLeaseStore } = createApp();
 
-  // P4-3: periodic distillation of reject metrics into skill-workshop proposals
-  registerDistillationCron(observationStore);
+  // P4-C3: periodic distillation of reject metrics into the deterministic
+  // generation engine, persisted into the unified C4 store (AI-2070). The prod
+  // context reads real step-guidance surfaces from the instance-config root.
+  registerDistillationCron(observationStore, proposalStore, createProdGenerationContext());
   // AI-1566: periodic rescue sweep — detect and repair dormant/malformed wf:* tickets
-  registerRescueSweepCron();
+  // AI-2093: pass the operationalEventStore so rescue:* outcomes are persisted + queryable.
+  registerRescueSweepCron(operationalEventStore);
 
   // AI-1775: periodic reconciliation sweep — heal wf:* tickets that never
   // enrolled (dropped Issue-update webhook). Safety net for the bootstrap path.
@@ -1129,6 +1296,11 @@ if (isEntryPoint) {
     getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
   const reconciliationWakeFn = async (agentName: string, ticketIdentifier: string) => {
     const sessionKey = normalizeSessionKey(ticketIdentifier);
+    // AI-2313: guard against re-dispatch when a session is already live for this (agent, ticket).
+    if (sessionTracker.isActiveForTicket(agentName, sessionKey)) {
+      log.info(`AI-2313 re-dispatch skipped for ${agentName} [${sessionKey}]: session already active (reconciliationWakeFn)`);
+      return;
+    }
     const agentCfg = getAgent(agentName);
     const deliveryConfig: DeliveryConfig = {
       nodeBin: process.execPath,
@@ -1136,6 +1308,9 @@ if (isEntryPoint) {
       hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
       hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
       hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+      // AI-2420: per-agent gateway-API target (never a global URL).
+      gatewayUrl: agentCfg?.gatewayUrl,
+      gatewayToken: agentCfg?.gatewayToken,
     };
     const actionText = `You were delegated ${ticketIdentifier}`;
     const message =
@@ -1156,6 +1331,7 @@ if (isEntryPoint) {
     authToken: reconciliationAuthToken,
     operationalEventStore,
     wakeFn: reconciliationWakeFn,
+    dispatchLeaseStore,
   });
 
   // AI-2009: first-action watchdog — arm a per-state deadline at dispatch
@@ -1323,6 +1499,7 @@ if (isEntryPoint) {
         ticketIdentifiers,
         since: body?.since,
         until: body?.until,
+        dispatchLeaseStore,
       });
       res.json({ success: true, ...result });
     } catch (err) {
@@ -1335,9 +1512,9 @@ if (isEntryPoint) {
   // their current state exceeds the per-state `sla:` value. Emits a
   // warning-level alert + steward wake per new breach (deduped via SQLite).
   // Managed children are excluded (barrier.ts predicate owns them).
-  const defaultWorkflowDefPath = "config/workflows.yaml";
+  const defaultWorkflowDefPath = resolveStatePath("config", "workflows.yaml");
   const slaWorkflowDefPath = process.env.WORKFLOW_DEFS_DIR ?? process.env.WORKFLOW_DEF_PATH ?? defaultWorkflowDefPath;
-  const slaDataDir = process.env.DATA_DIR ?? "data";
+  const slaDataDir = process.env.DATA_DIR ?? resolveStatePath("data");
   const slaBreachStorePath = process.env.SLA_BREACH_STORE_PATH ?? path.join(slaDataDir, "sla-breaches.db");
   const slaAuthToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
   const slaCadenceMs = process.env.SLA_SWEEP_CADENCE_MS ? parseInt(process.env.SLA_SWEEP_CADENCE_MS, 10) : undefined;
@@ -1352,6 +1529,9 @@ if (isEntryPoint) {
         hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
         hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
         hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+        // AI-2420: per-agent gateway-API target (never a global URL).
+        gatewayUrl: agentCfg?.gatewayUrl,
+        gatewayToken: agentCfg?.gatewayToken,
       };
       const actionText = `SLA breach detected for ${identifier}`;
       const message =
