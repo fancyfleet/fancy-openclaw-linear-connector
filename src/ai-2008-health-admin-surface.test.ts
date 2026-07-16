@@ -100,8 +100,9 @@ describe("AI-2008 — /health + /admin delivery-outcome surface", () => {
     const key = "linear-AI-9200";
     const wakeId = "wake-9200-abc";
     app.operationalEventStore.append({ outcome: "delivery-failed", agent: "igor", key, sessionKey: key, wakeId, attemptCount: 1 });
-    app.operationalEventStore.append({ outcome: "delivery-unconfirmed", agent: "igor", key, sessionKey: key, wakeId, attemptCount: 2 });
-    app.operationalEventStore.append({ outcome: "delivered", agent: "igor", key, sessionKey: key, wakeId, attemptCount: 3 });
+    app.operationalEventStore.append({ outcome: "delivery-pending-ack", agent: "igor", key, sessionKey: key, wakeId, attemptCount: 2 });
+    app.operationalEventStore.append({ outcome: "delivery-unconfirmed", agent: "igor", key, sessionKey: key, wakeId, attemptCount: 3 });
+    app.operationalEventStore.append({ outcome: "delivered", agent: "igor", key, sessionKey: key, wakeId, attemptCount: 4 });
 
     const res = await request(app.app)
       .get("/admin/api/board/ticket/AI-9200")
@@ -115,6 +116,7 @@ describe("AI-2008 — /health + /admin delivery-outcome surface", () => {
       (res.body.dispatch_timeline as Array<{ status: string }>).map((d) => d.status),
     );
     expect(statuses.has("failed")).toBe(true);
+    expect(statuses.has("pending-ack")).toBe(true);
     expect(statuses.has("retrying")).toBe(true);
     expect(statuses.has("delivered")).toBe(true);
   });
