@@ -37,7 +37,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import yaml from "js-yaml";
-import { componentLogger, createLogger } from "./logger.js";
+import { componentLogger, createLogger, type Logger } from "./logger.js";
 import { defaultWorkflowDefPath } from "./instance-config.js";
 import { bodyHasCapability, resolveBodiesForRole } from "./escalation-gate.js";
 import type { ObservationStore } from "./store/observation-store.js";
@@ -79,7 +79,15 @@ import type { OperationalEventStore } from "./store/operational-event-store.js";
  * Design: design.md §4.2, §4.4, §4.6, §11, §13, §16.1, §16.2, and H-6.
  */
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-gate");
+let log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-gate");
+
+/**
+ * AI-2544: Test hook to inject a spy logger for verifying error-payload logging.
+ * Call with no args or undefined to reset to the real logger.
+ */
+export function _setLogForTests(testLogger?: Logger): void {
+  log = testLogger ?? componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-gate");
+}
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 
@@ -4190,7 +4198,12 @@ async function postFanoutSummaryComment(
  * so the transition is all-or-nothing: either the full tuple lands or nothing does.
  *
  * @param delegateId - Linear user ID for the new delegate, or null to skip delegate update.
+ *
+ * AI-2544: Exported as _issueUpdateAtomicForTests so tests can verify log behavior
+ * without going through the full proxy stack. Underscore-prefixed per project convention.
  */
+export const _issueUpdateAtomicForTests = issueUpdateAtomic;
+
 async function issueUpdateAtomic(
   internalId: string,
   labelIds: string[],
@@ -4225,10 +4238,11 @@ async function issueUpdateAtomic(
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({ query: mutation, variables }),
     });
-    type Resp = { data?: { issueUpdate?: { success: boolean } } };
+    type Resp = { data?: { issueUpdate?: { success: boolean } }; errors?: unknown[] };
     const data = (await res.json()) as Resp;
     if (!data.data?.issueUpdate?.success) {
-      log.warn(`workflow-gate: atomic issueUpdate returned non-success for ${internalId}`);
+      const errors = data.errors ? JSON.stringify(data.errors) : "none";
+      log.warn(`workflow-gate: atomic issueUpdate returned non-success for ${internalId}; errors=${errors}`);
       return false;
     }
     return true;
