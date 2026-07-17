@@ -4,19 +4,25 @@ services:
     container_name: linear-connector
     restart: unless-stopped
     ports:
-      - "${PORT:-3000}:3000"
+      - "${PORT:-3000}:3100"
     env_file: .env
     environment:
       DATA_DIR: /data
       SECRETS_DIR: /secrets
       AGENTS_FILE: /config/agents.json
+      LINEAR_CONNECTOR_CONFIG_DIR: /home/appuser/.openclaw/linear-connector
+      WORKFLOW_DEFS_DIR: /home/appuser/.openclaw/linear-connector/workflows
     volumes:
       - ./data:/data
       - ./secrets:/secrets
+      - ~/.openclaw/secrets/linear-connector-encryption-key:/home/fancymatt/.openclaw/secrets/linear-connector-encryption-key:ro
       # AI-1767: Mount the root agents.json (28-agent source of truth) — NOT
       # config/agents.json, which does not exist in the repo. The v1.5.0 deploy
       # pointed at a non-existent path → empty roster → fleet-wide Linear outage.
       - ./agents.json:/config/agents.json:ro
+      # Mount the entire linear-connector config root so the connector can
+      # read workflow defs, capability policy, department roster, etc.
+      - ~/.openclaw/linear-connector:/home/appuser/.openclaw/linear-connector
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
       interval: 30s
