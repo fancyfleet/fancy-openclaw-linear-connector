@@ -2082,9 +2082,52 @@ export async function checkWorkflowRules(
     }
   }
 
-  // §4.6 mode switch: ad-hoc tickets (no wf:* label) are full pass-through.
+  // §4.6 mode switch: ad-hoc tickets (no wf:* label).
+  // INF-35: workflow transition verbs are rejected here — they must not
+  // silently pass through. Only safe verbs (informational, enrollment, or
+  // steward tools that work on any ticket) are allowed to proceed.
+  // Safe verbs:
+  //   - note: informational-only, never mutates state
+  //   - begin-work: the only way to add a wf:* label on an ad-hoc ticket
+  //   - observe-issue: read-only
+  //   - comment: just adds a comment
+  //   - parent: relation verb, not a workflow transition
+  //   - migrate-state: steward tool, handled before checkWorkflowRules
+  //   - rewind: steward break-glass rewind, handled before checkWorkflowRules
+  //   - handoff-work: delegate-routing meta-command, not a def transition
+  //   - set-state: state-setting tool, not a def transition
   const workflowId = getWorkflowId(labels);
-  if (!workflowId) return null;
+  if (!workflowId) {
+    // Break-glass override: a verified steward (workflow:break-glass) may force
+    // transition verbs through even when the ticket has no wf:* label. This covers
+    // the case where the label fetch failed (the ticket might be a workflow ticket
+    // but we can't see its labels) and the steward uses break-glass to push through.
+    if (breakGlassOverride) {
+      log.info(`workflow-gate: break-glass override — allowing '${intent}' on unarmed ticket ${issueId}`);
+      return null;
+    }
+    const safeOnUnarmed = [
+      "note",
+      "begin-work",
+      "observe-issue",
+      "comment",
+      "parent",
+      "migrate-state",
+      "rewind",
+      "handoff-work",
+      "set-state",
+    ];
+    if (!safeOnUnarmed.includes(intent)) {
+      log.warn(`workflow-gate: rejecting '${intent}' on unarmed ticket ${issueId} — no \`wf:*\` label`);
+      return (
+        `[Proxy] '${intent}' is only valid on workflow tickets ` +
+        `(ticket ${issueId} has no \`wf:*\` label). ` +
+        `Use \`linear begin-work ${issueId}\` to enroll the ticket in a workflow, ` +
+        `or \`linear observe-issue ${issueId}\` for read-only inspection.`
+      );
+    }
+    return null;
+  }
 
   // ── Phase 6.5 / H-1: Fail-closed on config-load failure (§16.0) ──────
   if (!breakGlassOverride && !isConfigHealthy()) {
