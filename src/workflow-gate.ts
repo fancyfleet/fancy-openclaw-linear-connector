@@ -47,6 +47,7 @@ import { getAgent, getAgents } from "./agents.js";
 import { executeFanout, shouldTriggerFanout, validateFanoutSpec, type Finding } from "./fanout.js";
 import { onChildTerminal, onManagingEntry, isTerminalState } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
+import { fetchLastCommentByUser } from "./linear-helpers.js";
 import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store.js";
 import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./config-health.js";
 import { captureAc, extractAcFromDescription, removeAcRecord } from "./ac-record-store.js";
@@ -2862,6 +2863,46 @@ export async function checkRawMutationInterception(
       if (isClearingDelegate) {
         log.warn(`workflow-gate: raw delegate null (self-clear) block agent=${bodyId} ticket=${issueId}`);
         return delegateClearRejection();
+      }
+      // AI-2020: verdict-comment gate for feedback-requiring states.
+      // When the current delegate attempts a handoff from a workflow state
+      // whose transitions require feedback, the mutation must be accompanied
+      // by a verdict comment from this caller. The skill CLI posts comments
+      // before the delegate mutation, so the comment already exists on the
+      // ticket. Fail-open on any fetch error.
+      if (def) {
+        const currentStateId = getCurrentState(labels);
+        if (currentStateId) {
+          const stateNode = def.states.find((s) => s.id === currentStateId);
+          const hasFeedbackTransition = stateNode?.transitions?.some(
+            (t) => t.feedback?.required === true,
+          );
+          if (hasFeedbackTransition && callerLinearUserId) {
+            let hasVerdictComment = true;
+            try {
+              const lastComment = await fetchLastCommentByUser(
+                issueId!,
+                callerLinearUserId,
+                authToken,
+              );
+              hasVerdictComment = lastComment !== null;
+            } catch {
+              // Fail-open: transient API failure
+            }
+            if (!hasVerdictComment) {
+              const breakCmd = def.break_glass?.command ?? "escape";
+              log.warn(
+                `workflow-gate: AI-2020 verdict gate — handoff from feedback-requiring state '${currentStateId}' ` +
+                `agent=${bodyId} ticket=${issueId} — no verdict comment found`,
+              );
+              return (
+                `[Proxy] Handoff blocked from state '${currentStateId}' which requires a review verdict. ` +
+                `Post a comment on the ticket explaining your review findings (use --comment on ` +
+                `\`linear handoff-work\`), or use \`linear ${breakCmd} ${issueId}\` to exit the workflow.`
+              );
+            }
+          }
+        }
       }
       return null; // current delegate may re-route (non-null target only)
     }

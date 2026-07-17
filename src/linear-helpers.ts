@@ -343,6 +343,64 @@ export async function issueUpdateLabels(
  *
  * Returns null if the issue is not found or the API call fails.
  */
+export async function fetchLastCommentByUser(
+  identifier: string,
+  linearUserId: string,
+  authToken: string,
+): Promise<{ body: string; createdAt: string } | null> {
+  const query = `
+    query LastCommentByUser($id: String!) {
+      issue(id: $id) {
+        comments(first: 50, orderBy: createdAt) {
+          nodes {
+            body
+            createdAt
+            user {
+              id
+            }
+          }
+        }
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: identifier } }),
+    });
+    type Resp = {
+      data?: {
+        issue?: {
+          comments: {
+            nodes: Array<{ body: string; createdAt: string; user: { id: string } | null }>;
+          };
+        } | null;
+      };
+    };
+    const data = (await res.json()) as Resp;
+    const comments = data.data?.issue?.comments?.nodes ?? [];
+    // Scan newest-to-oldest for the first comment by the specified user
+    // (comments are returned in ascending order by default even with first:50,
+    // so iterate in reverse for newest-first by the target user).
+    for (let i = comments.length - 1; i >= 0; i--) {
+      const node = comments[i];
+      if (node.user?.id === linearUserId && node.body?.trim()) {
+        return { body: node.body, createdAt: node.createdAt };
+      }
+    }
+    return null;
+  } catch (err) {
+    log.warn(`fetchLastCommentByUser failed for ${identifier}: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+/**
+ * Fetch issue labels and team id for label manipulation.
+ *
+ * Returns { internalId, teamId, labels } on success, null on any error.
+ */
 export async function fetchIssueWithLabels(
   identifier: string,
   authToken: string,
