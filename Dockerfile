@@ -8,6 +8,18 @@ WORKDIR /app
 
 COPY package.json package-lock.json ./
 COPY vendor/ vendor/
+
+# prebuild cache warmer: download better-sqlite3 prebuilt binary before npm ci
+# to avoid native compile under QEMU arm64 emulation (hangs indefinitely).
+# Cache path matches prebuild-install's convention so it skips download+compile.
+# See INF-46.
+RUN VERSION=$(node -p "require('./package.json').dependencies['better-sqlite3'].replace(/^[\^~]/, '')") \
+  && ABI=$(node -p "process.versions.modules") \
+  && URL="https://github.com/WiseLibs/better-sqlite3/releases/download/v${VERSION}/better-sqlite3-v${VERSION}-node-v${ABI}-linuxmusl-arm64.tar.gz" \
+  && CACHE_FILE="$(node -p "require('crypto').createHash('sha512').update('${URL}').digest('hex').slice(0, 6)")"-$(echo "better-sqlite3-v${VERSION}-node-v${ABI}-linuxmusl-arm64.tar.gz" | sed 's/[^a-zA-Z0-9.]/-/g') \
+  && mkdir -p /root/.npm/_prebuilds \
+  && curl -fsSL "${URL}" -o "/root/.npm/_prebuilds/${CACHE_FILE}"
+
 RUN npm ci
 
 COPY tsconfig.json ./
@@ -41,6 +53,16 @@ WORKDIR /app
 
 COPY package.json package-lock.json ./
 COPY vendor/ vendor/
+
+# Same prebuild cache warm for the runtime stage (each FROM gets its own
+# layer — builder's cache is not inherited).
+RUN VERSION=$(node -p "require('./package.json').dependencies['better-sqlite3'].replace(/^[\^~]/, '')") \
+  && ABI=$(node -p "process.versions.modules") \
+  && URL="https://github.com/WiseLibs/better-sqlite3/releases/download/v${VERSION}/better-sqlite3-v${VERSION}-node-v${ABI}-linuxmusl-arm64.tar.gz" \
+  && CACHE_FILE="$(node -p "require('crypto').createHash('sha512').update('${URL}').digest('hex').slice(0, 6)")"-$(echo "better-sqlite3-v${VERSION}-node-v${ABI}-linuxmusl-arm64.tar.gz" | sed 's/[^a-zA-Z0-9.]/-/g') \
+  && mkdir -p /root/.npm/_prebuilds \
+  && curl -fsSL "${URL}" -o "/root/.npm/_prebuilds/${CACHE_FILE}"
+
 RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --from=builder /app/dist/ dist/
