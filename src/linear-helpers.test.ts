@@ -24,6 +24,8 @@ interface LabelFixture {
   name: string;
   isGroup?: boolean;
   parent?: { id: string; name: string } | null;
+  /** AI-2557: team ownership for inherited-label filtering. */
+  team?: { id: string };
 }
 
 interface FetchLog {
@@ -39,6 +41,10 @@ function makeFetch(
   labels: LabelFixture[],
   createOutcome: { success: boolean; id?: string; errors?: unknown },
   log: FetchLog,
+  /** AI-2557: override the team.id injected into labels lacking an explicit team.
+   *  Defaults to the teamId arg passed to findOrCreateLabel. Set to a different
+   *  team ID to simulate an inherited parent-team label. */
+  teamFilterOverride?: string,
 ): typeof globalThis.fetch {
   return (async (_url: string, init?: RequestInit) => {
     const bodyText =
@@ -48,8 +54,21 @@ function makeFetch(
           ? init.body.toString()
           : "";
     if (bodyText.includes("TeamLabels")) {
+      // AI-2557: extract the teamId from the query variables so we inject the
+      // correct team ownership into mock labels for inherited-label filtering.
+      let queryTeamId = teamFilterOverride ?? "";
+      if (!queryTeamId) {
+        try {
+          const parsed = JSON.parse(bodyText) as { variables?: Record<string, unknown> };
+          queryTeamId = (parsed.variables?.teamId as string) ?? "";
+        } catch { /* ignore */ }
+      }
+      const enrichedLabels = labels.map((l) => ({
+        ...l,
+        team: l.team ?? (queryTeamId ? { id: queryTeamId } : undefined),
+      }));
       return new Response(
-        JSON.stringify({ data: { team: { labels: { nodes: labels } } } }),
+        JSON.stringify({ data: { team: { labels: { nodes: enrichedLabels } } } }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
@@ -141,6 +160,37 @@ describe("findOrCreateLabel — group-aware resolution (AI-2176)", () => {
     expect(log.createInputs).toHaveLength(1);
     expect(log.createInputs[0]).toMatchObject({ name: "state:product-definition" });
     expect(log.createInputs[0]).not.toHaveProperty("parentId");
+  });
+
+  it("rejects inherited parent-team label and falls through to create (AI-2557)", async () => {
+    // Simulate LIF team looking for a label owned by GEN (parent team).
+    // The label "state:product-definition" exists but its owning team is GEN,
+    // not LIF — pre-fix code would early-return GEN's id, which Linear rejects.
+    globalThis.fetch = makeFetch(
+      [
+        {
+          id: "gen-label-uuid",
+          name: "state:product-definition",
+          // Explicitly set a DIFFERENT team to simulate inherited parent-team label.
+          team: { id: "team-gen" },
+        },
+      ],
+      { success: true, id: "new-lif-label-uuid" },
+      log,
+      // Inject teamFilterOverride that matches the calling team, so the mock labels
+      // show the parent-team ownership for the inherited label.
+      "team-gen",
+    );
+    // Call with team-lif — the inherited label (team-gen) should be rejected.
+    const id = await findOrCreateLabel("team-lif", "state:product-definition", "Bearer t");
+    // Post-fix: inherited label rejected → create fires → new LIF-owned label id.
+    expect(id).toBe("new-lif-label-uuid");
+    // A create must have been attempted (the inherited match was rejected).
+    expect(log.createInputs).toHaveLength(1);
+    expect(log.createInputs[0]).toMatchObject({
+      name: "state:product-definition",
+      teamId: "team-lif",
+    });
   });
 
   it("fail-closes to null AND logs the raw GraphQL errors body on create failure (AI-2177)", async () => {
