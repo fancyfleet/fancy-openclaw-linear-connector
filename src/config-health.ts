@@ -23,7 +23,7 @@ const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "conf
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
-export type ArtifactKind = "workflow-def" | "capability-policy" | "agents";
+export type ArtifactKind = "workflow-def" | "capability-policy" | "agents" | "drift-detector";
 
 export interface ArtifactHealth {
   kind: ArtifactKind;
@@ -70,6 +70,14 @@ const artifactState: Record<ArtifactKind, ArtifactHealth> = {
   },
   agents: {
     kind: "agents",
+    healthy: true,
+    lastSuccess: null,
+    lastFailure: null,
+    lastError: null,
+    consecutiveFailures: 0,
+  },
+  "drift-detector": {
+    kind: "drift-detector",
     healthy: true,
     lastSuccess: null,
     lastFailure: null,

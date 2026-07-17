@@ -21,7 +21,7 @@ import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgent
 import { checkAgentLiveness, type LivenessConfig } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
 import { checkRoleGuardAndBlock, type LinearUserIdResolver } from "../routing-guard.js";
-import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, markAutoEnrollRegistered } from "../workflow-gate.js";
+import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, markAutoEnrollRegistered, invalidateTeamStateCache } from "../workflow-gate.js";
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/index.js";
 import { type WakeUpConfig } from "../bag/wake-up.js";
@@ -337,6 +337,26 @@ export function createWebhookRouter(
               dispatchLeaseStore.renew(leaseAgentId, leaseTicketKey);
             }
           }
+        }
+      }
+
+      // AI-2200: Invalidate team-state cache on Team webhook events.
+      // When a team is created or updated, its workflow states may have changed.
+      // Clearing the per-team cache entry ensures governed transitions on that
+      // team resolve the latest native state IDs without a restart.
+      // Fail-open: never blocks routing; cache invalidation is best-effort.
+      if (event.type === "Team") {
+        const teamData = event.data as Record<string, unknown> | null;
+        const teamId = teamData?.id as string | undefined;
+        if (teamId) {
+          invalidateTeamStateCache(teamId);
+          log.info(`Team event: invalidated state cache for team ${teamId} (action=${event.action})`);
+          appendOperationalEvent(operationalEventStore, {
+            outcome: "team-cache-invalidated",
+            type: event.type,
+            key: teamId,
+            detail: { action: event.action },
+          });
         }
       }
 

@@ -29,6 +29,7 @@ import { checkLinearIssueRouting } from "./linear-actionable.js";
 import { assertDispatchTargetFetchable } from "./delivery/index.js";
 import { markDispatchIntegrityGateActive, getDispatchIntegrityState } from "./dispatch-integrity-state.js";
 import { registerDistillationCron, createProdGenerationContext } from "./cron/p4-metrics-distillation.js";
+import { registerDriftDetectorCron } from "./drift-detector.js";
 import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
 import { registerBootstrapReconciliationCron } from "./bootstrap-reconciliation-sweep.js";
@@ -1186,6 +1187,11 @@ export function createApp(options?: CreateAppOptions) {
   // AI-2359: periodic registry-integrity check — runs daily, cross-checks
   // capability-policy bodies against agents.json entries and alerts on mismatches.
   registerRegistryIntegrityCron();
+
+  // AI-2200: periodic drift detection — compares runtime policy resolution
+  // against on-disk capability policy, alerts on mismatch. Runs every hour by
+  // default (configurable via DRIFT_DETECTOR_INTERVAL env, in ms).
+  registerDriftDetectorCron({ operationalEventStore });
 
   return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore };
 }

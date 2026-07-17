@@ -919,11 +919,37 @@ export function validateFanoutBarrierConfig(def: WorkflowDef): string[] {
 }
 
 // ── AI-1498: Native state resolution cache ────────────────────────────────
-// Maps (teamId, semanticName) → Linear workflow state UUID.
-// Resolved once per team, cached indefinitely. Invalidated on cache reset.
+// Maps teamId → array of team workflow states from Linear API.
+// Resolved once per team, cached with TTL. Invalidated on cache reset,
+// on Team webhook events, and on resolveNativeStateId miss (refetch once).
+// AI-2200: TTL prevents stale caches from blocking newly-created teams from
+// running governed transitions without a restart.
 
-/** Cache: teamId → array of team workflow states from Linear API. */
-let _teamStateCache: Map<string, Array<{ id: string; name: string; type: string }>> = new Map();
+/** Default TTL for team state cache: 30 minutes (configurable via TEAM_STATE_CACHE_TTL_MS env). */
+const DEFAULT_TEAM_STATE_CACHE_TTL_MS = 30 * 60 * 1000;
+
+interface TeamStateCacheEntry {
+  states: Array<{ id: string; name: string; type: string }>;
+  fetchedAt: number;
+}
+
+/** Cache: teamId → cached states with timestamp. */
+let _teamStateCache: Map<string, TeamStateCacheEntry> = new Map();
+
+/** Resolve TTL from env var or default. */
+function teamStateCacheTtlMs(): number {
+  const raw = process.env.TEAM_STATE_CACHE_TTL_MS;
+  if (raw !== undefined) {
+    const parsed = parseInt(raw, 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return DEFAULT_TEAM_STATE_CACHE_TTL_MS;
+}
+
+/** Check if a cache entry is still fresh. */
+function isTeamStateCacheFresh(entry: TeamStateCacheEntry): boolean {
+  return Date.now() - entry.fetchedAt < teamStateCacheTtlMs();
+}
 
 /** Reset the native-state cache (used in tests). */
 export function resetNativeStateCache(): void {
@@ -931,7 +957,15 @@ export function resetNativeStateCache(): void {
 }
 
 /**
- * Fetch a team's workflow states from Linear (with caching).
+ * Invalidate the cache entry for a specific team (AI-2200). Called on Team
+ * webhook events so newly-created or updated teams are resolved on next fetch.
+ */
+export function invalidateTeamStateCache(teamId: string): void {
+  _teamStateCache.delete(teamId);
+}
+
+/**
+ * Fetch a team's workflow states from Linear (with TTL caching).
  * Returns the raw state nodes for the team.
  */
 async function fetchTeamWorkflowStates(
@@ -939,7 +973,10 @@ async function fetchTeamWorkflowStates(
   authToken: string,
 ): Promise<Array<{ id: string; name: string; type: string }>> {
   const cached = _teamStateCache.get(teamId);
-  if (cached) return cached;
+  if (cached && isTeamStateCacheFresh(cached)) return cached.states;
+  if (cached && !isTeamStateCacheFresh(cached)) {
+    log.info(`workflow-gate: TTL expired for team ${teamId}, refetching states`);
+  }
 
   const query = `
     query TeamStates($teamId: String!) {
@@ -963,12 +1000,15 @@ async function fetchTeamWorkflowStates(
     type Resp = { data?: { team?: { states?: { nodes: Array<{ id: string; name: string; type: string }> } } } };
     const data = (await res.json()) as Resp;
     const nodes = data.data?.team?.states?.nodes ?? [];
-    _teamStateCache.set(teamId, nodes);
+    _teamStateCache.set(teamId, { states: nodes, fetchedAt: Date.now() });
     return nodes;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log.warn(`workflow-gate: team state fetch failed for team=${teamId}: ${msg}`);
-    return [];
+    // AI-2200: on fetch failure, retain stale cache if available so existing
+    // teams stay operational. Only clear if we had no prior cache at all.
+    if (!cached) return [];
+    return cached.states;
   }
 }
 
@@ -977,6 +1017,11 @@ async function fetchTeamWorkflowStates(
  * Linear workflow state UUID for the given team. Uses the same SEMANTIC_STATE_MAP
  * candidate-order resolution as the CLI so the proxy and CLI always agree.
  * Returns null if the state cannot be resolved.
+ *
+ * AI-2200: On cache miss (no match found), invalidates the team's cache entry
+ * and refetches once before returning null. This handles the case where a
+ * newly-created team's workflow states were fetched before the team was
+ * fully provisioned (e.g. states added after the initial fetch).
  */
 export async function resolveNativeStateId(
   teamId: string,
@@ -988,15 +1033,44 @@ export async function resolveNativeStateId(
     log.warn(`workflow-gate: resolveNativeStateId: unknown semantic name '${semanticName}'`);
     return null;
   }
-  const states = await fetchTeamWorkflowStates(teamId, authToken);
+
+  // First attempt: use cached (or freshly fetched) states.
+  let states = await fetchTeamWorkflowStates(teamId, authToken);
+  let match = findMatch(states, candidates);
+  if (match) return match;
+
+  // AI-2200: miss-refetch — invalidate the team's cache and try once more.
+  // This catches the case where states were cached before the team was fully
+  // provisioned (e.g. a new team whose workflow states hadn't propagated yet).
+  log.info(
+    `workflow-gate: resolveNativeStateId: no match for '${semanticName}' in team ${teamId}, refetching...`,
+  );
+  _teamStateCache.delete(teamId);
+  states = await fetchTeamWorkflowStates(teamId, authToken);
+  match = findMatch(states, candidates);
+  if (match) {
+    log.info(
+      `workflow-gate: resolveNativeStateId: refetch succeeded for '${semanticName}' in team ${teamId} (cache was stale)`,
+    );
+    return match;
+  }
+
+  log.warn(
+    `workflow-gate: resolveNativeStateId: no match for '${semanticName}' (tried: ${candidates.join(", ")}) in team ${teamId} after refetch`,
+  );
+  return null;
+}
+
+/** Match a semantic name candidate against a list of states (shared helper). */
+function findMatch(
+  states: Array<{ id: string; name: string; type: string }>,
+  candidates: string[],
+): string | null {
   const normalize = (s: string) => s.toLowerCase().replace(/\s+/g, "");
   for (const candidate of candidates) {
     const match = states.find((s) => normalize(s.name) === normalize(candidate));
     if (match) return match.id;
   }
-  log.warn(
-    `workflow-gate: resolveNativeStateId: no match for '${semanticName}' (tried: ${candidates.join(", ")}) in team ${teamId}`,
-  );
   return null;
 }
 
