@@ -7,6 +7,8 @@ const log = componentLogger(createLogger(), "linear-actionable");
 
 const TERMINAL_STATE_TYPES = new Set(["completed", "canceled", "cancelled"]);
 const TERMINAL_STATE_NAMES = new Set(["done", "canceled", "cancelled"]);
+const PARKED_STATE_TYPES = new Set(["backlog"]);
+const PARKED_STATE_NAMES = new Set(["backlog"]);
 
 export function isTerminalIssueState(state: unknown): boolean {
   if (!state || typeof state !== "object") return false;
@@ -14,6 +16,14 @@ export function isTerminalIssueState(state: unknown): boolean {
   const type = typeof record.type === "string" ? record.type.toLowerCase() : "";
   const name = typeof record.name === "string" ? record.name.toLowerCase() : "";
   return TERMINAL_STATE_TYPES.has(type) || TERMINAL_STATE_NAMES.has(name);
+}
+
+export function isParkedIssueState(state: unknown): boolean {
+  if (!state || typeof state !== "object") return false;
+  const record = state as Record<string, unknown>;
+  const type = typeof record.type === "string" ? record.type.toLowerCase() : "";
+  const name = typeof record.name === "string" ? record.name.toLowerCase() : "";
+  return PARKED_STATE_TYPES.has(type) || PARKED_STATE_NAMES.has(name);
 }
 
 export function issueIdentifierFromSessionKey(ticketId: string): string {
@@ -87,11 +97,11 @@ export async function isLinearIssueActionable(ticketId: string, agentId: string)
       return false;
     }
 
-    const terminal = isTerminalIssueState(issue.state);
-    if (terminal) {
-      log.info(`Dropping pending Linear ticket ${identifier}: state is ${issue.state?.name ?? issue.state?.type ?? "terminal"}`);
+    const nonActionable = isTerminalIssueState(issue.state) || isParkedIssueState(issue.state);
+    if (nonActionable) {
+      log.info(`Dropping pending Linear ticket ${identifier}: state is ${issue.state?.name ?? issue.state?.type ?? "non-actionable"}`);
     }
-    return !terminal;
+    return !nonActionable;
   } catch (err) {
     log.warn(`Linear actionable check failed for ${identifier}: ${err instanceof Error ? err.message : String(err)}`);
     return true;
