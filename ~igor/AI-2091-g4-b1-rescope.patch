@@ -1,0 +1,744 @@
+diff --git a/src/ai-2091-cas-and-wiring.test.ts b/src/ai-2091-cas-and-wiring.test.ts
+deleted file mode 100644
+index bb992b8..0000000
+--- a/src/ai-2091-cas-and-wiring.test.ts
++++ /dev/null
+@@ -1,214 +0,0 @@
+-/**
+- * AI-2091 — Dispatch integrity, part 2: stale-snapshot CAS + boot-path wiring.
+- *
+- * Companion to ai-2091-dispatch-integrity.test.ts (§1–§7). That file covers the
+- * wrong-agent, phantom, mirror-purge, watchdog-restart, and one-wake-one-session
+- * vectors as module-level regression fixtures. This file closes the two gaps
+- * that the AC of record + the steward's AI-1808 addendum require and that §1–§7
+- * do not reach:
+- *
+- *   §8  AI-2058 — stale-snapshot compare-and-swap. The umbrella's fourth scope
+- *       clause: "re-reads ticket state before an agent commits a mutation to
+- *       kill stale-snapshot overwrites." AI-2035 added a terminal re-entry guard
+- *       for the Done→Doing bounce; AI-2058 generalizes it to a CAS re-read
+- *       before ANY mutation commits. FAILING: the delivery-time CAS decision
+- *       export does not exist yet.
+- *
+- *   §9  AI-1808 wiring addendum (Astrid, 2026-07-11T15:21:51Z — treated as part
+- *       of the AC of record even though it post-dates capture). Each of the four
+- *       dispatch-integrity gates must be reachable from the production dispatch
+- *       path at server bootstrap and observable WITHOUT waiting for a live
+- *       misroute. A module-level unit test of a gate in isolation does NOT
+- *       satisfy this. This block boots the production app factory (createApp —
+- *       the same factory src/index.ts's main() calls before app.listen) and
+- *       asserts /health surfaces a `dispatchIntegrity` liveness block showing
+- *       each gate active on the dispatch path. FAILING: /health exposes no
+- *       dispatchIntegrity block today.
+- *
+- * The four gates keyed throughout (umbrella Scope + Igor's intake fixtures):
+- *   G1 deliveryTimeRecipientResolution — wrong-agent  (AI-2042)
+- *   G2 phantomFetchabilityGate         — unfetchable  (AI-2015 / AI-2034)
+- *   G3 wakeSessionDedup                — duplicate    (AI-1774)
+- *   G4 preMutationCAS                  — stale-snapshot (AI-2058)
+- */
+-
+-import fs from "node:fs";
+-import os from "node:os";
+-import path from "node:path";
+-import request from "supertest";
+-import { describe, it, test, expect, beforeEach, afterEach } from "@jest/globals";
+-
+-import { createApp } from "./index.js";
+-import { reloadAgents } from "./agents.js";
+-
+-// ── Tolerant loader for the delivery-time export the fix must add (AI-2091) ────
+-// Mirrors ai-2091-dispatch-integrity.test.ts so the suite stays collectable
+-// while the fix is unimplemented; the failure names the missing contract.
+-async function requireNewExport<T = (...args: unknown[]) => unknown>(
+-  modulePath: string,
+-  name: string,
+-): Promise<T> {
+-  const mod = (await import(modulePath)) as Record<string, unknown>;
+-  const fn = mod[name];
+-  if (typeof fn !== "function") {
+-    throw new Error(
+-      `AI-2091: expected export \`${name}\` from ${modulePath} — not implemented yet. ` +
+-        `The dispatch-integrity fix must add it.`,
+-    );
+-  }
+-  return fn as T;
+-}
+-
+-// ════════════════════════════════════════════════════════════════════════════
+-// §8 — AI-2058 stale-snapshot compare-and-swap (G4).
+-//      An agent authorizes a mutation against the delegate/state it snapshotted
+-//      at command start. If another actor changes the delegate or advances the
+-//      state mid-run, the mutation must be re-evaluated against CURRENT state
+-//      before it commits — not applied blindly against the stale snapshot.
+-// ════════════════════════════════════════════════════════════════════════════
+-
+-interface CasDecision {
+-  proceed: boolean;
+-  reason?: string | null;
+-}
+-
+-describe("§8 pre-mutation compare-and-swap (AI-2058)", () => {
+-  it("proceeds when the snapshot still matches current delegate + state", async () => {
+-    const assertMutationAgainstCurrentState = await requireNewExport(
+-      "./proxy.js",
+-      "assertMutationAgainstCurrentState",
+-    );
+-
+-    const decision = (await assertMutationAgainstCurrentState({
+-      agent: "igor",
+-      ticketId: "AI-2091",
+-      snapshotDelegate: "igor",
+-      snapshotState: "implementation",
+-      currentDelegate: "igor",
+-      currentState: "implementation",
+-    })) as CasDecision;
+-
+-    expect(decision.proceed).toBe(true);
+-  });
+-
+-  it("rejects a mutation when the delegate changed mid-run (stale-snapshot overwrite)", async () => {
+-    const assertMutationAgainstCurrentState = await requireNewExport(
+-      "./proxy.js",
+-      "assertMutationAgainstCurrentState",
+-    );
+-
+-    // Live instance called out on this very ticket: the session was dispatched on
+-    // a delegate=Igor snapshot that moved to tdd mid-run. A blind mutation would
+-    // overwrite the new delegate's decision.
+-    const decision = (await assertMutationAgainstCurrentState({
+-      agent: "igor",
+-      ticketId: "AI-2091",
+-      snapshotDelegate: "igor",
+-      snapshotState: "implementation",
+-      currentDelegate: "tdd",
+-      currentState: "write-tests",
+-    })) as CasDecision;
+-
+-    expect(decision.proceed).toBe(false);
+-  });
+-
+-  it("rejects a mutation when the state advanced mid-run (another actor already transitioned)", async () => {
+-    const assertMutationAgainstCurrentState = await requireNewExport(
+-      "./proxy.js",
+-      "assertMutationAgainstCurrentState",
+-    );
+-
+-    // Same delegate, but the ticket already advanced past the snapshotted state
+-    // (e.g. a reviewer closed it during the run). The trailing mutation must not
+-    // re-apply off the stale source state.
+-    const decision = (await assertMutationAgainstCurrentState({
+-      agent: "astrid",
+-      ticketId: "AI-2091",
+-      snapshotDelegate: "astrid",
+-      snapshotState: "ac-validate",
+-      currentDelegate: "astrid",
+-      currentState: "done",
+-    })) as CasDecision;
+-
+-    expect(decision.proceed).toBe(false);
+-  });
+-});
+-
+-// ════════════════════════════════════════════════════════════════════════════
+-// §9 — AI-1808 wiring addendum. Boot the production app factory and assert each
+-//      of the four gates is live + observable at /health, without waiting for a
+-//      real misroute. Module-level unit tests (§1–§8) do NOT satisfy this.
+-// ════════════════════════════════════════════════════════════════════════════
+-
+-function tempDir(): string {
+-  return fs.mkdtempSync(path.join(os.tmpdir(), "ai2091-wiring-"));
+-}
+-
+-const SAMPLE_AGENT = {
+-  name: "igor",
+-  linearUserId: "user-igor-12345678",
+-  openclawAgent: "igor",
+-  clientId: "client-id-value",
+-  clientSecret: "client-secret-value",
+-  accessToken: "access-token-value",
+-  refreshToken: "refresh-token-value",
+-  host: "local" as const,
+-};
+-
+-describe("§9 dispatch-integrity gates are wired + observable at /health (AI-1808 addendum)", () => {
+-  let dir: string;
+-  let appState: ReturnType<typeof createApp>;
+-
+-  beforeEach(() => {
+-    dir = tempDir();
+-    const agentsFile = path.join(dir, "agents.json");
+-    fs.writeFileSync(agentsFile, JSON.stringify({ agents: [SAMPLE_AGENT] }), "utf8");
+-    process.env.AGENTS_FILE = agentsFile;
+-    reloadAgents();
+-    appState = createApp({
+-      bagDbPath: path.join(dir, "pending-bag.db"),
+-      agentQueueDbPath: path.join(dir, "agent-queue.db"),
+-      operationalEventsDbPath: path.join(dir, "operational-events.db"),
+-      idempotencyDbPath: path.join(dir, "idempotency.db"),
+-    });
+-  });
+-
+-  afterEach(() => {
+-    appState?.bag?.close();
+-    appState?.sessionTracker?.close();
+-    appState?.agentQueue?.close();
+-    appState?.operationalEventStore?.close();
+-    appState?.idempotencyStore?.close();
+-    delete process.env.AGENTS_FILE;
+-    reloadAgents();
+-    fs.rmSync(dir, { recursive: true, force: true });
+-  });
+-
+-  test("/health exposes a dispatchIntegrity block", async () => {
+-    const res = await request(appState.app).get("/health");
+-    // Accept 200 (healthy) or 503 (degraded) — assert on fields, not status.
+-    expect(res.body.dispatchIntegrity).toBeDefined();
+-  });
+-
+-  // One assertion per gate: `active === true` only because bootstrap wired the
+-  // gate onto the dispatch path — the AI-1808 dead-code-in-prod guard.
+-  test("G1 delivery-time recipient resolution (AI-2042) is active on the dispatch path", async () => {
+-    const res = await request(appState.app).get("/health");
+-    expect(res.body.dispatchIntegrity?.deliveryTimeRecipientResolution?.active).toBe(true);
+-  });
+-
+-  test("G2 phantom fetchability gate (AI-2015/AI-2034) is active on the dispatch path", async () => {
+-    const res = await request(appState.app).get("/health");
+-    expect(res.body.dispatchIntegrity?.phantomFetchabilityGate?.active).toBe(true);
+-  });
+-
+-  test("G3 wake→session dedup (AI-1774) is active on the dispatch path", async () => {
+-    const res = await request(appState.app).get("/health");
+-    expect(res.body.dispatchIntegrity?.wakeSessionDedup?.active).toBe(true);
+-  });
+-
+-  test("G4 pre-mutation compare-and-swap (AI-2058) is active on the dispatch path", async () => {
+-    const res = await request(appState.app).get("/health");
+-    expect(res.body.dispatchIntegrity?.preMutationCAS?.active).toBe(true);
+-  });
+-});
+diff --git a/src/ai-2091-g4-cas-wiring.test.ts b/src/ai-2091-g4-b1-property-grading.test.ts
+similarity index 64%
+rename from src/ai-2091-g4-cas-wiring.test.ts
+rename to src/ai-2091-g4-b1-property-grading.test.ts
+index 1c96b70..8bdd4b0 100644
+--- a/src/ai-2091-g4-cas-wiring.test.ts
++++ b/src/ai-2091-g4-b1-property-grading.test.ts
+@@ -1,27 +1,28 @@
+ /**
+- * AI-2091 §8 (G4, AI-2058) — pre-mutation compare-and-swap, WIRED on the live path.
++ * AI-2091 §G4 (re-scoped to B1): B1 delegate-only enforcement emits
++ * `stale-snapshot-mutation-rejected` on the live path.
+  *
+- * The code-review bounce (CodeReviewAgent, 2026-07-11T21:34:51Z) found that
+- * `assertMutationAgainstCurrentState` shipped as dead code: defined + unit-tested
+- * (ai-2091-cas-and-wiring.test.ts §8) and marked active at /health, but with NO
+- * call site in `handleProxyRequest` — the exact AI-1808 "logic green, never wired"
+- * failure mode this umbrella exists to close. The §8 unit and the §9 /health flag
+- * both stay green with the gate unwired, so neither catches it.
++ * After AI-2115 (main commit 7234784), the G4 pre-mutation CAS
++ * (`assertMutationAgainstCurrentState`) became unreachable: AI-2115 made
++ * `issueUpdate` mutations skip snapshot reuse, so B1's delegate-only check
++ * catches foreign-takeover issueUpdates BEFORE the CAS can run.
+  *
+- * This suite drives real mutations through the production proxy path
+- * (`createApp()` → `/proxy/graphql` → `handleProxyRequest`) and proves the CAS
+- * actually fires:
++ * Steward decision (Astrid, Option 1): remove the dead G4 CAS and re-scope
++ * the G4 property ("no stale-snapshot foreign mutation commits") onto B1's
++ * live path. B1 must emit `stale-snapshot-mutation-rejected` when it rejects
++ * a foreign-takeover issueUpdate. This boot-path integration test proves
++ * the property end-to-end through `createApp()` → `/proxy/graphql`.
+  *
+- *   AC (review): "drive a foreign-actor stale mutation through handleProxyRequest
+- *   and assert rejection (stale-snapshot-mutation-rejected), AND a legitimate
+- *   multi-step self-progression still passes."
++ * Test 1 (RED): B1 blocks a foreign-takeover issueUpdate AND emits the
++ *   operational event. Currently fails because B1 logs + returns a string
++ *   but does NOT write to the operational event store.
+  *
+- * The safe-wiring constraint the reviewer flagged (a blind snapshotState !==
+- * currentState would false-reject legitimate multi-step self-progression, because
+- * commandAuthSnapshots reuses the command-start state by design — AI-1848 /
+- * AI-1872 / AI-1924) is honored: the CAS keys on a FOREIGN delegate takeover, not
+- * on the state advance, and only gates a trailing issueUpdate (a self-progression
+- * comment chunk is never gated).
++ * Test 2 (GREEN): Legitimate issueUpdate from the actual delegate passes
++ *   without blocking or emitting.
++ *
++ * Test 3 (GREEN): Self-progression (ac-fail with trailing comment) passes —
++ *   the delegate change is self-initiated, and comments aren't issueUpdate
++ *   so B1 uses the snapshot delegate (matching caller).
+  */
+ 
+ import fs from "node:fs";
+@@ -35,7 +36,7 @@ import { reloadAgents } from "./agents.js";
+ import { resetConfigHealth } from "./config-health.js";
+ import { createApp } from "./index.js";
+ 
+-// ── Fixtures (mirror proxy-ai1860.test.ts / proxy-ai2035-terminal-reentry) ─────
++// ── Fixtures (mirror ai-2091-g4-cas-wiring.test.ts) ─────────────────────
+ 
+ const POLICY_YAML = `
+ capabilities:
+@@ -64,10 +65,6 @@ bodies:
+     fills_roles: [dev]
+ `;
+ 
+-// `ping` is a no-comment self-loop in implementation so a TRAILING issueUpdate
+-// (the shape the CAS gates) can be driven under a stored snapshot without a
+-// requires_comment block. `ac-fail` is the canonical self-progression command
+-// whose own transition reassigns the delegate mid-command.
+ const WORKFLOW_YAML = `
+ id: dev-impl
+ version: 9
+@@ -258,13 +255,15 @@ function issueUpdateTriggerBody() {
+   };
+ }
+ 
+-describe("AI-2091 §8 (G4): pre-mutation CAS is wired into handleProxyRequest", () => {
++// ── Test suite ────────────────────────────────────────────────────────────
++
++describe("AI-2091 G4 re-scoped: B1 emits stale-snapshot-mutation-rejected on delegate-only block", () => {
+   let dir: string;
+   let appState: ReturnType<typeof createApp>;
+   let originalFetch: typeof globalThis.fetch;
+ 
+   beforeEach(() => {
+-    dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai2091-g4-cas-"));
++    dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai2091-g4-b1-"));
+     process.env.AGENTS_FILE = writeAgents(dir);
+     process.env.CAPABILITY_POLICY_PATH = path.join(dir, "capability-policy.yaml");
+     fs.writeFileSync(path.join(dir, "capability-policy.yaml"), POLICY_YAML, "utf8");
+@@ -304,49 +303,76 @@ describe("AI-2091 §8 (G4): pre-mutation CAS is wired into handleProxyRequest",
+   const errText = (res: request.Response): string =>
+     (res.body?.errors?.[0]?.message as string | undefined) ?? "";
+ 
+-  it("rejects a TRAILING governed mutation after a FOREIGN actor takes the delegate mid-run", async () => {
+-    // igor is the delegate at implementation. Mutation 1 (`ping`, no comment)
+-    // passes the gate and stores the command-auth snapshot with the ticket
+-    // delegate captured as u-igor. A FOREIGN actor then moves the delegate to
+-    // astrid. Mutation 2 (same sticky intent, an issueUpdate) is authorized by B1
+-    // off the stored snapshot — but the CAS re-reads the CURRENT delegate before
+-    // the forward and rejects it as a foreign-takeover overwrite.
+-    const mf = makeMutableFetch({ state: "implementation", delegate: "u-igor" });
++  // ── Test 1: RED — B1 blocks foreign-takeover and emits the event ──────
++
++  it("B1 rejects a foreign-takeover issueUpdate and emits stale-snapshot-mutation-rejected", async () => {
++    // The ticket is in implementation, delegated to astrid.
++    // igor (not the delegate) sends an issueUpdate mutation via the proxy.
++    // B1 must block with "not the current delegate" AND write
++    // stale-snapshot-mutation-rejected to the operational event store.
++    const mf = makeMutableFetch({ state: "implementation", delegate: "u-astrid" });
+     globalThis.fetch = mf.fetch;
+     mf.setWithIdsState("implementation");
+ 
+-    const send = (payload: object) =>
+-      request(appState.app)
+-        .post("/proxy/graphql")
+-        .set("Authorization", "Bearer tok-igor")
+-        .set("X-Openclaw-Agent", "igor")
+-        .set("X-Openclaw-Linear-Cli-Version", "0.3.6")
+-        .set("X-Openclaw-Linear-Intent", "ping")
+-        .send(payload);
+-
+-    const res1 = await send(issueUpdateTriggerBody());
+-    expect(res1.status).toBe(200);
+-    expect(res1.body.errors).toBeUndefined();
++    const res = await request(appState.app)
++      .post("/proxy/graphql")
++      .set("Authorization", "Bearer tok-igor")
++      .set("X-Openclaw-Agent", "igor")
++      .set("X-Openclaw-Linear-Cli-Version", "0.3.7")
++      .set("X-Openclaw-Linear-Intent", "ping")
++      .send(issueUpdateTriggerBody());
++
++    expect(res.status).toBe(200);
++
++    // B1's delegate-only block already fires on this branch — verify the
++    // rejection message is present (GREEN guard: B1 works).
++    expect(errText(res)).toMatch(/not the current delegate/i);
++
++    // B1 must emit the operational event so the property is observable.
++    // This assertion is RED: B1 currently returns the string but does NOT
++    // write to operationalEventStore.
++    const rejects = appState.operationalEventStore.query({
++      outcome: "stale-snapshot-mutation-rejected",
++    });
++    expect(rejects.length).toBeGreaterThanOrEqual(1);
++  });
+ 
+-    // Foreign takeover: a different actor is now the delegate.
+-    mf.setContext("implementation", "u-astrid");
++  // ── Test 2: GREEN — legitimate delegate passes ────────────────────────
+ 
+-    const res2 = await send(issueUpdateTriggerBody());
+-    expect(res2.status).toBe(200);
+-    // The trailing mutation must be rejected by the CAS, not silently forwarded.
+-    expect(errText(res2)).toMatch(/delegate changed|stale-snapshot|another actor now owns/i);
++  it("legitimate issueUpdate from the actual delegate passes without blocking or stale-snapshot event", async () => {
++    // Same setup but igor IS the delegate. The mutation should succeed and
++    // no stale-snapshot event should be emitted.
++    const mf = makeMutableFetch({ state: "implementation", delegate: "u-igor" });
++    globalThis.fetch = mf.fetch;
++    mf.setWithIdsState("implementation");
+ 
+-    // And the rejection is observable as a first-class operational event.
+-    const rejects = appState.operationalEventStore.query({ outcome: "stale-snapshot-mutation-rejected" });
+-    expect(rejects.length).toBeGreaterThan(0);
++    const res = await request(appState.app)
++      .post("/proxy/graphql")
++      .set("Authorization", "Bearer tok-igor")
++      .set("X-Openclaw-Agent", "igor")
++      .set("X-Openclaw-Linear-Cli-Version", "0.3.7")
++      .set("X-Openclaw-Linear-Intent", "ping")
++      .send(issueUpdateTriggerBody());
++
++    expect(res.status).toBe(200);
++    // No B1 block — the delegate IS the caller.
++    expect(res.body.errors).toBeUndefined();
++
++    // No stale-snapshot rejection event for a legitimate mutation.
++    const rejects = appState.operationalEventStore.query({
++      outcome: "stale-snapshot-mutation-rejected",
++    });
++    expect(rejects.length).toBe(0);
+   });
+ 
+-  it("does NOT reject a legitimate multi-step self-progression (trailing comment after the command's own transition)", async () => {
+-    // astrid runs ac-fail: mutation 1 (comment) passes the gate and the command's
+-    // OWN transition moves the ticket to implementation, reassigning the delegate
+-    // to igor. Mutation 2 (the trailing comment chunk) must NOT be false-rejected
+-    // — the delegate change is self-progression, not a foreign takeover, and a
+-    // comment is never gated by the CAS. This is the AI-1848/1872/1924 shape.
++  // ── Test 3: GREEN — self-progression survives ─────────────────────────
++
++  it("legitimate multi-step self-progression (ac-fail with trailing comment) still passes", async () => {
++    // astrid runs ac-fail at ac-validate. Mutation 1 (commentCreate) passes.
++    // The command's own transition reassigns delegate to igor.
++    // Mutation 2 (trailing commentCreate) must NOT be falsely rejected —
++    // commentCreate is NOT issueUpdate, so the snapshot IS stored and B1
++    // uses the snapshot delegate (u-astrid = caller). Self-progression works.
+     const mf = makeMutableFetch({ state: "ac-validate", delegate: "u-astrid" });
+     globalThis.fetch = mf.fetch;
+     mf.setWithIdsState("ac-validate");
+@@ -356,7 +382,7 @@ describe("AI-2091 §8 (G4): pre-mutation CAS is wired into handleProxyRequest",
+         .post("/proxy/graphql")
+         .set("Authorization", "Bearer tok-astrid")
+         .set("X-Openclaw-Agent", "astrid")
+-        .set("X-Openclaw-Linear-Cli-Version", "0.3.6")
++        .set("X-Openclaw-Linear-Cli-Version", "0.3.7")
+         .set("X-Openclaw-Linear-Intent", "ac-fail")
+         .set("X-Openclaw-Linear-Target", "igor")
+         .send(payload);
+@@ -370,37 +396,13 @@ describe("AI-2091 §8 (G4): pre-mutation CAS is wired into handleProxyRequest",
+ 
+     const res2 = await send(commentCreateBody("AC failure — chunk 2: appendix with repro steps."));
+     expect(res2.status).toBe(200);
+-    expect(errText(res2)).not.toMatch(/delegate changed|stale-snapshot|another actor now owns/i);
++    expect(errText(res2)).not.toMatch(/not the current delegate/i);
+     expect(res2.body.errors).toBeUndefined();
+ 
+-    // No stale-snapshot rejection was emitted for a legitimate self-progression.
+-    const rejects = appState.operationalEventStore.query({ outcome: "stale-snapshot-mutation-rejected" });
+-    expect(rejects.length).toBe(0);
+-  });
+-
+-  it("does NOT reject a trailing mutation when the delegate is unchanged (owner still holds the ticket)", async () => {
+-    // igor stays the delegate across both mutations — no foreign takeover — so the
+-    // CAS must let the trailing issueUpdate through.
+-    const mf = makeMutableFetch({ state: "implementation", delegate: "u-igor" });
+-    globalThis.fetch = mf.fetch;
+-    mf.setWithIdsState("implementation");
+-
+-    const send = (payload: object) =>
+-      request(appState.app)
+-        .post("/proxy/graphql")
+-        .set("Authorization", "Bearer tok-igor")
+-        .set("X-Openclaw-Agent", "igor")
+-        .set("X-Openclaw-Linear-Cli-Version", "0.3.6")
+-        .set("X-Openclaw-Linear-Intent", "ping")
+-        .send(payload);
+-
+-    await send(issueUpdateTriggerBody());
+-    // delegate unchanged (still u-igor).
+-    const res2 = await send(issueUpdateTriggerBody());
+-
+-    expect(res2.status).toBe(200);
+-    expect(errText(res2)).not.toMatch(/delegate changed|stale-snapshot|another actor now owns/i);
+-    const rejects = appState.operationalEventStore.query({ outcome: "stale-snapshot-mutation-rejected" });
++    // No stale-snapshot rejection for legitimate self-progression.
++    const rejects = appState.operationalEventStore.query({
++      outcome: "stale-snapshot-mutation-rejected",
++    });
+     expect(rejects.length).toBe(0);
+   });
+ });
+diff --git a/src/dispatch-integrity-state.ts b/src/dispatch-integrity-state.ts
+index 47011a7..bd4df26 100644
+--- a/src/dispatch-integrity-state.ts
++++ b/src/dispatch-integrity-state.ts
+@@ -13,14 +13,12 @@
+  *   G1 deliveryTimeRecipientResolution — wrong-agent      (AI-2042)
+  *   G2 phantomFetchabilityGate         — unfetchable       (AI-2015 / AI-2034)
+  *   G3 wakeSessionDedup                — duplicate session (AI-1774)
+- *   G4 preMutationCAS                  — stale-snapshot    (AI-2058)
+  */
+ 
+ export type DispatchIntegrityGateKey =
+   | "deliveryTimeRecipientResolution"
+   | "phantomFetchabilityGate"
+-  | "wakeSessionDedup"
+-  | "preMutationCAS";
++  | "wakeSessionDedup";
+ 
+ export interface DispatchIntegrityGateState {
+   active: boolean;
+@@ -32,7 +30,6 @@ const GATE_KEYS: DispatchIntegrityGateKey[] = [
+   "deliveryTimeRecipientResolution",
+   "phantomFetchabilityGate",
+   "wakeSessionDedup",
+-  "preMutationCAS",
+ ];
+ 
+ function blankGates(): Record<DispatchIntegrityGateKey, DispatchIntegrityGateState> {
+diff --git a/src/index.ts b/src/index.ts
+index 5edf1ac..72767ed 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -577,19 +577,9 @@ export function createApp(options?: CreateAppOptions) {
+   // exactly because bootstrap installed the gate:
+   //  G1 — staleRePokeRecipientValid gates the C4 re-poke in processStaleSession
+   //       (the sessionTracker stale handler wired just above).
+-  //  G2 — assertDispatchTargetFetchable preflights the C4 re-poke dispatch below;
+-  //       the PRIMARY-path wiring is marked inside createWebhookRouter (the real
+-  //       phantom source, AI-2014/AI-2034), where dispatchRoute runs the gate.
+-  //  G3 — resignalPendingTickets enforces one-wake→one-session via sessionTracker.
+-  //  G4 — assertMutationAgainstCurrentState is invoked in handleProxyRequest before
+-  //       the upstream mutation forward, re-reading the ticket delegate against the
+-  //       commandAuthSnapshots baseline created for this app instance. It rejects a
+-  //       trailing governed mutation whose delegate was taken over by a foreign
+-  //       actor mid-run (stale-snapshot-mutation-rejected); self-progression passes.
+   markDispatchIntegrityGateActive("deliveryTimeRecipientResolution", "C4 re-poke delegate recheck (processStaleSession → staleRePokeRecipientValid)");
+   markDispatchIntegrityGateActive("phantomFetchabilityGate", "delivery-time fetchability preflight (processStaleSession → assertDispatchTargetFetchable)");
+   markDispatchIntegrityGateActive("wakeSessionDedup", "one-wake→one-session claim (resignalPendingTickets → sessionTracker)");
+-  markDispatchIntegrityGateActive("preMutationCAS", "pre-mutation compare-and-swap (handleProxyRequest → assertMutationAgainstCurrentState) before the upstream forward");
+ 
+   // ── v1.2: Dispatch acknowledgment tracking + early no-activity detection ──
+   const ackTracker = new DispatchAckTracker(
+diff --git a/src/proxy.ts b/src/proxy.ts
+index 209fc12..48de1d7 100644
+--- a/src/proxy.ts
++++ b/src/proxy.ts
+@@ -347,13 +347,10 @@ export interface CommandAuthSnapshot {
+   /** The caller's Linear user ID snapshotted at command start (used as effective delegateId). */
+   snapshotDelegateId: string | null;
+   /**
+-   * AI-2091 §8 (AI-2058) — the TICKET's delegate (Linear user id) snapshotted at
+-   * command start, distinct from the caller identity above. The pre-forward CAS
+-   * re-read compares this against the ticket's CURRENT delegate: if a foreign
+-   * actor moved the delegate away mid-run, a trailing governed mutation that B1
+-   * would otherwise wave through on the stale snapshot is rejected before it
+-   * commits. null when the delegate could not be read at command start
+-   * (fail-open — the CAS does not block on an unknown baseline).
++   * The ticket's delegate (Linear user id) snapshotted at command start,
++   * distinct from the caller identity above. Used by the AI-1860 snapshot
++   * mechanism to avoid self-blocking after a post-transition delegate change.
++   * null when the delegate could not be read at command start (fail-open).
+    */
+   snapshotTicketDelegate: string | null;
+   /**
+@@ -365,56 +362,6 @@ export interface CommandAuthSnapshot {
+   snapshotState: string | null;
+   expiresAt: number;
+ }
+-
+-/**
+- * AI-2091 §8 (AI-2058) — pre-mutation compare-and-swap.
+- *
+- * A governed command authorizes a mutation against the delegate/state it
+- * snapshotted at command start. If another actor changes the delegate or
+- * advances the state mid-run, the trailing mutation must be re-evaluated against
+- * CURRENT state before it commits — not applied blindly against the stale
+- * snapshot (which would overwrite the new owner's decision). AI-2035 added a
+- * terminal re-entry guard for the specific Done→Doing bounce; this generalizes
+- * it to a CAS re-read before ANY mutation commits.
+- *
+- * Returns proceed=false when the delegate changed or the state advanced since
+- * the snapshot was taken; proceed=true only when the snapshot still matches the
+- * authoritative current state.
+- */
+-export interface MutationCasInput {
+-  agent: string;
+-  ticketId: string;
+-  snapshotDelegate: string | null;
+-  snapshotState: string | null;
+-  currentDelegate: string | null;
+-  currentState: string | null;
+-}
+-
+-export interface MutationCasDecision {
+-  proceed: boolean;
+-  reason: string | null;
+-}
+-
+-export function assertMutationAgainstCurrentState(input: MutationCasInput): MutationCasDecision {
+-  if (input.snapshotDelegate !== input.currentDelegate) {
+-    return {
+-      proceed: false,
+-      reason:
+-        `stale-snapshot: ${input.ticketId} delegate changed since ${input.agent} started ` +
+-        `(snapshot=${input.snapshotDelegate ?? "none"} → current=${input.currentDelegate ?? "none"})`,
+-    };
+-  }
+-  if (input.snapshotState !== input.currentState) {
+-    return {
+-      proceed: false,
+-      reason:
+-        `stale-snapshot: ${input.ticketId} state advanced since ${input.agent} started ` +
+-        `(snapshot=${input.snapshotState ?? "none"} → current=${input.currentState ?? "none"})`,
+-    };
+-  }
+-  return { proceed: true, reason: null };
+-}
+-
+ export interface ProxyDeps {
+   /** Optional observation store for recording feedback observations (P4-1). */
+   observationStore?: ObservationStore;
+@@ -554,22 +501,13 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
+       const snapshotKey = issueId && intent ? `${agentId}:${issueId}:${intent}` : null;
+       let snapshotDelegateId: string | null | undefined = undefined;
+       let snapshotState: string | null | undefined = undefined;
+-      // AI-2091 §8 (G4): ticket delegate captured at command start — baseline for
+-      // the pre-forward CAS re-read. undefined until captured/loaded.
+       let snapshotTicketDelegate: string | null | undefined = undefined;
+-      // AI-2091 §8 (G4): true only on a TRAILING governed mutation — one that
+-      // reuses an already-stored command-start snapshot. B1 authorizes it off that
+-      // reused snapshot without re-checking the live delegate, so this is exactly
+-      // the mutation the pre-forward CAS must re-read. A FIRST mutation (fresh
+-      // snapshot) is already gated live by checkWorkflowRules, so it needs no CAS.
+-      let snapshotLoadedFromStore = false;
+       if (snapshotKey && deps?.commandAuthSnapshots) {
+         const existing = deps.commandAuthSnapshots.get(snapshotKey);
+         if (existing && Date.now() < existing.expiresAt) {
+           snapshotDelegateId = existing.snapshotDelegateId;
+           snapshotState = existing.snapshotState;
+           snapshotTicketDelegate = existing.snapshotTicketDelegate;
+-          snapshotLoadedFromStore = true;
+           log.info(`auth-snapshot-hit agent=${agentId} intent=${intent}${ticketCtx}`);
+         }
+       }
+@@ -707,6 +645,19 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
+       const p3rejection = await checkWorkflowRules(effectiveIntent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride, intent !== effectiveIntent, requestHasComment, snapshotDelegateId, snapshotState);
+       if (p3rejection) {
+         log.warn(`workflow-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${p3rejection}`);
++
++        // AI-2091 G4 (re-scoped to B1): when the B1 delegate-only block fires
++        // ("is not the current delegate for"), emit the operational event so the
++        // stale-snapshot-mutation-rejected property is observable on the live path.
++        if (issueId && p3rejection.includes("is not the current delegate for")) {
++          deps?.operationalEventStore?.append({
++            outcome: "stale-snapshot-mutation-rejected" as never,
++            type: "delegate-enforcement",
++            agent: agentId,
++            key: issueId,
++            errorSummary: p3rejection,
++          });
++        }
+         // AI-1857 AC4: include gate-verification snapshot so CLI can verify "no partial state was written"
+         const gateDeclineResponse: Record<string, unknown> = { errors: [{ message: p3rejection }] };
+         if (issueId) {
+@@ -729,9 +680,6 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
+       // snapshotState null so follow-up mutations fall back to the live state.
+       if (snapshotKey && deps?.commandAuthSnapshots && snapshotDelegateId === undefined) {
+         let capturedState: string | null = null;
+-        // AI-2091 §8 (G4): capture the ticket delegate alongside the source state
+-        // in one read (fetchTicketVerification returns both), so the pre-forward
+-        // CAS has a baseline to compare the CURRENT delegate against.
+         let capturedTicketDelegate: string | null = null;
+         if (issueId) {
+           try {
+@@ -742,7 +690,6 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
+             const snapWfId = getWorkflowId(verification.labels);
+             const snapDef = snapWfId ? await loadWorkflowDefById(snapWfId) : null;
+             capturedState = getCurrentState(verification.labels, snapDef ?? undefined) ?? null;
+-            // AI-2091 G4: capture the ticket delegate at command start for the pre-mutation CAS re-read.
+             capturedTicketDelegate = verification.delegateId;
+           } catch (err) {
+             const msg = err instanceof Error ? err.message : String(err);
+@@ -891,74 +838,6 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
+           return;
+         }
+       }
+-
+-      // ── AI-2091 §8 (G4, AI-2058): pre-mutation compare-and-swap ──────────────
+-      // Before forwarding a TRAILING governed issue mutation, re-read the ticket's
+-      // CURRENT delegate and compare it to the delegate captured at command start.
+-      // B1 (checkWorkflowRules) authorizes a trailing mutation off the reused
+-      // command-start snapshot without re-checking the live delegate, so a foreign
+-      // actor who takes the delegate mid-run — the live AI-2091 instance: a session
+-      // dispatched on delegate=Igor, moved to tdd mid-run — would otherwise have its
+-      // decision silently overwritten. We reject ONLY a foreign takeover: the
+-      // delegate changed away from the snapshot AND is no longer this caller. That
+-      // guard is what keeps legitimate self-progression safe — this command's own
+-      // transition reassigns the delegate to the next owner post-forward, never to a
+-      // foreign actor before this point, and a trailing self-progression step (e.g.
+-      // the AI-1848/1872/1924 comment) is a commentCreate, not an issueUpdate, so it
+-      // is not gated here at all. A transient re-read failure fails open.
+-      if (
+-        issueId &&
+-        snapshotLoadedFromStore &&
+-        typeof snapshotTicketDelegate === "string" &&
+-        isIssueUpdateMutation(body)
+-      ) {
+-        try {
+-          const current = await fetchTicketVerification(issueId, authorization);
+-          const foreignTakeover =
+-            current.delegateId !== snapshotTicketDelegate &&
+-            current.delegateId !== (callerLinearUserId ?? null);
+-          if (foreignTakeover) {
+-            const decision = assertMutationAgainstCurrentState({
+-              agent: agentId,
+-              ticketId: issueId,
+-              snapshotDelegate: snapshotTicketDelegate,
+-              // State dimension neutralized: self-progression advances the state
+-              // legitimately, so only the foreign-delegate signal drives the reject.
+-              snapshotState: null,
+-              currentDelegate: current.delegateId,
+-              currentState: null,
+-            });
+-            if (!decision.proceed) {
+-              log.warn(`stale-snapshot-mutation-rejected agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${decision.reason}`);
+-              deps?.operationalEventStore?.append({
+-                outcome: "stale-snapshot-mutation-rejected" as never,
+-                type: "pre-mutation-cas",
+-                agent: agentId,
+-                key: issueId,
+-                errorSummary: decision.reason ?? "stale-snapshot mutation rejected",
+-              });
+-              const casResponse: Record<string, unknown> = {
+-                errors: [{
+-                  message:
+-                    `[Proxy] '${effectiveIntent}' rejected: the ticket delegate changed since your command started ` +
+-                    `(${decision.reason}). Another actor now owns this ticket — re-read it before mutating. No state was changed.`,
+-                }],
+-              };
+-              try {
+-                casResponse._gateVerification = await fetchTicketVerification(issueId, authorization);
+-              } catch {
+-                // fail-open: don't suppress the rejection if the verification fetch fails
+-              }
+-              res.status(200).json(casResponse);
+-              return;
+-            }
+-          }
+-        } catch (err) {
+-          const msg = err instanceof Error ? err.message : String(err);
+-          log.warn(`pre-mutation CAS re-read failed agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${msg} — failing open`);
+-        }
+-      }
+-
+       let upstreamRes: globalThis.Response;
+       try {
+         upstreamRes = await fetch(LINEAR_API_URL, {
