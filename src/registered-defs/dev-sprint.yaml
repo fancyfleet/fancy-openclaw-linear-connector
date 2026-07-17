@@ -1,0 +1,154 @@
+# dev-sprint — Sprint Execution Workflow (v2)
+# owner: steward (Astrid), engine (spawn-arms, spawn-impl)
+# last-updated: 2026-07-16
+# status: v2 deployed to production (INF-40, 2026-07-16)
+#
+# Registered-def copy for CI conformance validation (INF-42). The canonical
+# source is the vault markdown spec at:
+#   life-os/project-management/workflows/dev-sprint/dev-sprint-workflow-spec.md
+# Keep in sync with that spec.
+#
+# INF-45 (2026-07-16): added to registered-defs as child_workflow target
+# for sprint-spawner's launching state (fanout: wf:dev-sprint).
+#
+# Arm workflows (wf:sprint-arm-scope, wf:sprint-arm-ux, wf:sprint-arm-design,
+# wf:sprint-arm-spike) are registered as v0 stubs in src/registered-defs/.
+# They match the arm archetype table in dev-sprint-workflow-spec.md.
+#
+# Sprint spine (from dev-sprint-workflow-spec.md):
+#   1. intake → 2. product-definition → 3. spawn-arms → 4. managing-arms
+#   → 5. ac-definition → 6. spawn-impl → 7. managing-impl → 8. validation → done
+
+id: dev-sprint
+version: 2
+archetype: orchestrator
+entry_state: intake
+
+break_glass:
+  command: escape
+  to: escape
+  owner_role: steward
+
+states:
+
+  - id: intake
+    owner_role: steward
+    kind: normal
+    native_state: todo
+    description: >
+      Capture Matt's sprint description; set project/milestone; sanity-check
+      scope is sprint-shaped.
+    transitions:
+      - command: accept
+        to: product-definition
+        generic: continue          # AI-2519: `linear continue-workflow` resolves
+
+  - id: product-definition
+    owner_role: steward
+    kind: normal
+    native_state: doing
+    description: >
+      Problem statement, target user, success criteria, scope boundary (in/out),
+      MVP definition. Decides arm composition (spike in/out, design arm in/out
+      for backend-only sprints). Output: structured brief + arm spawn spec.
+    transitions:
+      - command: continue
+        to: spawn-arms
+        generic: continue
+
+  - id: spawn-arms
+    owner_role: engine
+    kind: normal
+    native_state: doing
+    description: >
+      Fanout phase 1: create arm tickets from spec. Each is a wf:sprint-arm-*
+      ticket, parentId = sprint.
+    # INF-45 (2026-07-16): arm workflows registered as v0 stubs
+    # (sprint-arm-scope, sprint-arm-ux, sprint-arm-design, sprint-arm-spike).
+    fanout:
+      spec_source: structured
+      child_workflow: wf:sprint-arm-scope    # representative — actual per-arm spec in source
+      initial_delegate: astrid
+    transitions:
+      - command: spawn
+        to: managing-arms
+        generic: continue
+
+  - id: managing-arms
+    owner_role: steward
+    kind: barrier
+    barrier: true
+    native_state: managing
+    description: >
+      Barrier: all arm children terminal → auto-advance.
+    transitions:
+      - command: continue
+        to: ac-definition
+        generic: continue
+
+  - id: ac-definition
+    owner_role: steward
+    kind: normal
+    native_state: doing
+    description: >
+      Synthesize arm outputs → sprint-level AC of record + impl spawn spec:
+      enumerated impl tickets (wf:dev-impl or wf:task), titles, AC, scope labels,
+      blocking relations. Must include >=1 debt/refactor ticket or documented waiver.
+    transitions:
+      - command: continue
+        to: spawn-impl
+        generic: continue
+
+  - id: spawn-impl
+    owner_role: engine
+    kind: normal
+    native_state: doing
+    description: >
+      Fanout phase 2: create impl tickets from spec. Children are wf:dev-impl
+      (default) or wf:task. Both are registered defs.
+    fanout:
+      spec_source: findings
+      child_workflow: wf:dev-impl
+      initial_delegate: astrid
+    transitions:
+      - command: spawn
+        to: managing-impl
+        generic: continue
+
+  - id: managing-impl
+    owner_role: steward
+    kind: barrier
+    barrier: true
+    native_state: managing
+    description: >
+      Barrier: all children terminal → auto-advance. Astrid runs board-review
+      discipline; stall handling via existing sweeps.
+    transitions:
+      - command: continue
+        to: validation
+        generic: continue
+
+  - id: validation
+    owner_role: steward
+    kind: normal
+    native_state: thinking
+    description: >
+      Author Matt-facing sprint validation. cra reviews technical accuracy.
+      requires_human_signoff_above_stakes — closes only on Matt's explicit yes.
+    transitions:
+      - command: approve
+        to: done
+        generic: continue
+        requires_human_signoff_above_stakes: true
+      - command: reject
+        to: ac-definition
+        generic: revision
+
+  - id: done
+    kind: terminal
+    native_state: done
+    satisfies_parent_barrier: true
+
+  - id: escape
+    kind: terminal
+    native_state: invalid
