@@ -773,13 +773,21 @@ export function validateGateAnchorDefs(def: WorkflowDef): string[] {
  *
  * A fanout block's `child_workflow` MUST be a `wf:*` label — a wf ticket spawns
  * only wf tickets (Matt, 2026-07-08, Option B). A `barrier` field, when present,
- * MUST be a boolean. Returns diagnostic errors; a non-empty result excludes the
- * def from the registry (the loader throws), so the engine can never fan out to
- * a non-workflow child type or misread a malformed barrier flag.
+ * MUST be a boolean. Two fanout states MUST NOT share BOTH a `spec_source` and a
+ * `child_workflow` (INF-32) — that pair is indistinguishable to the scoped dedup
+ * key, so the later state would silently mint nothing. Returns diagnostic errors;
+ * a non-empty result excludes the def from the registry (the loader throws), so
+ * the engine can never fan out to a non-workflow child type, misread a malformed
+ * barrier flag, or activate an ambiguous fan-out pair.
  */
 export function validateFanoutBarrierConfig(def: WorkflowDef): string[] {
   const errors: string[] = [];
   const wfLabelPattern = /^wf:.+/;
+  /** INF-32: (spec_source, child_workflow) → the fanout states sharing it. */
+  const fanoutSpecKeys = new Map<
+    string,
+    { specSource: string; childWorkflow: string; stateIds: string[] }
+  >();
   for (const state of def.states) {
     if (state.fanout !== undefined) {
       const fo = state.fanout as unknown;
@@ -789,6 +797,17 @@ export function validateFanoutBarrierConfig(def: WorkflowDef): string[] {
         const cfg = fo as Partial<FanoutConfig>;
         if (typeof cfg.spec_source !== "string" || cfg.spec_source.trim() === "") {
           errors.push(`Workflow state '${state.id}' fanout is missing a non-empty 'spec_source'.`);
+        } else {
+          // INF-32: group by (spec_source, child_workflow) — the same key the
+          // engine's scoped dedup uses. `extractSpecFindings` matches the section
+          // header case-insensitively, so 'Findings' and 'findings' read the SAME
+          // section and collide identically; normalize before grouping.
+          const specSource = cfg.spec_source.trim().toLowerCase();
+          const childWorkflow = String(cfg.child_workflow);
+          const key = `${specSource}\u0000${childWorkflow}`;
+          const bucket = fanoutSpecKeys.get(key);
+          if (bucket) bucket.stateIds.push(state.id);
+          else fanoutSpecKeys.set(key, { specSource, childWorkflow, stateIds: [state.id] });
         }
         if (typeof cfg.child_workflow !== "string" || !wfLabelPattern.test(cfg.child_workflow)) {
           errors.push(
@@ -846,6 +865,33 @@ export function validateFanoutBarrierConfig(def: WorkflowDef): string[] {
       errors.push(`Workflow state '${state.id}' barrier field must be a boolean when present.`);
     }
   }
+
+  // INF-32 AC2: refuse an ambiguous fan-out pair at ACTIVATION rather than let it
+  // fail silently at spawn time.
+  //
+  // Scope note (deliberate, flagged for review): this rejects two fanout states
+  // sharing a spec_source AND a child_workflow — NOT every shared spec_source.
+  // Once dedup is keyed on (specEntryId, child_workflow), two states reading one
+  // section into DIFFERENT child workflows are well-defined, and that is exactly
+  // the two-phase pipeline AI-1992 AC4 ships (`synthetic-two-phase`: arming →
+  // wf:sprint-arm, impl → wf:dev-impl, both from `findings`). Rejecting on
+  // spec_source alone would exclude that def from the registry and make INF-32's
+  // own AC1/AC4 scenario unreachable — the engine would support a def shape no
+  // def could express. What remains genuinely ambiguous is a shared
+  // (spec_source, child_workflow) pair: the scoped key cannot separate those, so
+  // the second state still mints nothing. That is what is refused here.
+  for (const { specSource, childWorkflow, stateIds } of fanoutSpecKeys.values()) {
+    if (stateIds.length > 1) {
+      errors.push(
+        `[INF-32] Workflow states ${stateIds.map((id) => `'${id}'`).join(", ")} share fanout ` +
+        `spec_source '${specSource}' AND child_workflow '${childWorkflow}'. Spec-entry ids are ` +
+        `derived from entry content alone, so these states mint colliding ids from the same ` +
+        `section and the later fan-out silently spawns nothing. Give each fanout state a distinct ` +
+        `'spec_source' section, or a distinct 'child_workflow'.`,
+      );
+    }
+  }
+
   return errors;
 }
 

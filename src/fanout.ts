@@ -41,6 +41,17 @@ const LINEAR_API_URL = "https://api.linear.app/graphql";
 const SPEC_ENTRY_MARKER_PREFIX = "<!-- ai-1994:spec-entry-id: ";
 const SPEC_ENTRY_MARKER_RE = /<!--\s*ai-1994:spec-entry-id:\s*(\S+?)\s*-->/;
 
+/**
+ * INF-32: marker binding a spawned child to the `wf:*` workflow that minted it.
+ * Full form: `<!-- inf-32:child-workflow: wf:dev-impl -->`. Written alongside the
+ * AI-1994 spec-entry marker; read back so dedup can key on
+ * `(specEntryId, child_workflow)` instead of the content-addressed id alone.
+ * Children minted before INF-32 carry no such marker — the read path falls back
+ * to the child's own `wf:*` label, then to an id-only match.
+ */
+const CHILD_WORKFLOW_MARKER_PREFIX = "<!-- inf-32:child-workflow: ";
+const CHILD_WORKFLOW_MARKER_RE = /<!--\s*inf-32:child-workflow:\s*(\S+?)\s*-->/;
+
 // ── Types ─────────────────────────────────────────────────────────────────
 
 /** A single finding to fan out into its own child issue. */
@@ -86,6 +97,15 @@ export interface ExistingChild {
   specEntryId: string;
   /** Current workflow state (any state suppresses re-spawn — informational). */
   state?: string;
+  /**
+   * INF-32: the `wf:*` workflow that minted this child. Spec-entry ids are
+   * content-addressed, so two fan-outs on one parent sharing a `spec_source`
+   * derive identical ids; without this field the second fan-out reads the
+   * first's children as its own and mints nothing. Optional: children minted
+   * before INF-32 carry no workflow marker — see {@link dedupeSpawnSpec} for
+   * the legacy read path.
+   */
+  childWorkflow?: string;
 }
 
 /** AI-2523: Result of a spawn_if predicate evaluation. */
@@ -352,30 +372,91 @@ export function extractSpecFindings(
 
 /**
  * AI-1994: pure dedup core for incremental re-spawn.
+ * INF-32: scoped by the minting workflow, not the spec-entry id alone.
  *
  * The dev-sprint rework loop re-enters a fan-out state. Without dedup, re-entry
  * would duplicate already-spawned children. This partitions the current spec
  * against the children that already exist:
  *
- *  - `toSpawn` — spec entries with NO existing child (matched by
- *    `finding.id === child.specEntryId`). Only these are minted; existing
- *    children in ANY state (including terminal) suppress re-spawn.
- *  - `unmatchedChildren` — existing children whose spec entry is gone from the
- *    current spec. These are NEVER cancelled here — destructive actions stay
+ *  - `toSpawn` — spec entries with no child minted by THIS workflow. Only these
+ *    are minted; a matching child in ANY state (including terminal) suppresses
+ *    re-spawn.
+ *  - `unmatchedChildren` — this workflow's children whose spec entry is gone from
+ *    the current spec. These are NEVER cancelled here — destructive actions stay
  *    human/steward-driven — the caller surfaces them in a note instead.
+ *  - `legacyIdOnlyMatches` — children that suppressed a spawn on an id-only
+ *    match because their minting workflow could not be resolved (see below).
+ *
+ * INF-32: `deriveFindingId` is content-addressed (FNV-1a over title+description)
+ * and knows nothing about the fan-out that consumed the entry. So two fan-out
+ * states on one parent sharing a `spec_source` derive IDENTICAL ids, and an
+ * id-only key made the second fan-out read the first's children as its own:
+ * `toSpawn` emptied, the engine logged a "legitimate no-op", and zero children
+ * spawned into a barrier that vacuously satisfied. The dedup key is therefore
+ * `(specEntryId, effective child_workflow)`. "Effective" means
+ * `finding.child_workflow ?? childWorkflow` — the per-entry AI-2199 override is
+ * what the child is actually labeled with at mint time, so it is what dedup must
+ * compare against.
+ *
+ * Legacy read path (AC1 back-compat): children minted before INF-32 carry no
+ * workflow. An unresolvable-workflow child still SUPPRESSES via an id-only match
+ * — the conservative choice, since double-minting against a real pre-INF-32
+ * parent is worse than a missed spawn — but every such match is reported in
+ * `legacyIdOnlyMatches` so the caller can surface it. Suppression is not the
+ * defect; silence is. Legacy children are likewise still eligible to be reported
+ * unmatched, preserving the AI-1994 orphan note for them.
+ *
+ * Orphan scoping: only children minted by this fan-out's own workflow (or legacy
+ * children of unknown provenance) can be unmatched here. Another workflow's child
+ * is not this fan-out's to orphan — reporting it would trade the silent no-op for
+ * a spurious note pointing a steward at a ticket doing exactly what it should.
  *
  * Pure and side-effect free: given the same inputs it always returns the same
  * partition, which is what makes re-entry idempotent.
+ *
+ * @param childWorkflow This fan-out config's `child_workflow` default. Omitted by
+ *   pre-INF-32 callers, which degrades to the id-only legacy path throughout.
  */
 export function dedupeSpawnSpec(
   findings: Finding[],
   existingChildren: ExistingChild[],
-): { toSpawn: Finding[]; unmatchedChildren: ExistingChild[] } {
-  const existingIds = new Set(existingChildren.map((c) => c.specEntryId));
+  childWorkflow?: string,
+): { toSpawn: Finding[]; unmatchedChildren: ExistingChild[]; legacyIdOnlyMatches: ExistingChild[] } {
+  const toSpawn: Finding[] = [];
+  const legacyIdOnlyMatches: ExistingChild[] = [];
+
+  for (const f of findings) {
+    // AI-2199: the per-entry override is what the child is labeled with at mint
+    // time (see the mint loop's `findingWorkflow`), so it is the dedup key.
+    const effectiveWorkflow = f.child_workflow ?? childWorkflow;
+    const sameEntry = existingChildren.filter((c) => c.specEntryId === f.id);
+
+    const scopedMatch = sameEntry.find(
+      (c) => c.childWorkflow !== undefined && c.childWorkflow === effectiveWorkflow,
+    );
+    if (scopedMatch) continue; // this workflow already minted it
+
+    const legacyMatch = sameEntry.find((c) => c.childWorkflow === undefined);
+    if (legacyMatch) {
+      // Unknown provenance: suppress conservatively, but never silently.
+      legacyIdOnlyMatches.push(legacyMatch);
+      continue;
+    }
+
+    toSpawn.push(f);
+  }
+
+  // Orphan detection, scoped in both directions: a child of ANOTHER workflow is
+  // never unmatched here (its spec belongs to a fan-out this one cannot see),
+  // while this workflow's own child with a vanished entry still is (AI-1994 AC2).
   const specIds = new Set(findings.map((f) => f.id));
-  const toSpawn = findings.filter((f) => !existingIds.has(f.id as string));
-  const unmatchedChildren = existingChildren.filter((c) => !specIds.has(c.specEntryId));
-  return { toSpawn, unmatchedChildren };
+  const unmatchedChildren = existingChildren.filter(
+    (c) =>
+      !specIds.has(c.specEntryId) &&
+      (c.childWorkflow === undefined || c.childWorkflow === childWorkflow),
+  );
+
+  return { toSpawn, unmatchedChildren, legacyIdOnlyMatches };
 }
 
 /**
@@ -948,8 +1029,25 @@ export async function executeFanout(
   // parent's children (fail-open → first spawn sees none, spawns everything).
   const existingChildren =
     options?.existingChildren ?? (await fetchExistingSpawnChildren(parentCtx.internalId, authToken));
-  const { toSpawn, unmatchedChildren } = dedupeSpawnSpec(findings, existingChildren);
+  // INF-32: scope the dedup to this fan-out's own workflow — spec-entry ids are
+  // content-addressed, so a sibling fan-out sharing this spec_source has children
+  // carrying the very ids we are about to mint.
+  const { toSpawn, unmatchedChildren, legacyIdOnlyMatches } = dedupeSpawnSpec(
+    findings,
+    existingChildren,
+    childWorkflowLabel,
+  );
   result.unmatchedChildren = unmatchedChildren.map((c) => c.identifier);
+
+  if (legacyIdOnlyMatches.length > 0) {
+    // INF-32 AC1: a workflow-less child suppressed a spawn on an id-only match.
+    // Conservative, but never silent — that silence is the bug this fixes.
+    log.warn(
+      `fanout: ${legacyIdOnlyMatches.length} child(ren) of ${parentIssueId} suppressed a spawn via the ` +
+      `pre-INF-32 id-only fallback (no child-workflow marker or wf:* label to scope against ` +
+      `'${childWorkflowLabel}'): ${legacyIdOnlyMatches.map((c) => c.identifier).join(", ")}`,
+    );
+  }
 
   if (unmatchedChildren.length > 0) {
     // AC2: never cancel — just post a note listing the orphaned children.
@@ -1112,6 +1210,9 @@ export async function executeFanout(
     const childDescription = [
       `Parent: ${parentIssueId}`,
       finding.id ? `${SPEC_ENTRY_MARKER_PREFIX}${finding.id} -->` : "",
+      // INF-32: record the minting workflow so a later fan-out sharing this
+      // spec_source can tell this child apart from one of its own.
+      finding.id ? `${CHILD_WORKFLOW_MARKER_PREFIX}${findingWorkflow} -->` : "",
       finding.description ? `\n${finding.description}` : "",
     ].filter(Boolean).join("\n");
 
@@ -1190,6 +1291,12 @@ async function postPreviewComment(
  * or hand-created children have no marker and are ignored — they neither
  * suppress a spawn nor surface as unmatched.
  *
+ * INF-32: each child's minting workflow is resolved so dedup can scope to it —
+ * from the `inf-32:child-workflow` marker when present, else from the child's own
+ * `wf:*` label (which is why this query asks for labels). Children predating
+ * INF-32 have neither and are left `childWorkflow: undefined`, which
+ * {@link dedupeSpawnSpec} handles via its reported id-only fallback.
+ *
  * Fail-open: any error (network, unmocked query in a test) yields an empty list,
  * so dedup degrades to "spawn everything" — the pre-AI-1994 behaviour.
  */
@@ -1200,7 +1307,7 @@ async function fetchExistingSpawnChildren(
   const query = `
     query FanoutChildren($id: String!) {
       issue(id: $id) {
-        children { nodes { identifier description state { name } } }
+        children { nodes { identifier description state { name } labels { nodes { name } } } }
       }
     }
   `;
@@ -1214,7 +1321,12 @@ async function fetchExistingSpawnChildren(
       data?: {
         issue?: {
           children?: {
-            nodes?: Array<{ identifier: string; description?: string | null; state?: { name?: string } | null }>;
+            nodes?: Array<{
+              identifier: string;
+              description?: string | null;
+              state?: { name?: string } | null;
+              labels?: { nodes?: Array<{ name?: string }> } | null;
+            }>;
           } | null;
         } | null;
       };
@@ -1225,7 +1337,19 @@ async function fetchExistingSpawnChildren(
     for (const n of nodes) {
       const m = SPEC_ENTRY_MARKER_RE.exec(n.description ?? "");
       if (m) {
-        children.push({ identifier: n.identifier, specEntryId: m[1], state: n.state?.name });
+        // INF-32: marker first (authoritative — written at mint time), then the
+        // child's live wf:* label. Neither ⇒ a pre-INF-32 child; leave undefined
+        // rather than guessing, and let dedupeSpawnSpec report the fallback.
+        const wfMarker = CHILD_WORKFLOW_MARKER_RE.exec(n.description ?? "");
+        const wfLabel = (n.labels?.nodes ?? [])
+          .map((l) => l.name)
+          .find((name): name is string => typeof name === "string" && /^wf:.+/.test(name));
+        children.push({
+          identifier: n.identifier,
+          specEntryId: m[1],
+          state: n.state?.name,
+          childWorkflow: wfMarker ? wfMarker[1] : wfLabel,
+        });
       }
     }
     return children;
