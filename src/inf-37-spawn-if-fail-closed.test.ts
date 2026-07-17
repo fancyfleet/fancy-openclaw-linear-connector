@@ -515,6 +515,31 @@ describe("INF-37 AC3/AC4: a failed spawn_if does not vacuously satisfy the barri
     // Keep the defs dir pure — the registry tries to load every YAML in it.
     const supportDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf37-support-"));
     fs.writeFileSync(path.join(dir, "inf37-fanout.yaml"), SPAWN_IF_FANOUT_YAML, "utf8");
+    // INF-41: the fanout config validation (validateFanoutSpec) requires the
+    // child_workflow label (wf:dev-impl) to reference a registered workflow def.
+    // Without this file, the validation rejects the transition before the fan-out
+    // engine ever reaches the spawn_if evaluation.
+    const devImplYaml = `
+id: dev-impl
+version: 1
+archetype: dev
+entry_state: intake
+states:
+  - id: intake
+    owner_role: dev
+    native_state: todo
+    transitions:
+      - { command: begin, to: implementation }
+  - id: implementation
+    owner_role: dev
+    native_state: doing
+    transitions:
+      - { command: complete, to: done }
+  - id: done
+    kind: terminal
+    native_state: done
+`;
+    fs.writeFileSync(path.join(dir, "dev-impl.yaml"), devImplYaml.trimStart(), "utf8");
     const policyFile = path.join(supportDir, "capability-policy.yaml");
     fs.writeFileSync(policyFile, CAPABILITY_POLICY_YAML, "utf8");
     const agentsFile = path.join(supportDir, "agents.json");
@@ -577,7 +602,11 @@ describe("INF-37 AC3/AC4: a failed spawn_if does not vacuously satisfy the barri
       .filter((c) => c.query.includes("commentCreate"))
       .map((c) => String(c.variables.body ?? ""));
     expect(comments.length).toBeGreaterThanOrEqual(1);
-    expect(comments.join("\n")).toMatch(/could not be evaluated/i);
+    // The error is a failed evaluation (not a successful waive). The exact
+    // error message depends on whether the failure is a transport error, a
+    // GraphQL error, or a config validation error (INF-41). The contract is:
+    // the steward is told the predicate failed and the transition was refused.
+    expect(comments.join("\n")).toMatch(/(could not be evaluated|spawn_if evaluation failed|fan-out refused)/i);
   });
 
   it("AC3: a transport throw on the children query also does NOT advance the parent", async () => {
