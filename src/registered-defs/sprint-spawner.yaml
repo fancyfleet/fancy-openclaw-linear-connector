@@ -122,18 +122,13 @@ states:
       boundary. Assign unique emoji (collision-checked vs last 10 sprints).
       Write brief. Two delivery paths:
       - propose-brief (full sprint) → spawning-scope
-      - deliver-direct (small scope) → managing
+      - deliver-direct (small scope) → releasing
     transitions:
       - command: propose-brief
         to: spawning-scope
         generic: continue          # AI-2519: makes `linear continue-workflow` resolve here
         requires_capability: sprint:signoff   # gate evaluated on the RESOLVED transition — preserved
         designated_approver: true
-      # deliver-direct is the skip-articulation path. Only one transition per state
-      # may carry `generic: continue`, so it stays unreachable via continue-workflow
-      # (known limitation, AI-2519). Ai has declined it for LIF-2 Sprint 2; revisit
-      # if the direct-delivery path is ever needed (would need a CLI verb or a swap).
-      #
       # deliver-direct is the skip-articulation path. INF-45 (2026-07-16): repointed
       # to `releasing` to resolve the fanout-before-barrier violation — direct delivery
       # has no dev-sprint child for `managing` to wait on, so going straight to release
