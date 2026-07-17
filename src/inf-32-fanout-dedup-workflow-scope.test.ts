@@ -289,10 +289,34 @@ describe("INF-32 AC2 — def validation rejects two fanout states sharing a spec
     } as unknown as WorkflowDef;
   }
 
-  it("rejects two fanout states sharing a spec_source within one workflow", () => {
+  // ⚠️ AC2 SCOPE NARROWED BY THE IMPLEMENTER (Igor, 2026-07-17) — flagged for
+  // Astrid/tdd to accept or overrule; see the handoff comment on INF-32.
+  //
+  // As originally written, this describe block asserted that ANY two fanout
+  // states sharing a `spec_source` are rejected, regardless of child_workflow.
+  // That contradicts AC1 and regresses shipped behavior:
+  //
+  //  - AC1 requires that "a parent with two fanouts over the same spec_source
+  //    mints both children". Rejecting the def at activation makes that scenario
+  //    unreachable — no def could express what the engine now supports.
+  //  - AI-1992 AC4 ships exactly that def (`synthetic-two-phase`: `arming` →
+  //    wf:sprint-arm and `impl` → wf:dev-impl, both reading `findings`). The
+  //    spec_source-only rule excluded it from the registry and turned 5 green
+  //    AI-1992 tests red — verified against a clean baseline.
+  //  - The ticket's own rationale is that the engine fix exists "so the next def
+  //    doesn't have to know that rule"; a hard activation error re-imposes the
+  //    rule the fix was meant to retire.
+  //
+  // Once dedup is keyed on (specEntryId, child_workflow), a shared spec_source
+  // across DIFFERENT child workflows is well-defined. What stays ambiguous is a
+  // shared (spec_source, child_workflow) PAIR — the scoped key cannot separate
+  // those, and the later fanout still silently mints nothing. That is the case
+  // these tests now pin. The two tests below were re-pointed accordingly; the
+  // rest of this block is tdd's, unchanged.
+  it("rejects two fanout states sharing a spec_source AND child_workflow", () => {
     const def = defWith([
       { id: "spawn-impl", fanout: { spec_source: "findings", child_workflow: WF_A } },
-      { id: "launching", fanout: { spec_source: "findings", child_workflow: WF_B } },
+      { id: "launching", fanout: { spec_source: "findings", child_workflow: WF_A } },
     ]);
 
     const errors = validateFanoutBarrierConfig(def);
@@ -304,6 +328,24 @@ describe("INF-32 AC2 — def validation rejects two fanout states sharing a spec
     expect(joined).toContain("findings");
     expect(joined).toContain("spawn-impl");
     expect(joined).toContain("launching");
+    // It must also name the shared child_workflow, since that is now half the key.
+    expect(joined).toContain(WF_A);
+    // ...and must actually RENDER. A `toContain` check alone passes happily on a
+    // diagnostic carrying an unsubstituted 'undefined' or a raw key separator —
+    // which is exactly what an earlier draft of this validator emitted.
+    expect(joined).not.toContain("undefined");
+    expect(joined).not.toContain("\u0000");
+  });
+
+  it("accepts two fanout states sharing a spec_source into DIFFERENT child workflows (AI-1992 two-phase)", () => {
+    // The shape AC1/AC4 exist to make work, and the one AI-1992's
+    // `synthetic-two-phase` def ships. Must NOT be refused at activation.
+    const def = defWith([
+      { id: "arming", fanout: { spec_source: "findings", child_workflow: WF_A } },
+      { id: "impl", fanout: { spec_source: "findings", child_workflow: WF_B } },
+    ]);
+
+    expect(validateFanoutBarrierConfig(def)).toEqual([]);
   });
 
   it("accepts two fanout states with DISTINCT spec_sources", () => {
@@ -328,9 +370,11 @@ describe("INF-32 AC2 — def validation rejects two fanout states sharing a spec
     // `extractSpecFindings` keys the section header case-insensitively
     // (src/fanout.ts:283), so "Findings" and "findings" read the SAME section and
     // collide exactly as the bug describes. The validator must see them as shared.
+    // (Re-pointed per the scope note above: child_workflow held equal so the
+    // case-insensitivity of spec_source is what this test actually isolates.)
     const def = defWith([
       { id: "spawn-impl", fanout: { spec_source: "findings", child_workflow: WF_A } },
-      { id: "launching", fanout: { spec_source: "Findings", child_workflow: WF_B } },
+      { id: "launching", fanout: { spec_source: "Findings", child_workflow: WF_A } },
     ]);
 
     expect(validateFanoutBarrierConfig(def).length).toBeGreaterThan(0);
