@@ -2098,6 +2098,14 @@ export async function checkWorkflowRules(
   //   - set-state: state-setting tool, not a def transition
   const workflowId = getWorkflowId(labels);
   if (!workflowId) {
+    // Break-glass override: a verified steward (workflow:break-glass) may force
+    // transition verbs through even when the ticket has no wf:* label. This covers
+    // the case where the label fetch failed (the ticket might be a workflow ticket
+    // but we can't see its labels) and the steward uses break-glass to push through.
+    if (breakGlassOverride) {
+      log.info(`workflow-gate: break-glass override — allowing '${intent}' on unarmed ticket ${issueId}`);
+      return null;
+    }
     const safeOnUnarmed = [
       "note",
       "begin-work",

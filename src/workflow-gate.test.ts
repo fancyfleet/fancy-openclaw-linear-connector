@@ -424,9 +424,11 @@ describe("checkWorkflowRules — mode switch", () => {
     expect(await checkWorkflowRules("submit", null, "Bearer tok", "charles")).toBeNull();
   });
 
-  it("returns null for ad-hoc ticket (no wf:* label) — §4.6 mode switch", async () => {
+  it("rejects transition verbs on ad-hoc ticket (no wf:* label) — §4.6 mode switch (INF-35)", async () => {
     globalThis.fetch = makeLabelFetch(["bug", "priority:high"]);
-    expect(await checkWorkflowRules("anything", "issue-uuid", "Bearer tok", "charles")).toBeNull();
+    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("no `wf:*` label");
   });
 
   it("returns null for unknown workflow id (wf:other-workflow) — fail open", async () => {
@@ -451,6 +453,8 @@ describe("checkWorkflowRules — mode switch", () => {
   // G-13a (AI-1551): steward can break-glass on fetch failure; non-steward cannot.
   it("allows blocked intent through on fetch failure with break-glass — steward caller (H-1 / G-13a)", async () => {
     globalThis.fetch = async () => { throw new Error("network error"); };
+    // submit passes through on break-glass: breakGlassOverride bypasses the fetch-failure
+    // fail-closed AND the no-wf-label guard
     const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "astrid", null, null, null, true);
     expect(result).toBeNull();
   });
@@ -521,9 +525,11 @@ describe("checkWorkflowRules — AI-1460: refuse-work meta-command", () => {
     expect(result).toContain("ghost-agent");
   });
 
-  it("refuse-work is pass-through on ad-hoc tickets (no wf:* label)", async () => {
+  it("rejects refuse-work on ad-hoc tickets (no wf:* label) (INF-35)", async () => {
     globalThis.fetch = makeLabelFetch(["bug", "priority:high"]);
-    expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles")).toBeNull();
+    const result = await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("no `wf:*` label");
   });
 
 });
@@ -577,10 +583,13 @@ describe("checkWorkflowRules — AI-1574: refuse-work caller-gating", () => {
     expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "astrid", null, "astrid-uid")).toBeNull();
   });
 
-  // AC3 regression: ad-hoc (ungoverned) tickets must continue to pass through.
-  it("AC3: refuse-work on an ungoverned ticket (no wf:* label) always passes through", async () => {
+  // AC3 regression: ad-hoc (ungoverned) tickets — refuse-work is a transition verb
+  // now rejected (INF-35). Handoff-work, note, and begin-work remain pass-through.
+  it("INF-35 AC3: refuse-work on an ungoverned ticket (no wf:* label) is now rejected", async () => {
     globalThis.fetch = makeDelegateFetch(["bug", "priority:high"], "real-delegate-uid");
-    expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles", null, "charles-uid")).toBeNull();
+    const result = await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles", null, "charles-uid");
+    expect(result).not.toBeNull();
+    expect(result).toContain("no `wf:*` label");
   });
 });
 
@@ -2154,10 +2163,11 @@ describe("checkWorkflowRules — AI-1402: unknown-caller fail-closed", () => {
     expect(result).toBeNull();
   });
 
-  it("unknown caller on ad-hoc ticket is pass-through (no wf:* label)", async () => {
+  it("unknown caller on ad-hoc ticket is rejected — transition verb blocked before caller check (INF-35)", async () => {
     globalThis.fetch = makeLabelFetch(["bug", "priority:high"]);
     const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "ghost-agent");
-    expect(result).toBeNull();
+    expect(result).not.toBeNull();
+    expect(result).toContain("no `wf:*` label");
   });
 
   it("escape (break-glass) does NOT bypass unknown-caller check — unidentified callers are blocked", async () => {
