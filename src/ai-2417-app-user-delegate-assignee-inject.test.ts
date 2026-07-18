@@ -92,6 +92,9 @@ describe("AI-2417: generic delegate-routing verbs inject assigneeId:null for app
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-2417-"));
     process.env.AGENTS_FILE = writeAgents(dir);
     process.env.CAPABILITY_POLICY_PATH = writePolicyFile(dir);
+    // Ensure WORKFLOW_DEFS_DIR points to an empty dir so config health
+    // stays healthy (no policy YAML mixed in with workflow defs).
+    process.env.WORKFLOW_DEFS_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "ai-2417-defs-"));
     resetPolicyCache();
     resetWorkflowCache();
     resetConfigHealth();
@@ -123,8 +126,30 @@ describe("AI-2417: generic delegate-routing verbs inject assigneeId:null for app
               data: {
                 issue: {
                   identifier: "GEN-178",
-                  labels: { nodes: [{ name: "bug" }] },
+                  // INF-35: include wf:* label so refuse-work on a governed
+                  // ticket reaches the delegate injection logic.
+                  labels: { nodes: [{ name: "wf:dev-impl" }, { name: "bug" }] },
                   delegate: { id: "u-ai" },
+                },
+              },
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+
+        // INF-27/INF-35: proxy now fetches issue labels via fetchIssueWithLabels
+        // (IssueWithLabels query) before processing mutations, to check if the
+        // ticket is workflow-armed.
+        if (query.includes("IssueWithLabels")) {
+          return new Response(
+            JSON.stringify({
+              data: {
+                issue: {
+                  id: "issue-uuid",
+                  identifier: "GEN-178",
+                  team: { id: "team-uuid" },
+                  // INF-35: wf:* label so ticket is workflow-governed.
+                  labels: { nodes: [{ id: "lbl-wf-dev-impl", name: "wf:dev-impl" }, { id: "lbl-bug", name: "bug" }] },
                 },
               },
             }),
@@ -146,6 +171,7 @@ describe("AI-2417: generic delegate-routing verbs inject assigneeId:null for app
     fs.rmSync(dir, { recursive: true, force: true });
     delete process.env.CAPABILITY_POLICY_PATH;
     delete process.env.AGENTS_FILE;
+    delete process.env.WORKFLOW_DEFS_DIR;
   });
 
   it("refuse-work: an omitted assigneeId is filled with null when a non-null delegate is set", async () => {
