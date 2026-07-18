@@ -1303,27 +1303,23 @@ async function findOrCreateLabel(
         typeof e.message === "string" && e.message.includes("conflicting inherited label"),
       );
     if (isInheritedConflict) {
-      log.info(`workflow-gate: attempting inherited-label promotion for '${labelName}' on team ${teamId}`);
-      const promoteMutation = group
-        ? `
-        mutation PromoteLabel($teamId: String!, $name: String!, $color: String!, $parentId: String!, $replaceTeamLabels: Boolean!) {
-          issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color, parentId: $parentId, replaceTeamLabels: $replaceTeamLabels }) {
-            success
-            issueLabel { id }
-          }
-        }
-      `
-        : `
-        mutation PromoteLabel($teamId: String!, $name: String!, $color: String!, $replaceTeamLabels: Boolean!) {
-          issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color, replaceTeamLabels: $replaceTeamLabels }) {
+      // AI-2543 + AGI-12: Linear's IssueLabelCreateInput does NOT accept
+      // `replaceTeamLabels` — it was removed from the schema. A plain retry
+      // with `teamId` just repeats the same rejected create. Instead, omit
+      // `teamId` to create a WORKSPACE-LEVEL label (visible to all teams),
+      // which cannot have inheritance conflicts and is accepted by every
+      // team's issueUpdate. For workflow state labels (state:*) this is also
+      // semantically correct — they are universal, not team-specific.
+      log.info(`workflow-gate: attempting inherited-label promotion for '${labelName}' — retrying as workspace-level label`);
+      const promoteMutation = `
+        mutation PromoteLabel($name: String!, $color: String!) {
+          issueLabelCreate(input: { name: $name, color: $color }) {
             success
             issueLabel { id }
           }
         }
       `;
-      const promoteVars = group
-        ? { teamId, name: createName, color: "#94a3b8", parentId: group.id, replaceTeamLabels: true }
-        : { teamId, name: createName, color: "#94a3b8", replaceTeamLabels: true };
+      const promoteVars = { name: createName, color: "#94a3b8" };
       try {
         const promoteRes = await fetch(LINEAR_API_URL, {
           method: "POST",
@@ -1333,7 +1329,7 @@ async function findOrCreateLabel(
         const promoteData = (await promoteRes.json()) as CreateResp;
         const promoteResult = promoteData.data?.issueLabelCreate;
         if (promoteResult?.success && promoteResult.issueLabel) {
-          log.info(`workflow-gate: promoted inherited label '${labelName}' to team ${teamId} as id=${promoteResult.issueLabel.id}`);
+          log.info(`workflow-gate: promoted inherited label '${labelName}' as workspace-level id=${promoteResult.issueLabel.id}`);
           return promoteResult.issueLabel.id;
         }
         const errBody = promoteData.errors ? JSON.stringify(promoteData.errors) : "none";
@@ -1610,6 +1606,10 @@ interface BranchAndPRStatus {
   hasPR: boolean;
   /** True when the issue has at least one merged pull request. */
   hasMergedPR: boolean;
+  /** Merge commit SHA from GitHub, if available (AI-2361 deploy health gate). */
+  mergeSha?: string | null;
+  /** GitHub repo URL (e.g. "fancyfleet/fancy-openclaw-linear-connector"), if available. */
+  repoUrl?: string | null;
 }
 
 /**
@@ -1692,15 +1692,73 @@ async function fetchBranchAndPRStatus(
       const status = (meta as { status?: unknown; state?: unknown }).status ?? (meta as { state?: unknown }).state;
       return typeof status === "string" && status.toLowerCase() === "merged";
     });
+    // Extract merge SHA and repo URL from the first merged PR (AI-2361 deploy health gate).
+    let mergeSha: string | null = null;
+    let repoUrl: string | null = null;
+    for (const pr of prNodes) {
+      const meta = pr.metadata ?? {};
+      const sha = (meta as { mergeCommitSha?: unknown; mergeSha?: unknown }).mergeCommitSha ?? (meta as { mergeSha?: unknown }).mergeSha;
+      if (typeof sha === "string" && sha.length > 0) {
+        mergeSha = sha;
+      }
+      if (typeof pr.url === "string") {
+        const m = pr.url.match(/github\.com\/([^/]+\/[^/]+)\/pull/);
+        if (m) repoUrl = m[1];
+      }
+      // Use the first merged PR with available data
+      if (mergeSha || repoUrl) break;
+    }
     return {
       // Attachments cannot see branches directly; a PR implies a pushed branch.
       hasBranch: hasPR,
       hasPR,
       hasMergedPR,
+      mergeSha,
+      repoUrl,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log.warn(`workflow-gate: branch/PR fetch failed for ${issueId}: ${msg}`);
+    return null;
+  }
+}
+
+// ── Deploy health gate (AI-2361): verify running artifact contains merge SHA ──
+
+/**
+ * Check if a given repo URL matches the connector repo (which has a verifiable
+ * /health endpoint). Uses the CONNECTOR_REPO env var (defaults to the
+ * fancyfleet/fancy-openclaw-linear-connector identifier) to determine the
+ * connector repo identity.
+ */
+function isConnectorRepo(repoUrl: string | null | undefined): boolean {
+  if (!repoUrl) return false;
+  const connectorRepo = process.env.CONNECTOR_REPO ?? "fancyfleet/fancy-openclaw-linear-connector";
+  return repoUrl.toLowerCase() === connectorRepo.toLowerCase();
+}
+
+/**
+ * Fetch the running connector's /health commit hash.
+ * Uses the HEALTH_CHECK_URL env var, defaulting to http://localhost:3100/health.
+ * Returns null on any error (fail-open for non-connector scenarios).
+ */
+async function fetchHealthCommit(): Promise<string | null> {
+  const url = process.env.HEALTH_CHECK_URL ?? "http://localhost:3100/health";
+  try {
+    const res = await fetch(url, { method: "GET", signal: AbortSignal.timeout(5000) });
+    if (!res.ok) {
+      log.warn(`workflow-gate: /health check returned ${res.status} from ${url}`);
+      return null;
+    }
+    const body = (await res.json()) as { commit?: unknown };
+    if (typeof body.commit !== "string") {
+      log.warn(`workflow-gate: /health response missing 'commit' field from ${url}`);
+      return null;
+    }
+    return body.commit;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: /health fetch failed from ${url}: ${msg}`);
     return null;
   }
 }
@@ -2072,15 +2130,16 @@ export async function checkWorkflowRules(
   // (signaling they believe this is a workflow command), fail closed.
   // Break-glass override bypasses this check.
   if (fetchFailed && !breakGlassOverride) {
-    // Safety: begin-work and note pass through even on fetch failure because:
+    // Safety: begin-work, note, complete, and cancel pass through even on fetch failure because:
     //   - begin-work on an ad-hoc ticket is harmless (labels are empty → getWorkflowId
     //     returns null → pass-through below), and it's the only way to add a wf:*
     //     label to start workflowing a ticket.
     //   - note is informational-only and never mutates state, so allowing it through
     //     is safe even if we can't verify workflow membership.
+    //   - complete and cancel on an ad-hoc ticket close it without workflow validation.
     // All other intents are rejected because they would mutate workflow state without
     //     being able to validate the move.
-    const looksLikeWorkflowCommand = intent !== "begin-work" && intent !== "note";
+    const looksLikeWorkflowCommand = intent !== "begin-work" && intent !== "note" && intent !== "complete" && intent !== "cancel";
     if (looksLikeWorkflowCommand) {
       log.error(`workflow-gate: FAIL-CLOSED — context fetch failed for ${issueId}, cannot determine if workflow ticket — rejecting '${intent}'`);
       return (
@@ -2125,14 +2184,17 @@ export async function checkWorkflowRules(
       "rewind",
       "handoff-work",
       "set-state",
+      "complete",
+      "cancel",
     ];
     if (!safeOnUnarmed.includes(intent)) {
       log.warn(`workflow-gate: rejecting '${intent}' on unarmed ticket ${issueId} — no \`wf:*\` label`);
       return (
         `[Proxy] '${intent}' is only valid on workflow tickets ` +
         `(ticket ${issueId} has no \`wf:*\` label). ` +
-        `Use \`linear begin-work ${issueId}\` to enroll the ticket in a workflow, ` +
-        `or \`linear observe-issue ${issueId}\` for read-only inspection.`
+        `Use \`linear complete ${issueId}\` to close this ad-hoc ticket, ` +
+        `\`linear cancel ${issueId}\` to cancel it, ` +
+        `or \`linear begin-work ${issueId}\` to enroll it in a workflow.`
       );
     }
     return null;
@@ -2542,10 +2604,12 @@ export async function checkWorkflowRules(
   // block when partial evidence exists (has branch but no PR = pushed but never
   // reviewed). Also fail-open on null (transient API failure) after one retry.
   //
-  // NOTE(AI-2476): The AI-1795 no-CI-auto-deploy guard (below) keys on
-  // `intent === "deploy"` and is also dead. It needs independent redesign
-  // (separate ticket) — its premise of a choice between two forward exits no
-  // longer exists in v14.
+  // NOTE(INF-62): The AI-1795 no-CI-auto-deploy guard (below) was re-armed.
+  // The old `intent === "deploy"` check was replaced with a destination-state
+  // check: the guard fires when a transition from a non-deploy state goes
+  // directly to ac-validate on a flagged repo. The guard's premise (blocking
+  // merge→ac-validate skip on no-CI-auto-deploy repos) is now enforced on
+  // the resolved transition's destination, not the caller's verb.
   if ((currentState === 'merge' || currentState === 'deploy') && intent === 'continue') {
     let branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
     // AI-1497: retry once on null — transient Linear API failure during
@@ -2596,32 +2660,88 @@ export async function checkWorkflowRules(
     }
   }
 
-  // AI-1795: no-CI-auto-deploy guard. On repos flagged `ci_auto_deploy: false`
-  // in the instance deploy policy, `deploy` (merge → ac-validate directly) is
-  // rejected: merge alone leaves the running service on the old build, and
-  // ac-validate would verify a stale artifact (recurred twice on AI-1775).
-  // The legal exit for such repos is `handoff-host-deploy` → host-deploy,
-  // which is never blocked here. Repo resolution: `repo:*` labels + GitHub
-  // attachments; unresolvable or unflagged repos pass (guard is opt-in per
-  // repo). Break-glass is exempt (steward recovery path, identity-gated).
-  if (intent === "deploy" && !breakGlassOverride) {
+  // ── AI-2361: Deploy health gate ───────────────────────────────────────
+  // When a ticket transitions forward from a deploy state on a connector repo
+  // ticket, verify the running connector's /health commit includes the merge SHA.
+  // This prevents stale-artifact tickets from reaching ac-validate (see AI-2357).
+  // Non-connector repos, missing merge SHA, and non-forward transitions (reject)
+  // are all pass-through.
+  if ((currentState?.includes('deploy') ?? false) && intent !== 'reject') {
+    const branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+    if (branchStatus) {
+      const repo = branchStatus.repoUrl;
+      const mergeSha = branchStatus.mergeSha;
+      if (!mergeSha) {
+        log.info(`workflow-gate: deploy health gate: ${issueId} — no merge SHA available (passing through)`);
+      } else if (!isConnectorRepo(repo)) {
+        log.info(`workflow-gate: deploy health gate: ${issueId} — non-connector repo '${repo}' (passing through)`);
+      } else {
+        const runningCommit = await fetchHealthCommit();
+        if (runningCommit === null) {
+          log.warn(`workflow-gate: deploy health gate: ${issueId} — /health unreachable, blocking deploy`);
+          notify({
+            severity: "warning",
+            source: "deploy-health-gate",
+            title: "Deploy health gate: /health unreachable",
+            detail: `Ticket ${issueId} on connector repo: /health returned no commit — blocking deploy to prevent stale-artifact validation.`,
+            ticket: issueId,
+            dedupKey: `deploy-health|${issueId}`,
+          });
+          return `[Proxy] '${intent}' blocked: the running connector's /health endpoint is unreachable. ` +
+            `Cannot verify the running artifact contains merge SHA ${mergeSha}. Ensure the connector is running and try again.`;
+        }
+        if (!runningCommit.startsWith(mergeSha) && !runningCommit.includes(mergeSha)) {
+          log.warn(`workflow-gate: deploy health gate: ${issueId} — stale artifact (running=${runningCommit}, merge=${mergeSha})`);
+          notify({
+            severity: "warning",
+            source: "deploy-health-gate",
+            title: `Deploy health gate: stale artifact (running=${runningCommit.slice(0,7)}, merge=${mergeSha.slice(0,7)})`,
+            detail: `Ticket ${issueId}: running commit '${runningCommit}' does not contain merge SHA '${mergeSha}'. ` +
+              `The running connector artifact was not built from this merge and would verify a stale build through ac-validate. ` +
+              `Deploy the new artifact (host restart or redeploy) before continuing.`,
+            ticket: issueId,
+          });
+          return `[Proxy] '${intent}' blocked: stale connector artifact. ` +
+            `Running commit: ${runningCommit}, merge SHA: ${mergeSha}. ` +
+            `The running connector was not built from this merge. Deploy the new artifact (restart/redeploy) before continuing.`;
+        }
+        log.info(`workflow-gate: deploy health gate: ${issueId} passed (running ${runningCommit.slice(0,7)} matches merge ${mergeSha.slice(0,7)})`);
+      }
+    }
+  }
+
+  // AI-1795: no-CI-auto-deploy guard (re-armed for v10+ generic continue, INF-62).
+  // On repos flagged `ci_auto_deploy: false` in the instance deploy policy, a
+  // `continue` transition from merge (or any non-deploy state) that goes directly
+  // to ac-validate is rejected: merging alone leaves the running service on the
+  // old build, and ac-validate would verify a stale artifact without the deploy
+  // state ever being traversed (recurred twice on AI-1775, bypassed again on
+  // GEN-198 by dead guard, INF-62).
+  // The old guard keyed on `intent === "deploy"` — the v8 literal command that
+  // AI-1872 (v10) replaced with `generic: continue`. The guard now fires when
+  // the resolved transition's destination is `ac-validate` from a non-deploy
+  // state, detecting the deploy-skip regardless of the intent string.
+  // Repo resolution: `repo:*` labels + GitHub attachments; unresolvable or
+  // unflagged repos pass (guard is opt-in per repo). Break-glass is exempt.
+  if (!breakGlassOverride && (match.to === 'ac-validate' && currentState !== 'deploy' || intent === 'deploy')) {
     const repoRefs = await resolveTicketRepoRefs(labels, issueId, authToken);
     const flagged = reposWithoutCiAutoDeploy(repoRefs);
     if (flagged.length > 0) {
       const repoList = flagged.join("', '");
-      log.warn(`workflow-gate: AI-1795 no-CI-auto-deploy guard blocked 'deploy' on ${issueId} (repo '${repoList}', agent=${bodyId})`);
+      log.warn(`workflow-gate: AI-1795 no-CI-auto-deploy guard blocked '${intent}' on ${issueId} (repo '${repoList}', agent=${bodyId})`);
       notify({
         severity: "warning",
         source: "deploy-policy",
-        title: `no-CI-auto-deploy guard blocked 'deploy' (repo: ${flagged.join(", ")})`,
-        detail: `Ticket ${issueId}: 'deploy' would advance to ac-validate without the merged artifact running. Agent must use 'handoff-host-deploy' → host-deploy instead.`,
+        title: `no-CI-auto-deploy guard blocked (repo: ${flagged.join(", ")})`,
+        detail: `Ticket ${issueId}: '${intent}' would advance to ac-validate (from ${currentState}) without the merged artifact running through the deploy state. Route through host-deploy instead.`,
         agent: bodyId,
         ticket: issueId,
       });
-      const legalMoves = [...transitions.filter((t) => t.command !== "deploy").map((t) => cliVerbFor(t)), breakGlassCommand].join(", ");
+      const legalMoves = [...transitions.filter((t) => t.command !== intent).map((t) => cliVerbFor(t)), breakGlassCommand].join(", ");
       return (
-        `[Proxy] 'deploy' blocked: repo '${repoList}' has no CI auto-deploy — merging alone leaves the running service on the old build, ` +
-        `and AC validation would verify a stale artifact. Use 'handoff-host-deploy' to route through host-deploy instead. ` +
+        `[Proxy] '${intent}' blocked: repo '${repoList}' has no CI auto-deploy — merging alone leaves ` +
+        `the running service on the old build, and AC validation would verify a stale artifact. ` +
+        `Use 'handoff-host-deploy' to route through host-deploy instead. ` +
         `Legal moves: ${legalMoves}.`
       );
     }
@@ -3841,7 +3961,16 @@ export async function applyStateTransition(
   // Step 2: Resolve the next delegate.
   // AI-1493: Deterministic owner-routing for ALL transitions.
   const destStateNode = def.states.find((s) => s.id === toStateName);
-  const destOwnerRole = destStateNode?.owner_role;
+  // §4.4 break-glass (escape): the steward who performs the escape owns the
+  // post-escape ticket, not the destination state's owner_role — otherwise
+  // escape routes to a multi-body role (e.g. task.yaml's `requester`) and
+  // fails closed with "multi-body role requires a --target"; the comment
+  // posts but the state label never lands (fixes INF-67). This matches
+  // dev-impl's design where intake.owner_role is steward, so escape works
+  // identically whether the YAML declares intake.owner_role or not.
+  const destOwnerRole = intent === breakGlassCommand
+    ? def.break_glass?.owner_role
+    : destStateNode?.owner_role;
   const isTerminal = destStateNode?.kind === 'terminal' || !destOwnerRole;
   let resolvedDelegateId: string | null | undefined = undefined;
 
@@ -5075,9 +5204,29 @@ export async function setStateAtomic(
             `workflow-gate: set-state: re-dispatched ${ticketIdentifier} to '${roleBodies[0]}' (role '${ownerRole}') after advancing to '${targetState}'`,
           );
         } else if (roleBodies.length > 1) {
-          log.warn(
-            `workflow-gate: set-state: skipping re-dispatch for ${ticketIdentifier} — role '${ownerRole}' has multiple bodies (${roleBodies.join(", ")}); delegate manually`,
-          );
+          // INF-58: when delegate is already resolved for a multi-body role,
+          // dispatch directly to the delegate body instead of skipping.
+          if (resolvedDelegateId != null) {
+            const delegateBody = roleBodies.find(b => {
+              const agent = getAgent(b);
+              return agent?.linearUserId === resolvedDelegateId;
+            });
+            if (delegateBody) {
+              await options.sendWakeUp(delegateBody, ticketIdentifier);
+              redispatched = delegateBody;
+              log.info(
+                `workflow-gate: set-state: re-dispatched ${ticketIdentifier} to '${delegateBody}' (role '${ownerRole}') after advancing to '${targetState}' — delegate pre-set for multi-body role`,
+              );
+            } else {
+              log.warn(
+                `workflow-gate: set-state: skipping re-dispatch for ${ticketIdentifier} — delegate (linearUserId=${resolvedDelegateId}) is not a member of role '${ownerRole}'`,
+              );
+            }
+          } else {
+            log.warn(
+              `workflow-gate: set-state: skipping re-dispatch for ${ticketIdentifier} — role '${ownerRole}' has multiple bodies (${roleBodies.join(", ")}); delegate manually`,
+            );
+          }
         } else {
           log.warn(
             `workflow-gate: set-state: skipping re-dispatch for ${ticketIdentifier} — role '${ownerRole}' has no bodies`,
