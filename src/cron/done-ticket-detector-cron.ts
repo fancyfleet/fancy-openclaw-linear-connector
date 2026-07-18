@@ -157,7 +157,7 @@ export function createLinearApi(linearToken?: string): LinearApi {
       const teamId = issueData.issue.team.id;
 
       const labelData = await graphQL<{
-        issueLabels: { nodes: Array<{ id: string }> };
+        issueLabels: { nodes: Array<{ id: string, name: string }> };
       }>(
         `query FindLabel($teamId: ID!) {
           issueLabels(filter: { team: { id: { eq: $teamId } } }, first: 50) {
