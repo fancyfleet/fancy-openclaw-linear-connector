@@ -53,6 +53,10 @@ export class NudgeStore {
   /**
    * Check if this agent+ticket is suppressed (nudged within the window).
    * Returns true if a nudge should be skipped.
+   *
+   * @deprecated Use {@link acquireNudgeSlot} instead — it atomically checks and
+   * records within a single SQLite transaction, eliminating the TOCTOU race
+   * between read (getCoalesceInfo) and write (recordNudge/recordCoalesced).
    */
   isSuppressed(agentId: string, ticketId: string, windowMs: number): boolean {
     return this.getCoalesceInfo(agentId, ticketId, windowMs).suppressed;
@@ -61,6 +65,9 @@ export class NudgeStore {
   /**
    * Get coalescing info for an agent+ticket pair.
    * Returns suppression status and the count of coalesced events since last delivery.
+   *
+   * @deprecated Use {@link acquireNudgeSlot} instead — this method participates
+   * in a racy read-then-write pattern.
    */
   getCoalesceInfo(agentId: string, ticketId: string, windowMs: number): { suppressed: boolean; coalescedCount: number } {
     const row = this.db
@@ -75,7 +82,96 @@ export class NudgeStore {
   }
 
   /**
+   * Atomically check-and-record a nudge slot for (agent, ticket) within the
+   * suppression window.
+   *
+   * This method is the atomic replacement for the racy two-step pattern:
+   * ```
+   * // 🚫 RACY:
+   * const info = nudgeStore.getCoalesceInfo(agentId, ticketId, windowMs);
+   * if (info.suppressed) {
+   *   nudgeStore.recordCoalesced(agentId, ticketId);
+   *   return;
+   * }
+   * nudgeStore.recordNudge(agentId, ticketId);
+   *
+   * // ✅ ATOMIC:
+   * const { suppressed, coalescedCount } =
+   *   nudgeStore.acquireNudgeSlot(agentId, ticketId, windowMs);
+   * if (suppressed) { route.coalescedCount = coalescedCount; return; }
+   * if (coalescedCount > 0) route.coalescedCount = coalescedCount;
+   * ```
+   *
+   * Returns:
+   *   { suppressed: true,  coalescedCount: N } — suppressed; N includes this event (>= 1)
+   *   { suppressed: false, coalescedCount: N } — admitted; N is drained count from prior window
+   *   { suppressed: false, coalescedCount: 0 } — admitted; no prior coalesced events
+   *
+   * The entire read-check-write-write sequence runs inside a single SQLite
+   * IMMEDIATE transaction, serializing concurrent access by key. See AI-2376.
+   */
+  acquireNudgeSlot(
+    agentId: string,
+    ticketId: string,
+    windowMs: number,
+    eventType?: string,
+    eventAction?: string,
+  ): { suppressed: boolean; coalescedCount: number } {
+    const acquire = this.db.transaction((): { suppressed: boolean; coalescedCount: number } => {
+      // 1. Read current state
+      const row = this.db
+        .prepare("SELECT last_nudge_at, coalesced_count FROM nudge_log WHERE agent_id = ? AND ticket_id = ?")
+        .get(agentId, ticketId) as { last_nudge_at: string; coalesced_count: number } | undefined;
+
+      if (!row) {
+        // No prior nudge — admit (prime the slot). No coalesced history.
+        this.db.prepare(`
+          INSERT INTO nudge_log (agent_id, ticket_id, last_nudge_at, nudge_count, coalesced_count, last_event_type, last_event_action)
+            VALUES (?, ?, datetime('now'), 1, 0, NULL, NULL)
+        `).run(agentId, ticketId);
+        return { suppressed: false, coalescedCount: 0 };
+      }
+
+      const lastNudge = new Date(row.last_nudge_at + "Z").getTime();
+      const isSuppressed = Date.now() - lastNudge < windowMs;
+
+      if (isSuppressed) {
+        // Suppressed — increment coalesced counter. Return > 0 to tell
+        // the caller this event was merged, not delivered.
+        // NB: Use positional (?) params. Numbered params (?1, ?2) in CASE
+        // expressions within better-sqlite3 cause "Too many parameter values"
+        // — the numbered references seem to be counted additively across the
+        // CASE branches. Positional ? avoids this entirely (AI-2376).
+        this.db.prepare(`
+          UPDATE nudge_log SET
+            coalesced_count = coalesced_count + 1,
+            last_event_type = CASE WHEN ? IS NOT NULL THEN ? ELSE last_event_type END,
+            last_event_action = CASE WHEN ? IS NOT NULL THEN ? ELSE last_event_action END
+          WHERE agent_id = ? AND ticket_id = ?
+        `).run(eventType ?? null, eventType ?? null, eventAction ?? null, eventAction ?? null, agentId, ticketId);
+        return { suppressed: true, coalescedCount: row.coalesced_count + 1 };
+      } else {
+        // Window expired — refresh the nudge and drain coalesced count to caller.
+        // The caller should use the drained count as a signal of dropped work.
+        const drainedCount = row.coalesced_count;
+        this.db.prepare(`
+          UPDATE nudge_log SET
+            last_nudge_at = datetime('now'),
+            nudge_count = nudge_count + 1,
+            coalesced_count = 0
+          WHERE agent_id = ? AND ticket_id = ?
+        `).run(agentId, ticketId);
+        return { suppressed: false, coalescedCount: drainedCount };
+      }
+    });
+
+    return acquire();
+  }
+
+  /**
    * Record a nudge for this agent+ticket, updating the timestamp and count.
+   *
+   * @deprecated Use {@link acquireNudgeSlot} instead.
    */
   recordNudge(agentId: string, ticketId: string): void {
     this.db.prepare(`
@@ -91,6 +187,8 @@ export class NudgeStore {
   /**
    * Record a coalesced (suppressed) event — increments the coalesced counter
    * and tracks the latest event type/action for context.
+   *
+   * @deprecated Use {@link acquireNudgeSlot} instead.
    */
   recordCoalesced(agentId: string, ticketId: string, eventType?: string, eventAction?: string): void {
     this.db.prepare(`

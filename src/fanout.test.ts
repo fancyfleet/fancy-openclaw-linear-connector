@@ -13,6 +13,7 @@ import os from "node:os";
 import path from "node:path";
 import { extractFindings, executeFanout, shouldTriggerFanout, type Finding } from "./fanout.js";
 import { applyStateTransition, resetWorkflowCache, type WorkflowDef, type FanoutConfig } from "./workflow-gate.js";
+import { reloadAgents } from "./agents.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 
 const CANONICAL_UX_AUDIT_FIXTURE = path.resolve(process.cwd(), "src/__fixtures__/canonical-ux-audit.yaml");
@@ -427,12 +428,20 @@ describe("executeFanout — mocked Linear API", () => {
       },
     });
 
+      teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ],
     const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true });
 
     expect(result.created).toBe(2);
     expect(result.childIdentifiers).toHaveLength(2);
   });
 
+      teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ],
   it("AI-1992 (AC5): refuses — no children — when the description has no parseable spec", async () => {
     globalThis.fetch = makeFanoutFetch({
       parentContext: {
@@ -513,7 +522,10 @@ describe("executeFanout — mocked Linear API", () => {
     ];
 
     // Only first child succeeds
-    globalThis.fetch = makeFanoutFetch({ successCount: 1 });
+    globalThis.fetch = makeFanoutFetch({ successCount: 1, teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ] });
 
     const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true, findingsOverride: findings });
 
@@ -531,7 +543,12 @@ describe("executeFanout — mocked Linear API", () => {
       { title: "Orchestrator-type finding that might spawn its own children" },
     ];
 
-    globalThis.fetch = makeFanoutFetch({});
+    globalThis.fetch = makeFanoutFetch({
+      teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ],
+    });
 
     const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true, findingsOverride: findings });
 
@@ -551,7 +568,12 @@ describe("executeFanout — mocked Linear API", () => {
       { title: "Finding B" },
     ];
 
-    globalThis.fetch = makeFanoutFetch({});
+    globalThis.fetch = makeFanoutFetch({
+      teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ],
+    });
 
     const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true, findingsOverride: findings });
 
@@ -573,7 +595,10 @@ describe("executeFanout — mocked Linear API", () => {
       { title: "Finding B" },
     ];
 
-    globalThis.fetch = makeFanoutFetch({ parentInternalId: "parent-uuid-123" });
+    globalThis.fetch = makeFanoutFetch({ parentInternalId: "parent-uuid-123", teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ] });
 
     const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true, findingsOverride: findings });
 
@@ -700,11 +725,11 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
   let originalFetch: typeof globalThis.fetch;
   let fetchCalls: Array<{ url: string; body: Record<string, unknown> }>;
   let uxDir: string;
-  let originalWorkflowPath: string | undefined;
+  let originalWorkflowDefsDir: string | undefined;
   let originalPolicyPath: string | undefined;
 
   beforeAll(() => {
-    originalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    originalWorkflowDefsDir = process.env.WORKFLOW_DEFS_DIR;
     originalPolicyPath = process.env.CAPABILITY_POLICY_PATH;
 
     uxDir = fs.mkdtempSync(path.join(os.tmpdir(), "fanout-integration-"));
@@ -712,15 +737,41 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     fs.writeFileSync(policyFile, UX_AUDIT_POLICY_YAML, "utf8");
     process.env.CAPABILITY_POLICY_PATH = policyFile;
 
-    process.env.WORKFLOW_DEF_PATH = CANONICAL_UX_AUDIT_FIXTURE;
+    // AI-2359: agents.json must include the policy bodies so singleton delegate
+    // resolution (engine-1 for engine, maya for ux-researcher) does not fail-closed.
+    const agentsFile = path.join(uxDir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [
+        { name: "engine-1", linearUserId: "engine-1-linear-uuid", clientId: "e-c", clientSecret: "e-s", accessToken: "e-t", refreshToken: "e-r" },
+        { name: "maya", linearUserId: "maya-linear-uuid", clientId: "m-c", clientSecret: "m-s", accessToken: "m-t", refreshToken: "m-r" },
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-c", clientSecret: "a-s", accessToken: "a-t", refreshToken: "a-r" },
+        { name: "charles", linearUserId: "charles-linear-uuid", clientId: "c-c", clientSecret: "c-s", accessToken: "c-t", refreshToken: "c-r" },
+        { name: "hanzo", linearUserId: "hanzo-linear-uuid", clientId: "h-c", clientSecret: "h-s", accessToken: "h-t", refreshToken: "h-r" },
+      ],
+    }), "utf8");
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+
+    // INF-41: switch from WORKFLOW_DEF_PATH (single-file) to WORKFLOW_DEFS_DIR
+    // so the registry includes both ux-audit AND dev-impl (the fanout config
+    // default child_workflow is wf:dev-impl, which must be registered).
+    fs.copyFileSync(CANONICAL_UX_AUDIT_FIXTURE, path.join(uxDir, "canonical-ux-audit.yaml"));
+    fs.copyFileSync(
+      path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml"),
+      path.join(uxDir, "canonical-dev-impl.yaml"),
+    );
+    process.env.WORKFLOW_DEFS_DIR = uxDir;
+    delete process.env.WORKFLOW_DEF_PATH;
   });
 
   afterAll(() => {
-    if (originalWorkflowPath !== undefined) {
-      process.env.WORKFLOW_DEF_PATH = originalWorkflowPath;
+    if (originalWorkflowDefsDir !== undefined) {
+      process.env.WORKFLOW_DEFS_DIR = originalWorkflowDefsDir;
     } else {
-      delete process.env.WORKFLOW_DEF_PATH;
+      delete process.env.WORKFLOW_DEFS_DIR;
     }
+    // Restore WORKFLOW_DEF_PATH to undefined (was not set before this test)
+    delete process.env.WORKFLOW_DEF_PATH;
     if (originalPolicyPath !== undefined) {
       process.env.CAPABILITY_POLICY_PATH = originalPolicyPath;
     } else {

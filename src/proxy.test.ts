@@ -483,7 +483,7 @@ describe("proxy enforcement — needs-human (Phase 2 slice 1)", () => {
     expect(res.body.data).toBeDefined();
   });
 
-  it("allows needs-human on a non-workflow ticket (§4.6 mode switch)", async () => {
+  it("rejects needs-human on a non-workflow ticket — transition verb blocked (INF-35)", async () => {
     globalThis.fetch = makeFetch(NON_WORKFLOW_LABEL_RESPONSE);
 
     const res = await request(appState.app)
@@ -494,8 +494,8 @@ describe("proxy enforcement — needs-human (Phase 2 slice 1)", () => {
       .send({ query: "mutation NeedsHuman($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
 
     expect(res.status).toBe(200);
-    expect(res.body.errors).toBeUndefined();
-    expect(res.body.data).toBeDefined();
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("no `wf:*` label");
   });
 
   it("allows non-needs-human commands on workflow ticket (zero behavior change)", async () => {
@@ -676,7 +676,7 @@ describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
     expect(res.body.data).toBeDefined();
   });
 
-  it("is pass-through for ad-hoc tickets (no wf:* label) — §4.6 mode switch", async () => {
+  it("rejects deploy on ad-hoc tickets (no wf:* label) — transition verb blocked (INF-35)", async () => {
     globalThis.fetch = makeFetch(NON_WORKFLOW_LABEL_RESPONSE);
 
     const res = await request(appState.app)
@@ -687,8 +687,8 @@ describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
       .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
 
     expect(res.status).toBe(200);
-    expect(res.body.errors).toBeUndefined();
-    expect(res.body.data).toBeDefined();
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("no `wf:*` label");
   });
 
   // ── AI-1397: delegate-only enforcement ───────────────────────────────────
@@ -1804,11 +1804,11 @@ describe("proxy — Phase 6.5 fail-closed (AI-1476)", () => {
     expect(res.body.errors).toBeDefined();
   });
 
-  it("allows ad-hoc tickets even when config is degraded (§4.6 pass-through)", async () => {
+  it("rejects submit on ad-hoc ticket even when config is degraded — no-wf-label guard fires first (INF-35)", async () => {
     process.env.WORKFLOW_DEF_PATH = path.join(dir, "nonexistent-workflow.yaml");
     resetWorkflowCache();
 
-    // Non-workflow ticket — should still pass through
+    // Non-workflow ticket — no-wf-label guard rejects before config check
     globalThis.fetch = makeFetch(NON_WORKFLOW_LABEL_RESPONSE);
 
     const res = await request(appState.app)
@@ -1819,8 +1819,8 @@ describe("proxy — Phase 6.5 fail-closed (AI-1476)", () => {
       .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
 
     expect(res.status).toBe(200);
-    expect(res.body.errors).toBeUndefined();
-    expect(res.body.data).toBeDefined();
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("no `wf:*` label");
   });
 
   it("returns 200 with UPSTREAM_TIMEOUT when upstream Linear API is unreachable", async () => {

@@ -1,0 +1,72 @@
+# sprint-arm-scope — Sprint Arm: Backend/Scope child workflow (v0)
+# owner: backend planner (Igor), reviewer (cra)
+# last-updated: 2026-07-16
+# status: v0 — registered-def fixture placeholder
+#
+# Registered-def copy for CI conformance validation (INF-42 / INF-45). The
+# canonical source is the spec embedded in dev-sprint-workflow-spec.md.
+# Keep in sync with that spec when a full YAML is authored in the vault.
+#
+# INF-45 (2026-07-16): added to registered-defs as child_workflow target
+# for dev-sprint's spawn-arms fanout.
+#
+# Archetype: linear — simple doing → review → done, no fanout or barrier.
+# Owner: backend planner (Igor), review/complete authority: cra.
+# Content: approach, infra readiness checklist, dependency tickets, spike recommendation.
+
+id: sprint-arm-scope
+version: 0
+archetype: linear
+entry_state: intake
+
+break_glass:
+  command: escape
+  to: escape
+  owner_role: steward
+
+states:
+
+  - id: intake
+    owner_role: steward
+    kind: normal
+    native_state: todo
+    description: >
+      Receive arm brief from dev-sprint. Confirm scope is well-defined.
+    transitions:
+      - command: begin
+        to: planning
+        generic: continue
+
+  - id: planning
+    owner_role: implementer
+    kind: normal
+    native_state: doing
+    description: >
+      Approach, infra readiness checklist, dependency tickets, spike recommendation.
+    transitions:
+      - command: submit
+        to: review
+        generic: continue
+
+  - id: review
+    owner_role: reviewer
+    kind: normal
+    native_state: thinking
+    description: >
+      Substantive pushback required; enumerated approval or revision request.
+    transitions:
+      - command: approve
+        to: done
+        generic: continue
+      - command: request-changes
+        to: planning
+        generic: revision
+
+  - id: done
+    kind: terminal
+    native_state: done
+    satisfies_parent_barrier: true
+
+  - id: escape
+    kind: terminal
+    native_state: invalid

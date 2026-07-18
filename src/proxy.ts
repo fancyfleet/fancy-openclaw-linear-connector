@@ -31,7 +31,7 @@
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules, bodyHasCapability } from "./escalation-gate.js";
-import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
+import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, setStateAtomic, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
 import type { ObservationStore } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
@@ -40,9 +40,33 @@ import { isTerminalState } from "./barrier.js";
 import { getAgent, getAgentByProxyToken } from "./agents.js";
 import type { NoActivityDetector } from "./bag/no-activity-detector.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
+import { IssueCreateDedupCache, extractIssueCreateInput, fingerprintIssueCreate, isSuccessfulIssueCreate, DEFAULT_DEDUP_TTL_MS, type Claim } from "./issue-create-dedup.js";
+import { checkArtifactDisclosure } from "./artifact-disclosure.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
+
+/**
+ * AGI-3: process-local dedup window for agent-driven `issueCreate`.
+ *
+ * `ISSUE_CREATE_DEDUP_TTL_MS=0` disables the guard, leaving creates to forward
+ * unconditionally.
+ */
+const issueCreateDedupTtlMs = (() => {
+  const raw = process.env.ISSUE_CREATE_DEDUP_TTL_MS;
+  if (raw === undefined) return DEFAULT_DEDUP_TTL_MS;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_DEDUP_TTL_MS;
+})();
+let issueCreateDedupCache = new IssueCreateDedupCache(issueCreateDedupTtlMs);
+
+/**
+ * Drop the dedup window. Test seam — the cache is process-local and long-lived,
+ * so without this a create cached by one test leaks into the next.
+ */
+export function resetIssueCreateDedupCache(): void {
+  issueCreateDedupCache = new IssueCreateDedupCache(issueCreateDedupTtlMs);
+}
 
 // G-16/AI-1548: per-ticket command lock (first-wins).
 // Tracks ticket IDs whose commands are currently in-flight. A second concurrent
@@ -281,9 +305,9 @@ function stripStateLabelDeltas(body: GraphQLRequestBody | null, stateLabelIds: S
 function stripNullDelegateAssigneeFields(body: GraphQLRequestBody | null, effectiveIntent: string | null): void {
   const input = issueUpdateInput(body);
   if (!input) return;
-  // AI-2067: needs-human and complete legitimately send delegateId:null as
+  // AI-2067: needs-human, complete, and park legitimately send delegateId:null as
   // part of their documented contract — don't block it.
-  if (effectiveIntent === 'needs-human' || effectiveIntent === 'complete') {
+  if (effectiveIntent === 'needs-human' || effectiveIntent === 'complete' || effectiveIntent === 'park') {
     return;
   }
   if (input.delegateId === null) delete input.delegateId;
@@ -313,6 +337,17 @@ function extractCommentBody(body: GraphQLRequestBody | null): string | null {
   }
   if (typeof vars.body === "string" && (vars.body as string).length > 0) return vars.body as string;
   return null;
+}
+
+/**
+ * True when the mutation is a `commentCreate` — a mutation that posts a comment
+ * and can never change workflow state or delegate. Used to skip workflow
+ * enforcement (B1) on the intent path so a trailing commentCreate in a
+ * multi-step governed command is not re-gated against the post-transition state
+ * (AI-2472).
+ */
+function isCommentCreateMutation(body: GraphQLRequestBody | null): boolean {
+  return !!body?.query && /\bcommentCreate\s*\(/.test(body.query);
 }
 
 /**
@@ -415,6 +450,8 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
   const target = (req.headers["x-openclaw-linear-target"] as string | undefined) ?? null;
   const feedbackCategoryHeader = (req.headers["x-openclaw-feedback-category"] as string | undefined) ?? null;
   const artifactRefHeader = (req.headers["x-openclaw-artifact-ref"] as string | undefined) ?? null;
+  const codeArtifactHeader = (req.headers["x-openclaw-code-artifact"] as string | undefined) ?? null;
+  const substitutionReasonHeader = (req.headers["x-openclaw-substitution-reason"] as string | undefined) ?? null;
   const cliVersion = (req.headers["x-openclaw-linear-cli-version"] as string | undefined) ?? null;
   // AI-1860 AC7: invoking session identity, recorded on governed proxy audit rows so
   // "who ran this mutation" is a one-query lookup (the AI-1909 forensics gap).
@@ -498,7 +535,15 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // meta-intent resolution, the delegate check, nor the transition-legality check is
       // re-evaluated against the command's own post-transition state — the AI-1848 /
       // AI-1872 / AI-1924 "apply-then-self-block, comment dropped, exit 1" repros.
-      const snapshotKey = issueId && intent ? `${agentId}:${issueId}:${intent}` : null;
+      //
+      // AI-2530: the key now includes a per-invocation command nonce
+      // (X-Openclaw-Command-Id) so that a FRESH command always gets a cache-miss
+      // and re-derives from live state, while follow-up mutations (chunked
+      // commentCreate, AI-2472) from the SAME command share the nonce and reuse
+      // the snapshot. The header is REQUIRED for intent-resolving paths; a hard
+      // gate below rejects requests that lack it.
+      const commandId = (req.headers['x-openclaw-command-id'] as string | undefined) ?? null;
+      const snapshotKey = issueId && intent ? `${agentId}:${issueId}:${intent}:${commandId}` : null;
       let snapshotDelegateId: string | null | undefined = undefined;
       let snapshotState: string | null | undefined = undefined;
       // AI-2115 Bug 1: the auth snapshot is keyed only on the sticky intent header
@@ -517,6 +562,27 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // still reuse the snapshot and thus are never re-gated against post-transition
       // state.
       const isTransitionMutation = isIssueUpdateMutation(body);
+
+      // AI-2530 hard-gate: reject intent-resolving requests that lack a command
+      // identity header. Without the nonce, two separate `continue-workflow`
+      // calls from the same agent on the same issue within TTL hash to the
+      // identical snapshot key and the second reuses stale state — a structural
+      // bug with no connector-only fix (proven in the AI-2530 evidence branch).
+      // The header is emitted by skill CLI >= the version shipping this fix;
+      // older CLIs must be updated before the connector accepts their requests.
+      // Only gated on paths that engage meta-intent resolution — plain intents
+      // (begin-work, handoff-work, etc.) don't need a command nonce because they
+      // already resolve to the user-supplied verb directly.
+      if (
+        (intent === 'continue-workflow' || intent === 'request-revision') &&
+        issueId &&
+        !commandId
+      ) {
+        log.warn(`command-nonce-missing agent=${agentId} intent=${intent}${ticketCtx}: connector rejects intent-resolving path without X-Openclaw-Command-Id; upgrade the skill CLI`);
+        res.status(200).json({ errors: [{ message: `Command identity header X-Openclaw-Command-Id is required for '${intent}'. This connector requires skill CLI >= the AI-2530 release that emits per-invocation nonces.` }] });
+        return;
+      }
+
       let snapshotTicketDelegate: string | null | undefined = undefined;
       if (snapshotKey && deps?.commandAuthSnapshots && !isTransitionMutation) {
         const existing = deps.commandAuthSnapshots.get(snapshotKey);
@@ -609,6 +675,92 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         }
         const migrateText = await migrateRes.text();
         res.status(migrateRes.status).set("Content-Type", "application/json").send(migrateText);
+        return;
+      }
+
+      // INF-27 AC3: steward break-glass rewind to a named live state in the
+      // ticket's own workflow. This is not a def transition and must not fall
+      // through to the normal transition-legality path.
+      if (effectiveIntent === "rewind") {
+        const rewindTarget = (req.headers["x-openclaw-rewind-target"] as string | undefined) ?? null;
+
+        let hasBreakGlass = false;
+        try {
+          hasBreakGlass = await bodyHasCapability(agentId, "workflow:break-glass");
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.warn(`rewind-audit agent=${agentId} authorized=false result=identity-check-failed${ticketCtx}: ${msg}`);
+          res.status(200).json({ errors: [{ message: `[Proxy] rewind rejected: capability check failed for caller '${agentId}' (${msg}). Required capability: workflow:break-glass.` }] });
+          return;
+        }
+        if (!hasBreakGlass) {
+          log.warn(`rewind-audit agent=${agentId} authorized=false${ticketCtx} target=${rewindTarget ?? "(none)"}`);
+          res.status(200).json({ errors: [{ message: `[Proxy] rewind rejected: caller '${agentId}' does not hold workflow:break-glass.` }] });
+          return;
+        }
+
+        let def: Awaited<ReturnType<typeof loadWorkflowDefById>> = null;
+        try {
+          const labels = await fetchWorkflowLabels(issueId ?? "", authorization);
+          const workflowId = getWorkflowId(labels);
+          def = workflowId ? await loadWorkflowDefById(workflowId) : null;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.warn(`rewind-target-check-failed agent=${agentId}${ticketCtx}: ${msg}`);
+          res.status(200).json({ errors: [{ message: `[Proxy] rewind rejected: could not resolve the workflow def to validate the target (${msg}).` }] });
+          return;
+        }
+        if (!rewindTarget || !def || !def.states.some((s) => s.id === rewindTarget)) {
+          log.warn(`rewind-block agent=${agentId}${ticketCtx} target=${rewindTarget ?? "(none)"}: not a live-def state`);
+          res.status(200).json({ errors: [{ message: `[Proxy] rewind rejected: target '${rewindTarget ?? "(missing)"}' is not a state in the ticket's workflow def. Supply a live state with X-Openclaw-Rewind-Target.` }] });
+          return;
+        }
+
+        const rewindResult = await setStateAtomic(issueId ?? "", rewindTarget, undefined, authorization, {
+          operationalEventStore: deps?.operationalEventStore,
+        });
+        if (!rewindResult.ok) {
+          log.warn(`rewind-audit agent=${agentId} authorized=true result=state-write-failed${ticketCtx} target=${rewindTarget}: ${rewindResult.error}`);
+          res.status(200).json({ errors: [{ message: `[Proxy] rewind failed: ${rewindResult.error}` }] });
+          return;
+        }
+
+        log.warn(`rewind-audit agent=${agentId} authorized=true${ticketCtx} ${rewindResult.from ?? "(unknown)"}→${rewindTarget}`);
+        deps?.operationalEventStore?.append({
+          outcome: "state-rewound",
+          type: "state-rewind",
+          agent: agentId,
+          key: issueId ?? undefined,
+          detail: { from: rewindResult.from, to: rewindTarget, via: "steward-verb" },
+        });
+        deps?.mutationAuditStore?.append({
+          source: "proxy",
+          ticket: issueId ?? "",
+          changeType: "state",
+          oldValue: rewindResult.from,
+          newValue: rewindTarget,
+          actorId: agentId,
+          opName: "rewind",
+          intent: "steward break-glass rewind",
+        });
+
+        const commentIssueId = rewindResult.internalId ?? issueId;
+        if (commentIssueId) {
+          const commentBody =
+            `[Steward rewind by ${agentId}] state:${rewindResult.from ?? "?"} -> state:${rewindTarget} - break-glass rewind (INF-27 AC3). This is a rewind, not an escape: the ticket remains live in its workflow.`;
+          await fetch(LINEAR_API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: authorization },
+            body: JSON.stringify({
+              query: `mutation($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } } }`,
+              variables: { issueId: commentIssueId, body: commentBody },
+            }),
+          }).catch((err: unknown) => {
+            log.warn(`rewind audit comment failed for ${commentIssueId}: ${err instanceof Error ? err.message : String(err)}`);
+          });
+        }
+
+        res.status(200).json({ data: { rewind: { success: true, from: rewindResult.from, to: rewindTarget } } });
         return;
       }
 
@@ -776,6 +928,42 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           stripNullDelegateAssigneeFields(body, effectiveIntent);
         }
 
+        // AI-2417: Restore assignee-clear alongside a delegate SET so app-user
+        // delegates persist. The Linear API silently drops a delegateId write to
+        // an app/bot user unless assigneeId is carried in the SAME mutation
+        // (AI-1395: "silently rejects delegateId writes for app users unless
+        // assigneeId is [sent]"; the valid persistent shape is
+        // { delegateId: app_user, assigneeId: null }). Two paths converge on the
+        // bug for generic delegate-routing verbs (refuse-work, generic
+        // handoff-work, undelegate):
+        //   • refuse-work OMITS assigneeId entirely (the AI-1395 CLI guard leaves
+        //     it unset for app-user targets), so Linear drops the delegate back to
+        //     the caller — the "reverts to Ai" symptom on GEN-178.
+        //   • generic handoff-work DOES send assigneeId:null, but
+        //     stripNullDelegateAssigneeFields (AI-1857) just removed it above,
+        //     re-creating the same omit shape.
+        // When the CLI itself set a non-null delegateId and did not pin a specific
+        // assignee, inject assigneeId:null so the app-user delegate write persists.
+        // This runs BEFORE the AI-1977 delegate-pre-resolve block, so it only fires
+        // for verbs where the CLI wrote the delegate directly (the generic path);
+        // governed dev-impl verbs omit the CLI delegateId — the proxy's
+        // applyStateTransition owns their delegate/assignee — and are untouched.
+        // A delegate CLEAR (delegateId:null) is excluded, so the AI-1857 guard
+        // against ungoverned delegate self-clears is unaffected.
+        if (isIssueUpdateMutation(body)) {
+          const inputForDelegate = issueUpdateInput(body);
+          if (
+            inputForDelegate &&
+            inputForDelegate.delegateId != null &&
+            !("assigneeId" in inputForDelegate)
+          ) {
+            inputForDelegate.assigneeId = null;
+            log.info(
+              `app-user-delegate-assignee-clear agent=${agentId} intent=${effectiveIntent}${ticketCtx}: injected assigneeId:null alongside delegateId so the delegate persists (AI-2417)`,
+            );
+          }
+        }
+
         // AI-1977: Pre-resolve the delegateId and inject it into the forwarded mutation
         // BEFORE the forward, so webhook #1 carries the correct delegate from the start.
         // Previously applyStateTransition set the delegate as a separate API call after
@@ -845,13 +1033,17 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         // mutation. Running it here — after strip has removed legitimate state:* deltas
         // — catches anything that survived (strip failure, non-state label manipulation).
         // commentCreate is excluded: workflow commands legitimately use it.
-        const intentPathRawRejection = await checkRawMutationInterception(
-          body, issueId, authorization, agentId, callerLinearUserId, /* skipCommentCreate */ true, /* skipLabelFields */ true
-        );
-        if (intentPathRawRejection) {
-          log.warn(`raw-mutation-block-on-intent-path agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${intentPathRawRejection}`);
-          res.status(200).json({ errors: [{ message: intentPathRawRejection }] });
-          return;
+        // AI-2262: `park` is exempt — it sends stateId for Backlog + null delegate/assignee
+        // as its documented contract, and B2 handles the workflow demotion.
+        if (effectiveIntent !== 'park') {
+          const intentPathRawRejection = await checkRawMutationInterception(
+            body, issueId, authorization, agentId, callerLinearUserId, /* skipCommentCreate */ true, /* skipLabelFields */ true
+          );
+          if (intentPathRawRejection) {
+            log.warn(`raw-mutation-block-on-intent-path agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${intentPathRawRejection}`);
+            res.status(200).json({ errors: [{ message: intentPathRawRejection }] });
+            return;
+          }
         }
       }
       let upstreamRes: globalThis.Response;
@@ -979,16 +1171,18 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
 
         // AI-2035 guard B (defense-in-depth): once a transition has successfully
         // landed on a TERMINAL state, invalidate the AI-1860 command-auth
-        // snapshot(s) for this issue so a trailing same-turn mutation under the
-        // same sticky intent header can no longer present a stale pre-terminal
-        // snapshotState to B1 (checkWorkflowRules). Without this the snapshot
-        // keeps satisfying B1's terminal rejection for the full 10-min TTL,
-        // letting the lag-prone gate read reopen the ticket. Guard A (the
-        // getAppliedState-backed terminal re-entry guard in applyStateTransition)
-        // is the lag-proof primary stop; this restores B1's live terminal
-        // rejection at the gate. We drop every snapshot for the issue (all
-        // intents), since a reviewer's close may carry >1 intent and any lingering
-        // pre-terminal snapshot could re-authorize a re-entrant write.
+        // snapshot for this issue except the current in-flight command's own
+        // snapshot. A trailing same-turn commentCreate under the same sticky
+        // intent header needs the pre-terminal snapshotState to resolve its
+        // meta-intent and pass B1; without it the re-resolution against the
+        // live terminal state rejects the comment and drops the body silently
+        // (AI-2472). The current command's snapshot is safe to preserve because
+        // issueUpdate mutations (isTransitionMutation=true) never reuse a
+        // snapshot — they always re-fetch. Only non-transition mutations like
+        // commentCreate reuse it. Guard A (getAppliedState-backed terminal
+        // re-entry guard in applyStateTransition) is the primary stop against
+        // re-open; dropping OTHER snapshots for the issue still catches the
+        // reviewer-close scenario where a different intent might follow.
         if (
           transitionResult?.status === "applied" &&
           transitionResult.to &&
@@ -998,7 +1192,10 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           const issueKeyFragment = issueId ? `:${issueId}:` : null;
           let dropped = 0;
           for (const key of [...deps.commandAuthSnapshots.keys()]) {
-            if (key === snapshotKey || (issueKeyFragment && key.includes(issueKeyFragment))) {
+            // AI-2472: preserve the current in-flight command's snapshot so a
+            // trailing commentCreate can reuse its pre-terminal snapshotState.
+            if (key === snapshotKey) continue;
+            if (issueKeyFragment && key.includes(issueKeyFragment)) {
               deps.commandAuthSnapshots.delete(key);
               dropped++;
             }
@@ -1062,6 +1259,49 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       res.status(200).json({ errors: [{ message: rawRejection }] });
       return;
     }
+    const artifactRejection = await checkArtifactDisclosure(
+      body, issueId, authorization, agentId, callerLinearUserId,
+      codeArtifactHeader, substitutionReasonHeader,
+    );
+    if (artifactRejection) {
+      log.warn(`artifact-disclosure-block agent=${agentId}${ticketCtx}: ${artifactRejection}`);
+      res.status(200).json({ errors: [{ message: artifactRejection }] });
+      return;
+    }
+  }
+
+  // AGI-3: idempotent issueCreate dedup. An identical create from the same agent
+  // inside the TTL is answered with the first create's upstream response, so the
+  // caller receives the issue that already exists instead of minting a second one.
+  // `linear create` carries no intent header, so this sits on the non-intent path.
+  let createClaim: Claim | null = null;
+  const createInput = issueCreateDedupTtlMs > 0 ? extractIssueCreateInput(body) : null;
+  if (createInput) {
+    const hash = fingerprintIssueCreate(agentId, createInput);
+    let claim = issueCreateDedupCache.claim(hash);
+
+    if (claim.kind === "await") {
+      // An identical create is already in flight. Wait for it rather than racing it.
+      const replayed = await claim.wait;
+      if (replayed !== null) {
+        log.warn(`issue-create-dedup agent=${agentId} coalesced in-flight duplicate create title='${createInput.title ?? ""}'`);
+        res.status(200).set("Content-Type", "application/json").send(replayed);
+        return;
+      }
+      // The in-flight create failed and cached nothing; this request is a genuine
+      // attempt, not a duplicate. Re-claim — the abandoned entry is gone, so this
+      // yields a fresh forward claim and cannot loop.
+      claim = issueCreateDedupCache.claim(hash);
+    }
+
+    if (claim.kind === "replay") {
+      log.warn(`issue-create-dedup agent=${agentId} replayed duplicate create title='${createInput.title ?? ""}'`);
+      res.status(200).set("Content-Type", "application/json").send(claim.responseText);
+      return;
+    }
+    if (claim.kind === "forward") {
+      createClaim = claim;
+    }
   }
 
   // Non-intent forward path (reads and raw non-workflow mutations).
@@ -1076,6 +1316,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       body: JSON.stringify(body),
     });
   } catch (err) {
+    createClaim?.abandon();
     const msg = err instanceof Error ? err.message : String(err);
     log.error(`upstream request failed: ${msg}`);
     res.status(200).json({
@@ -1091,6 +1332,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
   log.info(`response agent=${agentId} op=${opName} status=${upstreamRes.status}`);
 
   if (!upstreamRes.ok) {
+    createClaim?.abandon();
     const status = upstreamRes.status;
     log.warn(`upstream-error agent=${agentId} op=${opName}${ticketCtx} status=${status}`);
     if (status === 429) {
@@ -1113,6 +1355,16 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
     return;
   }
 
+  if (createClaim) {
+    // Only a genuine success is remembered: Linear reports rejected mutations as
+    // HTTP 200 with a GraphQL `errors` array, and caching one would replay the
+    // failure onto a legitimate retry.
+    if (isSuccessfulIssueCreate(responseText)) {
+      createClaim.settle(responseText);
+    } else {
+      createClaim.abandon();
+    }
+  }
 
   res
     .status(upstreamRes.status)

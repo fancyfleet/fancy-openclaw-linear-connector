@@ -15,13 +15,18 @@ import { routeEvent, routeEventAll, unresolvedRoutingCandidates } from "../route
 import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
 import { deliverToAgent, DeliveryThrottle, type DeliveryConfig, assertDispatchTargetFetchable } from "../delivery/index.js";
 import { markDispatchIntegrityGateActive } from "../dispatch-integrity-state.js";
+import {
+  checkBreaker,
+  recordDispatch,
+  checkCommentFedSuppressionForTicket,
+} from "../dispatch-circuit-breaker.js";
 import type { RouteResult } from "../types.js";
 import { normalizeSessionKey } from "../session-key.js";
 import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgents } from "../agents.js";
 import { checkAgentLiveness, type LivenessConfig } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
 import { checkRoleGuardAndBlock, type LinearUserIdResolver } from "../routing-guard.js";
-import { fetchWorkflowLabels, enrollIfMissing } from "../workflow-gate.js";
+import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, markAutoEnrollRegistered } from "../workflow-gate.js";
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/index.js";
 import { type WakeUpConfig } from "../bag/wake-up.js";
@@ -138,10 +143,11 @@ async function deliverWithSlot(
   route: RouteResult,
   config: DeliveryConfig,
   throttle?: DeliveryThrottle,
+  dispatchLeaseStore?: DispatchLeaseStore,
 ): Promise<Awaited<ReturnType<typeof deliverToAgent>>> {
   if (throttle) await throttle.acquireSlot();
   try {
-    return await deliverToAgent(route, config);
+    return await deliverToAgent(route, config, dispatchLeaseStore);
   } finally {
     if (throttle) throttle.releaseSlot();
   }
@@ -174,6 +180,11 @@ export function createWebhookRouter(
   markDispatchIntegrityGateActive(
     "phantomFetchabilityGate",
     "primary webhook dispatch path (dispatchRoute → assertDispatchTargetFetchable)",
+  );
+  markAutoEnrollRegistered();
+  markDispatchIntegrityGateActive(
+    "deliveryTimeRecipientResolution",
+    "primary webhook dispatch path (dispatchRoute → roster-based recipient validation, AI-2192)",
   );
 
   if (NUDGE_DEDUP_WINDOW_MS > 0) {
@@ -363,6 +374,30 @@ export function createWebhookRouter(
           }).catch((err) => {
             log.warn(`enrollIfMissing failed for ${enrollIssueId}: ${err instanceof Error ? err.message : String(err)}`);
           });
+
+          // AI-2469 AC1(a): Auto-enroll AI-team tickets into dev-impl at intake.
+          // Runs on every Issue event alongside enrollIfMissing. Skips tickets
+          // that already have a wf:* label (enrollIfMissing handles the gap where
+          // wf:* exists but state:* is missing; this handles the case where
+          // neither exists).
+          const enrollTeamKey = enrollData?.teamKey as string | undefined;
+          if (enrollTeamKey) {
+            autoEnrollByTeam(enrollIssueId, enrollTeamKey, enrollToken, undefined, (info) => {
+              appendOperationalEvent(operationalEventStore, {
+                outcome: "auto-enrolled",
+                type: event.type,
+                key: enrollIdentifier,
+                sessionKey: normalizeSessionKey(enrollIdentifier),
+                detail: { workflowId: info.workflowId, entryState: info.entryState, teamKey: info.teamKey },
+              });
+            }, enrolledTicketsStore).then((result) => {
+              if (result.enrolled) {
+                log.info(`Auto-enrolled: stamped wf:dev-impl + state:${result.entryState} on ${enrollIssueId} (team=AI)`);
+              }
+            }).catch((err) => {
+              log.warn(`autoEnrollByTeam failed for ${enrollIssueId}: ${err instanceof Error ? err.message : String(err)}`);
+            });
+          }
         }
       }
 
@@ -433,22 +468,23 @@ export function createWebhookRouter(
                 hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
                 hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
                 hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
-                // NB: no global gatewayUrl/gatewayToken here. The gateway API
-                // delivery path (deliver.ts) is preferred whenever both are set,
-                // but OPENCLAW_GATEWAY_URL only ever points at ONE gateway (the
-                // host), which knows only host-local agents (grover/main). There
-                // is no per-agent gatewayUrl override in AgentConfig, so injecting
-                // the global here made every container agent (astrid@18822,
-                // igor@18820, …) unreachable — "Unknown agent" — while silently
-                // bypassing the correct per-agent hooksUrl. Delivery routes via
-                // per-agent hooksUrl/hooksToken from agents.json instead.
+                // AI-2420: gateway-API target comes from the agent's OWN config
+                // (agents.json), never the global OPENCLAW_GATEWAY_URL. The global
+                // points at ONE gateway (the host, which knows only grover/main),
+                // so injecting it would strand every container agent (astrid@18822,
+                // igor@18820, …) as "Unknown agent" while bypassing the correct
+                // per-agent hooksUrl. With per-agent gatewayUrl+gatewayToken set,
+                // delivery prefers the x-openclaw-session-key path; otherwise it
+                // falls back to per-agent hooksUrl/hooksToken from agents.json.
+                gatewayUrl: agentCfg?.gatewayUrl,
+                gatewayToken: agentCfg?.gatewayToken,
               };
               try {
                 if (throttle) {
                   await throttle.wait(wakeRoute.agentId);
                   throttle.record(wakeRoute.agentId);
                 }
-                const wakeResult = await deliverWithSlot(wakeRoute, wakeDeliveryConfig, throttle);
+                const wakeResult = await deliverWithSlot(wakeRoute, wakeDeliveryConfig, throttle, dispatchLeaseStore);
                 log.info(
                   `Bootstrap wake delivered to ${bootstrapResult.delegateAgentName} for ${bootstrapResult.ticketIdentifier} (runId=${wakeResult.runId ?? "ok"})`,
                 );
@@ -648,12 +684,151 @@ export function createWebhookRouter(
         }
       }
 
+      // ── AI-2192: Delivery-time recipient resolution ─────────────────────
+      // Check whether the resolved agent is registered in the live roster.
+      // A non-roster agent means the resolution path (delegate/assignee/mention/
+      // department-prefix/steward-escalation) produced a name absent from
+      // agents.json — a half-applied rename, stale cache, or config drift.
+      // Instead of silently attempting delivery (which will fail with retries
+      // into the void), dead-letter immediately with a critical alert naming
+      // the ticket, intended agent, and resolution path.
+      const ticketId = route.sessionKey;
+      const resolvedAgentName = route.agentId;
+      const rosterNames = getAgents().map((a) => a.name);
+      const rosterNameSet = new Set(rosterNames);
+      if (!rosterNameSet.has(resolvedAgentName)) {
+        const detail = {
+          ticket: ticketId.replace(/^linear-/, ""),
+          resolvedAgent: resolvedAgentName,
+          routingReason: route.routingReason,
+          eventType: event.type,
+          rosterAgents: rosterNames,
+        };
+        log.error(
+          `non-roster-agent: ${resolvedAgentName} is not in the agent roster — aborting dispatch for ${ticketId}. ` +
+          `routingReason=${route.routingReason} roster=[${rosterNames.join(", ")}]`,
+        );
+        // Raise a critical alert naming the ticket, agent, and resolution path.
+        notify({
+          severity: "critical",
+          source: "dispatch",
+          title: `Non-roster dispatch target: ${resolvedAgentName} for ${ticketId.replace(/^linear-/, "")}`,
+          detail: JSON.stringify(detail),
+          agent: resolvedAgentName,
+          ticket: ticketId.replace(/^linear-/, ""),
+        });
+        // Write an operational event recording the dead-letter.
+        appendOperationalEvent(operationalEventStore, {
+          outcome: "dispatch-undeliverable",
+          type: event.type,
+          agent: resolvedAgentName,
+          key: ticketId,
+          sessionKey: ticketId,
+          deliveryMode: "non-roster-recipient",
+          attemptCount: 0,
+          errorSummary: `Non-roster dispatch target: ${resolvedAgentName} — routingReason=${route.routingReason}`,
+          detail,
+          wakeId,
+          plane: "connector",
+        });
+        // Zero delivery attempts — return immediately. No retry, no wake.
+        return;
+      }
+
+      // ── AI-2178: Dispatch circuit breaker + comment-fed suppression ─────
+      // Checks run sequentially:
+      //   1. Comment-fed re-wake suppression (pre-wake heuristic) — skip
+      //      without incrementing breaker when the delegate comments on their
+      //      own ticket without advancing state.
+      //   2. Circuit breaker — skip when the breaker is tripped (N
+      //      consecutive no-change wakes).
+      //   3. State comparison — if state hasn't moved since last dispatch,
+      //      increment the breaker counter. If it has, reset.
+      {
+        const cbTicketId = route.sessionKey;
+        const cbData = event.data as Record<string, unknown> | null;
+
+        // Resolve the current state:* label from the event payload.
+        const cbLabels = ((): string[] => {
+          if (Array.isArray(cbData?.labels)) return cbData.labels as string[];
+          const issue = cbData?.issue as Record<string, unknown> | undefined;
+          if (issue && Array.isArray(issue.labels)) return issue.labels as string[];
+          return [];
+        })();
+        const cbStateLabel = cbLabels
+          .filter((l: string) => /^state:/i.test(l))
+          .map((l: string) => l.slice(l.indexOf(":") + 1).toLowerCase())
+          .sort() // deterministic for multi-label edge case
+          .join(",") || null;
+
+        // Feature 2: comment-fed re-wake suppression (pre-wake heuristic).
+        // Runs BEFORE the breaker counter increment so the dominant self-feed
+        // loop never burns a breaker slot.
+        const commentSuppress = checkCommentFedSuppressionForTicket(
+          cbTicketId,
+          event,
+          cbStateLabel,
+          route.agentId,
+        );
+
+        if (commentSuppress.suppressed) {
+          log.info(
+            `Comment-fed suppression: skipping wake for ${route.agentId} [${cbTicketId}] — ${commentSuppress.reason ?? "delegate comment, no state change"}`,
+          );
+          appendOperationalEvent(operationalEventStore, {
+            outcome: "suppressed-comment-fed" as never,
+            type: event.type,
+            agent: route.agentId,
+            key: cbTicketId,
+            sessionKey: cbTicketId,
+            deliveryMode: "circuit-breaker",
+            plane: "connector",
+            detail: { reason: commentSuppress.reason ?? "delegate comment, no state change" },
+          });
+          return;
+        }
+
+        // Feature 1: circuit breaker. First, check if tripped.
+        const breakerCheck = checkBreaker(cbTicketId);
+        if (breakerCheck.blocked) {
+          log.info(
+            `Circuit breaker: blocking dispatch for ${route.agentId} [${cbTicketId}] — tripped at ${breakerCheck.state!.trippedAt} (${breakerCheck.state!.wakeCount} wakes, state=${breakerCheck.state!.lastStateLabel ?? "unknown"})`,
+          );
+          appendOperationalEvent(operationalEventStore, {
+            outcome: "breaked-blocked" as never,
+            type: event.type,
+            agent: route.agentId,
+            key: cbTicketId,
+            sessionKey: cbTicketId,
+            deliveryMode: "circuit-breaker",
+            plane: "connector",
+            detail: { wakeCount: breakerCheck.state!.wakeCount, trippedAt: breakerCheck.state!.trippedAt, stateLabel: breakerCheck.state!.lastStateLabel },
+          });
+          return;
+        }
+
+        // Not blocked and not comment-suppressed. Determine whether this
+        // wake is a repeat on the same state or a state advance (reset).
+        // recordDispatch handles the comparison internally:
+        //   - First dispatch: seed state, counter=0.
+        //   - State changed from last: reset counter to 0.
+        //   - State unchanged: keep existing counter.
+        //
+        // The counter is then incremented by a SUBSEQUENT webhook that
+        // sees the state hasn't changed from THIS dispatch. That increment
+        // happens in the next arrival's dispatchRoute call — when the
+        // state label matches this recording, recordFailedWake fires.
+        //
+        // We record BEFORE the stale-route guard so the state snapshot
+        // reflects THIS event, not a stale previous entry.
+        recordDispatch(cbTicketId, cbStateLabel);
+      }
+
       // ── 9a. Stale-route guard ───────────────────────────────────────────
       // Linear webhook payloads are snapshots. Before waking an agent from a
       // delegate/assignee event, re-check Linear's current issue state so an
       // accidental delegation that was already corrected does not let the old
       // agent take ownership or mutate the ticket later.
-      const ticketId = route.sessionKey;
       const routingCheck = await checkLinearIssueRouting(ticketId, route.agentId, route.routingReason);
 
       // ── AI-2091 §2 (G2): delivery-time fetchability gate on the PRIMARY path.
@@ -692,21 +867,37 @@ export function createWebhookRouter(
         return;
       }
 
-      // ── 9b. Nudge deduplication + coalescing ─────────────────────────────
+      // ── 9b. Nudge deduplication + coalescing (atomic) ────────────────────
       // Suppress rapid-fire duplicate events for the same agent+ticket.
+      // Uses acquireNudgeSlot for an atomic read-check-write within a single
+      // SQLite transaction — eliminates the TOCTOU race between the old
+      // getCoalesceInfo + recordNudge/recordCoalesced two-step (AI-2376).
       if (NUDGE_DEDUP_WINDOW_MS > 0 && nudgeStore) {
-        const info = nudgeStore.getCoalesceInfo(route.agentId, ticketId, NUDGE_DEDUP_WINDOW_MS);
-        if (info.suppressed) {
-          log.info(`Nudge dedup: coalescing delivery for ${route.agentId} [${ticketId}] — within ${NUDGE_DEDUP_WINDOW_MS}ms window`);
-          nudgeStore.recordCoalesced(route.agentId, ticketId, event.type, "action" in event ? event.action : undefined);
+        const { suppressed, coalescedCount } = nudgeStore.acquireNudgeSlot(
+          route.agentId,
+          ticketId,
+          NUDGE_DEDUP_WINDOW_MS,
+          event.type,
+          "action" in event ? event.action : undefined,
+        );
+
+        if (suppressed) {
+          // The nudge slot was NOT acquired — an existing suppression window
+          // is still active, and this event was merged into the coalesced
+          // counter. Return without delivering; the coalesced count will be
+          // passed to the next delivery that refreshes the window.
+          log.info(`Nudge dedup (atomic): coalescing delivery for ${route.agentId} [${ticketId}] — coalescedCount=${coalescedCount}`);
           appendOperationalEvent(operationalEventStore, { outcome: "dedup-suppressed", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "nudge-dedup" });
           return;
         }
-        // Window expired — drain coalesced count before delivering
-        const coalescedCount = nudgeStore.drainCoalescedCount(route.agentId, ticketId);
-        nudgeStore.recordNudge(route.agentId, ticketId);
+
+        // Slot acquired: the suppression window was absent or expired.
+        // acquireNudgeSlot refreshed the nudge timestamp and zeroed the DB
+        // coalesced_count. Any coalescedCount > 0 means events were merged
+        // into the previous window and are now drained — the caller should
+        // carry that as a signal of dropped events.
         if (coalescedCount > 0) {
-          log.info(`Nudge dedup: delivering for ${route.agentId} [${ticketId}] with ${coalescedCount} coalesced event(s)`);
+          log.info(`Nudge dedup (atomic): delivering for ${route.agentId} [${ticketId}] with ${coalescedCount} coalesced event(s) from prior window`);
           route.coalescedCount = coalescedCount;
         }
       }
@@ -856,10 +1047,10 @@ export function createWebhookRouter(
           hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
           hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
           // No global gatewayUrl/gatewayToken — see note at the wakeDeliveryConfig
-          // above. wakeConfigForAgent (below) overrides hooksUrl/hooksToken per
-          // agent but NOT gatewayUrl, so a global gateway here would win the
-          // delivery-path preference and strand every container agent. Route via
-          // per-agent hooks instead.
+          // above. A global gateway URL points at ONE gateway and would win the
+          // delivery-path preference, stranding every container agent. AI-2420:
+          // wakeConfigForAgent (below) now sets gatewayUrl/gatewayToken per agent
+          // from agents.json; this base config stays gateway-less on purpose.
           timeoutMs: process.env.NODE_ENV === "test" ? 50 : undefined,
           maxRetries: process.env.NODE_ENV === "test" ? 0 : undefined,
         };
@@ -877,6 +1068,9 @@ export function createWebhookRouter(
             ...wakeConfig,
             hooksUrl: cfg?.hooksUrl ?? wakeConfig.hooksUrl,
             hooksToken: cfg?.hooksToken ?? wakeConfig.hooksToken,
+            // AI-2420: per-agent gateway-API target (never a global URL).
+            gatewayUrl: cfg?.gatewayUrl,
+            gatewayToken: cfg?.gatewayToken,
             linearAuthToken,
           };
         };
@@ -901,7 +1095,7 @@ export function createWebhookRouter(
               await throttle.wait(route.agentId);
               throttle.record(route.agentId);
             }
-            const sameTicketResult = await deliverWithSlot(route, wakeConfigForAgent(route.agentId), throttle);
+            const sameTicketResult = await deliverWithSlot(route, wakeConfigForAgent(route.agentId), throttle, dispatchLeaseStore);
             bag.removeTicket(agentName, normalizedTicketId);
             appendOperationalEvent(operationalEventStore, {
               outcome: sameTicketResult.runId ? "dispatch-accepted" : "delivered",
@@ -966,9 +1160,13 @@ export function createWebhookRouter(
         hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
         hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
         hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
-        // No global gatewayUrl/gatewayToken — see note at the wakeDeliveryConfig
-        // earlier in this file. Routes via per-agent hooksUrl/hooksToken so
-        // container agents are reachable.
+        // AI-2420: gateway-API target from the agent's OWN config (never the
+        // global OPENCLAW_GATEWAY_URL — see note at wakeDeliveryConfig earlier).
+        // With both set, delivery prefers the x-openclaw-session-key path; else
+        // it falls back to per-agent hooksUrl/hooksToken so container agents stay
+        // reachable.
+        gatewayUrl: agentCfg?.gatewayUrl,
+        gatewayToken: agentCfg?.gatewayToken,
       };
       try {
         if (throttle) {
@@ -976,7 +1174,7 @@ export function createWebhookRouter(
           await throttle.wait(route.agentId);
           throttle.record(route.agentId);
         }
-        const directResult = await deliverWithSlot(route, deliveryConfig, throttle);
+        const directResult = await deliverWithSlot(route, deliveryConfig, throttle, dispatchLeaseStore);
         appendOperationalEvent(operationalEventStore, { outcome: directResult.runId ? "dispatch-accepted" : "delivered", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1, runId: directResult.runId ?? null, wakeId, plane: "connector", detail: directResult.canonVersion ? { canonVersion: directResult.canonVersion } : undefined });
         // Direct deliveries (incl. comment-routed wakes into an existing
         // session) must register the dispatch and flip engagement → Thinking
@@ -998,7 +1196,7 @@ export function createWebhookRouter(
                 await throttle.wait(route.agentId);
                 throttle.record(route.agentId);
               }
-              const drainResult = await deliverWithSlot(next, deliveryConfig, throttle);
+              const drainResult = await deliverWithSlot(next, deliveryConfig, throttle, dispatchLeaseStore);
               appendOperationalEvent(operationalEventStore, { outcome: drainResult.runId ? "dispatch-accepted" : "delivered", type: next.event.type, agent: route.agentId, key: next.sessionKey, sessionKey: next.sessionKey, deliveryMode: "agent-queue-drain", attemptCount: 1, runId: drainResult.runId ?? null, detail: drainResult.canonVersion ? { canonVersion: drainResult.canonVersion } : undefined });
             } catch (err) {
               log.error(`Agent queue: failed to deliver promoted task for ${route.agentId}: ${err instanceof Error ? err.message : String(err)}`);

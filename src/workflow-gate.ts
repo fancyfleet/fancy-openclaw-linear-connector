@@ -37,7 +37,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import yaml from "js-yaml";
-import { componentLogger, createLogger } from "./logger.js";
+import { componentLogger, createLogger, type Logger } from "./logger.js";
 import { defaultWorkflowDefPath } from "./instance-config.js";
 import { bodyHasCapability, resolveBodiesForRole } from "./escalation-gate.js";
 import type { ObservationStore } from "./store/observation-store.js";
@@ -47,6 +47,7 @@ import { getAgent, getAgents } from "./agents.js";
 import { executeFanout, shouldTriggerFanout, validateFanoutSpec, type Finding } from "./fanout.js";
 import { onChildTerminal, onManagingEntry, isTerminalState } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
+import { fetchLastCommentByUser } from "./linear-helpers.js";
 import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store.js";
 import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./config-health.js";
 import { captureAc, extractAcFromDescription, removeAcRecord } from "./ac-record-store.js";
@@ -79,7 +80,15 @@ import type { OperationalEventStore } from "./store/operational-event-store.js";
  * Design: design.md §4.2, §4.4, §4.6, §11, §13, §16.1, §16.2, and H-6.
  */
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-gate");
+let log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-gate");
+
+/**
+ * AI-2544: Test hook to inject a spy logger for verifying error-payload logging.
+ * Call with no args or undefined to reset to the real logger.
+ */
+export function _setLogForTests(testLogger?: Logger): void {
+  log = testLogger ?? componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-gate");
+}
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 
@@ -128,6 +137,23 @@ export interface WorkflowTransition {
  * by this config — replacing the hardcoded `ux-audit`/`sprint` allowlist and
  * the hardcoded `wf:dev-impl` child label in fanout.ts.
  */
+/**
+ * AI-2523: Configuration for the spawn_if predicate — conditional child spawning.
+ *
+ * A state declaring `spawn_if` will only spawn its child_workflow when the
+ * predicate evaluates to true. In v1, the only predicate type is `label_present`
+ * which checks whether any closed child ticket carries the specified label.
+ */
+export interface SpawnIfConfig {
+  /** Label name to check for on closed children. */
+  label_present: string;
+  /**
+   * Evaluation scope. v1 only supports "closed_children" (default when absent).
+   * Only children in a terminal Linear native state (type: "completed") are examined.
+   */
+  scope?: "closed_children";
+}
+
 export interface FanoutConfig {
   /** Structured section of the parent ticket description that supplies the
    *  fan-out cardinality (e.g. "findings" → the `## Findings` section). */
@@ -141,6 +167,10 @@ export interface FanoutConfig {
   /** When true, create sibling blocking relations between the spawned children
    *  at spawn time (each sibling blocks the next). */
   block_siblings?: boolean;
+  /** AI-2523: conditional spawn predicate. When present, children are spawned
+   *  ONLY if the predicate evaluates to true. When absent, unconditional spawn
+   *  behavior is preserved (no regression). */
+  spawn_if?: SpawnIfConfig;
 }
 
 export interface WorkflowState {
@@ -218,6 +248,11 @@ export interface WorkflowDef {
    * than silently stranding in-flight tickets.
    */
   strand_acknowledged?: string[];
+  /** INF-42: Waiver mechanism — invariant_skip per-def. Accepted keys:
+   * "barrier-before-managing", "fanout-before-barrier". Unrecognized keys cause
+   * a hard validation failure (no silent misspellings). The skip is per-def,
+   * not per-state. */
+  invariant_skip?: string[];
   states: WorkflowState[];
 }
 
@@ -381,6 +416,15 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
         if (removalErrors.length > 0) {
           throw new Error(removalErrors.join("; "));
         }
+        // AI-2476: Drift guard — assert that gate-anchor states referenced by
+        // the merged-PR release gate predicates exist in the def. If a subsequent
+        // def rename removes or renames `merge` or `deploy`, the gate goes dead
+        // silently (same class as the v8→v10 fossil-predicate bug this closes).
+        // Only dev-impl has gate-anchor states; other workflows are unaffected.
+        const driftErrors = validateGateAnchorDefs(def);
+        if (driftErrors.length > 0) {
+          throw new Error(driftErrors.join("; "));
+        }
         registry.set(def.id, def);
       } catch (err) {
         // AC2: one bad def fails that def only — exclude it, keep the rest.
@@ -406,6 +450,11 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
       const removalErrors = validateDefStateRemovals(prevSnapshot[def.id] ?? [], def);
       if (removalErrors.length > 0) {
         throw new Error(removalErrors.join("; "));
+      }
+      // AI-2476: Drift guard for single-file path (same check as dir path above).
+      const driftErrors = validateGateAnchorDefs(def);
+      if (driftErrors.length > 0) {
+        throw new Error(driftErrors.join("; "));
       }
       registry.set(def.id, def);
       recordSuccess("workflow-def");
@@ -434,8 +483,157 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
   return registry;
 }
 
+/**
+ * Sync accessor for the cached registry. Returns the registry if already
+ * loaded, or null if the cache is empty (not yet loaded). Used by the
+ * conformance validator (INF-42) to check child_workflow resolution without
+ * requiring an async call when the registry is already in memory.
+ */
+export function getCachedRegistrySync(): Map<string, WorkflowDef> | null {
+  return _registryCache;
+}
+
 /** Invalidate the in-process workflow registry cache (used in tests & live-reload). */
 export function resetWorkflowCache(): void {
+  _registryCache = null;
+}
+
+/**
+ * INF-25: Reload workflow defs from disk, fail-closed on any invalid def.
+ *
+ * Unlike loadWorkflowRegistry (which excludes bad defs per-file and keeps the
+ * rest), this function validates ALL defs before committing the reload. If any
+ * def fails validation, the prior registry is left intact and the validation
+ * diagnostics are returned — the endpoint must never take the registry down.
+ *
+ * Returns the loaded registry ids + versions on success.
+ * Throws on catastrophic failure (dir unreadable, etc.) or returns
+ * { diagnostics: string[] } on per-def validation failures.
+ *
+ * Intended for use by the POST /api/workflows/reload admin endpoint.
+ */
+/**
+ * INF-25: Reload workflow defs from disk, fail-closed on any invalid def.
+ *
+ * Unlike loadWorkflowRegistry (which excludes bad defs per-file and keeps the
+ * rest), this function validates ALL defs before committing the reload. If any
+ * def fails validation, the prior registry is left intact and the validation
+ * diagnostics are returned — the endpoint must never take the registry down.
+ *
+ * Returns the loaded registry ids + versions on success.
+ * Catastrophic failures (dir unreadable, etc.) throw.
+ * Per-def validation failures return { ok: false, diagnostics }.
+ *
+ * Intended for use by the POST /api/workflows/reload admin endpoint.
+ */
+/**
+ * INF-25: Reload workflow defs from disk, fail-closed on any invalid def.
+ *
+ * Runs the full loadWorkflowRegistry pipeline (native_state, state-removal,
+ * gate-anchor drift, fanout/barrier checks) but snapshots the prior state so
+ * a partial failure can be rolled back cleanly.
+ *
+ * If any def fails validation, the prior registry is left intact and the
+ * validation diagnostics are returned — the endpoint must never take the
+ * registry down.
+ *
+ * Returns the loaded registry ids + versions on success.
+ * Catastrophic failures (dir unreadable, etc.) throw.
+ * Per-def validation failures return { ok: false, diagnostics }.
+ *
+ * Intended for use by the POST /api/workflows/reload admin endpoint.
+ */
+export async function reloadWorkflowDefs(): Promise<
+  {
+    ok: true;
+    registry: Record<string, { version: number | undefined; states: string[] }>;
+  }
+  | { ok: false; diagnostics: string[] }
+> {
+  // Snapshot prior state for rollback.
+  const priorCache = _registryCache;
+  const priorSnapshot = await readDefStateSnapshot();
+
+  // Force a fresh read from disk.
+  _registryCache = null;
+
+  let newRegistry: Map<string, WorkflowDef>;
+  try {
+    newRegistry = await loadWorkflowRegistry();
+  } catch (err) {
+    // Catastrophic failure (dir unreadable, single-file parse error) —
+    // restore prior state and re-throw.
+    _registryCache = priorCache;
+    await writeDefStateSnapshot(priorSnapshot);
+    throw err;
+  }
+
+  // Detect excluded defs: every .yaml file should have produced a registry
+  // entry. If not, a def was silently excluded — roll back.
+  const dir = process.env.WORKFLOW_DEFS_DIR || process.env.WORKFLOW_DEF_DIR || undefined;
+  const diagnostics: string[] = [];
+
+  if (dir) {
+    try {
+      const entries = await fs.readdir(dir);
+      const yamlFiles = entries.filter((f) => f.endsWith(".yaml")).sort();
+      const loadedIds = new Set(newRegistry.keys());
+
+      for (const f of yamlFiles) {
+        try {
+          const full = path.join(dir, f);
+          const raw = await fs.readFile(full, "utf8");
+          const parsed = yaml.load(raw) as Record<string, unknown> | null;
+          const id = parsed && typeof parsed.id === "string" ? parsed.id : null;
+          if (id && !loadedIds.has(id)) {
+            // Def was excluded; get the reason by attempting a load.
+            try {
+              await loadDefFromFile(full);
+              diagnostics.push(`${f}: definition '${id}' excluded (state-removal or gate-anchor check)`);
+            } catch (err) {
+              diagnostics.push(`${f}: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          } else if (!id) {
+            // File exists and is parseable but has no id — that's a validation failure.
+            try {
+              await loadDefFromFile(full);
+            } catch (err) {
+              diagnostics.push(`${f}: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          }
+        } catch {
+          diagnostics.push(`${f}: could not read or parse`);
+        }
+      }
+    } catch {
+      // Cannot read the defs dir (defensive — loadWorkflowRegistry succeeded).
+    }
+  }
+
+  if (diagnostics.length > 0) {
+    // Roll back: restore prior cache AND snapshot (loadWorkflowRegistry may
+    // have written a new snapshot with the partial set).
+    _registryCache = priorCache;
+    await writeDefStateSnapshot(priorSnapshot);
+    return { ok: false, diagnostics };
+  }
+
+  // All good — newRegistry is already in _registryCache. Build the response.
+  const result: Record<string, { version: number | undefined; states: string[] }> = {};
+  for (const [id, def] of newRegistry) {
+    result[id] = {
+      version: def.version,
+      states: (def.states ?? []).map((s) => s.id),
+    };
+  }
+  return { ok: true, registry: result };
+}
+
+/**
+ * AI-2359: Alias for resetWorkflowCache() used by the singleton-fail-closed
+ * test to clear the workflow registry between cases.
+ */
+export function resetWorkflowRegistry(): void {
   _registryCache = null;
 }
 
@@ -549,17 +747,71 @@ export function validateNativeStateMappings(def: WorkflowDef): string[] {
 }
 
 /**
+ * AI-2476: Drift guard for gate-anchor states.
+ *
+ * The merged-PR release gate predicates (`checkWorkflowRules` and
+ * `applyStateTransition`) key on the state ids `'merge'` and `'deploy'` in the
+ * `dev-impl` workflow. If a future def rename renames or removes either state,
+ * the gate goes dead silently — exactly the class of bug that allowed the v8→v10
+ * fossil predicates to live for 10 days without detection.
+ *
+ * This function is called at registry load time (after the def is otherwise
+ * validated and activated). A non-empty return causes the def to be excluded
+ * from the registry (same fail-closed pattern as validateDefStateRemovals and
+ * validateNativeStateMappings).
+ *
+ * Non-dev-impl workflows are unrelated to this gate and always pass.
+ */
+export function validateGateAnchorDefs(def: WorkflowDef): string[] {
+  // Only dev-impl v10+ has gate-anchor states (merge/deploy) for the
+  // merged-PR release gate. Earlier dev-impl versions (v1-v9) used the old
+  // `deployment` single state and are unaffected.
+  if (def.id !== "dev-impl") return [];
+  if ((def.version ?? 0) < 10) return [];
+
+  const errors: string[] = [];
+  const stateIds = new Set(def.states.map((s) => s.id));
+
+  if (!stateIds.has("merge")) {
+    errors.push(
+      `[AI-2476 drift guard] dev-impl v${def.version} workflow is missing state 'merge' — ` +
+      `the release gate predicates checkWorkflowRules/applyStateTransition both key ` +
+      `on this state. If the rename is intentional, update the drift guard and gate ` +
+      `predicates together.`,
+    );
+  }
+  if (!stateIds.has("deploy")) {
+    errors.push(
+      `[AI-2476 drift guard] dev-impl v${def.version} workflow is missing state 'deploy' — ` +
+      `the release gate predicates checkWorkflowRules/applyStateTransition both key ` +
+      `on this state. If the rename is intentional, update the drift guard and gate ` +
+      `predicates together.`,
+    );
+  }
+
+  return errors;
+}
+
+/**
  * AI-1992: Validate the fanout/barrier config of a workflow def (fail-closed).
  *
  * A fanout block's `child_workflow` MUST be a `wf:*` label — a wf ticket spawns
  * only wf tickets (Matt, 2026-07-08, Option B). A `barrier` field, when present,
- * MUST be a boolean. Returns diagnostic errors; a non-empty result excludes the
- * def from the registry (the loader throws), so the engine can never fan out to
- * a non-workflow child type or misread a malformed barrier flag.
+ * MUST be a boolean. Two fanout states MUST NOT share BOTH a `spec_source` and a
+ * `child_workflow` (INF-32) — that pair is indistinguishable to the scoped dedup
+ * key, so the later state would silently mint nothing. Returns diagnostic errors;
+ * a non-empty result excludes the def from the registry (the loader throws), so
+ * the engine can never fan out to a non-workflow child type, misread a malformed
+ * barrier flag, or activate an ambiguous fan-out pair.
  */
 export function validateFanoutBarrierConfig(def: WorkflowDef): string[] {
   const errors: string[] = [];
   const wfLabelPattern = /^wf:.+/;
+  /** INF-32: (spec_source, child_workflow) → the fanout states sharing it. */
+  const fanoutSpecKeys = new Map<
+    string,
+    { specSource: string; childWorkflow: string; stateIds: string[] }
+  >();
   for (const state of def.states) {
     if (state.fanout !== undefined) {
       const fo = state.fanout as unknown;
@@ -569,6 +821,17 @@ export function validateFanoutBarrierConfig(def: WorkflowDef): string[] {
         const cfg = fo as Partial<FanoutConfig>;
         if (typeof cfg.spec_source !== "string" || cfg.spec_source.trim() === "") {
           errors.push(`Workflow state '${state.id}' fanout is missing a non-empty 'spec_source'.`);
+        } else {
+          // INF-32: group by (spec_source, child_workflow) — the same key the
+          // engine's scoped dedup uses. `extractSpecFindings` matches the section
+          // header case-insensitively, so 'Findings' and 'findings' read the SAME
+          // section and collide identically; normalize before grouping.
+          const specSource = cfg.spec_source.trim().toLowerCase();
+          const childWorkflow = String(cfg.child_workflow);
+          const key = `${specSource}\u0000${childWorkflow}`;
+          const bucket = fanoutSpecKeys.get(key);
+          if (bucket) bucket.stateIds.push(state.id);
+          else fanoutSpecKeys.set(key, { specSource, childWorkflow, stateIds: [state.id] });
         }
         if (typeof cfg.child_workflow !== "string" || !wfLabelPattern.test(cfg.child_workflow)) {
           errors.push(
@@ -582,12 +845,77 @@ export function validateFanoutBarrierConfig(def: WorkflowDef): string[] {
         if (cfg.block_siblings !== undefined && typeof cfg.block_siblings !== "boolean") {
           errors.push(`Workflow state '${state.id}' fanout block_siblings must be a boolean when present.`);
         }
+
+        // AI-2523: spawn_if validation
+        if (cfg.spawn_if !== undefined) {
+          const si = cfg.spawn_if as unknown;
+          if (si === null || typeof si !== "object") {
+            errors.push(`Workflow state '${state.id}' fanout spawn_if must be an object when present.`);
+          } else {
+            const sif = si as Record<string, unknown>;
+
+            // Required: label_present must be a non-empty string
+            if (
+              sif.label_present === undefined ||
+              typeof sif.label_present !== "string" ||
+              (sif.label_present as string).trim() === ""
+            ) {
+              errors.push(
+                `Workflow state '${state.id}' fanout spawn_if requires a non-empty string 'label_present' field.`,
+              );
+            }
+
+            // scope must be "closed_children" when present
+            if (sif.scope !== undefined && sif.scope !== "closed_children") {
+              errors.push(
+                `Workflow state '${state.id}' fanout spawn_if scope must be "closed_children" when present.`,
+              );
+            }
+
+            // No unknown fields
+            const knownFields = new Set(["label_present", "scope"]);
+            for (const key of Object.keys(sif)) {
+              if (!knownFields.has(key)) {
+                errors.push(
+                  `Workflow state '${state.id}' fanout spawn_if has unknown field '${key}'.`,
+                );
+              }
+            }
+          }
+        }
       }
     }
     if (state.barrier !== undefined && typeof state.barrier !== "boolean") {
       errors.push(`Workflow state '${state.id}' barrier field must be a boolean when present.`);
     }
   }
+
+  // INF-32 AC2: refuse an ambiguous fan-out pair at ACTIVATION rather than let it
+  // fail silently at spawn time.
+  //
+  // Scope note (deliberate, flagged for review): this rejects two fanout states
+  // sharing a spec_source AND a child_workflow — NOT every shared spec_source.
+  // Once dedup is keyed on (specEntryId, child_workflow), two states reading one
+  // section into DIFFERENT child workflows are well-defined, and that is exactly
+  // the two-phase pipeline AI-1992 AC4 ships (`synthetic-two-phase`: arming →
+  // wf:sprint-arm, impl → wf:dev-impl, both from `findings`). Rejecting on
+  // spec_source alone would exclude that def from the registry and make INF-32's
+  // own AC1/AC4 scenario unreachable — the engine would support a def shape no
+  // def could express. What remains genuinely ambiguous is a shared
+  // (spec_source, child_workflow) pair: the scoped key cannot separate those, so
+  // the second state still mints nothing. That is what is refused here.
+  for (const { specSource, childWorkflow, stateIds } of fanoutSpecKeys.values()) {
+    if (stateIds.length > 1) {
+      errors.push(
+        `[INF-32] Workflow states ${stateIds.map((id) => `'${id}'`).join(", ")} share fanout ` +
+        `spec_source '${specSource}' AND child_workflow '${childWorkflow}'. Spec-entry ids are ` +
+        `derived from entry content alone, so these states mint colliding ids from the same ` +
+        `section and the later fan-out silently spawns nothing. Give each fanout state a distinct ` +
+        `'spec_source' section, or a distinct 'child_workflow'.`,
+      );
+    }
+  }
+
   return errors;
 }
 
@@ -690,6 +1018,14 @@ interface TicketContext {
   labels: string[];
   /** Linear user ID of the current delegate, or null if unset. */
   delegateId: string | null;
+  /**
+   * AI-2357: the human issue identifier (e.g. "AI-2357"), as returned by Linear.
+   * The caller's `issueId` is whatever the mutation carried — a UUID on the
+   * `issueUpdate` path (see extractIssueId) — but the applied-state store is keyed
+   * by the human identifier. Resolving it here gives the store's true key
+   * regardless of which form the request supplied. Null if the fetch failed.
+   */
+  identifier: string | null;
   /** True when the context fetch itself failed (network error, API error, etc.). */
   fetchFailed: boolean;
 }
@@ -705,7 +1041,7 @@ interface TicketContext {
  * configured posture.
  */
 async function fetchTicketContext(issueId: string, authToken: string): Promise<TicketContext> {
-  const query = `query IssueContext($id: String!) { issue(id: $id) { labels { nodes { name } } delegate { id } } }`;
+  const query = `query IssueContext($id: String!) { issue(id: $id) { identifier labels { nodes { name } } delegate { id } } }`;
   try {
     const res = await fetch(LINEAR_API_URL, {
       method: "POST",
@@ -718,6 +1054,7 @@ async function fetchTicketContext(issueId: string, authToken: string): Promise<T
     type ContextResp = {
       data?: {
         issue?: {
+          identifier?: string;
           labels?: { nodes: Array<{ name: string }> };
           delegate?: { id: string } | null;
         };
@@ -727,17 +1064,18 @@ async function fetchTicketContext(issueId: string, authToken: string): Promise<T
     const issue = data.data?.issue;
     if (!issue) {
       log.warn(`workflow-gate: issue ${issueId} not found in context fetch — returning fetchFailed`);
-      return { labels: [], delegateId: null, fetchFailed: true };
+      return { labels: [], delegateId: null, identifier: null, fetchFailed: true };
     }
     return {
       labels: (issue?.labels?.nodes ?? []).map((n) => n.name),
       delegateId: issue?.delegate?.id ?? null,
+      identifier: issue?.identifier ?? null,
       fetchFailed: false,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log.warn(`workflow-gate: context fetch failed for ${issueId}: ${msg}`);
-    return { labels: [], delegateId: null, fetchFailed: true };
+    return { labels: [], delegateId: null, identifier: null, fetchFailed: true };
   }
 }
 
@@ -945,56 +1283,56 @@ async function findOrCreateLabel(
       `workflow-gate: B2 label create FAIL-CLOSED for '${labelName}' in team ${teamId} (${group ? `child of group '${groupName}'` : "flat"}): success=${result?.success ?? "null"} errors=${errorBody}`,
     );
 
-    // AI-2176 inherited-label fallback: when a sub-team (e.g. LIF) tries to create a
-    // label that conflicts with an inherited label from a parent team (e.g. GEN),
-    // Linear rejects the create with "conflicting inherited label". The inherited
-    // label's ID is still usable for issue mutations on the sub-team. Fall back to
-    // querying all org teams for the label by name (org has ~3 teams; acceptable).
+    // AI-2543 inherited-label promotion: Linear rejects a parent-team create with
+    // "conflicting inherited label" and tells us to use `replaceTeamLabels` to promote
+    // the label to this team. Retry with the promotion argument; the promoted label
+    // is then owned by this team and accepted on issueUpdate.
+    // (Replaces the AI-2176 fallback that borrowed the parent id — that id is rejected
+    // by Linear's issueUpdate, blocking all governed transitions on the sub-team.)
     const isInheritedConflict = createData.errors &&
       Array.isArray(createData.errors) &&
       createData.errors.some((e: Record<string, unknown>) =>
         typeof e.message === "string" && e.message.includes("conflicting inherited label"),
       );
     if (isInheritedConflict) {
-      log.info(`workflow-gate: attempting inherited-label fallback for '${labelName}' on team ${teamId}`);
-      try {
-        // Fetch all teams in the org, then search each for the label.
-        const teamsQuery = `query OrgTeams { teams { nodes { id } } }`;
-        const teamsRes = await fetch(LINEAR_API_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: authToken },
-          body: JSON.stringify({ query: teamsQuery }),
-        });
-        const teamsData = (await teamsRes.json()) as {
-          data?: { teams?: { nodes: Array<{ id: string }> } };
-        };
-        const teamIds = teamsData.data?.teams?.nodes?.map((t) => t.id).filter((id) => id !== teamId) ?? [];
-        for (const otherTeamId of teamIds) {
-          const otherLabelsQuery = `
-            query OtherTeamLabels($tid: String!) {
-              team(id: $tid) {
-                labels(first: 250) { nodes { id name } }
-              }
-            }
-          `;
-          const otherRes = await fetch(LINEAR_API_URL, {
-            method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: authToken },
-            body: JSON.stringify({ query: otherLabelsQuery, variables: { tid: otherTeamId } }),
-          });
-          const otherData = (await otherRes.json()) as {
-            data?: { team?: { labels: { nodes: Array<{ id: string; name: string }> } } };
-          };
-          const match = otherData.data?.team?.labels?.nodes?.find((l) => l.name === labelName);
-          if (match) {
-            log.info(`workflow-gate: inherited-label fallback found '${labelName}' as id=${match.id} on team ${otherTeamId} (usable on sub-team ${teamId})`);
-            return match.id;
+      log.info(`workflow-gate: attempting inherited-label promotion for '${labelName}' on team ${teamId}`);
+      const promoteMutation = group
+        ? `
+        mutation PromoteLabel($teamId: String!, $name: String!, $color: String!, $parentId: String!, $replaceTeamLabels: Boolean!) {
+          issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color, parentId: $parentId, replaceTeamLabels: $replaceTeamLabels }) {
+            success
+            issueLabel { id }
           }
         }
-        log.warn(`workflow-gate: inherited-label fallback found no org-wide match for '${labelName}' across ${teamIds.length} teams`);
-      } catch (fallbackErr) {
-        const fallbackMsg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
-        log.warn(`workflow-gate: inherited-label fallback query failed: ${fallbackMsg}`);
+      `
+        : `
+        mutation PromoteLabel($teamId: String!, $name: String!, $color: String!, $replaceTeamLabels: Boolean!) {
+          issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color, replaceTeamLabels: $replaceTeamLabels }) {
+            success
+            issueLabel { id }
+          }
+        }
+      `;
+      const promoteVars = group
+        ? { teamId, name: createName, color: "#94a3b8", parentId: group.id, replaceTeamLabels: true }
+        : { teamId, name: createName, color: "#94a3b8", replaceTeamLabels: true };
+      try {
+        const promoteRes = await fetch(LINEAR_API_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: authToken },
+          body: JSON.stringify({ query: promoteMutation, variables: promoteVars }),
+        });
+        const promoteData = (await promoteRes.json()) as CreateResp;
+        const promoteResult = promoteData.data?.issueLabelCreate;
+        if (promoteResult?.success && promoteResult.issueLabel) {
+          log.info(`workflow-gate: promoted inherited label '${labelName}' to team ${teamId} as id=${promoteResult.issueLabel.id}`);
+          return promoteResult.issueLabel.id;
+        }
+        const errBody = promoteData.errors ? JSON.stringify(promoteData.errors) : "none";
+        log.warn(`workflow-gate: inherited-label promotion FAILED for '${labelName}' on team ${teamId}: success=${promoteResult?.success ?? "null"} errors=${errBody}`);
+      } catch (promoteErr) {
+        const promoteMsg = promoteErr instanceof Error ? promoteErr.message : String(promoteErr);
+        log.warn(`workflow-gate: inherited-label promotion query failed: ${promoteMsg}`);
       }
     }
 
@@ -1092,6 +1430,39 @@ export async function resolveTransitionDelegate(
   }
 
   return undefined;
+}
+
+/**
+ * AI-2359 — Singleton delegate resolution with fail-closed on missing linearUserId.
+ *
+ * Resolves a singleton role body to a linearUserId. Returns a fail-closed result
+ * when the body has no linearUserId (not just a warning — the transition must
+ * abort). Exported for unit testing.
+ *
+ * @returns resolvedDelegateId when the single body has a linearUserId;
+ *          { failed: true, code, detail } when resolution fails.
+ */
+export function resolveSingletonDelegate(
+  roleBodies: string[],
+  destOwnerRole: string,
+): { resolvedDelegateId?: string; failed?: boolean; code?: string; detail?: string } {
+  if (roleBodies.length !== 1) {
+    return {
+      failed: true,
+      code: 'not-a-singleton',
+      detail: `role '${destOwnerRole}' has ${roleBodies.length} bodies (expected 1 for singleton resolution)`,
+    };
+  }
+
+  const agent = getAgent(roleBodies[0]);
+  if (agent?.linearUserId) {
+    return { resolvedDelegateId: agent.linearUserId };
+  }
+  return {
+    failed: true,
+    code: 'delegate-unresolved',
+    detail: `singleton body '${roleBodies[0]}' has no linearUserId`,
+  };
 }
 
 export function getWorkflowId(labels: string[]): string | null {
@@ -1678,7 +2049,7 @@ export async function checkWorkflowRules(
     }
   }
 
-  const { labels, delegateId: fetchedDelegateId, fetchFailed } = await fetchTicketContext(issueId, authToken);
+  const { labels, delegateId: fetchedDelegateId, identifier: fetchedIdentifier, fetchFailed } = await fetchTicketContext(issueId, authToken);
 
   // AI-1860: use snapshotted delegateId for authorization checks when provided.
   // snapshotDelegateId is the delegateId captured at command start (first mutation);
@@ -1712,9 +2083,52 @@ export async function checkWorkflowRules(
     }
   }
 
-  // §4.6 mode switch: ad-hoc tickets (no wf:* label) are full pass-through.
+  // §4.6 mode switch: ad-hoc tickets (no wf:* label).
+  // INF-35: workflow transition verbs are rejected here — they must not
+  // silently pass through. Only safe verbs (informational, enrollment, or
+  // steward tools that work on any ticket) are allowed to proceed.
+  // Safe verbs:
+  //   - note: informational-only, never mutates state
+  //   - begin-work: the only way to add a wf:* label on an ad-hoc ticket
+  //   - observe-issue: read-only
+  //   - comment: just adds a comment
+  //   - parent: relation verb, not a workflow transition
+  //   - migrate-state: steward tool, handled before checkWorkflowRules
+  //   - rewind: steward break-glass rewind, handled before checkWorkflowRules
+  //   - handoff-work: delegate-routing meta-command, not a def transition
+  //   - set-state: state-setting tool, not a def transition
   const workflowId = getWorkflowId(labels);
-  if (!workflowId) return null;
+  if (!workflowId) {
+    // Break-glass override: a verified steward (workflow:break-glass) may force
+    // transition verbs through even when the ticket has no wf:* label. This covers
+    // the case where the label fetch failed (the ticket might be a workflow ticket
+    // but we can't see its labels) and the steward uses break-glass to push through.
+    if (breakGlassOverride) {
+      log.info(`workflow-gate: break-glass override — allowing '${intent}' on unarmed ticket ${issueId}`);
+      return null;
+    }
+    const safeOnUnarmed = [
+      "note",
+      "begin-work",
+      "observe-issue",
+      "comment",
+      "parent",
+      "migrate-state",
+      "rewind",
+      "handoff-work",
+      "set-state",
+    ];
+    if (!safeOnUnarmed.includes(intent)) {
+      log.warn(`workflow-gate: rejecting '${intent}' on unarmed ticket ${issueId} — no \`wf:*\` label`);
+      return (
+        `[Proxy] '${intent}' is only valid on workflow tickets ` +
+        `(ticket ${issueId} has no \`wf:*\` label). ` +
+        `Use \`linear begin-work ${issueId}\` to enroll the ticket in a workflow, ` +
+        `or \`linear observe-issue ${issueId}\` for read-only inspection.`
+      );
+    }
+    return null;
+  }
 
   // ── Phase 6.5 / H-1: Fail-closed on config-load failure (§16.0) ──────
   if (!breakGlassOverride && !isConfigHealthy()) {
@@ -1919,10 +2333,27 @@ export async function checkWorkflowRules(
   // already advanced to the post-transition state; re-checking legality against it
   // self-blocks the command (exit 1) after its own transition applied. The live state
   // is still used above for informational legal-moves hints in block messages.
+  //
+  // AI-2357: prefer the applied-state store (getAppliedState) over the stale label
+  // projection. When the engine's authoritative state (recorded at the last successful
+  // applyStateTransition) disagrees with the stale state:* label on the ticket, the
+  // engine state wins — the label projection is advisory, not authoritative. This
+  // prevents governed transitions from declining on desynced labels.
+  //
+  // The store is keyed by the HUMAN identifier ("AI-2357") — that is what
+  // applyStateTransition writes (recordAppliedState(issue.identifier, ...)). `issueId`
+  // here is whatever the mutation carried, which on the issueUpdate path is a UUID
+  // (extractIssueId prefers the raw `id` variable), so it must NOT be used as the key:
+  // a UUID read can never hit an identifier write, and the lookup would silently miss,
+  // fall through to the stale label, and decline the verb — the very bug this closes.
+  // fetchTicketContext resolves the true identifier for us regardless of the form
+  // supplied. Fall back to issueId only when the fetch gave us nothing (it may itself
+  // already be an identifier on the CLI path).
+  const appliedStateKey = fetchedIdentifier ?? issueId;
   const currentState =
     typeof snapshotState === "string" && snapshotState.length > 0
       ? snapshotState
-      : getCurrentState(labels, def); // AI-2094: def-aware — a stale state:* label can never win over the real one
+      : getAppliedState(appliedStateKey) ?? getCurrentState(labels, def); // AI-2357: applied-state store wins over stale label; AI-2094: def-aware fallback
   if (!currentState) {
     // AI-1402: For needs-human, fail-closed even without a state label.
     // We cannot determine if there is a forward path, so treat the ticket as actionable.
@@ -1971,6 +2402,22 @@ export async function checkWorkflowRules(
 
   if (!match) {
     const legalMoves = [...transitions.map((t) => t.command), breakGlassCommand].join(", ");
+    // AI-2055: `needs-human` is not a transition in any workflow def, so a governed
+    // ticket rejects it here — before the mutation, so nothing is half-applied and no
+    // delegate is stranded. The bare "not a legal command" text left an agent that is
+    // genuinely blocked on a human with no idea what to do, and the delegate-clear guard
+    // (Layer 2) used to answer that question with `undelegate`, which it also blocks.
+    // Name the sanctioned exit: break-glass hands the ticket to the steward, who owns
+    // the human escalation from there.
+    if (intent === "needs-human") {
+      return (
+        `[Proxy] 'needs-human' is not a legal command in state '${currentState}' — governed tickets ` +
+        `escalate by exiting the workflow, not by clearing the delegate. ` +
+        `Run \`linear ${breakGlassCommand} ${issueId} --comment "<why you are blocked>"\` to hand it to the ` +
+        `workflow steward (re-enters at '${def.break_glass?.to ?? "intake"}'), who owns the human escalation. ` +
+        `Legal moves: ${legalMoves}.`
+      );
+    }
     return (
       `[Proxy] '${intent}' is not a legal command in state '${currentState}'. ` +
       `Legal moves: ${legalMoves}.`
@@ -2027,11 +2474,23 @@ export async function checkWorkflowRules(
   if (match.requires_human_signoff_above_stakes && def.stakes) {
     const ticketStakesLevel = resolveStakesLevel(labels, def.stakes);
     if (ticketStakesLevel >= def.stakes.threshold) {
-      // AI-2358: designated-approver bypass — if the transition names a
-      // requires_capability holder and the caller holds it, they are the
-      // designated approver and bypass the stakes gate. Only the designated
-      // approver passes; all other AI agents are still blocked.
-      if (match.requires_capability && (await bodyHasCapability(bodyId, match.requires_capability))) {
+      // AI-2358: designated-approver bypass — a transition marked
+      // `designated_approver: true` AND naming a `requires_capability` nominates
+      // its holder as the sign-off authority; that holder bypasses the stakes
+      // gate. Only the designated approver passes; all other AI agents are still
+      // blocked.
+      //
+      // AI-2360: the flag is required, not optional. A bare `requires_capability`
+      // must NOT lift this gate — same opt-in the delegate gate above enforces.
+      // Keying off `requires_capability` alone handed the bypass to every
+      // capability-gated transition, including dev-impl's `deploy`
+      // (`requires_capability: deploy:execute`), letting hanzo self-sign-off on
+      // high-stakes deploys and breaking G-13 AC1.
+      if (
+        match.designated_approver === true &&
+        match.requires_capability &&
+        (await bodyHasCapability(bodyId, match.requires_capability))
+      ) {
         log.info(`workflow-gate: stakes-threshold gate: ${intent} on ${issueId} — stakes level ${ticketStakesLevel} >= threshold ${def.stakes.threshold}, but caller '${bodyId}' holds required capability '${match.requires_capability}' — designated-approver bypass`);
       } else {
         // A body known in the capability policy is an AI agent; unknown = human
@@ -2053,25 +2512,33 @@ export async function checkWorkflowRules(
   // Resolve destination state for subsequent gates.
   const destStateNode = def.states.find((s) => s.id === match.to);
 
-  // AI-1475 Defect 1 + AI-1492 + AI-1497: Merged-PR release gate (§5.6) — a
-  // wf:dev-impl ticket must not leave the deployment state forward without
+  // ── AI-2476: Merged-PR release gate re-armed (§5.6) ──────────────────
+  // A wf:dev-impl ticket must not leave merge or deploy states forward without
   // evidence that the implementation was pushed, reviewed, and merged.
-  // v8: deployment now has two forward exits — `deploy` (→ ac-validate, CI
-  // auto-deploys) and `handoff-host-deploy` (→ host-deploy, bare-metal action).
-  // The PR merge happens in `deployment` before either, so the gate fires on
-  // both. (`done` is now reached later via `validated`, after ac-validate.)
-  // Other workflows (ux-audit) have their own gate paths (parent-AC gate).
+  //
+  // v8 → v14 evolution: the old gate checked for literal `deploy` and
+  // `handoff-host-deploy` commands — v8 verbs deleted by AI-1872 (v10). In v14,
+  // the forward exits from both merge and deploy states use the generic `continue`
+  // intent (resolved from continue-workflow by resolveMetaIntent). The gate now
+  // keys on (currentState+intent) rather than a literal intent string, so a
+  // workflow def rename of these states is caught by the drift guard at registry
+  // load (AI-2476).
   //
   // AI-1492 fix: A merged PR satisfies the gate even when the source branch was
   // auto-deleted by GitHub after a squash merge.
   //
   // AI-1497 fix: When branch+PR data are completely absent (both false), this is
   // indistinguishable from a successfully-merged ticket whose data was lost to
-  // auto-delete. Since the ticket is in 'deployment' state (reachable only after
-  // code-review approval), fail-open rather than stranding the ticket. Only block
-  // when partial evidence exists (has branch but no PR = pushed but never reviewed).
-  // Also fail-open on null (transient API failure) after one retry.
-  if (intent === 'deploy' || intent === 'handoff-host-deploy') {
+  // auto-delete. Since the ticket is in merge or deploy state (reachable only
+  // after code-review approval), fail-open rather than stranding the ticket. Only
+  // block when partial evidence exists (has branch but no PR = pushed but never
+  // reviewed). Also fail-open on null (transient API failure) after one retry.
+  //
+  // NOTE(AI-2476): The AI-1795 no-CI-auto-deploy guard (below) keys on
+  // `intent === "deploy"` and is also dead. It needs independent redesign
+  // (separate ticket) — its premise of a choice between two forward exits no
+  // longer exists in v14.
+  if ((currentState === 'merge' || currentState === 'deploy') && intent === 'continue') {
     let branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
     // AI-1497: retry once on null — transient Linear API failure during
     // Hanzo merge+deploy quick succession.
@@ -2081,13 +2548,13 @@ export async function checkWorkflowRules(
     }
     if (!branchStatus) {
       // Two consecutive nulls — transient API failure. Fail-open to avoid
-      // stranding tickets; deployment state is already past code review.
+      // stranding tickets; merge/deploy state is already past code review.
       log.warn(`workflow-gate: done gate: could not verify branch/PR status for ${issueId} after retry — failing open`);
     } else if (branchStatus.hasMergedPR) {
       log.info(`workflow-gate: done gate: ${issueId} passed (merged PR confirmed)`);
     } else if (!branchStatus.hasBranch && !branchStatus.hasPR) {
       // AI-1497: Complete absence of evidence — likely lost to auto-delete.
-      // Fail-open: a ticket in deployment state has already passed code review,
+      // Fail-open: a ticket in merge/deploy state has already passed code review,
       // so the PR almost certainly existed and was merged.
       log.info(`workflow-gate: done gate: ${issueId} passed (no branch/PR evidence — treating as merged, data likely lost to auto-delete)`);
       // AI-1797: with no GitHub integration installed, EVERY ticket takes this
@@ -2097,7 +2564,7 @@ export async function checkWorkflowRules(
         severity: "warning",
         source: "done-gate",
         title: "done gate passed with no branch/PR evidence (GitHub integration missing?)",
-        detail: `Ticket ${issueId} passed '${intent}' with zero GitHub attachments. If this fires for every deploy, the Linear GitHub integration is not installed and the merged-PR gate is verifying nothing.`,
+        detail: `Ticket ${issueId} passed '${intent}' with zero GitHub attachments. If this fires for every forward move, the Linear GitHub integration is not installed and the merged-PR gate is verifying nothing.`,
         ticket: issueId,
         dedupKey: "done-gate|no-evidence",
       });
@@ -2332,11 +2799,11 @@ export async function checkRawMutationInterception(
 
   // AI-1535: a *delegate-only* raw change (delegateId changed, no state/assignee/
   // label) gets delegate-only semantics rather than the blanket block below. The
-  // delegate-routing meta-commands (handoff-work, undelegate) write delegateId
-  // with no intent header, and they are LEGITIMATE for the current delegate —
-  // blanket-blocking them would break re-routing. But a non-delegate (e.g. a prior
-  // owner's lingering session, as in the AI-1531 dogfood) must not be able to yank
-  // the delegate. Mirror the intent-path delegate-only rule (lines ~912-925):
+  // delegate-routing meta-command `handoff-work` writes delegateId with no intent
+  // header, and it is LEGITIMATE for the current delegate — blanket-blocking it
+  // would break re-routing. But a non-delegate (e.g. a prior owner's lingering
+  // session, as in the AI-1531 dogfood) must not be able to yank the delegate.
+  // Mirror the intent-path delegate-only rule (lines ~912-925):
   //   - caller IS the current delegate            → allow (legitimate re-route)
   //   - caller is a known non-delegate            → block
   //   - caller unverifiable + ticket has delegate → block (AI-1400 B2 parity)
@@ -2346,13 +2813,40 @@ export async function checkRawMutationInterception(
   // delegate (delegateId → null). A null write is a self-clear, not a re-route
   // — it is the shape of the ungoverned direct-Done bypass (the `complete` verb
   // clears delegate + assignee + state). A non-null delegateId write remains
-  // legitimate (handoff-work, undelegate).
-  const inputDelegateId =
-    vars?.input && typeof vars.input === "object"
-      ? (vars.input as Record<string, unknown>).delegateId
-      : undefined;
+  // legitimate (handoff-work).
+  //
+  // AI-2055: `undelegate` is NOT a way past this guard and never was. It issues an
+  // intent-free {delegateId:null, assigneeId:null}, which lands here and is caught by
+  // the isClearingDelegate check below (deliberately ordered before delegateOnlyChange,
+  // per AI-1857). Because this whole function has already returned null for ad-hoc
+  // tickets (`!workflowId`) and unregistered defs (`!def`), every message emitted from
+  // here is on a governed ticket — where `undelegate` is always blocked. Recommending it
+  // sent agents in a circle (AI-2048, AI-2050). Name the two paths that do work instead.
+  // AI-2055: detect the null the same way `hasDelegateChange` detects the key —
+  // by deep-scanning the variables. The old check only read `variables.input
+  // .delegateId`, but GraphQL input-object *variables* can be named anything
+  // (`issueUpdate(id: $id, input: $patch)` is legal and `variables.input` is then
+  // undefined). That shape was seen as a delegate change but not as a *clear*, so it
+  // fell through to the delegate-only rule and the current delegate was allowed to
+  // self-clear — the exact bypass AI-1835 exists to stop. Input-object *keys* cannot
+  // be aliased, so a query-text `delegateId: null` literal is still caught by the regex.
+  const varsHaveNullField = (obj: unknown, key: string): boolean => {
+    if (!obj || typeof obj !== "object") return false;
+    if (Array.isArray(obj)) return obj.some((v) => varsHaveNullField(v, key));
+    const rec = obj as Record<string, unknown>;
+    if (key in rec && rec[key] === null) return true;
+    return Object.values(rec).some((v) => varsHaveNullField(v, key));
+  };
   const isClearingDelegate =
-    hasDelegateChange && (inputDelegateId === null || /\bdelegateId\s*:\s*null\b/.test(q));
+    hasDelegateChange && (varsHaveNullField(vars, "delegateId") || /\bdelegateId\s*:\s*null\b/.test(q));
+  const breakGlass = def.break_glass?.command ?? "escape";
+  const delegateClearRejection = () =>
+    `[Proxy] Direct delegate clear blocked: the current delegate may re-route ${issueId} ` +
+    `but may not null the delegate field directly. ` +
+    `On a governed ticket \`undelegate\` is blocked by this same guard — it is not the remedy. ` +
+    `To release ownership: \`linear ${breakGlass} ${issueId}\` (break-glass; exits the workflow to ` +
+    `'${def.break_glass?.to ?? "intake"}' under the steward), or \`linear handoff-work ${issueId} <agent>\` ` +
+    `to re-route to another agent.`;
   // AI-1857: Block delegate clears regardless of mutation shape. The combined
   // {delegateId:null, assigneeId:null} shape (partial semantic-verb application)
   // has hasAssigneeChange=true → delegateOnlyChange=false → bypasses the AI-1835 guard.
@@ -2360,10 +2854,7 @@ export async function checkRawMutationInterception(
   // Only applies when no state change is present (hasStateChange=true has its own message).
   if (isClearingDelegate && delegateId && !hasStateChange) {
     log.warn(`workflow-gate: raw delegate null (self-clear) block agent=${bodyId} ticket=${issueId}`);
-    return (
-      `[Proxy] Direct delegate clear blocked: the current delegate may re-route ${issueId} ` +
-      `but may not null the delegate field directly. Use undelegate or handoff-work to release ownership.`
-    );
+    return delegateClearRejection();
   }
   const delegateOnlyChange =
     hasDelegateChange && !hasStateChange && !hasAssigneeChange && !hasLabelChange;
@@ -2371,10 +2862,47 @@ export async function checkRawMutationInterception(
     if (callerLinearUserId && delegateId && callerLinearUserId === delegateId) {
       if (isClearingDelegate) {
         log.warn(`workflow-gate: raw delegate null (self-clear) block agent=${bodyId} ticket=${issueId}`);
-        return (
-          `[Proxy] Direct delegate clear blocked: the current delegate may re-route ${issueId} ` +
-          `but may not null the delegate field directly. Use undelegate or handoff-work to release ownership.`
-        );
+        return delegateClearRejection();
+      }
+      // AI-2020: verdict-comment gate for feedback-requiring states.
+      // When the current delegate attempts a handoff from a workflow state
+      // whose transitions require feedback, the mutation must be accompanied
+      // by a verdict comment from this caller. The skill CLI posts comments
+      // before the delegate mutation, so the comment already exists on the
+      // ticket. Fail-open on any fetch error.
+      if (def) {
+        const currentStateId = getCurrentState(labels);
+        if (currentStateId) {
+          const stateNode = def.states.find((s) => s.id === currentStateId);
+          const hasFeedbackTransition = stateNode?.transitions?.some(
+            (t) => t.feedback?.required === true,
+          );
+          if (hasFeedbackTransition && callerLinearUserId) {
+            let hasVerdictComment = true;
+            try {
+              const lastComment = await fetchLastCommentByUser(
+                issueId!,
+                callerLinearUserId,
+                authToken,
+              );
+              hasVerdictComment = lastComment !== null;
+            } catch {
+              // Fail-open: transient API failure
+            }
+            if (!hasVerdictComment) {
+              const breakCmd = def.break_glass?.command ?? "escape";
+              log.warn(
+                `workflow-gate: AI-2020 verdict gate — handoff from feedback-requiring state '${currentStateId}' ` +
+                `agent=${bodyId} ticket=${issueId} — no verdict comment found`,
+              );
+              return (
+                `[Proxy] Handoff blocked from state '${currentStateId}' which requires a review verdict. ` +
+                `Post a comment on the ticket explaining your review findings (use --comment on ` +
+                `\`linear handoff-work\`), or use \`linear ${breakCmd} ${issueId}\` to exit the workflow.`
+              );
+            }
+          }
+        }
       }
       return null; // current delegate may re-route (non-null target only)
     }
@@ -2809,6 +3337,43 @@ async function postComment(internalIssueId: string, body: string, authToken: str
   }
 }
 
+/**
+ * INF-12: the single exit for every `delegate-unresolved` fail-close.
+ *
+ * Four of the five original return sites logged their reason server-side and
+ * returned mute: the agent's comment posted, the state label never flipped, and
+ * nothing said why. A mute fail-close is indistinguishable from a hang, so
+ * agents retry instead of correcting — it costs sessions, not seconds (LIF-7
+ * declined 5× across three sessions before being demoted to Backlog to stop the
+ * loop). The reason was already computed at every site; only the delivery was
+ * missing.
+ *
+ * Routing all five sites through here is the actual guard: a sixth fail-close
+ * path cannot be added mute without deliberately going around this function.
+ *
+ * `remedy` is the operator-facing half — what to DO — and is what separates a
+ * useful comment from a restatement of the failure. `detail` stays the terse
+ * machine-facing string already on the wire.
+ *
+ * Fail-close semantics are unchanged and deliberately so (AI-1709): this always
+ * returns failed/delegate-unresolved and never applies a write. `postComment` is
+ * itself fail-open, so a failed comment cannot convert a clean abort into a
+ * throw — which matters because two of these sites sit inside the try block
+ * whose catch is itself a fail-close site.
+ */
+async function failDelegateUnresolved(args: {
+  issueId: string;
+  authToken: string;
+  detail: string;
+  remedy: string;
+  from?: string | null;
+  to?: string;
+}): Promise<TransitionApplyResult> {
+  const { issueId, authToken, detail, remedy, from, to } = args;
+  await postComment(issueId, `[Connector] Transition blocked: ${remedy}`, authToken);
+  return { status: "failed", code: "delegate-unresolved", detail, from, to };
+}
+
 export async function applyStateTransition(
   intent: string,
   issueId: string | null,
@@ -2891,8 +3456,17 @@ export async function applyStateTransition(
   // AI-1813 fix: break-glass (escape) must be legal when no state:* label is
   // present — that's precisely the corruption escape exists to recover from.
   // The no-source-state guard below applies only to non-break-glass intents.
+  // AI-2262: `park` is not a workflow transition — it demotes the ticket out of
+  // the workflow (removes state:* and wf:* labels) and clears delegate + assignee.
+  // This mirrors the __ad_hoc__ demotion path below, which handles the actual
+  // label removal. The CLI's forwarded issueUpdate carries the native Backlog
+  // stateId, delegateId: null, and assigneeId: null — the proxy now exempts
+  // the nulls (stripNullDelegateAssigneeFields) so they reach Linear directly.
   if (intent === breakGlassCommand) {
     toStateName = def.break_glass?.to ?? "escape";
+  } else if (intent === "park") {
+    toStateName = "__ad_hoc__";
+    log.info(`workflow-gate: B2 apply: ${issueId} parking — demoting to __ad_hoc__`);
   } else {
     if (!currentStateName) {
       log.warn(`workflow-gate: B2 apply: no state:* label on ${issueId} — skipping`);
@@ -2916,7 +3490,22 @@ export async function applyStateTransition(
     const keepIds = issue.labels
       .filter((l) => !l.name.startsWith("state:") && !l.name.startsWith("wf:"))
       .map((l) => l.id);
-    await issueUpdateLabels(issue.internalId, keepIds, authToken);
+    const labelsApplied = await issueUpdateLabels(issue.internalId, keepIds, authToken);
+    if (!labelsApplied) {
+      log.error(
+        `workflow-gate: B2 apply: FAILED — ${issueId} demoted to __ad_hoc__ but label mutation returned false`,
+      );
+      emitTransitionWriteFailure({
+        identifier: issue.identifier ?? issueId,
+        from: currentStateName,
+        to: "__ad_hoc__",
+        intent,
+        agent: options?.bodyId ?? null,
+        outcome: { ok: false, attempts: 1, failureKind: "mutation", divergent: [], unverified: false },
+        operationalEventStore: options?.operationalEventStore,
+      });
+      return { status: "failed", code: "atomic-mutation-failed", detail: `__ad_hoc__ demote label mutation did not apply`, from: currentStateName, to: "__ad_hoc__" };
+    }
     // AI-1534: ticket left the workflow — drop any cached state so it can't
     // override a later live read.
     clearAppliedState(issue.identifier);
@@ -3044,19 +3633,21 @@ export async function applyStateTransition(
     return { status: "failed", code: "atomic-mutation-failed", detail: `re-stamp of '${targetLabelName}' did not apply`, from: currentStateName, to: toStateName };
   }
 
-  // ── AI-1475 Defect 1 + AI-1492 + AI-1497: Merged-PR release gate defense-in-depth (§5.6) ─
-  // Block the forward label swap out of deployment if the branch/PR gate is not
-  // satisfied. Defense-in-depth: checkWorkflowRules is the primary gate, but
-  // applyStateTransition also blocks to prevent any bypass path.
-  // v8: fires on both forward exits from deployment — `deploy` and
-  // `handoff-host-deploy` (the merge precedes either).
+  // ── AI-2476: Merged-PR release gate defense-in-depth (§5.6) ────────
+  // Block the forward label swap out of merge or deploy if the branch/PR gate
+  // is not satisfied. Defense-in-depth: checkWorkflowRules is the primary gate,
+  // but applyStateTransition also blocks to prevent any bypass path.
+  //
+  // AI-2476 re-arm: v8's literal verb predicate (`'deploy'`, `'handoff-host-deploy'`)
+  // was deleted by AI-1872 (v10). The gate now keys on (currentStateName+intent)
+  // to match the v14 generic-verb architecture.
   //
   // AI-1492: A merged PR satisfies the gate even without a branch (auto-deleted
   // after squash merge).
   //
   // AI-1497: Fail-open on null (after retry) and on complete absence of evidence
   // (no branch + no PR). Only block on partial evidence (branch exists but no PR).
-  if (intent === 'deploy' || intent === 'handoff-host-deploy') {
+  if ((currentStateName === 'merge' || currentStateName === 'deploy') && intent === 'continue') {
     let branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
     if (!branchStatus) {
       await new Promise((r) => setTimeout(r, 1000));
@@ -3304,7 +3895,17 @@ export async function applyStateTransition(
             log.error(
               `workflow-gate: B2 apply: FAIL-CLOSED — prior implementer '${priorImplementer}' has no linearUserId. Cannot route ${intent} on ${issueId}.`,
             );
-            return { status: "failed", code: "delegate-unresolved", detail: `prior implementer '${priorImplementer}' has no linearUserId`, from: currentStateName, to: toStateName };
+            return await failDelegateUnresolved({
+              issueId,
+              authToken,
+              detail: `prior implementer '${priorImplementer}' has no linearUserId`,
+              remedy:
+                `'${intent}' routes back to the prior implementer '${priorImplementer}', but that agent has no ` +
+                `linearUserId in agents.json. Register the agent's Linear user ID to proceed, or re-run with ` +
+                `\`--target <body>\` to route this transition to someone else.`,
+              from: currentStateName,
+              to: toStateName,
+            });
           }
         } else {
           log.warn(
@@ -3318,25 +3919,58 @@ export async function applyStateTransition(
         try {
           const roleBodies = await resolveBodiesForRole(destOwnerRole!);
           if (roleBodies.length === 1) {
-            const agent = getAgent(roleBodies[0]);
-            if (agent?.linearUserId) {
-              resolvedDelegateId = agent.linearUserId;
+            const singletonResult = resolveSingletonDelegate(roleBodies, destOwnerRole!);
+            if (singletonResult.resolvedDelegateId) {
+              resolvedDelegateId = singletonResult.resolvedDelegateId;
             } else {
-              log.warn(
-                `workflow-gate: B2 apply: singleton body '${roleBodies[0]}' for role '${destOwnerRole}' has no linearUserId — skipping auto-delegate`,
+              log.error(
+                `workflow-gate: B2 apply: FAIL-CLOSED — singleton body '${roleBodies[0]}' for role '${destOwnerRole}' has no linearUserId. Transition aborted.`,
               );
+              // INF-12: text pinned verbatim — this path was already correct and
+              // its wording is asserted exactly by the regression suite.
+              return await failDelegateUnresolved({
+                issueId,
+                authToken,
+                detail: singletonResult.detail ?? "singleton body has no linearUserId",
+                remedy:
+                  `singleton body '${roleBodies[0]}' for role '${destOwnerRole}' has no linearUserId in agents.json. ` +
+                  `Register the agent's Linear user ID to proceed.`,
+                from: currentStateName,
+                to: toStateName,
+              });
             }
           } else if (roleBodies.length > 1) {
             log.error(
               `workflow-gate: B2 apply: FAIL-CLOSED — multi-body role '${destOwnerRole}' (${roleBodies.join(", ")}) on '${intent}' for ${issueId} requires a CLI --target${wantsPriorImplementer ? " (no prior implementer recorded)" : ""} but none was supplied. Transition aborted.`,
             );
-            return { status: "failed", code: "delegate-unresolved", detail: `multi-body role '${destOwnerRole}' requires a --target`, from: currentStateName, to: toStateName };
+            return await failDelegateUnresolved({
+              issueId,
+              authToken,
+              detail: `multi-body role '${destOwnerRole}' requires a --target`,
+              remedy:
+                `'${intent}' routes to role '${destOwnerRole}', which is filled by ${roleBodies.length} bodies ` +
+                `(${roleBodies.join(", ")}), so the connector will not guess which one` +
+                `${wantsPriorImplementer ? " and no prior implementer is recorded on this ticket" : ""}. ` +
+                `Re-run with \`--target <body>\`, naming one of: ${roleBodies.join(", ")}.`,
+              from: currentStateName,
+              to: toStateName,
+            });
           } else {
             if (intent === 'approve' || intent === 'reject') {
               log.error(
                 `workflow-gate: B2 apply: FAIL-CLOSED — no bodies found for role '${destOwnerRole}' on '${intent}'. Transition aborted per AI-1493.`,
               );
-              return { status: "failed", code: "delegate-unresolved", detail: `no bodies found for role '${destOwnerRole}'`, from: currentStateName, to: toStateName };
+              return await failDelegateUnresolved({
+                issueId,
+                authToken,
+                detail: `no bodies found for role '${destOwnerRole}'`,
+                remedy:
+                  `'${intent}' routes to role '${destOwnerRole}', but no body is registered as filling that role, ` +
+                  `so there is nobody to delegate to. Add a body with '${destOwnerRole}' in its \`fills_roles\` in ` +
+                  `capability-policy.yaml, or re-run with \`--target <body>\` to route this transition explicitly.`,
+                from: currentStateName,
+                to: toStateName,
+              });
             }
             log.warn(
               `workflow-gate: B2 apply: no bodies found for role '${destOwnerRole}' on '${intent}' — skipping auto-delegate`,
@@ -3347,7 +3981,18 @@ export async function applyStateTransition(
           log.error(
             `workflow-gate: B2 apply: FAIL-CLOSED — role resolution failed for '${destOwnerRole}': ${msg}. Transition aborted.`,
           );
-          return { status: "failed", code: "delegate-unresolved", detail: `role resolution failed for '${destOwnerRole}': ${msg}`, from: currentStateName, to: toStateName };
+          return await failDelegateUnresolved({
+            issueId,
+            authToken,
+            detail: `role resolution failed for '${destOwnerRole}': ${msg}`,
+            remedy:
+              `'${intent}' routes to role '${destOwnerRole}', but resolving the bodies for that role failed: ${msg}. ` +
+              `This is usually an unreadable or malformed capability-policy.yaml rather than anything about this ` +
+              `ticket — check the connector's config-health. Re-run with \`--target <body>\` to route explicitly in ` +
+              `the meantime.`,
+            from: currentStateName,
+            to: toStateName,
+          });
         }
       }
     }
@@ -3553,9 +4198,15 @@ export async function applyStateTransition(
           clearAppliedState(issue.identifier);
           return { status: "applied", code: "transition-applied", from: currentStateName, to: toStateName };
         }
-        log.info(
-          `workflow-gate: AI-1730: onManagingEntry returned no transition for ${issueId} — children still active`,
-        );
+        if (barrierResult.error) {
+          log.warn(
+            `workflow-gate: AI-1730: onManagingEntry barrier held for ${issueId} — ${barrierResult.error}`,
+          );
+        } else {
+          log.info(
+            `workflow-gate: AI-1730: onManagingEntry returned no transition for ${issueId} — children still active`,
+          );
+        }
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -3661,7 +4312,12 @@ async function postFanoutSummaryComment(
  * so the transition is all-or-nothing: either the full tuple lands or nothing does.
  *
  * @param delegateId - Linear user ID for the new delegate, or null to skip delegate update.
+ *
+ * AI-2544: Exported as _issueUpdateAtomicForTests so tests can verify log behavior
+ * without going through the full proxy stack. Underscore-prefixed per project convention.
  */
+export const _issueUpdateAtomicForTests = issueUpdateAtomic;
+
 async function issueUpdateAtomic(
   internalId: string,
   labelIds: string[],
@@ -3696,10 +4352,11 @@ async function issueUpdateAtomic(
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({ query: mutation, variables }),
     });
-    type Resp = { data?: { issueUpdate?: { success: boolean } } };
+    type Resp = { data?: { issueUpdate?: { success: boolean } }; errors?: unknown[] };
     const data = (await res.json()) as Resp;
     if (!data.data?.issueUpdate?.success) {
-      log.warn(`workflow-gate: atomic issueUpdate returned non-success for ${internalId}`);
+      const errors = data.errors ? JSON.stringify(data.errors) : "none";
+      log.warn(`workflow-gate: atomic issueUpdate returned non-success for ${internalId}; errors=${errors}`);
       return false;
     }
     return true;
@@ -4041,6 +4698,191 @@ export async function enrollIfMissing(
   } catch (err) {
     log.warn(`workflow-gate: enrollIfMissing: onHeal audit hook threw for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
   }
+  return { enrolled: true, entryState: def.entry_state };
+}
+
+// ── AI-2469: Auto-enroll AI-team tickets into dev-impl at intake ────────────
+
+/**
+ * AI-2469 AC1(a): Auto-enroll tickets from a target team into a default
+ * workflow when the ticket has no `wf:*` label at all.
+ *
+ * This is the PRIMARY enrollment path — a ticket enters dev-impl at its first
+ * webhook event, before any agent touches it. Over-inclusive in the right
+ * direction: non-code tickets can use `escape`; code tickets that never
+ * entered the workflow are precisely the defect class from AI-2450.
+ *
+ * Fail-open: any API or registry failure logs a warning and returns
+ * `{ enrolled: false }` — the inbound path is never blocked by enrollment.
+ *
+ * Compare with `enrollIfMissing`, which only heals the gap where a `wf:*`
+ * label exists but `state:*` is missing. This function handles the case
+ * where neither label exists.
+ *
+ * @param issueId - Linear issue UUID to enroll
+ * @param teamKey - Team key from the webhook event (e.g. "AI")
+ * @param authToken - Linear API token
+ * @param config - Configuration for which teams map to which workflows
+ * @param onEnroll - Optional audit hook called on successful enrollment
+ */
+export interface TeamEnrollConfig {
+  /** Map of team keys to workflow IDs. Default: { "AI": "dev-impl" } */
+  [teamKey: string]: string;
+}
+
+export interface AutoEnrollLiveness {
+  active: boolean;
+  enrolledCount: number;
+  suppressedDemotedCount: number;
+  lastEnrolledAt: string | null;
+  lastSuppressedAt: string | null;
+}
+
+let autoEnrollLiveness: AutoEnrollLiveness = {
+  active: false,
+  enrolledCount: 0,
+  suppressedDemotedCount: 0,
+  lastEnrolledAt: null,
+  lastSuppressedAt: null,
+};
+
+/** AI-2542: Mark auto-enroll live only where the webhook path is actually wired. */
+export function markAutoEnrollRegistered(): void {
+  autoEnrollLiveness = { ...autoEnrollLiveness, active: true };
+}
+
+/** AI-2542: Liveness snapshot for /health.autoEnroll. */
+export function getAutoEnrollLiveness(): AutoEnrollLiveness {
+  return { ...autoEnrollLiveness };
+}
+
+export interface AutoEnrollInfo {
+  /** Display identifier or UUID passed in. */
+  issueId: string;
+  /** Linear internal issue UUID. */
+  internalId: string;
+  /** Resolved workflow id (e.g. "dev-impl"). */
+  workflowId: string;
+  /** Entry state stamped (e.g. "intake"). */
+  entryState: string;
+  /** Team key that triggered enrollment. */
+  teamKey: string;
+}
+
+const DEFAULT_TEAM_ENROLL_CONFIG: TeamEnrollConfig = {
+  "AI": "dev-impl",
+};
+
+/**
+ * Auto-enroll a ticket from a configured team into its default workflow.
+ *
+ * Skips if:
+ * - The ticket already has a `wf:*` label (already enrolled or in another workflow)
+ * - The team key is not in the enrollment config
+ * - The workflow def cannot be loaded
+ * - Any API error occurs (fail-open)
+ *
+ * Called from the webhook inbound path on every Issue event, alongside
+ * `enrollIfMissing`. Idempotent on re-runs.
+ */
+export async function autoEnrollByTeam(
+  issueId: string,
+  teamKey: string,
+  authToken: string,
+  config?: TeamEnrollConfig,
+  onEnroll?: (info: AutoEnrollInfo) => void,
+  enrolledTicketsStore?: EnrolledTicketsStore,
+): Promise<{ enrolled: boolean; entryState?: string }> {
+  const enrollConfig = config ?? DEFAULT_TEAM_ENROLL_CONFIG;
+  const workflowId = enrollConfig[teamKey];
+  if (!workflowId) return { enrolled: false }; // team not configured for auto-enroll
+
+  const issue = await fetchIssueWithLabels(issueId, authToken);
+  if (!issue) {
+    log.warn(`workflow-gate: autoEnrollByTeam: failed to fetch labels for ${issueId} (team=${teamKey}) — skipping`);
+    return { enrolled: false };
+  }
+
+  const labelNames = issue.labels.map((l) => l.name);
+  const existingWorkflowId = getWorkflowId(labelNames);
+  if (existingWorkflowId) {
+    return { enrolled: false }; // already has a wf:* label — skip
+  }
+
+  // AI-2542: A governed demote/escape removes wf/state labels, then Linear
+  // echoes an Issue webhook. Suppress only that same ticket while its last
+  // lifecycle event remains demoted; later genuine enrollment overwrites it.
+  if (enrolledTicketsStore?.wasDemoted(issue.identifier)) {
+    autoEnrollLiveness = {
+      ...autoEnrollLiveness,
+      suppressedDemotedCount: autoEnrollLiveness.suppressedDemotedCount + 1,
+      lastSuppressedAt: new Date().toISOString(),
+    };
+    log.info(`workflow-gate: autoEnrollByTeam: skipping ${issue.identifier} (team=${teamKey}) because last enrolled-ticket event is demoted`);
+    return { enrolled: false };
+  }
+
+  // Ticket has no wf:* label. Enroll into the configured workflow.
+  let def: WorkflowDef | undefined;
+  try {
+    const registry = await loadWorkflowRegistry();
+    def = registry.get(workflowId);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: autoEnrollByTeam: registry load failed for ${issueId}: ${msg} — skipping`);
+    return { enrolled: false };
+  }
+
+  if (!def?.entry_state) {
+    log.warn(`workflow-gate: autoEnrollByTeam: no entry_state in def for ${workflowId} on ${issueId} — skipping`);
+    return { enrolled: false };
+  }
+
+  // Resolve or create both labels: wf:<workflowId> and state:<entry_state>
+  const wfLabelName = `wf:${workflowId}`;
+  const stateLabelName = `state:${def.entry_state}`;
+
+  const wfLabelId = await findOrCreateLabel(issue.teamId, wfLabelName, authToken);
+  if (!wfLabelId) {
+    log.warn(`workflow-gate: autoEnrollByTeam: could not resolve label '${wfLabelName}' for ${issueId} — skipping`);
+    return { enrolled: false };
+  }
+
+  const stateLabelId = await findOrCreateLabel(issue.teamId, stateLabelName, authToken);
+  if (!stateLabelId) {
+    log.warn(`workflow-gate: autoEnrollByTeam: could not resolve label '${stateLabelName}' for ${issueId} — skipping`);
+    return { enrolled: false };
+  }
+
+  // Add both labels alongside existing ones
+  const existingIds = issue.labels.map((l) => l.id);
+  const newLabelIds = [...new Set([...existingIds, wfLabelId, stateLabelId])];
+
+  const success = await issueUpdateLabels(issue.internalId, newLabelIds, authToken);
+  if (!success) {
+    log.warn(`workflow-gate: autoEnrollByTeam: label update failed for ${issueId} — skipping`);
+    return { enrolled: false };
+  }
+
+  log.info(`workflow-gate: autoEnrollByTeam: stamped '${wfLabelName}' + '${stateLabelName}' on ${issueId} (team=${teamKey})`);
+  autoEnrollLiveness = {
+    ...autoEnrollLiveness,
+    enrolledCount: autoEnrollLiveness.enrolledCount + 1,
+    lastEnrolledAt: new Date().toISOString(),
+  };
+
+  try {
+    onEnroll?.({
+      issueId,
+      internalId: issue.internalId,
+      workflowId,
+      entryState: def.entry_state,
+      teamKey,
+    });
+  } catch (err) {
+    log.warn(`workflow-gate: autoEnrollByTeam: onEnroll audit hook threw for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
   return { enrolled: true, entryState: def.entry_state };
 }
 
