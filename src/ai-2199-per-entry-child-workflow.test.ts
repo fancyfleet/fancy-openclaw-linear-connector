@@ -436,7 +436,7 @@ describe("AC1: executeFanout per-entry child_workflow", () => {
         return jsonResp({ issue: { children: { nodes: [] } } });
       }
       if (query.includes("TeamLabels")) {
-        return jsonResp({ team: { labels: { nodes: existingTeamLabels } } });
+        return jsonResp({ team: { labels: { nodes: existingTeamLabels.map((l: any) => ({ ...l, team: { id: "team-uuid" } })) } } });
       }
       if (query.includes("issueLabelCreate") && !query.includes("issueCreate")) {
         const name = (parsed.variables as Record<string, unknown>).name as string;
@@ -864,8 +864,8 @@ describe("AC3: backward compatibility — entries without per-entry markers", ()
       }
       if (query.includes("TeamLabels")) {
         return jsonResp({ team: { labels: { nodes: [
-          { id: "label-sprint-arm-scope", name: "wf:sprint-arm-scope" },
-          { id: "label-state-intake", name: "state:intake" },
+          { id: "label-sprint-arm-scope", name: "wf:sprint-arm-scope", team: { id: "team-uuid" } },
+          { id: "label-state-intake", name: "state:intake", team: { id: "team-uuid" } },
         ] } } });
       }
       if (query.includes("issueLabelCreate") && !query.includes("issueCreate")) {
@@ -1290,10 +1290,10 @@ describe("Integration: end-to-end spawn with per-entry child workflows", () => {
       }
       if (query.includes("TeamLabels")) {
         return jsonResp({ team: { labels: { nodes: [
-          { id: "label-sprint-arm-scope", name: "wf:sprint-arm-scope" },
-          { id: "label-sprint-arm-ux", name: "wf:sprint-arm-ux" },
-          { id: "label-sprint-arm-design", name: "wf:sprint-arm-design" },
-          { id: "label-sprint-arm-spike", name: "wf:sprint-arm-spike" },
+          { id: "label-sprint-arm-scope", name: "wf:sprint-arm-scope", team: { id: "team-uuid" } },
+          { id: "label-sprint-arm-ux", name: "wf:sprint-arm-ux", team: { id: "team-uuid" } },
+          { id: "label-sprint-arm-design", name: "wf:sprint-arm-design", team: { id: "team-uuid" } },
+          { id: "label-sprint-arm-spike", name: "wf:sprint-arm-spike", team: { id: "team-uuid" } },
         ] } } });
       }
       if (query.includes("issueLabelCreate") && !query.includes("issueCreate")) {

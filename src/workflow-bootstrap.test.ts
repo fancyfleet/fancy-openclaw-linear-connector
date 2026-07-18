@@ -231,7 +231,7 @@ function makeBootstrapFetch(opts: {
     if (body.includes("labels") && body.includes(TEAM_ID)) {
       return new Response(
         JSON.stringify({
-          data: { team: { labels: { nodes: teamLabels } } },
+          data: { team: { labels: { nodes: teamLabels.map((l: any) => ({ ...l, team: { id: TEAM_ID } })) } } },
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );

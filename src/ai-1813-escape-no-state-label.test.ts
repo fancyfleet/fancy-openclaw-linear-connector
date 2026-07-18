@@ -145,8 +145,9 @@ function makeTransitionFetch(opts: {
     }
 
     if (query.includes("TeamLabels")) {
+      const nodes = teamLabels.map((l) => ({ ...l, team: { id: teamId } }));
       return new Response(
-        JSON.stringify({ data: { team: { labels: { nodes: teamLabels } } } }),
+        JSON.stringify({ data: { team: { labels: { nodes } } } }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
@@ -462,8 +463,12 @@ describe("AI-1813 AC2: proxy integration — escape from no-state-label ticket e
 
       // Team labels for label lookup.
       if (q.includes("TeamLabels")) {
+        const raw = opts.b2TeamLabels ?? TEAM_LABELS_WITH_INTAKE;
+        if (raw.data?.team?.labels?.nodes) {
+          raw.data.team.labels.nodes = raw.data.team.labels.nodes.map((l: any) => ({ ...l, team: { id: opts.teamId ?? "team-uuid" } }));
+        }
         return new Response(
-          JSON.stringify(opts.b2TeamLabels ?? TEAM_LABELS_WITH_INTAKE),
+          JSON.stringify(raw),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }

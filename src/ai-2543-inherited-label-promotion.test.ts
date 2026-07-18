@@ -159,7 +159,7 @@ function makeFakeLinear(opts: FakeLinearOpts, passthrough: typeof globalThis.fet
       const teamId = vars.teamId as string;
       const nodes = labels
         .filter((l) => l.teamId === teamId)
-        .map((l) => ({ id: l.id, name: l.name, isGroup: false, parent: null }));
+        .map((l) => ({ id: l.id, name: l.name, isGroup: false, parent: null, team: { id: teamId } }));
       return json({ data: { team: { labels: { nodes } } } });
     }
 

@@ -247,8 +247,9 @@ function makeLabelFetch(labels: string[], opts: MakeLabelFetchOpts = {}) {
     }
 
     if (query.includes("TeamLabels")) {
+      const nodes = teamLabels.map((l: any) => ({ ...l, team: { id: "team-uuid" } }));
       return new Response(
-        JSON.stringify({ data: { team: { labels: { nodes: teamLabels } } } }),
+        JSON.stringify({ data: { team: { labels: { nodes } } } }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }

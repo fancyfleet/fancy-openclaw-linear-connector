@@ -146,7 +146,8 @@ function makeTransitionFetch(opts: {
       });
     }
     if (query.includes("TeamLabels")) {
-      return jsonResponse({ data: { team: { labels: { nodes: opts.teamLabels } } } });
+      const nodes = opts.teamLabels.map((l: any) => ({ ...l, team: { id: "team-uuid" } }));
+      return jsonResponse({ data: { team: { labels: { nodes } } } });
     }
     if (query.includes("TeamStates")) {
       return jsonResponse({

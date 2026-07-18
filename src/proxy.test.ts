@@ -936,13 +936,21 @@ const DEV_IMPL_IMPLEMENTATION_WITH_IDS = {
   },
 };
 
+/** AI-2557: inject team.id into TeamLabels response nodes so findOrCreateLabel ownership filter accepts them. */
+function injectTeamIds(raw: any): string {
+  if (raw?.data?.team?.labels?.nodes) {
+    raw.data.team.labels.nodes = raw.data.team.labels.nodes.map((l: any) => ({ ...l, team: { id: "team-uuid" } }));
+  }
+  return JSON.stringify(raw);
+}
+
 const TEAM_LABELS_WITH_CR = {
   data: {
     team: {
       labels: {
         nodes: [
-          { id: "cr-lbl", name: "state:code-review" },
-          { id: "impl-lbl", name: "state:implementation" },
+          { id: "cr-lbl", name: "state:code-review", team: { id: "team-uuid" } },
+          { id: "impl-lbl", name: "state:implementation", team: { id: "team-uuid" } },
         ],
       },
     },
@@ -1021,7 +1029,7 @@ describe("proxy enforcement — B2 state-label transition application", () => {
       }
       if (q.includes("TeamLabels")) {
         return new Response(
-          JSON.stringify(opts.b2TeamLabels ?? TEAM_LABELS_WITH_CR),
+          injectTeamIds(opts.b2TeamLabels ?? TEAM_LABELS_WITH_CR),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
@@ -1560,7 +1568,7 @@ describe("proxy — Layer 1 workflow reminder header (AI-1387)", () => {
       }
       if (q.includes("TeamLabels")) {
         return new Response(
-          JSON.stringify(opts.b2TeamLabels ?? TEAM_LABELS_WITH_CR),
+          injectTeamIds(opts.b2TeamLabels ?? TEAM_LABELS_WITH_CR),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }

@@ -331,7 +331,7 @@ describe("executeFanout — mocked Linear API", () => {
       if (query.includes("TeamLabels")) {
         return new Response(
           JSON.stringify({
-            data: { team: { labels: { nodes: opts.teamLabels ?? [] } } },
+            data: { team: { labels: { nodes: (opts.teamLabels ?? []).map((l: any) => ({ ...l, team: { id: opts.teamId ?? 'team-uuid' } })) } } },
           }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
@@ -842,7 +842,7 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
       // B2: team label lookup
       if (query.includes("TeamLabels")) {
         return new Response(
-          JSON.stringify({ data: { team: { labels: { nodes: teamLabels } } } }),
+          JSON.stringify({ data: { team: { labels: { nodes: teamLabels.map((l: any) => ({ ...l, team: { id: teamId } })) } } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }

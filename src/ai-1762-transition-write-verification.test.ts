@@ -134,8 +134,8 @@ const TEAM_LABELS = {
     team: {
       labels: {
         nodes: [
-          { id: "acv-lbl", name: "state:ac-validate" },
-          { id: "impl-lbl", name: "state:implementation" },
+          { id: "acv-lbl", name: "state:ac-validate", team: { id: "team-uuid" } },
+          { id: "impl-lbl", name: "state:implementation", team: { id: "team-uuid" } },
         ],
       },
     },

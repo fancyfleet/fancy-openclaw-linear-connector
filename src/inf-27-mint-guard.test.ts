@@ -101,7 +101,7 @@ describe("INF-27 AC2: mint guard — an absent wf:* label must fail loudly, not 
 
       if (query.includes("TeamLabels")) {
         return new Response(
-          JSON.stringify({ data: { team: { labels: { nodes: opts.teamLabels ?? [] } } } }),
+          JSON.stringify({ data: { team: { labels: { nodes: (opts.teamLabels ?? []).map((l: any) => ({ ...l, team: { id: "team-uuid" } })) } } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }

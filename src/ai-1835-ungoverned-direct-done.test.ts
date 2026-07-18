@@ -304,7 +304,7 @@ function makeLabelFetch(
     // Team labels query (for state label ID resolution)
     if (bodyText.includes("TeamStateLabels")) {
       return new Response(JSON.stringify({
-        data: { issue: { team: { labels: { nodes: teamLabels } } } },
+        data: { issue: { team: { labels: { nodes: teamLabels.map((l: any) => ({ ...l, team: { id: teamId } })) } } } },
       }), { status: 200, headers: { "Content-Type": "application/json" } });
     }
 

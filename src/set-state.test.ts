@@ -158,7 +158,7 @@ function makeSetStateFetch(opts: MockOptions): typeof globalThis.fetch {
     // Label lookup (findOrCreateLabel — TeamLabels query)
     if (bodyText.includes("TeamLabels")) {
       return new Response(
-        JSON.stringify({ data: { team: { labels: { nodes: [{ id: "label-state-target-uuid", name: "state:implementation" }, { id: "label-state-done-uuid", name: "state:done" }, { id: "label-state-escape-uuid", name: "state:escape" }, { id: "label-state-intake-uuid", name: "state:intake" }] } } } }),
+        JSON.stringify({ data: { team: { labels: { nodes: [{ id: "label-state-target-uuid", name: "state:implementation", team: { id: "team-uuid" } }, { id: "label-state-done-uuid", name: "state:done", team: { id: "team-uuid" } }, { id: "label-state-escape-uuid", name: "state:escape", team: { id: "team-uuid" } }, { id: "label-state-intake-uuid", name: "state:intake", team: { id: "team-uuid" } }] } } } }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }

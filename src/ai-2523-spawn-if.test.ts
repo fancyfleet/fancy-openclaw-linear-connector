@@ -136,7 +136,7 @@ function makeSpawnIfFetch(opts: {
     if (query.includes("TeamLabels")) {
       return new Response(
         JSON.stringify({
-          data: { team: { labels: { nodes: opts.teamLabels ?? [] } } },
+          data: { team: { labels: { nodes: (opts.teamLabels ?? []).map((l: any) => ({ ...l, team: { id: opts.teamId ?? 'team-uuid' } })) } } },
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );

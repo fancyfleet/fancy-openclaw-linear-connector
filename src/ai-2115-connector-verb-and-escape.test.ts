@@ -156,10 +156,10 @@ const TASK_TEAM_LABELS = {
     team: {
       labels: {
         nodes: [
-          { id: "intake-lbl", name: "state:intake" },
-          { id: "routing-lbl", name: "state:routing" },
-          { id: "doing-lbl", name: "state:doing" },
-          { id: "done-lbl", name: "state:done" },
+          { id: "intake-lbl", name: "state:intake", team: { id: "team-uuid" } },
+          { id: "routing-lbl", name: "state:routing", team: { id: "team-uuid" } },
+          { id: "doing-lbl", name: "state:doing", team: { id: "team-uuid" } },
+          { id: "done-lbl", name: "state:done", team: { id: "team-uuid" } },
         ],
       },
     },
@@ -414,7 +414,10 @@ function makeApplyFetch(opts: {
       return json({ data: { issue: { id: "internal-uuid", identifier: "AI-2115", team: { id: "team-uuid" }, labels: { nodes: liveLabels } } } });
     }
     if (query.includes("TeamStateLabels")) return json({ data: { issue: { team: { labels: opts.teamLabels } } } });
-    if (query.includes("TeamLabels")) return json({ data: { team: { labels: { nodes: opts.teamLabels } } } });
+    if (query.includes("TeamLabels")) {
+      const nodes = opts.teamLabels.map((l: any) => ({ ...l, team: { id: "team-uuid" } }));
+      return json({ data: { team: { labels: { nodes } } } });
+    }
     if (query.includes("TeamStates")) return json({ data: { team: { states: { nodes: ESCAPE_TEAM_STATES } } } });
     if (query.includes("issueLabelCreate")) return json({ data: { issueLabelCreate: { success: true, issueLabel: { id: "new-label-id" } } } });
     if (query.includes("VerifyTransitionWrite")) {
