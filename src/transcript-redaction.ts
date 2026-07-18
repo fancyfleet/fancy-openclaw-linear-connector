@@ -188,8 +188,10 @@ export async function runTranscriptRedaction(
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       _health.status = "error";
+      // Report the actual files discovered even if Python failed —
+      // returning 0 would hide evidence of what was found (AI-2582).
       return {
-        filesScanned: 0,
+        filesScanned: trajectoryFiles.length,
         filesRedacted: 0,
         errors: [...walkErrors, `python redaction script failed: ${msg}`],
       };
