@@ -466,6 +466,273 @@ describe("setStateAtomic (AI-1546)", () => {
   });
 });
 
+// ── INF-58: multi-body role re-dispatch ─────────────────────────────────────
+
+describe("setStateAtomic — INF-58 multi-body role re-dispatch", () => {
+  let inf58Dir: string;
+  let inf58OriginalFetch: typeof globalThis.fetch;
+  let inf58OriginalWorkflowPath: string | undefined;
+  let inf58OriginalPolicyPath: string | undefined;
+  let inf58OriginalAgentsFile: string | undefined;
+
+  const INF58_MULTI_BODY_WORKFLOW = `
+id: dev-impl
+version: 1
+entry_state: intake
+
+break_glass:
+  command: escape
+  owner_role: steward
+
+states:
+  - id: intake
+    owner_role: steward
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: accept
+        to: write-tests
+
+  - id: write-tests
+    owner_role: test-author
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: tests-ready
+        to: implementation
+        assign: { mode: required }
+
+  - id: implementation
+    owner_role: dev
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: submit
+        to: done
+
+  - id: done
+    kind: terminal
+    native_state: done
+    transitions: []
+
+  - id: escape
+    kind: terminal
+    native_state: invalid
+    transitions:
+      - command: unescape
+        to: intake
+        assign: { mode: auto }
+`;
+
+  const INF58_MULTI_BODY_POLICY = `
+capabilities:
+  - id: linear:transition
+  - id: human:escalate
+  - id: workflow:break-glass
+
+containers:
+  - id: dev
+    grants: [linear:transition]
+  - id: test-author-container
+    grants: [linear:transition]
+  - id: steward
+    grants: [linear:transition, human:escalate, workflow:break-glass]
+
+roles:
+  - id: dev
+    requires: [linear:transition]
+  - id: test-author
+    requires: [linear:transition]
+  - id: steward
+    requires: [human:escalate]
+
+bodies:
+  - id: igor
+    container: dev
+    fills_roles: [dev]
+  - id: felix
+    container: dev
+    fills_roles: [dev]
+  - id: tdd
+    container: test-author-container
+    fills_roles: [test-author]
+  - id: astrid
+    container: steward
+    fills_roles: [steward]
+`;
+
+  beforeEach(() => {
+    inf58Dir = fs.mkdtempSync(path.join(os.tmpdir(), "inf58-"));
+    inf58OriginalFetch = globalThis.fetch;
+
+    const policyFile = path.join(inf58Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, INF58_MULTI_BODY_POLICY, "utf8");
+    inf58OriginalPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(inf58Dir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, INF58_MULTI_BODY_WORKFLOW, "utf8");
+    inf58OriginalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    const agentsFile = path.join(inf58Dir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [
+        { name: "igor", linearUserId: "user-igor-linear-id", clientId: "c", clientSecret: "s", accessToken: "t", refreshToken: "r" },
+        { name: "felix", linearUserId: "user-felix-linear-id", clientId: "c", clientSecret: "s", accessToken: "t", refreshToken: "r" },
+        { name: "tdd", linearUserId: "user-tdd-linear-id", clientId: "c", clientSecret: "s", accessToken: "t", refreshToken: "r" },
+        { name: "astrid", linearUserId: "user-astrid-linear-id", clientId: "c", clientSecret: "s", accessToken: "t", refreshToken: "r" },
+      ],
+    }, null, 2), "utf8");
+    inf58OriginalAgentsFile = process.env.AGENTS_FILE;
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+    resetWorkflowCache();
+    resetPolicyCache();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = inf58OriginalFetch;
+
+    if (inf58OriginalWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = inf58OriginalWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
+
+    if (inf58OriginalPolicyPath !== undefined) process.env.CAPABILITY_POLICY_PATH = inf58OriginalPolicyPath;
+    else delete process.env.CAPABILITY_POLICY_PATH;
+
+    if (inf58OriginalAgentsFile !== undefined) process.env.AGENTS_FILE = inf58OriginalAgentsFile;
+    else delete process.env.AGENTS_FILE;
+    reloadAgents();
+
+    fs.rmSync(inf58Dir, { recursive: true, force: true });
+  });
+
+  // Helper: creates a custom fetch that echoes delegate from mutation to verification response.
+  // This is needed for multi-body tests because makeSetStateFetch always returns delegate=null
+  // in the consistency check, which fails when a delegate was written.
+  function makeDelegateEchoFetch(fromLabels: string[], consistencyLabels: string[]) {
+    let mutationBody: string | undefined;
+    const baseMock = makeSetStateFetch({
+      fromLabels,
+      updateSuccess: true,
+      consistencyLabels,
+    });
+    return async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const bodyText = typeof init?.body === "string" ? init.body : "";
+      // Capture the mutation body to extract the delegateId
+      if (bodyText.includes("ApplyAtomicTransition") || (bodyText.includes("issueUpdate") && bodyText.includes("labelIds"))) {
+        mutationBody = bodyText;
+        return new Response(
+          JSON.stringify({ data: { issueUpdate: { success: true } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      // Echo the delegate back in the verification response so consistency check passes
+      if (bodyText.includes("VerifyTransitionWrite")) {
+        const writtenDelegateId = mutationBody
+          ? (JSON.parse(mutationBody) as { variables?: { delegateId?: string | null } }).variables?.delegateId ?? null
+          : null;
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                labels: { nodes: consistencyLabels.map((name) => ({ name })) },
+                delegate: writtenDelegateId ? { id: writtenDelegateId } : null,
+                state: { id: "state-todo-uuid" },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return baseMock(_url, init);
+    };
+  }
+
+  // INF-58 Scenario 1: Multi-body role + delegate already set → dispatches to delegate
+  it("INF-58: dispatches to the pre-set delegate body when role has multiple bodies", async () => {
+    // Transition to 'implementation' — owned by role 'dev', filled by BOTH igor and felix
+    // Delegate is set to 'igor' (body name), which resolves to 'user-igor-linear-id'
+    globalThis.fetch = makeDelegateEchoFetch(
+      ["wf:dev-impl", "state:write-tests"],
+      ["wf:dev-impl", "state:implementation"],
+    );
+
+    const wakeCalls: Array<{ agentId: string; ticketId: string }> = [];
+    const sendWakeUp = async (agentId: string, ticketId: string) => {
+      wakeCalls.push({ agentId, ticketId });
+    };
+
+    const result = await setStateAtomic("INF-58-SCENARIO1", "implementation", "igor", "Bearer test-token", { sendWakeUp });
+    expect(result.ok).toBe(true);
+    expect(result.to).toBe("implementation");
+    // Should have dispatched to igor (the pre-set delegate), not skipped
+    expect(wakeCalls).toHaveLength(1);
+    expect(wakeCalls[0].agentId).toBe("igor");
+    expect(wakeCalls[0].ticketId).toBe("INF-58-SCENARIO1");
+    expect(result.redispatched).toBe("igor");
+  });
+
+  // INF-58 Scenario 2: Multi-body role + delegate NOT set → current skip behavior (unchanged)
+  it("INF-58: skips re-dispatch when multi-body role has no delegate set (unchanged)", async () => {
+    globalThis.fetch = makeSetStateFetch({
+      fromLabels: ["wf:dev-impl", "state:write-tests"],
+      updateSuccess: true,
+      consistencyLabels: ["wf:dev-impl", "state:implementation"],
+    });
+
+    const wakeCalls: Array<{ agentId: string; ticketId: string }> = [];
+    const sendWakeUp = async (agentId: string, ticketId: string) => {
+      wakeCalls.push({ agentId, ticketId });
+    };
+
+    // No delegate specified (undefined) — current behavior: skip
+    const result = await setStateAtomic("INF-58-SCENARIO2", "implementation", undefined, "Bearer test-token", { sendWakeUp });
+    expect(result.ok).toBe(true);
+    expect(wakeCalls).toHaveLength(0);
+    expect(result.redispatched).toBeUndefined();
+  });
+
+  // INF-58 Scenario 3: Delegated agent NOT in role → warning log (not crash)
+  it("INF-58: does not crash when delegate is not a member of the target role", async () => {
+    globalThis.fetch = makeDelegateEchoFetch(
+      ["wf:dev-impl", "state:write-tests"],
+      ["wf:dev-impl", "state:implementation"],
+    );
+
+    const wakeCalls: Array<{ agentId: string; ticketId: string }> = [];
+    const sendWakeUp = async (agentId: string, ticketId: string) => {
+      wakeCalls.push({ agentId, ticketId });
+    };
+
+    // 'astrid' fills 'steward' role, not 'dev' — delegate not in role
+    const result = await setStateAtomic("INF-58-SCENARIO3", "implementation", "astrid", "Bearer test-token", { sendWakeUp });
+    expect(result.ok).toBe(true);
+    // Should NOT have dispatched since astrid is not a dev role member
+    expect(wakeCalls).toHaveLength(0);
+    expect(result.redispatched).toBeUndefined();
+  });
+
+  it("INF-58: dispatches to felix when felix is the pre-set delegate", async () => {
+    globalThis.fetch = makeDelegateEchoFetch(
+      ["wf:dev-impl", "state:write-tests"],
+      ["wf:dev-impl", "state:implementation"],
+    );
+
+    const wakeCalls: Array<{ agentId: string; ticketId: string }> = [];
+    const sendWakeUp = async (agentId: string, ticketId: string) => {
+      wakeCalls.push({ agentId, ticketId });
+    };
+
+    const result = await setStateAtomic("INF-58-SCENARIO4", "implementation", "felix", "Bearer test-token", { sendWakeUp });
+    expect(result.ok).toBe(true);
+    expect(wakeCalls).toHaveLength(1);
+    expect(wakeCalls[0].agentId).toBe("felix");
+    expect(wakeCalls[0].ticketId).toBe("INF-58-SCENARIO4");
+    expect(result.redispatched).toBe("felix");
+  });
+});
+
 // ── Integration tests — admin HTTP endpoint ─────────────────────────────────
 
 describe("POST /admin/api/set-state (AI-1546 / AC2)", () => {

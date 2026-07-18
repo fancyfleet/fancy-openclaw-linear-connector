@@ -5017,9 +5017,29 @@ export async function setStateAtomic(
             `workflow-gate: set-state: re-dispatched ${ticketIdentifier} to '${roleBodies[0]}' (role '${ownerRole}') after advancing to '${targetState}'`,
           );
         } else if (roleBodies.length > 1) {
-          log.warn(
-            `workflow-gate: set-state: skipping re-dispatch for ${ticketIdentifier} — role '${ownerRole}' has multiple bodies (${roleBodies.join(", ")}); delegate manually`,
-          );
+          // INF-58: when delegate is already resolved for a multi-body role,
+          // dispatch directly to the delegate body instead of skipping.
+          if (resolvedDelegateId != null) {
+            const delegateBody = roleBodies.find(b => {
+              const agent = getAgent(b);
+              return agent?.linearUserId === resolvedDelegateId;
+            });
+            if (delegateBody) {
+              await options.sendWakeUp(delegateBody, ticketIdentifier);
+              redispatched = delegateBody;
+              log.info(
+                `workflow-gate: set-state: re-dispatched ${ticketIdentifier} to '${delegateBody}' (role '${ownerRole}') after advancing to '${targetState}' — delegate pre-set for multi-body role`,
+              );
+            } else {
+              log.warn(
+                `workflow-gate: set-state: skipping re-dispatch for ${ticketIdentifier} — delegate (linearUserId=${resolvedDelegateId}) is not a member of role '${ownerRole}'`,
+              );
+            }
+          } else {
+            log.warn(
+              `workflow-gate: set-state: skipping re-dispatch for ${ticketIdentifier} — role '${ownerRole}' has multiple bodies (${roleBodies.join(", ")}); delegate manually`,
+            );
+          }
         } else {
           log.warn(
             `workflow-gate: set-state: skipping re-dispatch for ${ticketIdentifier} — role '${ownerRole}' has no bodies`,
