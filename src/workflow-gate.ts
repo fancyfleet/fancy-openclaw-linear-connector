@@ -47,6 +47,7 @@ import { getAgent, getAgents } from "./agents.js";
 import { executeFanout, shouldTriggerFanout, validateFanoutSpec, type Finding } from "./fanout.js";
 import { onChildTerminal, onManagingEntry, isTerminalState } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
+import { fetchLastCommentByUser } from "./linear-helpers.js";
 import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store.js";
 import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./config-health.js";
 import { captureAc, extractAcFromDescription, removeAcRecord } from "./ac-record-store.js";
@@ -1011,6 +1012,9 @@ interface LabelNode {
   isGroup?: boolean;
   /** AI-2176: the parent group of this label, when it is a group child. */
   parent?: { id: string; name: string } | null;
+  /** AI-2557: the team that owns this label. Undefined when the query doesn't select it.
+   *  Used to reject inherited parent-team label IDs that Linear rejects on atomic write. */
+  team?: { id: string };
 }
 
 interface TicketContext {
@@ -1199,7 +1203,7 @@ async function findOrCreateLabel(
   const lookupQuery = `
     query TeamLabels($teamId: String!) {
       team(id: $teamId) {
-        labels(first: 250) { nodes { id name isGroup parent { id name } } }
+        labels(first: 250) { nodes { id name isGroup team { id } parent { id name } } }
       }
     }
   `;
@@ -1217,12 +1221,17 @@ async function findOrCreateLabel(
     }
     nodes = lookupData.data?.team?.labels?.nodes ?? [];
     // (a) Flat exact match — GEN and the flat state:* labels LIF already carries.
-    const flat = nodes.find((n) => n.name === labelName && !n.isGroup);
+    // AI-2557: only return the label ID if it is owned by the requesting team.
+    // Inherited parent-team labels pass the name check but Linear rejects their ID
+    // on atomic issueUpdate(labelIds:). A non-matching team falls through to create
+    // → inherited conflict → replaceTeamLabels promotion (AI-2543).
+    // Labels without a `team` field (compatibility/default) always match.
+    const flat = nodes.find((n) => n.name === labelName && !n.isGroup && (n.team == null || n.team.id === teamId));
     if (flat) return flat.id;
     // (b) Group-child match — the label is modeled as a child of a `groupName` group.
     if (groupName) {
       const child = nodes.find(
-        (n) => !n.isGroup && n.parent?.name === groupName && n.name === childName,
+        (n) => !n.isGroup && n.parent?.name === groupName && n.name === childName && (n.team == null || n.team.id === teamId),
       );
       if (child) return child.id;
     }
@@ -2863,6 +2872,46 @@ export async function checkRawMutationInterception(
         log.warn(`workflow-gate: raw delegate null (self-clear) block agent=${bodyId} ticket=${issueId}`);
         return delegateClearRejection();
       }
+      // AI-2020: verdict-comment gate for feedback-requiring states.
+      // When the current delegate attempts a handoff from a workflow state
+      // whose transitions require feedback, the mutation must be accompanied
+      // by a verdict comment from this caller. The skill CLI posts comments
+      // before the delegate mutation, so the comment already exists on the
+      // ticket. Fail-open on any fetch error.
+      if (def) {
+        const currentStateId = getCurrentState(labels);
+        if (currentStateId) {
+          const stateNode = def.states.find((s) => s.id === currentStateId);
+          const hasFeedbackTransition = stateNode?.transitions?.some(
+            (t) => t.feedback?.required === true,
+          );
+          if (hasFeedbackTransition && callerLinearUserId) {
+            let hasVerdictComment = true;
+            try {
+              const lastComment = await fetchLastCommentByUser(
+                issueId!,
+                callerLinearUserId,
+                authToken,
+              );
+              hasVerdictComment = lastComment !== null;
+            } catch {
+              // Fail-open: transient API failure
+            }
+            if (!hasVerdictComment) {
+              const breakCmd = def.break_glass?.command ?? "escape";
+              log.warn(
+                `workflow-gate: AI-2020 verdict gate — handoff from feedback-requiring state '${currentStateId}' ` +
+                `agent=${bodyId} ticket=${issueId} — no verdict comment found`,
+              );
+              return (
+                `[Proxy] Handoff blocked from state '${currentStateId}' which requires a review verdict. ` +
+                `Post a comment on the ticket explaining your review findings (use --comment on ` +
+                `\`linear handoff-work\`), or use \`linear ${breakCmd} ${issueId}\` to exit the workflow.`
+              );
+            }
+          }
+        }
+      }
       return null; // current delegate may re-route (non-null target only)
     }
     if (!callerLinearUserId && delegateId) {
@@ -3415,8 +3464,17 @@ export async function applyStateTransition(
   // AI-1813 fix: break-glass (escape) must be legal when no state:* label is
   // present — that's precisely the corruption escape exists to recover from.
   // The no-source-state guard below applies only to non-break-glass intents.
+  // AI-2262: `park` is not a workflow transition — it demotes the ticket out of
+  // the workflow (removes state:* and wf:* labels) and clears delegate + assignee.
+  // This mirrors the __ad_hoc__ demotion path below, which handles the actual
+  // label removal. The CLI's forwarded issueUpdate carries the native Backlog
+  // stateId, delegateId: null, and assigneeId: null — the proxy now exempts
+  // the nulls (stripNullDelegateAssigneeFields) so they reach Linear directly.
   if (intent === breakGlassCommand) {
     toStateName = def.break_glass?.to ?? "escape";
+  } else if (intent === "park") {
+    toStateName = "__ad_hoc__";
+    log.info(`workflow-gate: B2 apply: ${issueId} parking — demoting to __ad_hoc__`);
   } else {
     if (!currentStateName) {
       log.warn(`workflow-gate: B2 apply: no state:* label on ${issueId} — skipping`);

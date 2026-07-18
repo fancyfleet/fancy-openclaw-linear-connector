@@ -305,9 +305,9 @@ function stripStateLabelDeltas(body: GraphQLRequestBody | null, stateLabelIds: S
 function stripNullDelegateAssigneeFields(body: GraphQLRequestBody | null, effectiveIntent: string | null): void {
   const input = issueUpdateInput(body);
   if (!input) return;
-  // AI-2067: needs-human and complete legitimately send delegateId:null as
+  // AI-2067: needs-human, complete, and park legitimately send delegateId:null as
   // part of their documented contract — don't block it.
-  if (effectiveIntent === 'needs-human' || effectiveIntent === 'complete') {
+  if (effectiveIntent === 'needs-human' || effectiveIntent === 'complete' || effectiveIntent === 'park') {
     return;
   }
   if (input.delegateId === null) delete input.delegateId;
@@ -1033,13 +1033,17 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         // mutation. Running it here — after strip has removed legitimate state:* deltas
         // — catches anything that survived (strip failure, non-state label manipulation).
         // commentCreate is excluded: workflow commands legitimately use it.
-        const intentPathRawRejection = await checkRawMutationInterception(
-          body, issueId, authorization, agentId, callerLinearUserId, /* skipCommentCreate */ true, /* skipLabelFields */ true
-        );
-        if (intentPathRawRejection) {
-          log.warn(`raw-mutation-block-on-intent-path agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${intentPathRawRejection}`);
-          res.status(200).json({ errors: [{ message: intentPathRawRejection }] });
-          return;
+        // AI-2262: `park` is exempt — it sends stateId for Backlog + null delegate/assignee
+        // as its documented contract, and B2 handles the workflow demotion.
+        if (effectiveIntent !== 'park') {
+          const intentPathRawRejection = await checkRawMutationInterception(
+            body, issueId, authorization, agentId, callerLinearUserId, /* skipCommentCreate */ true, /* skipLabelFields */ true
+          );
+          if (intentPathRawRejection) {
+            log.warn(`raw-mutation-block-on-intent-path agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${intentPathRawRejection}`);
+            res.status(200).json({ errors: [{ message: intentPathRawRejection }] });
+            return;
+          }
         }
       }
       let upstreamRes: globalThis.Response;

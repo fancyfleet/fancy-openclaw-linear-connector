@@ -21,16 +21,19 @@ import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, N
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 import { getAutoEnrollLiveness, getTicketNoActivityTimeoutMs, getWorkflowRegistryLiveness, loadWorkflowRegistry } from "./workflow-gate.js";
 import { getDefStateMigrationLiveness, registerDefStateMigrationRunner } from "./def-state-migration.js";
+import { getFixtureDriftLiveness, runFixtureDriftCheck } from "./fixture-drift-detector.js";
 import { normalizeSessionKey } from "./session-key.js";
-import { applyEngagementStatus } from "./engagement-status.js";
+import { applyEngagementStatus, registerEngagementNativeStateOverlay } from "./engagement-status.js";
 import { createAdminRouter } from "./admin.js";
 import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, STALE_CLASS_NAMES, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
 import { checkLinearIssueRouting } from "./linear-actionable.js";
 import { assertDispatchTargetFetchable } from "./delivery/index.js";
 import { markDispatchIntegrityGateActive, getDispatchIntegrityState } from "./dispatch-integrity-state.js";
+import { getCircuitBreakerHealth } from "./dispatch-circuit-breaker.js";
 import { registerDistillationCron, createProdGenerationContext } from "./cron/p4-metrics-distillation.js";
 import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
+import { registerDoneDetectorCron } from "./cron/done-ticket-detector-cron.js";
 import { registerBootstrapReconciliationCron } from "./bootstrap-reconciliation-sweep.js";
 import { registerDelegationReconciliationCron, runDelegationReconciliationSweep } from "./delegation-reconciliation-sweep.js";
 import { registerRegistryIntegrityCron } from "./registry-integrity-cron.js";
@@ -221,6 +224,9 @@ export function createApp(options?: CreateAppOptions) {
   // AI-1773/AI-1775 shipped without. `subscribed` records the second half: the
   // transition handler in workflow-gate receives this exact instance.
   registerObservationWritePath(observationStore, { subscribed: true });
+  // AI-2568: enable native_state-aware engagement overlay so "doing" semantics
+  // respect the workflow state's native_state declaration on delegate assignment.
+  registerEngagementNativeStateOverlay();
 
   // Raw body capture for webhook signature validation.
   app.use(
@@ -374,6 +380,11 @@ export function createApp(options?: CreateAppOptions) {
       // check ran on load (migratedCount 0 allowed), observable at ac-validate
       // without waiting for a def change.
       workflowMigrations: getDefStateMigrationLiveness(),
+      // AI-1894 AC3: fixture-drift liveness — shows whether all deployed
+      // workflow defs match their canonical fixtures. healthy=true when all
+      // are in sync; entries list per-def details. Observable at ac-validate
+      // without waiting for a dispatch trigger.
+      fixtureDrift: getFixtureDriftLiveness(),
       // AI-2542: auto-enroll liveness and demote/escape suppression counters.
       autoEnroll: getAutoEnrollLiveness(),
       // AI-1908 AC5: per-agent OAuth token status. Exposes lastRefreshOkAt,
@@ -381,6 +392,7 @@ export function createApp(options?: CreateAppOptions) {
       // and a computed state (healthy/stale/expired/failing). Powers the
       // console token panel (AI-1955 AC3) and operator triage without log access.
       tokens: getAllTokenStatuses(),
+      dispatchCircuitBreaker: getCircuitBreakerHealth(),
     });
   });
 
@@ -1269,6 +1281,12 @@ if (isEntryPoint) {
   // Watch agents.json for external changes — no restart needed to add agents
   watchAgentsFile();
 
+  // AI-1894 AC3: run the fixture-drift check at bootstrap so /health
+  // reflects the current state. Fire-and-forget; logs + alerts on drift.
+  runFixtureDriftCheck().catch((err: unknown) => {
+    log.error(`fixture-drift bootstrap check failed: ${err instanceof Error ? err.message : String(err)}`);
+  });
+
   // Phase 2 (rebuild): assert agents.json ⇄ capability-policy agreement at
   // startup and on every registry hot-reload. Drift alerts, never crashes.
   startRegistryPolicyCheck();
@@ -1562,6 +1580,14 @@ if (isEntryPoint) {
 
   // G-20: scheduled gate-silently-off canary (AI-1552, §5.1)
   registerG20CanaryCron();
+
+  // AI-2576: periodic done-ticket detector — flag Done tickets missing from main
+  registerDoneDetectorCron({
+    repoPath: process.env.DONE_DETECTOR_REPO_PATH ?? process.env.REPO_BASE_PATH,
+    lookbackDays: parseInt(process.env.DONE_DETECTOR_LOOKBACK_DAYS ?? "14", 10),
+    graceHours: parseInt(process.env.DONE_DETECTOR_GRACE_HOURS ?? "4", 10),
+    pollIntervalMs: parseInt(process.env.DONE_DETECTOR_POLL_INTERVAL_MS ?? String(60 * 60 * 1000), 10),
+  });
 
   // AI-1838: out-of-band mutation reconcile sweep. Detects state/label/delegate
   // changes that bypassed the proxy gate (raw token → api.linear.app direct).
