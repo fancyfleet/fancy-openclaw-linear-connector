@@ -174,25 +174,27 @@ describe("AI-2417: generic delegate-routing verbs inject assigneeId:null for app
     delete process.env.WORKFLOW_DEFS_DIR;
   });
 
-  it("refuse-work: an omitted assigneeId is filled with null when a non-null delegate is set", async () => {
-    // refuse-work to an app-user leaves assigneeId unset (AI-1395 CLI guard). The
-    // forwarded mutation must carry assigneeId:null so Linear persists the delegate.
+  it("generic handoff-work: an omitted assigneeId is filled with null when a non-null delegate is set", async () => {
+    // Generic handoff to an app-user may leave assigneeId unset (AI-1395 CLI
+    // guard). The forwarded mutation must carry assigneeId:null so Linear
+    // persists the delegate. `refuse-work` used to cover this path, but INF-35
+    // made it workflow-only; ad-hoc delegate routing should use handoff-work.
     const mutation = {
-      query: `mutation RefuseWork($id: String!, $input: IssueUpdateInput!) {
+      query: `mutation HandoffWork($id: String!, $input: IssueUpdateInput!) {
         issueUpdate(id: $id, input: $input) { success issue { id identifier } }
       }`,
       variables: {
         id: "issue-uuid",
         input: { stateId: "state-todo", delegateId: "u-tdd" },
       },
-      operationName: "RefuseWork",
+      operationName: "HandoffWork",
     };
 
     await request(appState.app)
       .post("/proxy/graphql")
       .set("Authorization", "Bearer tok-ai")
       .set("x-openclaw-agent", "ai")
-      .set("x-openclaw-linear-intent", "refuse-work")
+      .set("x-openclaw-linear-intent", "handoff-work")
       .set("x-openclaw-linear-target", "GEN-178")
       .set("Content-Type", "application/json")
       .send(mutation);
