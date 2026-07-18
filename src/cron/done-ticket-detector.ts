@@ -12,8 +12,10 @@
  * registers in the cron registry and /health enumerates the entry.
  *
  * The hallmark symbol is a named export or function that the ticket's fix introduces.
- * Detection: `git grep <symbol> origin/main --` — a squash-merge-safe check that
+ * Detection: `git grep <symbol> <ref> --` — a squash-merge-safe check that
  * verifies the code is present in the tree, not that a particular commit is an ancestor.
+ * Uses `origin/main` when it exists (production clones), falling back to `HEAD`
+ * for local/test repos with no remote.
  */
 
 import { execFileSync } from "node:child_process";
@@ -121,15 +123,37 @@ function extractHallmarkSymbol(labels: string[]): string | null {
 }
 
 /**
- * Check if a hallmark symbol exists in the repo tree via `git grep`.
+ * Resolve the ref to check for code presence — production clones use
+ * `origin/main` (canonical shipped state); test repos with no remote fall
+ * back to the current `HEAD` (typically the default branch).
+ */
+function resolveShippedRef(repoDir: string): string {
+  try {
+    execFileSync(
+      "git",
+      ["rev-parse", "--verify", "-q", "origin/main"],
+      { cwd: repoDir, stdio: "pipe", timeout: 5_000 },
+    );
+    return "origin/main";
+  } catch {
+    return "HEAD";
+  }
+}
+
+/**
+ * Check if a hallmark symbol exists in the shipped repo tree via `git grep`.
+ * Checks `origin/main` when it exists (production clones), falling back to
+ * `HEAD` for local/test repos with no remote.
+ *
  * The definitive check is code presence (git grep), not SHA ancestry —
  * squash-merge rewrites commits, so ancestry checks produce false positives.
  */
 function symbolExistsOnMain(symbol: string, repoDir: string): boolean {
+  const ref = resolveShippedRef(repoDir);
   try {
     execFileSync(
       "git",
-      ["grep", "-q", "--fixed-strings", "--", symbol, "origin/main"],
+      ["grep", "-q", "--fixed-strings", "--", symbol, ref],
       { cwd: repoDir, stdio: "pipe", timeout: 15_000 },
     );
     return true;
