@@ -16,6 +16,7 @@
  * verifies the code is present in the tree, not that a particular commit is an ancestor.
  */
 
+import { execFileSync } from "node:child_process";
 import { createLogger, componentLogger } from "../logger.js";
 import { registerCron, formatIntervalMs } from "./registry.js";
 import {
@@ -23,6 +24,11 @@ import {
   recordDetectorSkip,
   recordDetectorFail,
 } from "../done-ticket-detector-state.js";
+
+// ── Constants ──────────────────────────────────────────────────────────────
+
+const LINEAR_API_URL = "https://api.linear.app/graphql";
+const HALLMARK_LABEL_PREFIX = "hallmark:";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "done-ticket-detector");
 
@@ -101,9 +107,129 @@ function parseIntervalMs(value: string): number {
 // ── Core scanning logic ────────────────────────────────────────────────────
 
 /**
+ * Extract the hallmark symbol from a ticket's labels.
+ * Looks for a label matching `hallmark:<symbol>` and returns the symbol portion.
+ * Returns null if no hallmark label is found.
+ */
+function extractHallmarkSymbol(labels: string[]): string | null {
+  for (const label of labels) {
+    if (label.startsWith(HALLMARK_LABEL_PREFIX)) {
+      return label.slice(HALLMARK_LABEL_PREFIX.length);
+    }
+  }
+  return null;
+}
+
+/**
+ * Check if a hallmark symbol exists in the repo tree via `git grep`.
+ * The definitive check is code presence (git grep), not SHA ancestry —
+ * squash-merge rewrites commits, so ancestry checks produce false positives.
+ */
+function symbolExistsOnMain(symbol: string, repoDir: string): boolean {
+  try {
+    execFileSync(
+      "git",
+      ["grep", "-q", "--fixed-strings", "--", symbol, "origin/main"],
+      { cwd: repoDir, stdio: "pipe", timeout: 15_000 },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Check if a hallmark symbol exists at a specific commit.
+ */
+function symbolExistsAtCommit(symbol: string, commit: string, repoDir: string): boolean {
+  try {
+    execFileSync(
+      "git",
+      ["grep", "-q", "--fixed-strings", "--", symbol, commit],
+      { cwd: repoDir, stdio: "pipe", timeout: 15_000 },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Query Linear for Done tickets with wf:* labels (code-touching tickets in Done state).
+ */
+async function queryDoneTickets(
+  authToken: string,
+  linearApiUrl: string,
+): Promise<Array<{ identifier: string; title: string; branchName: string | null; labels: string[] }>> {
+  const graphqlQuery = `
+    query {
+      issues(filter: {
+        labels: { some: { name: { startsWith: "wf:" } } }
+        state: { name: { eq: "Done" } }
+      }) {
+        nodes {
+          identifier
+          title
+          branchName
+          labels {
+            nodes {
+              name
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const res = await fetch(linearApiUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: authToken,
+    },
+    body: JSON.stringify({ query: graphqlQuery }),
+  });
+
+  type LinearResp = {
+    data?: {
+      issues?: {
+        nodes?: Array<{
+          identifier: string;
+          title: string;
+          branchName: string | null;
+          labels?: { nodes?: Array<{ name: string }> };
+        }>;
+      };
+    };
+    errors?: Array<{ message: string }>;
+  };
+
+  const json = (await res.json()) as LinearResp;
+
+  if (json.errors && json.errors.length > 0) {
+    const messages = json.errors.map((e) => e.message).join("; ");
+    throw new Error(`Linear API error: ${messages}`);
+  }
+
+  const nodes = json.data?.issues?.nodes ?? [];
+  return nodes.map((node) => ({
+    identifier: node.identifier,
+    title: node.title,
+    branchName: node.branchName ?? null,
+    labels: (node.labels?.nodes ?? []).map((l) => l.name),
+  }));
+}
+
+/**
  * Scan Done tickets and check if their hallmark symbols are present in the repo tree.
  * The definitive check is code presence (git grep), not SHA ancestry — squash-merge
  * rewrites commits, so ancestry checks produce false positives.
+ *
+ * Workflow:
+ * 1. Query Linear for Done tickets with wf:* labels
+ * 2. Extract hallmark symbol from each ticket's labels (hallmark:<symbol> label)
+ * 3. Run git grep <symbol> on origin/main for each ticket
+ * 4. If no hallmark label, skip the git check but still count as scanned
  */
 export async function scanDoneTickets(
   config: DoneTicketScanConfig,
@@ -112,10 +238,58 @@ export async function scanDoneTickets(
   const errors: string[] = [];
   const violations: DoneTicketViolation[] = [];
 
-  // TODO(AI-2468): implement Linear "Done tickets" query and git grep check.
-  // Stub — returns empty results for test compilation.
+  const linearApiUrl = config.linearApiUrl ?? LINEAR_API_URL;
+
+  let tickets: Array<{ identifier: string; title: string; branchName: string | null; labels: string[] }>;
+  try {
+    tickets = await queryDoneTickets(config.authToken, linearApiUrl);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    errors.push(msg);
+    log.error(`[done-ticket-detector] Linear query failed: ${msg}`);
+    return { scanned: 0, violations, errors, timestamp };
+  }
+
+  for (const ticket of tickets) {
+    const hallmarkSymbol = extractHallmarkSymbol(ticket.labels);
+
+    let absentFromMain = false;
+    let absentFromHealthCommit = false;
+
+    if (hallmarkSymbol) {
+      try {
+        absentFromMain = !symbolExistsOnMain(hallmarkSymbol, config.repoDir);
+
+        // Also check against the deployed health commit if provided
+        if (config.healthCommitSha) {
+          absentFromHealthCommit = !symbolExistsAtCommit(
+            hallmarkSymbol,
+            config.healthCommitSha,
+            config.repoDir,
+          );
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        errors.push(`${ticket.identifier}: git grep failed: ${msg}`);
+        absentFromMain = true;
+      }
+
+      if (absentFromMain || absentFromHealthCommit) {
+        violations.push({
+          identifier: ticket.identifier,
+          title: ticket.title,
+          hallmarkSymbol,
+          absentFromMain,
+          absentFromHealthCommit,
+          branchName: ticket.branchName,
+        });
+      }
+    }
+    // Ticket without hallmark label is still counted as scanned but no grep check
+  }
+
   return {
-    scanned: 0,
+    scanned: tickets.length,
     violations,
     errors,
     timestamp,

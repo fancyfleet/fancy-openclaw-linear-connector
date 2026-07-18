@@ -135,7 +135,13 @@ function installLinearMock() {
               identifier: t.identifier,
               title: t.title,
               branchName: t.branchName,
-              labels: { nodes: (t.labels ?? []).map((l: string) => ({ name: l })) },
+              labels: {
+                nodes: [
+                  ...(t.labels ?? []).map((l: string) => ({ name: l })),
+                  // Include hallmark symbol as a label so extraction works
+                  ...(t.hallmarkSymbol ? [{ name: `hallmark:${t.hallmarkSymbol}` }] : []),
+                ],
+              },
             })),
           },
         },
