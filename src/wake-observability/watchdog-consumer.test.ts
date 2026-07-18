@@ -174,13 +174,13 @@ describe("INF-84 AC4: watchdog consumes reason code", () => {
     // The resolver produces a StallReason; the watchdog ticket carries it;
     // the sweep reads it and adapts escalation.
     const deps: Partial<StallResolverDeps> = {
-      getWakeDeliveryOutcome: async () => ({ delivered: true, deliveredAt: Date.now() - 30 * 60_000 }),
+      getWakeDeliveryOutcome: async () => ({ delivered: true, deliveredAt: Date.now() - 90 * 60_000 }),
       getActiveSessionKeys: () => [],
     };
 
     const reason: StallReason | null = await resolveStallReason(
       "LIF-53", "ai",
-      { delegatedAtMs: Date.now() - 10 * 60_000 },
+      { delegatedAtMs: Date.now() - 90 * 60_000 },
       deps as StallResolverDeps,
     );
 
@@ -199,7 +199,7 @@ describe("INF-84 AC4: watchdog consumes reason code", () => {
           delegate: "ai",
           humanAssigned: false,
           labels: [],
-          dispatchDeliveredAtMs: Date.now() - 10 * 60_000,
+          dispatchDeliveredAtMs: Date.now() - 90 * 60_000,
           dispatchUpdatedAt: "2026-07-18T21:00:00.000Z",
           firstOwnerActionAtMs: null,
           rungsFired: 0,
