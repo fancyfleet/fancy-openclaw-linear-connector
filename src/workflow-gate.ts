@@ -2669,6 +2669,16 @@ export async function checkWorkflowRules(
     );
   }
 
+  // INF-124: `handoff` is a delegate-routing meta-command, not a state transition.
+  // A governed handoff between two agents must never be blocked by a missing def
+  // transition or a branch-evidence gate — it changes delegate only, not workflow
+  // progress. Allow it from any state; applyStateTransition handles the self-loop
+  // delegate-only semantics.
+  if (intent === "handoff") {
+    log.info(`workflow-gate: handoff meta-command allowed from state '${currentState}' on ${issueId}`);
+    return null;
+  }
+
   const transitions = stateNode.transitions ?? [];
   // INF-112: `force-deploy` is an alias for `continue` in merge/deploy states.
   // It maps to the same transition but skips the evidence gate.
@@ -3831,6 +3841,21 @@ export async function applyStateTransition(
   } else if (intent === "park") {
     toStateName = "__ad_hoc__";
     log.info(`workflow-gate: B2 apply: ${issueId} parking — demoting to __ad_hoc__`);
+  } else if (intent === "handoff") {
+    // INF-124: handoff is a delegate-routing meta-command — self-loop, same state.
+    // Skip state label swap; delegate resolution still runs below.
+    if (!currentStateName) {
+      log.warn(`workflow-gate: B2 apply: handoff on ${issueId} has no state:* label — skipping`);
+      return { status: "failed", code: "no-state-label", detail: `handoff on ticket ${issueId} has no state:* label` };
+    }
+    // INF-124: always a self-loop regardless of def transitions. The delegate
+    // write arrives via the mutation or delegateOverride; B2 only preserves
+    // the state projection and native state, which don't change for a self-loop.
+    log.info(`workflow-gate: B2 apply: ${issueId} handoff self-loop at state '${currentStateName}'`);
+    // Use matchedTransition if it exists (for def-aware routing), otherwise
+    // treat as a self-loop (delegate-only change, no label swap).
+    matchedTransition = def.states.find((s) => s.id === currentStateName)?.transitions?.find((t) => t.command === intent);
+    toStateName = currentStateName;
   } else {
     if (!currentStateName) {
       log.warn(`workflow-gate: B2 apply: no state:* label on ${issueId} — skipping`);
@@ -3945,7 +3970,12 @@ export async function applyStateTransition(
   // AI-1534: this branch is state-preserving (source === destination), so it
   // intentionally neither records nor clears the applied-state cache — any
   // existing entry already holds this same state, and its absence is harmless.
-  if (currentStateName === toStateName) {
+  // INF-124: for handoff self-loop, don't short-circuit — the delegate
+  // write (via delegateOverride or the target field in the forwarded mutation
+  // body) must still fire. Skip the idempotency check entirely.
+  if (intent === "handoff" || intent === "handoff-work") {
+    log.info(`workflow-gate: B2 apply: ${issueId} handoff self-loop at state '${toStateName}' — continuing to delegate write`);
+  } else if (currentStateName === toStateName) {
     const targetLabelName = `state:${toStateName}`;
     const hasTargetLabel = issue.labels.some((l) => l.name === targetLabelName);
     if (hasTargetLabel) {
