@@ -194,51 +194,112 @@ export async function findOrCreateLabel(
     const errorBody = createData.errors ? JSON.stringify(createData.errors) : "none";
     log.error(`label create FAIL-CLOSED for '${labelName}' in team ${teamId} (${group ? `child of group '${groupName}'` : "flat"}): success=${result?.success ?? "null"} errors=${errorBody}`);
 
-    // AI-2543 inherited-label promotion: Linear rejects a parent-team create with
-    // "conflicting inherited label" and tells us to use `replaceTeamLabels` to promote
-    // the label to this team. Retry with the promotion argument; the promoted label
-    // is then owned by this team and accepted on issueUpdate.
-    // (Replaces the AI-2176 fallback that borrowed the parent id — that id is rejected
-    // by Linear's issueUpdate, blocking all governed transitions on the sub-team.)
+    // AI-2543 + INF-74: `replaceTeamLabels` is NOT a valid field on `IssueLabelCreateInput`
+    // (removed from the Linear GraphQL schema). Any retry with `replaceTeamLabels: true`
+    // returns a GraphQL validation error and always falls through to `return null`.
+    //
+    // Three-tier fallback (tried in order):
+    //
+    // Tier 1: Workspace-level create (omit `teamId`).
+    //   Creates a label visible to all teams with no ownership restrictions.
+    //   For workflow state labels (state:*) this is semantically correct — they
+    //   are universal, not team-specific. Works when the label name is unique
+    //   across the org.
+    //
+    // Tier 2: Existing-label search.
+    //   When workspace-level create fails with "duplicate label name" (name already
+    //   exists as a team-level label on GEN/BBS/etc.), search all org teams for
+    //   the existing label and return its ID as best-effort. Logs a warning that
+    //   issueUpdate may reject it ("labelIds for incorrect team") — the caller
+    //   should be prepared for this.
+    //
+    // Tier 3: Manual migration warning.
+    //   If nothing can be found, logs a clear error directing to manual migration
+    //   steps (archive conflicting team-level labels, create workspace-level versions).
     const isInheritedConflict = createData.errors &&
       Array.isArray(createData.errors) &&
       createData.errors.some((e: Record<string, unknown>) =>
         typeof e.message === "string" && e.message.includes("conflicting inherited label"),
       );
     if (isInheritedConflict) {
-      // AI-2543 + AGI-12: Linear's IssueLabelCreateInput does NOT accept
-      // `replaceTeamLabels` — it was removed from the schema. A plain retry
-      // with `teamId` just repeats the same rejected create. Instead, omit
-      // `teamId` to create a WORKSPACE-LEVEL label (visible to all teams),
-      // which cannot have inheritance conflicts and is accepted by every
-      // team's issueUpdate. For workflow state labels (state:*) this is also
-      // semantically correct — they are universal, not team-specific.
-      log.info(`inherited-label promotion for '${labelName}' — retrying as workspace-level label`);
-      const promoteMutation = `
-        mutation PromoteLabel($name: String!, $color: String!) {
+      log.info(`findOrCreateLabel: inherited-conflict for '${labelName}' on team ${teamId} — trying three-tier fallback`);
+
+      // ── Tier 1: Workspace-level create (omit teamId) ──
+      const wsMutation = `
+        mutation WsLabelCreate($name: String!, $color: String!) {
           issueLabelCreate(input: { name: $name, color: $color }) {
             success
             issueLabel { id }
           }
         }
       `;
-      const promoteVars = { name: createName, color: "#94a3b8" };
+      const wsVars = { name: createName, color: "#94a3b8" };
       try {
-        const promoteRes = await fetch(LINEAR_API_URL, {
+        const wsRes = await fetch(LINEAR_API_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: authToken },
-          body: JSON.stringify({ query: promoteMutation, variables: promoteVars }),
+          body: JSON.stringify({ query: wsMutation, variables: wsVars }),
         });
-        const promoteData = (await promoteRes.json()) as CreateResp;
-        const promoteResult = promoteData.data?.issueLabelCreate;
-        if (promoteResult?.success && promoteResult.issueLabel) {
-          log.info(`promoted inherited label '${labelName}' as workspace-level id=${promoteResult.issueLabel.id}`);
-          return promoteResult.issueLabel.id;
+        const wsData = (await wsRes.json()) as CreateResp;
+        const wsResult = wsData.data?.issueLabelCreate;
+        if (wsResult?.success && wsResult.issueLabel) {
+          log.info(`findOrCreateLabel: workspace-level create succeeded for '${labelName}' as id=${wsResult.issueLabel.id}`);
+          return wsResult.issueLabel.id;
         }
-        const errBody = promoteData.errors ? JSON.stringify(promoteData.errors) : "none";
-        log.warn(`inherited-label promotion failed for '${labelName}' on team ${teamId}: success=${promoteResult?.success ?? "null"} errors=${errBody}`);
-      } catch (promoteErr) {
-        log.warn(`inherited-label promotion failed: ${promoteErr instanceof Error ? promoteErr.message : String(promoteErr)}`);
+        const wsErrBody = wsData.errors ? JSON.stringify(wsData.errors) : "none";
+        log.warn(`findOrCreateLabel: workspace-level create failed for '${labelName}': success=${wsResult?.success ?? "null"} errors=${wsErrBody}`);
+
+        // ── Tier 2: Org-wide search for the existing label ──
+        const isDuplicateName = Array.isArray(wsData.errors) &&
+          wsData.errors.some((e: Record<string, unknown>) =>
+            typeof e.message === "string" && e.message.includes("duplicate label name"),
+          );
+        if (isDuplicateName) {
+          // Fetch all teams in the org
+          const orgTeamsQuery = `
+            query OrgTeams {
+              teams { nodes { id } }
+            }
+          `;
+          const teamsRes = await fetch(LINEAR_API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: authToken },
+            body: JSON.stringify({ query: orgTeamsQuery }),
+          });
+          const teamsData = (await teamsRes.json()) as { data?: { teams?: { nodes: Array<{ id: string }> } }; errors?: unknown };
+          const orgTeamIds = teamsData.data?.teams?.nodes?.map((t) => t.id) ?? [];
+          log.info(`findOrCreateLabel: searching ${orgTeamIds.length} teams for existing label '${labelName}'`);
+
+          for (const tid of orgTeamIds) {
+            const otherTeamQuery = `
+              query OtherTeamLabels($tid: String!) {
+                team(id: $tid) { labels(first: 250) { nodes { id name isGroup team { id } parent { id name } } } }
+              }
+            `;
+            const otherRes = await fetch(LINEAR_API_URL, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Authorization: authToken },
+              body: JSON.stringify({ query: otherTeamQuery, variables: { tid } }),
+            });
+            const otherData = (await otherRes.json()) as { data?: { team?: { labels: { nodes: LabelNode[] } } }; errors?: unknown };
+            const otherNodes = otherData.data?.team?.labels?.nodes ?? [];
+            const found = findLabelInNodes(otherNodes, labelName, tid);
+            if (found) {
+              log.warn(`findOrCreateLabel: found existing label '${labelName}' in team ${tid} as id=${found} — this is a best-effort fallback; issueUpdate may reject inherited label IDs`);
+              return found;
+            }
+          }
+
+          // ── Tier 3: Nothing found — manual migration required ──
+          log.error(
+            `findOrCreateLabel: MANUAL MIGRATION REQUIRED — label '${labelName}' exists as a team-level label ` +
+            `somewhere in the org but could not be resolved. Archive the conflicting team-level label(s) ` +
+            `and create workspace-level versions, or use the Linear UI to create the label on team ${teamId}.`,
+          );
+          return null;
+        }
+      } catch (wsErr) {
+        log.warn(`findOrCreateLabel: workspace-level create query failed: ${wsErr instanceof Error ? wsErr.message : String(wsErr)}`);
       }
     }
 
