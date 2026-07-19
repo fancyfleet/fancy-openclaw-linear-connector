@@ -31,8 +31,10 @@
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules, bodyHasCapability } from "./escalation-gate.js";
+import { checkStaleSnapshotForTerminal } from "./proxy-cas-check.js";
 import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, setStateAtomic, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
 import { buildTransitionAuditRecord, emitTransitionAuditRecord, verifyPostTransition, type GateResult, type TransitionAuditRecord } from "./transition-audit.js";
+import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import type { ObservationStore } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
@@ -486,6 +488,8 @@ export interface ProxyDeps {
    * idempotent; calling it multiple times for the same agent+ticket is harmless.
    */
   onProxyCall?: (agentId: string, ticketId: string) => void;
+  /** AI-2565: dispatch lease store for CAS stale-snapshot enforcement on terminal transitions. */
+  dispatchLeaseStore?: DispatchLeaseStore;
 }
 
 export async function handleProxyRequest(req: Request, res: Response, deps?: ProxyDeps): Promise<void> {
@@ -703,18 +707,29 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         }
 
         // Target must be a state in the live def for this ticket's workflow.
+        // Three failure modes share distinct errors (AI-2016 AC2).
+        const msLabels = await fetchWorkflowLabels(issueId ?? "", authorization);
+        const msWorkflowId = getWorkflowId(msLabels);
+        if (!msWorkflowId) {
+          log.warn(`migrate-state-block agent=${agentId}${ticketCtx} target=${migrateTarget ?? "(none)"}: no wf: label — def unresolvable`);
+          res.status(200).json({ errors: [{ message: `[Proxy] migrate-state rejected: could not resolve the workflow def — the ticket has no wf:* workflow label. Use 'escape' to re-enroll or attach the correct wf:* label first.` }] });
+          return;
+        }
         let def: Awaited<ReturnType<typeof loadWorkflowDefById>> = null;
         try {
-          const labels = await fetchWorkflowLabels(issueId ?? "", authorization);
-          const workflowId = getWorkflowId(labels);
-          def = workflowId ? await loadWorkflowDefById(workflowId) : null;
+          def = await loadWorkflowDefById(msWorkflowId);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           log.warn(`migrate-state-target-check-failed agent=${agentId}${ticketCtx}: ${msg}`);
-          res.status(200).json({ errors: [{ message: `[Proxy] migrate-state rejected: could not resolve the workflow def to validate the target (${msg}).` }] });
+          res.status(200).json({ errors: [{ message: `[Proxy] migrate-state rejected: could not resolve the workflow def for '${msWorkflowId}' (${msg}).` }] });
           return;
         }
-        if (!migrateTarget || !def || !def.states.some((s) => s.id === migrateTarget)) {
+        if (!def) {
+          log.warn(`migrate-state-block agent=${agentId}${ticketCtx} target=${migrateTarget ?? "(none)"}: def not found for workflow '${msWorkflowId}'`);
+          res.status(200).json({ errors: [{ message: `[Proxy] migrate-state rejected: could not resolve the workflow def — workflow '${msWorkflowId}' is not registered in the registry.` }] });
+          return;
+        }
+        if (!migrateTarget || !def.states.some((s) => s.id === migrateTarget)) {
           log.warn(`migrate-state-block agent=${agentId}${ticketCtx} target=${migrateTarget ?? "(none)"}: not a live-def state`);
           res.status(200).json({ errors: [{ message: `[Proxy] migrate-state rejected: target '${migrateTarget ?? "(missing)"}' is not a state in the live workflow def. Migrate only to a state that exists in the current def.` }] });
           return;
@@ -901,6 +916,28 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         }
         res.status(200).json(gateDeclineResponse);
         return;
+      }
+
+      // ====================================================================
+      // AI-2565: CAS stale-snapshot check for terminal transitions.
+      // Runs after B1 (workflow rules) passes but before the forward mutation.
+      // Only applies to terminal/routing intents (handoff-work, complete-work,
+      // needs-human, refuse-work).
+      // ====================================================================
+      if (issueId && effectiveIntent) {
+        const staleRejection = await checkStaleSnapshotForTerminal(
+          effectiveIntent,
+          issueId,
+          agentId,
+          authorization,
+          callerLinearUserId,
+          deps?.dispatchLeaseStore,
+        );
+        if (staleRejection) {
+          log.warn(`stale-snapshot-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${staleRejection}`);
+          res.status(200).json({ errors: [{ message: staleRejection }] });
+          return;
+        }
       }
 
       // AI-1860: first successful authorization — store the snapshot so subsequent

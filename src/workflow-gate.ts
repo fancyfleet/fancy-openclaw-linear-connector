@@ -45,6 +45,7 @@ import { recordObservation } from "./store/observation-write-path.js";
 import { isBodyKnown } from "./escalation-gate.js";
 import { getAgent, getAgents } from "./agents.js";
 import { executeFanout, shouldTriggerFanout, validateFanoutSpec, type Finding } from "./fanout.js";
+import { recordFanoutOutcome } from "./fanout-outcome-store.js";
 import { onChildTerminal, onManagingEntry, isTerminalState } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
 import { fetchLastCommentByUser } from "./linear-helpers.js";
@@ -2329,17 +2330,28 @@ export async function checkWorkflowRules(
   // A demote on a dev-impl ticket carrying a pushed branch or open/merged PR silently
   // drops it off-spine while implementation is already underway. Fail-open on fetch
   // error so a transient API outage never permanently strands a genuinely-fresh intake.
+  // AI-2016 AC1: skip the guard when ALL PR evidence is merged — a shipped ticket
+  // with merged PRs is safe to demote (it's done, not in-flight). When the guard
+  // permits demote (no evidence, or evidence is all merged), return null immediately
+  // to short-circuit the transition-legality check — demote is not a normal state
+  // transition but a workflow-exit action handled by applyStateTransition (B2).
   if (intent === "demote" && workflowId === "dev-impl" && !breakGlassOverride) {
     const branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
     if (branchStatus && (branchStatus.hasBranch || branchStatus.hasPR)) {
-      log.warn(`workflow-gate: AI-1576 demote-guard blocked agent=${bodyId} ticket=${issueId} (hasBranch=${branchStatus.hasBranch} hasPR=${branchStatus.hasPR})`);
-      return (
-        `[Proxy] 'demote' blocked on ${issueId}: this ticket has in-flight or merged implementation work ` +
-        `(branch: ${branchStatus.hasBranch}, PR: ${branchStatus.hasPR}). ` +
-        `Demoting would silently drop it off the dev-impl spine while implementation is underway. ` +
-        `Use break-glass ('escape') to override if intentional.`
-      );
+      if (!branchStatus.hasMergedPR) {
+        log.warn(`workflow-gate: AI-1576 demote-guard blocked agent=${bodyId} ticket=${issueId} (hasBranch=${branchStatus.hasBranch} hasPR=${branchStatus.hasPR} hasMergedPR=${branchStatus.hasMergedPR})`);
+        return (
+          `[Proxy] 'demote' blocked on ${issueId}: this ticket has in-flight implementation work ` +
+          `(branch: ${branchStatus.hasBranch}, PR: ${branchStatus.hasPR}) that is not yet merged. ` +
+          `Demoting would silently drop it off the dev-impl spine while implementation is underway. ` +
+          `Use break-glass ('escape') to override if intentional.`
+        );
+      }
+      // All PRs are merged — shipped ticket, safe to demote
+      log.info(`workflow-gate: AI-1576 demote-guard allowed agent=${bodyId} ticket=${issueId} (merged PR — shipped ticket)`);
+      return null;
     }
+    // No branch/PR evidence at all — fresh intake, not blocking
   }
 
   // AI-1397: delegate-only enforcement at proxy (CLI-version-agnostic).
@@ -2634,38 +2646,34 @@ export async function checkWorkflowRules(
     } else if (branchStatus.hasMergedPR) {
       log.info(`workflow-gate: done gate: ${issueId} passed (merged PR confirmed)`);
     } else if (!branchStatus.hasBranch && !branchStatus.hasPR) {
-      // AI-1497: Complete absence of evidence — likely lost to auto-delete.
-      // Fail-open: a ticket in merge/deploy state has already passed code review,
-      // so the PR almost certainly existed and was merged.
-      log.info(`workflow-gate: done gate: ${issueId} passed (no branch/PR evidence — treating as merged, data likely lost to auto-delete)`);
-      // AI-1797: with no GitHub integration installed, EVERY ticket takes this
-      // path — an evidence-free gate. Constant dedup key: one folded alert row,
-      // count keeps rising until the integration lands, then it goes quiet.
+      // INF-96: Complete absence of evidence → hard block. This was an AI-1497
+      // fail-open, but with no GitHub integration installed every ticket passed
+      // evidence-free — a silent false-completion failure mode. The warning-only
+      // alert scrolled past. Now treated as a hard block with an actionable alert.
+      log.warn(`workflow-gate: done gate: ${issueId} blocked — no branch/PR evidence`);
       notify({
-        severity: "warning",
+        severity: "critical",
         source: "done-gate",
-        title: "done gate passed with no branch/PR evidence (GitHub integration missing?)",
-        detail: `Ticket ${issueId} passed '${intent}' with zero GitHub attachments. If this fires for every forward move, the Linear GitHub integration is not installed and the merged-PR gate is verifying nothing.`,
+        title: "done gate blocked: no branch/PR evidence (GitHub integration missing?)",
+        detail: `Ticket ${issueId} blocked on '${intent}' with zero GitHub attachments. If this fires for every forward move, the Linear GitHub integration is not installed and the merged-PR gate is verifying nothing. Install the integration or use break-glass to bypass.`,
         ticket: issueId,
         dedupKey: "done-gate|no-evidence",
       });
+      return `[Proxy] '${intent}' blocked: cannot release — no branch/PR evidence found.`;
     } else {
-      // Partial evidence exists (has branch but no PR, or similar).
-      // Block: affirmative evidence that review was not completed.
-      // AI-1797: with attachment-derived status hasBranch ≡ hasPR, so this
-      // block is currently unreachable (open PR falls through to the pass
-      // log below). Kept for defense-in-depth if a richer source returns.
+      // Has some GitHub evidence but PR is not yet merged (open PR, partial
+      // evidence, etc.). Block: affirmative evidence that code review was not
+      // completed. The only pass through the done gate is a verified merged PR.
+      // (INF-96 / AI-1497 rework: open PR no longer passes.)
       const missing: string[] = [];
       if (!branchStatus.hasBranch) missing.push('branch not pushed to origin');
       if (!branchStatus.hasPR) missing.push('no pull request associated');
-      if (missing.length > 0) {
-        log.warn(`workflow-gate: release gate: ${issueId} blocked — ${missing.join('; ')}`);
-        return (
-          `[Proxy] '${intent}' blocked: cannot release unmerged work. Missing: ${missing.join('; ')}. ` +
-          `Push the branch and open a pull request before deploying.`
-        );
-      }
-      log.info(`workflow-gate: done gate: ${issueId} passed (has branch + PR, not yet merged)`);
+      if (missing.length === 0) missing.push('pull request not yet merged');
+      log.warn(`workflow-gate: done gate: ${issueId} blocked — ${missing.join('; ')}`);
+      return (
+        `[Proxy] '${intent}' blocked: cannot release unmerged work. Missing: ${missing.join('; ')}. ` +
+        `Push the branch and open a pull request before deploying.`
+      );
     }
   }
 
@@ -3741,24 +3749,24 @@ export async function applyStateTransition(
       await new Promise((r) => setTimeout(r, 1000));
       branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
     }
-    const hasMergedPR = branchStatus?.hasMergedPR === true;
-    const hasBranchAndPR = branchStatus?.hasBranch && branchStatus?.hasPR;
-    const noEvidenceAtAll = branchStatus && !branchStatus.hasBranch && !branchStatus.hasPR;
-    if (!hasMergedPR && !hasBranchAndPR && !noEvidenceAtAll) {
-      // Block: either null after retry (branchStatus is null → noEvidenceAtAll is false)
-      // or partial evidence (has branch but no PR).
-      // But AI-1497: if null after retry, fail-open instead of blocking.
-      if (!branchStatus) {
-        log.warn(`workflow-gate: B2 apply: done gate could not verify status for ${issueId} after retry — failing open`);
-      } else {
-        const missing: string[] = [];
-        if (!branchStatus.hasBranch) missing.push('branch not pushed to origin');
-        if (!branchStatus.hasPR) missing.push('no pull request associated');
-        log.warn(`workflow-gate: B2 apply: done gate blocked for ${issueId} — ${missing.join('; ')}`);
-        return { status: "blocked", code: "release-gate", detail: missing.join('; '), from: currentStateName, to: toStateName }; // Block the transition
-      }
-    } else if (noEvidenceAtAll) {
-      log.info(`workflow-gate: B2 apply: done gate for ${issueId} — no branch/PR evidence, treating as merged (AI-1497 fail-open)`);
+    if (!branchStatus) {
+      // Two consecutive nulls — transient API failure. Fail-open to avoid
+      // stranding tickets; merge/deploy state is already past code review.
+      log.warn(`workflow-gate: B2 apply: done gate could not verify status for ${issueId} after retry — failing open`);
+    } else if (branchStatus.hasMergedPR) {
+      // Merged PR confirmed — pass (AI-1492 preserved).
+    } else if (!branchStatus.hasBranch && !branchStatus.hasPR) {
+      // INF-96: no evidence → hard block (was AI-1497 fail-open).
+      log.warn(`workflow-gate: B2 apply: done gate blocked for ${issueId} — no branch/PR evidence`);
+      return { status: "blocked", code: "release-gate", detail: "no branch/PR evidence", from: currentStateName, to: toStateName };
+    } else {
+      // Has some evidence but not merged → block.
+      const missing: string[] = [];
+      if (!branchStatus.hasBranch) missing.push('branch not pushed to origin');
+      if (!branchStatus.hasPR) missing.push('no pull request associated');
+      if (missing.length === 0) missing.push('pull request not yet merged');
+      log.warn(`workflow-gate: B2 apply: done gate blocked for ${issueId} — ${missing.join('; ')}`);
+      return { status: "blocked", code: "release-gate", detail: missing.join('; '), from: currentStateName, to: toStateName };
     }
   }
 
@@ -4246,12 +4254,24 @@ export async function applyStateTransition(
   // already validated pre-transition (AC5) and the findings stashed in
   // `pendingFanout`, so this never re-guesses the spec.
   // Fail-open: fan-out errors are logged and never block the transition.
+  // INF-37: set when a spawn_if predicate could not be *evaluated* (as opposed
+  // to evaluating false). Zero children then means "we never found out", not
+  // "none were needed" — so the barrier below must not read it as vacuous
+  // satisfaction. Scoped deliberately to the spawn_if failure: the surrounding
+  // fan-out fail-open (above) is a separate, deliberate contract.
+  let spawnIfEvaluationFailed = false;
+  // INF-28: set when the fanout outcome record could not be persisted.
+  // A write failure must suppress the barrier auto-advance (stale record → stale
+  // set → all-terminal → advance would re-create LIF-2).
+  let fanoutRecordWriteFailed = false;
+
   if (applied && pendingFanout) {
     try {
       log.info(`workflow-gate: AI-1992 fan-out: triggering fan-out for ${issueId} (${currentStateName} → ${toStateName}, child=${pendingFanout.config.child_workflow})`);
       const fanoutResult = await executeFanout(issueId, authToken, pendingFanout.config, {
         findingsOverride: pendingFanout.findings,
       });
+      spawnIfEvaluationFailed = fanoutResult.spawnIfResult?.outcome === "failed";
       if (fanoutResult.created > 0) {
         log.info(
           `workflow-gate: B-2 fan-out: ${fanoutResult.created} child(ren) created for ${issueId}: ${fanoutResult.childIdentifiers.join(", ")}`,
@@ -4263,18 +4283,89 @@ export async function applyStateTransition(
       if (fanoutResult.created > 0) {
         await postFanoutSummaryComment(issue.internalId, fanoutResult, authToken);
       }
+
+      // ── INF-28: Record fanout outcome to store ────────────────────────
+      // Derive the outcome from the fanout result and persist it before the
+      // barrier check runs. The barrier reads this outcome to know which children
+      // to wait on, or whether to block+alarm.
+      if (!spawnIfEvaluationFailed) {
+        const now = new Date().toISOString();
+        let outcomeType: string;
+        let childIds: string[] | undefined;
+
+        if (fanoutResult.refused) {
+          outcomeType = "refused";
+        } else if (fanoutResult.pendingApproval) {
+          outcomeType = "pending-approval";
+        } else if (fanoutResult.spawnIfResult && !fanoutResult.spawnIfResult.shouldSpawn) {
+          // Verified waive (spawnIfResult.outcome === "waived")
+          outcomeType = "waived";
+        } else if (fanoutResult.created === 0 && fanoutResult.errors.length > 0) {
+          outcomeType = "failed";
+        } else if (fanoutResult.attempted > 0 && fanoutResult.created === 0) {
+          // Attempted N, minted 0 — rare but distinct from waived
+          outcomeType = "failed";
+        } else if (fanoutResult.specMatchedChildren.length > 0) {
+          outcomeType = "awaiting";
+          childIds = fanoutResult.specMatchedChildren;
+        } else if (fanoutResult.created > 0) {
+          // Created children without spec-matched set (fallback — should not happen
+          // with the FanoutResult extension, but be defensive)
+          outcomeType = "awaiting";
+          childIds = fanoutResult.childIdentifiers;
+        } else {
+          // Zero children created, no errors, no refusal — effectively waived
+          outcomeType = "waived";
+        }
+
+        try {
+          await recordFanoutOutcome(issueId, {
+            outcome: outcomeType as "refused" | "pending-approval" | "waived" | "failed" | "awaiting",
+            childIdentifiers: childIds,
+            recordedAt: now,
+          });
+        } catch (err) {
+          fanoutRecordWriteFailed = true;
+          const writeErr = err instanceof Error ? err.message : String(err);
+          log.error(
+            `workflow-gate: INF-28: failed to persist fanout outcome for ${issueId}: ${writeErr}. ` +
+            `Barrier auto-advance will be suppressed.`,
+          );
+        }
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      log.warn(`workflow-gate: B-2 fan-out: fan-out failed for ${issueId}: ${msg}`);
+      log.warn(`workflow-gate: B-2 fan-out: fan-out execution failed for ${issueId}: ${msg}`);
     }
   }
 
-  // ── AI-1730 + AI-1992: Zero-child barrier auto-advance on barrier entry ──
+  // ── AI-1730 + AI-1992 + INF-28: Barrier auto-advance on barrier entry ──
   // After the fan-out block (which may create 0..N children), check if the
   // barrier is already satisfied. This is a no-op when children are in-progress
   // — it only fires when all children are terminal or none exist. Barrier-ness
   // is config-driven (any state declaring `barrier: true`), not just "managing".
-  if (applied && destStateNode?.barrier === true) {
+  //
+  // INF-37: `spawnIfEvaluationFailed` — a spawn_if that could not be evaluated
+  // spawned zero children, and zero children is exactly what the AI-1730
+  // vacuous-satisfaction contract advances on — so the parent would sail past
+  // a sprint that never started, on a transient API error, and log it as
+  // healthy. The parent stays in the barrier state, which is recoverable; the
+  // error comment was already posted on the parent by executeFanout.
+  //
+  // INF-28: `fanoutRecordWriteFailed` — if the fanout outcome record could not
+  // be persisted, the barrier has no way to distinguish "waived" from "mint
+  // failed" from "write failed". Advancing would re-create LIF-2 (stale record
+  // → stale set → all-terminal → advance). The parent stays put, which is the
+  // alarm.
+  if (applied && destStateNode?.barrier === true && (spawnIfEvaluationFailed || fanoutRecordWriteFailed)) {
+    const reason = spawnIfEvaluationFailed
+      ? "spawn_if predicate could not be evaluated"
+      : "fanout outcome record could not be persisted";
+    log.error(
+      `workflow-gate: INF-28: skipping barrier auto-advance for ${issueId} — ` +
+      `${reason}. ${issueId} stays in '${toStateName}' pending steward retry.`,
+    );
+  } else if (applied && destStateNode?.barrier === true) {
     try {
       const barrierResult = await onManagingEntry(issueId, authToken);
       if (barrierResult) {
