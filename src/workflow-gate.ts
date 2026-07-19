@@ -1739,6 +1739,7 @@ async function fetchBranchAndPRStatus(
   const query = `
     query IssueBranchAndPR($id: String!) {
       issue(id: $id) {
+        description
         attachments {
           nodes {
             url
@@ -1761,7 +1762,7 @@ async function fetchBranchAndPRStatus(
       metadata?: Record<string, unknown> | null;
     };
     type PRResp = {
-      data?: { issue?: { attachments?: { nodes: AttachmentNode[] } } };
+      data?: { issue?: { description?: string | null; attachments?: { nodes: AttachmentNode[] } } };
       errors?: Array<{ message?: string; extensions?: { code?: string } }>;
     };
     const data = (await res.json()) as PRResp;
