@@ -44,7 +44,8 @@ import type { ObservationStore } from "./store/observation-store.js";
 import { recordObservation } from "./store/observation-write-path.js";
 import { isBodyKnown } from "./escalation-gate.js";
 import { getAgent, getAgents } from "./agents.js";
-import { executeFanout, shouldTriggerFanout, validateFanoutSpec, extractSpecFindings, deriveSpecFromPriorChildren, upsertDerivedSpecSection, updateIssueDescription, type Finding } from "./fanout.js";
+<<<<<<< HEAD
+import { executeFanout, shouldTriggerFanout, validateFanoutSpec, extractSpecFindings, autoDeriveArmFindings, deriveSpecFromPriorChildren, upsertDerivedSpecSection, updateIssueDescription, type Finding } from "./fanout.js";
 import { recordFanoutOutcome } from "./fanout-outcome-store.js";
 import { onChildTerminal, onManagingEntry, isTerminalState } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
@@ -3824,7 +3825,7 @@ export async function applyStateTransition(
     }
   }
 
-  let toStateName: string;
+  let toStateName: string = "";
   let matchedTransition: WorkflowTransition | undefined;
 
   // AI-1813 fix: break-glass (escape) must be legal when no state:* label is
@@ -3857,6 +3858,7 @@ export async function applyStateTransition(
     matchedTransition = def.states.find((s) => s.id === currentStateName)?.transitions?.find((t) => t.command === intent);
     toStateName = currentStateName;
   } else {
+    // Normal transition resolution — no special handling needed.
     if (!currentStateName) {
       log.warn(`workflow-gate: B2 apply: no state:* label on ${issueId} — skipping`);
       return { status: "failed", code: "no-state-label", detail: `workflow ticket ${issueId} has no state:* label` };
@@ -3917,18 +3919,54 @@ export async function applyStateTransition(
     ? null
     : shouldTriggerFanout(def, currentStateName ?? "", intent);
   if (fanoutConfig) {
-    const specDescription = await fetchFanoutSpecDescription(issueId, authToken);
-    // AI-2199: load registry to validate per-entry child workflow ids.
-    // Fail-open: if registry load fails, skip per-entry validation (backward compat).
-    let registeredWorkflows: Set<string> | undefined;
-    try {
-      const registry = await loadWorkflowRegistry();
-      registeredWorkflows = new Set(registry.keys());
-    } catch (err) {
-      log.warn(`workflow-gate: AI-2199: failed to load workflow registry for per-entry validation: ${err instanceof Error ? err.message : String(err)}`);
-    }
-    const validation = validateFanoutSpec(specDescription, fanoutConfig, registeredWorkflows);
-    if (!validation.ok) {
+    specDescriptionLoop: for (let attempt = 0; attempt < 2; attempt++) {
+      const specDescription = await fetchFanoutSpecDescription(issueId, authToken);
+      // AI-2199: load registry to validate per-entry child workflow ids.
+      // Fail-open: if registry load fails, skip per-entry validation (backward compat).
+      let registeredWorkflows: Set<string> | undefined;
+      try {
+        const registry = await loadWorkflowRegistry();
+        registeredWorkflows = new Set(registry.keys());
+      } catch (err) {
+        log.warn(`workflow-gate: AI-2199: failed to load workflow registry for per-entry validation: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      const validation = validateFanoutSpec(specDescription, fanoutConfig, registeredWorkflows);
+      if (validation.ok) {
+        pendingFanout = { config: fanoutConfig, findings: validation.findings };
+        break specDescriptionLoop;
+      }
+
+      // INF-123: auto-derive ## Findings from completed arm children before refusing.
+      // When spec_source is "findings" and validation fails, attempt to derive findings
+      // from terminal wf:sprint-arm-* children and write them to the parent description.
+      // If derivation succeeds, loop back and re-validate on the updated description.
+      if (fanoutConfig.spec_source === "findings" && attempt === 0) {
+        log.info(
+          `workflow-gate: INF-123: attempting auto-derive of findings for ${issueId} ` +
+          `(state '${currentStateName}' → '${toStateName}') after validation failure`,
+        );
+        const derivedFindings = await autoDeriveArmFindings(issue.internalId, authToken);
+        if (derivedFindings.length > 0) {
+          const { autoPopulateFindingsSection } = await import("./fanout.js");
+          const updated = await autoPopulateFindingsSection(
+            issue.internalId,
+            derivedFindings,
+            specDescription,
+            authToken,
+          );
+          if (updated) {
+            log.info(
+              `workflow-gate: INF-123: auto-derived ${derivedFindings.length} finding(s) and wrote to description for ${issueId} — re-validating`,
+            );
+            continue; // Re-fetch and re-validate
+          }
+          log.warn(
+            `workflow-gate: INF-123: auto-derived ${derivedFindings.length} finding(s) but failed to write description for ${issueId}`,
+          );
+        }
+      }
+
+      // Refusal: validation failed and auto-derivation did not (or could not) resolve it
       log.warn(
         `workflow-gate: AI-1992: fan-out spec REFUSED for ${issueId} (state '${currentStateName}' → '${toStateName}'): ${validation.reason}`,
       );
@@ -3959,7 +3997,6 @@ export async function applyStateTransition(
         to: toStateName,
       };
     }
-    pendingFanout = { config: fanoutConfig, findings: validation.findings };
   }
 
   // ── Idempotency check (AI-1490 hardened) ────────────────────────────────
@@ -4007,10 +4044,21 @@ export async function applyStateTransition(
         );
         return { status: "applied", code: "stale-label-purged", from: currentStateName, to: toStateName };
       }
-      log.info(
-        `workflow-gate: B2 apply: ${issueId} already in state '${toStateName}' with label present — no-op`,
-      );
-      return { status: "noop", code: "already-in-state", from: currentStateName, to: toStateName };
+      // INF-124: for handoff self-loop, don't short-circuit — the delegate
+      // must be written even though the state label doesn't change.
+      if (intent === "handoff") {
+        log.info(
+          `workflow-gate: B2 apply: ${issueId} handoff self-loop at state '${toStateName}' — continuing to delegate write`,
+        );
+        // Don't return; fall through to the delegate resolution + atomic write below.
+        // The state labels are already correct, so the atomic write will be a
+        // label-preserving no-op that updates delegate + native state.
+      } else {
+        log.info(
+          `workflow-gate: B2 apply: ${issueId} already in state '${toStateName}' with label present — no-op`,
+        );
+        return { status: "noop", code: "already-in-state", from: currentStateName, to: toStateName };
+      }
     }
     // Label is missing despite being in the correct state — re-stamp.
     log.warn(
