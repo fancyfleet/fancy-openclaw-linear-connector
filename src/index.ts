@@ -40,6 +40,7 @@ import { registerRegistryIntegrityCron } from "./registry-integrity-cron.js";
 import { getAlertBus } from "./alerts/alert-bus.js";
 import { registerSlaSweepCron } from "./sla-sweep.js";
 import { registerLabelSyncAuditCron } from "./cron/label-sync-audit.js";
+import { registerAntiEntropyCron } from "./cron/anti-entropy.js";
 import { registerOobReconcileCron } from "./oob-reconcile-sweep.js";
 import { MutationAuditStore } from "./store/mutation-audit-store.js";
 import { DispatchIdempotencyStore } from "./store/dispatch-idempotency-store.js";
@@ -1601,6 +1602,20 @@ if (isEntryPoint) {
     graceHours: parseInt(process.env.DONE_DETECTOR_GRACE_HOURS ?? "4", 10),
     pollIntervalMs: parseInt(process.env.DONE_DETECTOR_POLL_INTERVAL_MS ?? String(60 * 60 * 1000), 10),
   });
+
+  // INF-122: periodic anti-entropy reconciliation (G-7/G-17).
+  // AC1 — native state desync heal; AC2 — missed barrier webhook auto-advance.
+  // Uses the same auth token and workflow def path as the SLA sweep.
+  const antiEntropyAuthToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  if (antiEntropyAuthToken) {
+    registerAntiEntropyCron({ authToken: antiEntropyAuthToken });
+    const intervalMs = process.env.ANTI_ENTROPY_INTERVAL
+      ? parseInt(process.env.ANTI_ENTROPY_INTERVAL, 10)
+      : 15 * 60 * 1000;
+    log.info(`INF-122: anti-entropy cron registered (interval=${intervalMs}ms) — barrier auto-heal now active`);
+  } else {
+    log.warn("INF-122: anti-entropy cron NOT registered — no Linear auth token available");
+  }
 
   // AI-1838: out-of-band mutation reconcile sweep. Detects state/label/delegate
   // changes that bypassed the proxy gate (raw token → api.linear.app direct).

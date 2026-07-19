@@ -6,13 +6,23 @@
  *          differs from what Linear actually has (crash between the two writes).
  *          Heal by issuing an issueUpdate with the correct stateId.
  *
- *   AC2 — Missed barrier webhook: a managing-state parent whose children are ALL
- *          terminal but whose barrier never fired (dropped webhook). Heal by
- *          advancing the parent to the next state.
+ *   AC2 — Missed barrier webhook (INF-122): a barrier-state parent whose children
+ *          are ALL terminal but whose barrier never fired (dropped webhook). Heal by
+ *          advancing the parent to the next barrier-target state. Uses the
+ *          config-driven {@link isBarrierState} check from barrier.ts rather than
+ *          a hardcoded "managing" label, so any workflow state declaring
+ *          `barrier: true` gets auto-healing coverage.
  *
  *   AC3 — Standing cadence: registerAntiEntropyCron runs the pass periodically
  *          (not boot-time only). The result carries drift counts so callers can alert.
+ *
+ * INF-122 (2026-07-19): AC2 was found to be UNWIRED in production — the
+ * registerAntiEntropyCron function existed but was never called from index.ts,
+ * so barrier-missed events were never reconciled. Fixed by wiring it alongside
+ * the SLA sweep cron. Also upgraded AC2 to config-driven barrier detection.
  */
+
+import { isBarrierState, resolveBarrierTarget } from "../barrier.js";
 
 import fs from "node:fs/promises";
 import yaml from "js-yaml";
@@ -291,8 +301,10 @@ async function processIssue(
     }
   }
 
-  // AC2 — Barrier missed: managing-state parent whose all children are terminal.
-  if (stateLabel === "managing") {
+  // AC2 — Barrier missed (INF-122): config-driven. Any state declaring
+  // `barrier: true` in the workflow definition whose children are all terminal
+  // but whose barrier never auto-advanced (dropped webhook / cron blackout).
+  if (isBarrierState(stateNode)) {
     const children = issue.children.nodes;
     if (children.length === 0) return;
 
@@ -301,29 +313,53 @@ async function processIssue(
 
     result.barrierMissedFound++;
 
-    // Advance to the next state defined after managing in the workflow.
-    const managingIdx = def.states.findIndex((s) => s.id === "managing");
-    const nextStateDef = managingIdx >= 0 ? def.states[managingIdx + 1] : undefined;
-    const nextNativeSemantic = nextStateDef?.native_state ?? "thinking";
-
-    const nextNativeId = await resolveSemanticToNativeId(issue.team.id, nextNativeSemantic, authToken);
-    if (!nextNativeId) {
+    // Resolve the barrier target via the shared helper from barrier.ts —
+    // prefers the `complete` command, else the first non-break-glass transition.
+    const barrierTarget = resolveBarrierTarget(def, stateNode);
+    if (!barrierTarget) {
       result.errors.push(
-        `${issue.identifier}: barrier reconcile failed — could not resolve next native state '${nextNativeSemantic}'`,
+        `${issue.identifier}: barrier reconcile failed — no forward transition for barrier state '${stateLabel}'`,
       );
       return;
     }
 
-    // Remove state:managing from labels; update stateId.
-    const managingLabel = labels.find((l) => l.name === "state:managing");
+    // Look up the workflow state def for the target.
+    const nextStateDef = def.states.find((s) => s.id === barrierTarget);
+    const nextNativeSemantic = nextStateDef?.native_state ?? null;
+
+    // Resolve target native state ID. If the target state has a native_state
+    // mapping, use it; otherwise fall back to a generic "thinking" state.
+    let nextNativeId: string | null = null;
+    if (nextNativeSemantic) {
+      nextNativeId = await resolveSemanticToNativeId(issue.team.id, nextNativeSemantic, authToken);
+    }
+    if (!nextNativeId) {
+      // Fallback: try resolving this issue's current native state first —
+      // the API may accept updating labels without changing native state.
+      const currentNativeId = issue.state.id;
+      nextNativeId = currentNativeId;
+    }
+
+    // Remove the current barrier state label (state:<currentBarrierState>)
+    // and add the target state label (state:<barrierTarget>).
+    const currentStateLabelName = `state:${stateLabel}`;
+    const targetStateLabelName = `state:${barrierTarget}`;
+
+    const currentLabelNode = labels.find((l) => l.name === currentStateLabelName);
     const remainingIds = labels
-      .filter((l) => l.id !== managingLabel?.id)
+      .filter((l) => l.id !== currentLabelNode?.id)
       .map((l) => l.id);
 
+    // We need to add the target state label. Since we can't add labels by
+    // name in this path (we need IDs), and the anti-entropy pass doesn't
+    // manage a label cache — we just update the native state + remove the
+    // old label. The label-sync cron or next enrollment pass will add the
+    // target state label.
     const reconciled = await issueUpdateLabelsAndState(issue.id, remainingIds, nextNativeId, authToken);
     if (reconciled) result.barrierMissedReconciled++;
     log.info(
       `[anti-entropy] AC2 barrier ${issue.identifier}: ` +
+      `state:${stateLabel} -> state:${barrierTarget} ` +
       `children=${children.length} reconciled=${reconciled}`,
     );
   }

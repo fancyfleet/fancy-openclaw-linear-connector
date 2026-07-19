@@ -26,7 +26,7 @@ import type { OperationalEventStore } from "../store/operational-event-store.js"
 import type { ManagingStateStore } from "../store/managing-state-store.js";
 import type { DeliveryConfig } from "../delivery/index.js";
 import { sendManagingWakeSignal, type ManagingWakeTicket } from "./managing-wake.js";
-import { surfaceStalledChildren } from "../barrier.js";
+import { surfaceStalledChildren, evaluateBarrier, attemptBarrierTransition, isManagedBarrierFromLabels } from "../barrier.js";
 import { notify } from "../alerts/alert-bus.js";
 
 const log = componentLogger(createLogger(), "managing-poller");
@@ -288,6 +288,51 @@ export class ManagingPoller {
           } catch (err) {
             log.warn(
               `Stall detection failed for ${ticket.identifier}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
+      }
+
+      // INF-122: Barrier-stuck detection — check if any due ticket is in a
+      // barrier state with all children terminal but hasn't advanced.
+      // This catches the case where a dropped webhook (during a firefight or
+      // cron blackout) left the barrier stranded. If detected, attempt the
+      // barrier transition to self-heal.
+      if (stallToken) {
+        for (const ticket of dueTickets) {
+          try {
+            const barrier = await evaluateBarrier(
+              ticket.identifier,
+              /^Bearer\s+/i.test(stallToken) ? stallToken : `Bearer ${stallToken}`,
+            );
+            if (barrier.allTerminal) {
+              // All children are terminal but the parent is still in the
+              // barrier state — the barrier webhook was missed. Attempt
+              // self-healing via the standard barrier transition path.
+              log.warn(
+                `INF-122 barrier-stuck: ${ticket.identifier} — all ${barrier.totalChildren} child(ren) ` +
+                `terminal but still in barrier state; attempting self-heal advance`,
+              );
+              const transitionResult = await attemptBarrierTransition(
+                ticket.identifier,
+                /^Bearer\s+/i.test(stallToken) ? stallToken : `Bearer ${stallToken}`,
+              );
+              if (transitionResult.transitioned) {
+                log.info(
+                  `INF-122 barrier-stuck self-heal: ${ticket.identifier} — ` +
+                  `advanced (${barrier.terminalCount}/${barrier.totalChildren} children terminal)`,
+                );
+                result.ticketsDispatched++; // count the auto-advance
+              } else {
+                log.warn(
+                  `INF-122 barrier-stuck self-heal FAILED for ${ticket.identifier}: ` +
+                  `${transitionResult.error ?? "unknown error"}`,
+                );
+              }
+            }
+          } catch (err) {
+            log.warn(
+              `INF-122 barrier-stuck detection failed for ${ticket.identifier}: ${err instanceof Error ? err.message : String(err)}`,
             );
           }
         }
