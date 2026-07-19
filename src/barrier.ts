@@ -848,8 +848,12 @@ export async function attemptBarrierTransition(
  * to when the barrier is satisfied. Prefers the `complete` command (the canonical
  * barrier edge), else the first transition that is not the def's break-glass
  * command. Returns undefined when the state has no eligible forward transition.
+ *
+ * INF-122: exported for anti-entropy AC2 (barrier missed) and engine-watch
+ * detection paths, which re-evaluate barriers on a periodic sweep rather than
+ * relying solely on the event-driven webhook path.
  */
-function resolveBarrierTarget(def: WorkflowDef, state: WorkflowState): string | undefined {
+export function resolveBarrierTarget(def: WorkflowDef, state: WorkflowState): string | undefined {
   const transitions = state.transitions ?? [];
   const complete = transitions.find((t) => t.command === "complete");
   if (complete) return complete.to;
