@@ -120,31 +120,41 @@ states:
  * non-AI team issues to UUIDs. The proxy must handle both UUID and
  * human-readable identifiers for ALL teams uniformly.
  */
+/**
+ * AI-2597: teams under test.
+ *
+ * `issueUuid` is what the post-resolution forwarded mutation carries.
+ * For AI this is already a UUID; for BBS/GEN/LIF this is an identifier that
+ * the proxy must resolve to the `resolvedUuid` before forwarding.
+ */
 const TEAMS = {
   AI: {
+    /** The value the mutation carries in its variables (already a UUID for AI). */
     issueUuid: "b4a7c3e1-129f-4a3d-9c8b-0f1e2a3b4c5d",
+    /** The internal UUID the proxy resolves to (same as issueUuid for AI). */
+    resolvedUuid: "b4a7c3e1-129f-4a3d-9c8b-0f1e2a3b4c5d",
     identifier: "AI-2597",
     teamId: "team-ai",
-    /** Human-readable identifier as it might appear when UUID resolution fails */
-    idAsIdentifier: "AI-2597",
   },
   BBS: {
+    /** Human-readable identifier that starts as the mutation variable value. */
     issueUuid: "BBS-3",
+    /** The internal UUID the proxy resolves it to. */
+    resolvedUuid: "e9b2c8a1-2345-4b6d-8a9c-0d1e2f3a4b5c",
     identifier: "BBS-3",
     teamId: "team-bbs",
-    idAsIdentifier: "BBS-3",
   },
   GEN: {
     issueUuid: "GEN-103",
+    resolvedUuid: "a1b2c3d4-5678-4e9f-abcd-ef0123456789",
     identifier: "GEN-103",
     teamId: "team-gen",
-    idAsIdentifier: "GEN-103",
   },
   LIF: {
     issueUuid: "LIF-54",
+    resolvedUuid: "f0e1d2c3-b4a5-4c6d-8e7f-901234567890",
     identifier: "LIF-54",
     teamId: "team-lif",
-    idAsIdentifier: "LIF-54",
   },
 };
 
@@ -163,12 +173,16 @@ function contextFor(state: string, delegate: string | null, identifier: string):
   };
 }
 
-/** Build an IssueWithLabels response (for setStateAtomic / applyStateTransition). */
-function withIdsFor(teamId: string, identifier: string): object {
+/**
+ * Build an IssueWithLabels response (for setStateAtomic / applyStateTransition)
+ * OR the AI-2597 UUID-resolution query response.
+ * `id` is set to `resolvedUuid` when provided, otherwise `identifier`.
+ */
+function withIdsFor(teamId: string, identifier: string, resolvedUuid?: string): object {
   return {
     data: {
       issue: {
-        id: identifier,
+        id: resolvedUuid ?? identifier,
         identifier,
         team: { id: teamId },
         labels: {
@@ -223,6 +237,8 @@ function makeMockFetch(initial: {
   delegate: string | null;
   teamId: string;
   identifier: string;
+  /** AI-2597: the UUID the proxy's resolution query should return. */
+  resolvedUuid?: string;
 }): {
   fetch: typeof globalThis.fetch;
   calls: Array<{ query: string; variables: Record<string, unknown> }>;
@@ -230,7 +246,7 @@ function makeMockFetch(initial: {
 } {
   let currentState = initial.state;
   let currentDelegate = initial.delegate;
-  const { teamId, identifier } = initial;
+  const { teamId, identifier, resolvedUuid } = initial;
   const calls: Array<{ query: string; variables: Record<string, unknown> }> = [];
 
   const mockFetch: typeof globalThis.fetch = async (url, init) => {
@@ -245,12 +261,22 @@ function makeMockFetch(initial: {
     const json = (payload: object) =>
       new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } });
 
+    // AI-2597: UUID resolution query — return the resolved UUID so the proxy
+    // rewrites the identifier before forwarding.
+    if (q.includes("issue(id: $id) { id }")) {
+      if (resolvedUuid) {
+        return json({ data: { issue: { id: resolvedUuid } } });
+      }
+      // Fallback: return the identifier as-is (no resolution needed).
+      return json({ data: { issue: { id: identifier } } });
+    }
+
     // Workflow label queries — must succeed for any team so enforcement can proceed
     if ((q.includes("IssueContext") || q.includes("IssueLabels")) && !q.includes("IssueWithLabels") && !q.includes("TeamStateLabels")) {
       return json(contextFor(currentState, currentDelegate, identifier));
     }
     if (q.includes("IssueWithLabels")) {
-      return json(withIdsFor(teamId, identifier));
+      return json(withIdsFor(teamId, identifier, resolvedUuid));
     }
     if (q.includes("TeamStateLabels")) {
       return json({
@@ -435,11 +461,12 @@ describe("proxy — AI-2597: cross-team write mutations (BBS/GEN/LIF) succeed", 
           delegate: "u-astrid",
           teamId: team.teamId,
           identifier: team.identifier,
+          resolvedUuid: team.resolvedUuid,
         });
         globalThis.fetch = mf.fetch;
 
-        // Use the issueUuid as-is — for BBS/GEN/LIF this is the human-readable
-        // identifier (e.g. "BBS-3"), for AI it's a UUID.
+        // For BBS/GEN/LIF the issueUuid is a human-readable identifier — the
+        // proxy must resolve it to the UUID before forwarding (AI-2597).
         const res = await rawPost(commentCreateReq(team.issueUuid, `${teamName} comment`));
 
         expect(res.status).toBe(200);
@@ -449,13 +476,14 @@ describe("proxy — AI-2597: cross-team write mutations (BBS/GEN/LIF) succeed", 
         const forwarded = countMutationCalls(mf.calls, "commentCreate");
         expect(forwarded).toBeGreaterThanOrEqual(1);
 
-        // The issue ID must pass through to Linear unchanged
+        // AI-2597: the forwarded issueId must be the resolved UUID (not the
+        // human-readable identifier) for all teams.
         const bodyMatch = mf.calls.some(
           (c) =>
             c.query.includes("commentCreate") &&
             c.query.startsWith("mutation") &&
             !c.query.includes("VerifyTransition") &&
-            c.variables?.issueId === team.issueUuid &&
+            c.variables?.issueId === team.resolvedUuid &&
             c.variables?.body === `${teamName} comment`,
         );
         expect(bodyMatch).toBe(true);
@@ -467,6 +495,7 @@ describe("proxy — AI-2597: cross-team write mutations (BBS/GEN/LIF) succeed", 
           delegate: "u-astrid",
           teamId: team.teamId,
           identifier: team.identifier,
+          resolvedUuid: team.resolvedUuid,
         });
         globalThis.fetch = mf.fetch;
 
@@ -491,7 +520,7 @@ describe("proxy — AI-2597: cross-team write mutations (BBS/GEN/LIF) succeed", 
     const lif = TEAMS.LIF;
 
     it("BBS commentCreate (non-intent) — raw note passes through", async () => {
-      const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: bbs.teamId, identifier: bbs.identifier });
+      const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: bbs.teamId, identifier: bbs.identifier, resolvedUuid: bbs.resolvedUuid });
       globalThis.fetch = mf.fetch;
       const res = await rawPost(commentCreateReq(bbs.issueUuid, "BBS raw note"));
       expect(res.status).toBe(200);
@@ -500,7 +529,7 @@ describe("proxy — AI-2597: cross-team write mutations (BBS/GEN/LIF) succeed", 
     });
 
     it("BBS commentCreate under sticky intent — governed path forwards", async () => {
-      const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: bbs.teamId, identifier: bbs.identifier });
+      const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: bbs.teamId, identifier: bbs.identifier, resolvedUuid: bbs.resolvedUuid });
       globalThis.fetch = mf.fetch;
       const res = await intentPost(commentCreateReq(bbs.issueUuid, "BBS governed comment"), "accept");
       expect(res.status).toBe(200);
@@ -508,7 +537,7 @@ describe("proxy — AI-2597: cross-team write mutations (BBS/GEN/LIF) succeed", 
     });
 
     it("GEN commentCreate (non-intent) — raw note passes through", async () => {
-      const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: gen.teamId, identifier: gen.identifier });
+      const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: gen.teamId, identifier: gen.identifier, resolvedUuid: gen.resolvedUuid });
       globalThis.fetch = mf.fetch;
       const res = await rawPost(commentCreateReq(gen.issueUuid, "GEN raw note"));
       expect(res.status).toBe(200);
@@ -517,7 +546,7 @@ describe("proxy — AI-2597: cross-team write mutations (BBS/GEN/LIF) succeed", 
     });
 
     it("LIF commentCreate (non-intent) — raw note passes through", async () => {
-      const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: lif.teamId, identifier: lif.identifier });
+      const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: lif.teamId, identifier: lif.identifier, resolvedUuid: lif.resolvedUuid });
       globalThis.fetch = mf.fetch;
       const res = await rawPost(commentCreateReq(lif.issueUuid, "LIF raw note"));
       expect(res.status).toBe(200);
@@ -526,7 +555,7 @@ describe("proxy — AI-2597: cross-team write mutations (BBS/GEN/LIF) succeed", 
     });
 
     it("BBS delete-comment (non-intent) — forwarded", async () => {
-      const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: bbs.teamId, identifier: bbs.identifier });
+      const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: bbs.teamId, identifier: bbs.identifier, resolvedUuid: bbs.resolvedUuid });
       globalThis.fetch = mf.fetch;
       const res = await rawPost(deleteCommentReq("c-bbs-1"));
       expect(res.status).toBe(200);
@@ -534,7 +563,7 @@ describe("proxy — AI-2597: cross-team write mutations (BBS/GEN/LIF) succeed", 
     });
 
     it("BBS delete-comment under sticky intent — forwarded", async () => {
-      const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: bbs.teamId, identifier: bbs.identifier });
+      const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: bbs.teamId, identifier: bbs.identifier, resolvedUuid: bbs.resolvedUuid });
       globalThis.fetch = mf.fetch;
       const res = await intentPost(deleteCommentReq("c-bbs-2"), "accept");
       expect(res.status).toBe(200);
@@ -542,7 +571,7 @@ describe("proxy — AI-2597: cross-team write mutations (BBS/GEN/LIF) succeed", 
     });
 
     it("BBS issueUpdate (non-intent) — raw state write forwarded", async () => {
-      const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: bbs.teamId, identifier: bbs.identifier });
+      const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: bbs.teamId, identifier: bbs.identifier, resolvedUuid: bbs.resolvedUuid });
       globalThis.fetch = mf.fetch;
       const res = await rawPost(issueUpdateReq(bbs.issueUuid));
       expect(res.status).toBe(200);
@@ -555,7 +584,7 @@ describe("proxy — AI-2597: cross-team write mutations (BBS/GEN/LIF) succeed", 
     const ai = TEAMS.AI;
 
     it("AI commentCreate (non-intent) — still works", async () => {
-      const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: ai.teamId, identifier: ai.identifier });
+      const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: ai.teamId, identifier: ai.identifier, resolvedUuid: ai.resolvedUuid });
       globalThis.fetch = mf.fetch;
       const res = await rawPost(commentCreateReq(ai.issueUuid, "AI raw comment"));
       expect(res.status).toBe(200);
@@ -564,7 +593,7 @@ describe("proxy — AI-2597: cross-team write mutations (BBS/GEN/LIF) succeed", 
     });
 
     it("AI commentCreate under sticky intent — still works", async () => {
-      const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: ai.teamId, identifier: ai.identifier });
+      const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: ai.teamId, identifier: ai.identifier, resolvedUuid: ai.resolvedUuid });
       globalThis.fetch = mf.fetch;
       const res = await intentPost(commentCreateReq(ai.issueUuid, "AI governed comment"), "accept");
       expect(res.status).toBe(200);
@@ -572,14 +601,14 @@ describe("proxy — AI-2597: cross-team write mutations (BBS/GEN/LIF) succeed", 
     });
 
     it("AI delete-comment (non-intent) — still works", async () => {
-      const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: ai.teamId, identifier: ai.identifier });
+      const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: ai.teamId, identifier: ai.identifier, resolvedUuid: ai.resolvedUuid });
       globalThis.fetch = mf.fetch;
       const res = await rawPost(deleteCommentReq("c-ai-1"));
       expect(res.status).toBe(200);
     });
 
     it("AI issueUpdate (non-intent) — still works", async () => {
-      const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: ai.teamId, identifier: ai.identifier });
+      const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: ai.teamId, identifier: ai.identifier, resolvedUuid: ai.resolvedUuid });
       globalThis.fetch = mf.fetch;
       const res = await rawPost(issueUpdateReq(ai.issueUuid));
       expect(res.status).toBe(200);
@@ -598,7 +627,7 @@ describe("proxy — AI-2597: cross-team write mutations (BBS/GEN/LIF) succeed", 
       const results: Array<{ team: string; forwarded: number }> = [];
 
       for (const [teamName, team] of Object.entries(TEAMS)) {
-        const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: team.teamId, identifier: team.identifier });
+        const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: team.teamId, identifier: team.identifier, resolvedUuid: team.resolvedUuid });
         globalThis.fetch = mf.fetch;
 
         const res = await rawPost(commentCreateReq(team.issueUuid, "cross-team body"));
@@ -623,7 +652,7 @@ describe("proxy — AI-2597: cross-team write mutations (BBS/GEN/LIF) succeed", 
      * upstream Linear fetch was called.
      */
     it("BBS write mutations reach the proxy's upstream Linear fetch", async () => {
-      const bbsMf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: TEAMS.BBS.teamId, identifier: TEAMS.BBS.identifier });
+      const bbsMf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: TEAMS.BBS.teamId, identifier: TEAMS.BBS.identifier, resolvedUuid: TEAMS.BBS.resolvedUuid });
       globalThis.fetch = bbsMf.fetch;
 
       const res = await rawPost(commentCreateReq(TEAMS.BBS.issueUuid, "BBS via proxy"));
@@ -640,23 +669,24 @@ describe("proxy — AI-2597: cross-team write mutations (BBS/GEN/LIF) succeed", 
     /**
      * The proxy must not silently drop BBS write mutations on the intent
      * path while allowing the same mutation for AI. It must also not apply
-     * any team-based transformation to the mutation body.
+     * any team-based transformation to the mutation body — but it MUST
+     * resolve human-readable identifiers to UUIDs for all teams (AI-2597).
      */
-    it("proxy does not rewrite issueId based on team", async () => {
+    it("proxy resolves identifiers to UUIDs for every team", async () => {
       for (const [teamName, team] of Object.entries(TEAMS)) {
-        const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: team.teamId, identifier: team.identifier });
+        const mf = makeMockFetch({ state: "intake", delegate: "u-astrid", teamId: team.teamId, identifier: team.identifier, resolvedUuid: team.resolvedUuid });
         globalThis.fetch = mf.fetch;
 
         const body = `test comment for ${teamName}`;
         await rawPost(commentCreateReq(team.issueUuid, body));
 
-        // The forwarded issueId must exactly match what was sent
+        // The forwarded issueId must be the resolved UUID (AI-2597)
         const forwarded = mf.calls.some(
           (c) =>
             c.query.includes("commentCreate") &&
             c.query.startsWith("mutation") &&
             !c.query.includes("VerifyTransition") &&
-            c.variables?.issueId === team.issueUuid,
+            c.variables?.issueId === team.resolvedUuid,
         );
         expect(forwarded).toBe(true);
       }
