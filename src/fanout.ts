@@ -421,7 +421,7 @@ export function extractFindings(description: string | null | undefined, fallback
   const sectionMatch = findingsSectionRegex.exec(description);
 
   if (sectionMatch) {
-    const sectionBody = sectionMatch[1];
+    const sectionBody = sectionMatch[1].replace(/<!--[\s\S]*?-->/g, '');
     // Parse bullet points or numbered lists
     const lineRegex = /[-*]\s+\*\*(.+?)\*\*(?:[:\s-]+(.*))?|[-*]\s+(.+?)(?:\n|$)|\d+\.\s+(.+?)(?:\n|$)/g;
     let match: RegExpExecArray | null;
@@ -512,7 +512,8 @@ export function extractSpecFindings(
   const PER_ENTRY_MARKER_RE = /^\\?\[wf:([^\s\\\]]+)(?:\s*[→>-]\s*([^\s\\\]]+))?\\?\]\s*/;
 
   if (sectionMatch) {
-    const sectionBody = sectionMatch[1];
+    // Strip HTML comments — INF-138.
+    const sectionBody = sectionMatch[1].replace(/<!--[\s\S]*?-->/g, '');
     const lineRegex = /[-*]\s+\*\*(.+?)\*\*(?:[:\s-]+(.*))?|[-*]\s+(.+?)(?:\n|$)|\d+\.\s+(.+?)(?:\n|$)/g;
     let match: RegExpExecArray | null;
     while ((match = lineRegex.exec(sectionBody)) !== null) {
