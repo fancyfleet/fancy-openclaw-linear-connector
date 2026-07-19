@@ -1685,27 +1685,34 @@ describe("checkWorkflowRules — AI-2476: merged-PR release gate (branch/PR veri
   beforeEach(() => { originalFetch = globalThis.fetch; });
   afterEach(() => { globalThis.fetch = originalFetch; });
 
-  it("allows 'continue' from merge state when branch exists and PR exists", async () => {
+  // INF-96: open PR (not merged) is now blocked — only verified merged PR passes.
+  it("blocks 'continue' from merge state when branch and PR exist but are not merged (INF-96)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"], { hasBranch: true, hasPR: true });
-    expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("blocked");
   });
 
-  it("allows 'continue' from deploy state when branch exists and PR exists", async () => {
+  it("blocks 'continue' from deploy state when branch and PR exist but are not merged (INF-96)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deploy"], { hasBranch: true, hasPR: true });
-    expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("blocked");
   });
 
-  // AI-1797: branch/PR status comes from GitHub PR attachments; a PR attachment
-  // implies a pushed branch, so branch-only / PR-only partial evidence no longer
-  // exists and an open (unmerged) PR passes, matching prior branch+PR semantics.
-  it("allows 'continue' from merge state with an open PR attachment (PR implies pushed branch, AI-1797)", async () => {
+  // INF-96: open (unmerged) PR no longer passes the gate.
+  it("blocks 'continue' from merge state with an open PR attachment (INF-96)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"], { hasBranch: false, hasPR: true });
-    expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("blocked");
   });
 
-  it("allows 'continue' from deploy state with an open PR attachment (PR implies pushed branch, AI-1797)", async () => {
+  it("blocks 'continue' from deploy state with an open PR attachment (INF-96)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deploy"], { hasBranch: false, hasPR: true });
-    expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("blocked");
   });
 
   // AI-1797 regression: schema-level errors payload → fail-open with alert.
@@ -1742,17 +1749,19 @@ describe("checkWorkflowRules — AI-2476: merged-PR release gate (branch/PR veri
     }
   });
 
-  // AI-1497: Complete absence of evidence is now fail-open — data likely lost to auto-delete.
-  it("allows 'continue' from merge state when neither branch nor PR exist (AI-1497 fail-open)", async () => {
+  // INF-96: Complete absence of evidence is now a hard block (was AI-1497 fail-open).
+  it("blocks 'continue' from merge state when neither branch nor PR exist (INF-96)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"], { hasBranch: false, hasPR: false });
     const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
-    expect(result).toBeNull(); // fail-open: data likely lost to auto-delete
+    expect(result).not.toBeNull();
+    expect(result).toContain("blocked");
   });
 
-  it("allows 'continue' from deploy state when neither branch nor PR exist (AI-1497 fail-open)", async () => {
+  it("blocks 'continue' from deploy state when neither branch nor PR exist (INF-96)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deploy"], { hasBranch: false, hasPR: false });
     const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
-    expect(result).toBeNull(); // fail-open: data likely lost to auto-delete
+    expect(result).not.toBeNull();
+    expect(result).toContain("blocked");
   });
 
   // AI-1497: null after retry is now fail-open to avoid stranding tickets.
@@ -1874,8 +1883,8 @@ describe("applyStateTransition — AI-2476: merged-PR release gate defense-in-de
   // v8 literal verb (deploy/handoff-host-deploy). Both merge→deploy and
   // deploy→ac-validate forward carries trigger the gate.
 
-  it("allows label swap from merge state with open PR attachment (PR implies branch, AI-1797)", async () => {
-    const { fetch: mock, calls } = makeTransitionFetch({
+  it("blocks label swap from merge state with open PR attachment (INF-96)", async () => {
+    const { fetch: mock } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
         { id: "state-lbl", name: "state:merge" },
@@ -1884,13 +1893,13 @@ describe("applyStateTransition — AI-2476: merged-PR release gate defense-in-de
       branchStatus: { hasBranch: false, hasPR: true },
     });
     globalThis.fetch = mock;
-    await applyStateTransition("continue", "issue-uuid", "Bearer tok");
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
-    expect(updateCall).toBeDefined();
+    const result = await applyStateTransition("continue", "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toHaveProperty("status", "blocked");
   });
 
-  it("allows label swap from deploy state with open PR attachment (PR implies branch, AI-1797)", async () => {
-    const { fetch: mock, calls } = makeTransitionFetch({
+  it("blocks label swap from deploy state with open PR attachment (INF-96)", async () => {
+    const { fetch: mock } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
         { id: "state-lbl", name: "state:deploy" },
@@ -1899,9 +1908,9 @@ describe("applyStateTransition — AI-2476: merged-PR release gate defense-in-de
       branchStatus: { hasBranch: false, hasPR: true },
     });
     globalThis.fetch = mock;
-    await applyStateTransition("continue", "issue-uuid", "Bearer tok");
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
-    expect(updateCall).toBeDefined();
+    const result = await applyStateTransition("continue", "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toHaveProperty("status", "blocked");
   });
 
   // AI-1797 regression: a schema-level errors payload (the silent fail-open bug)
@@ -1922,8 +1931,8 @@ describe("applyStateTransition — AI-2476: merged-PR release gate defense-in-de
     expect(updateCall).toBeDefined();
   });
 
-  it("allows label swap from merge state when branch + PR exist", async () => {
-    const { fetch: mock, calls } = makeTransitionFetch({
+  it("blocks label swap from merge state when branch + PR exist but not merged (INF-96)", async () => {
+    const { fetch: mock } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
         { id: "state-lbl", name: "state:merge" },
@@ -1932,13 +1941,13 @@ describe("applyStateTransition — AI-2476: merged-PR release gate defense-in-de
       branchStatus: { hasBranch: true, hasPR: true },
     });
     globalThis.fetch = mock;
-    await applyStateTransition("continue", "issue-uuid", "Bearer tok");
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
-    expect(updateCall).toBeDefined();
+    const result = await applyStateTransition("continue", "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toHaveProperty("status", "blocked");
   });
 
-  it("allows label swap from deploy state when branch + PR exist", async () => {
-    const { fetch: mock, calls } = makeTransitionFetch({
+  it("blocks label swap from deploy state when branch + PR exist but not merged (INF-96)", async () => {
+    const { fetch: mock } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
         { id: "state-lbl", name: "state:deploy" },
@@ -1947,9 +1956,9 @@ describe("applyStateTransition — AI-2476: merged-PR release gate defense-in-de
       branchStatus: { hasBranch: true, hasPR: true },
     });
     globalThis.fetch = mock;
-    await applyStateTransition("continue", "issue-uuid", "Bearer tok");
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
-    expect(updateCall).toBeDefined();
+    const result = await applyStateTransition("continue", "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toHaveProperty("status", "blocked");
   });
 
   it("gate does NOT block non-forward transitions (reject) from merge state", async () => {
@@ -2013,9 +2022,9 @@ describe("applyStateTransition — AI-2476: merged-PR release gate defense-in-de
     expect(updateCall).toBeDefined();
   });
 
-  // AI-1497: complete absence of evidence is fail-open in B2 too.
-  it("allows label swap from merge state when neither branch nor PR exist (AI-1497 fail-open)", async () => {
-    const { fetch: mock, calls } = makeTransitionFetch({
+  // INF-96: complete absence of evidence is now hard-block in B2 too.
+  it("blocks label swap from merge state when neither branch nor PR exist (INF-96)", async () => {
+    const { fetch: mock } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
         { id: "state-lbl", name: "state:merge" },
@@ -2024,13 +2033,13 @@ describe("applyStateTransition — AI-2476: merged-PR release gate defense-in-de
       branchStatus: { hasBranch: false, hasPR: false },
     });
     globalThis.fetch = mock;
-    await applyStateTransition("continue", "issue-uuid", "Bearer tok");
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
-    expect(updateCall).toBeDefined();
+    const result = await applyStateTransition("continue", "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toHaveProperty("status", "blocked");
   });
 
-  it("allows label swap from deploy state when neither branch nor PR exist (AI-1497 fail-open)", async () => {
-    const { fetch: mock, calls } = makeTransitionFetch({
+  it("blocks label swap from deploy state when neither branch nor PR exist (INF-96)", async () => {
+    const { fetch: mock } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
         { id: "state-lbl", name: "state:deploy" },
@@ -2039,9 +2048,9 @@ describe("applyStateTransition — AI-2476: merged-PR release gate defense-in-de
       branchStatus: { hasBranch: false, hasPR: false },
     });
     globalThis.fetch = mock;
-    await applyStateTransition("continue", "issue-uuid", "Bearer tok");
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
-    expect(updateCall).toBeDefined();
+    const result = await applyStateTransition("continue", "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toHaveProperty("status", "blocked");
   });
 
   // AI-1497: null after retry is fail-open in B2.
@@ -4915,9 +4924,9 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
       expect(deployTransitions).toHaveLength(0);
     });
 
-    // AI-1497: deploy now fails open when no branch/PR evidence exists (data likely lost to auto-delete).
-    // Previously this blocked, but the absence of evidence is not evidence of absence.
-    it("dev-impl merge passes done gate when no branch/PR evidence (AI-1497 fail-open)", async () => {
+    // INF-96: no branch/PR evidence is now a hard block (reverses AI-1497 fail-open).
+    // The done gate no longer silently passes tickets with zero GitHub evidence.
+    it("blocks dev-impl merge when no branch/PR evidence (INF-96)", async () => {
       const devImplFixture = path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml");
       process.env.WORKFLOW_DEF_PATH = devImplFixture;
       resetWorkflowCache();
@@ -4929,7 +4938,8 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
 
       globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge", "stakes:low"], { hasBranch: false, hasPR: false });
       const result = await checkWorkflowRules("continue", "AI-3001", "Bearer tok", "hanzo");
-      expect(result).toBeNull(); // AI-1497: fail-open on no evidence
+      expect(result).not.toBeNull(); // INF-96: block on no evidence
+      expect(result).toContain("blocked");
 
       process.env.WORKFLOW_DEF_PATH = CANONICAL_SPRINT_FIXTURE;
       process.env.CAPABILITY_POLICY_PATH = path.join(c3Dir, "capability-policy.yaml");
