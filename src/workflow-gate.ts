@@ -93,6 +93,19 @@ export function _setLogForTests(testLogger?: Logger): void {
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 
+/**
+ * Base URL for the GitHub REST API. Used to verify PR merge state directly
+ * when Linear's GitHub integration attachment metadata is stale.
+ */
+const GITHUB_API_BASE = "https://api.github.com";
+
+/**
+ * Optional GitHub personal access token for API verification of PR merge state.
+ * Set via GITHUB_TOKEN or GH_TOKEN env var. When unset, falls back to
+ * unauthenticated requests (public repos only, lower rate limit).
+ */
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? null;
+
 /** Resolve the workflow def path dynamically (reads env each call so test beforeAll works). */
 function workflowDefPath(): string {
   return process.env.WORKFLOW_DEF_PATH ?? defaultWorkflowDefPath();
@@ -1757,11 +1770,52 @@ async function fetchBranchAndPRStatus(
     const nodes = issue.attachments?.nodes ?? [];
     const prNodes = nodes.filter((n) => typeof n.url === "string" && /github\.com\/[^/]+\/[^/]+\/pull\/\d+/i.test(n.url));
     const hasPR = prNodes.length > 0;
-    const hasMergedPR = prNodes.some((n) => {
+    // hasMergedPR: any PR attachment has metadata.status === "merged".
+    // prMetadataAvailable: any PR attachment has explicit status/state metadata
+    // ("merged", "open", etc.), as opposed to the INF-112 metadata-gap case
+    // where the attachment URL exists but Linear's GitHub integration didn't
+    // sync merge status (externally-created branches).
+    let hasMergedPR = false;
+    let prMetadataAvailable = false;
+    for (const n of prNodes) {
       const meta = n.metadata ?? {};
       const status = (meta as { status?: unknown; state?: unknown }).status ?? (meta as { state?: unknown }).state;
-      return typeof status === "string" && status.toLowerCase() === "merged";
-    });
+      if (typeof status === "string") {
+        prMetadataAvailable = true;
+        if (status.toLowerCase() === "merged") {
+          hasMergedPR = true;
+        }
+      }
+    }
+    const attachmentPrUrls = prNodes.map((n) => n.url ?? "");
+
+    // INF-121: Fall back to scanning the issue description for GitHub PR URLs
+    // when no attachment-based PR evidence exists. This covers the case where
+    // Linear's GitHub integration is not installed or didn't correlate the PR
+    // (externally-created branches, no attachment metadata sync).
+    const descPrUrls: string[] = [];
+    const desc = issue.description ?? "";
+    if (!hasPR && desc) {
+      const descPrPattern = /https?:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/gi;
+      let match: RegExpExecArray | null;
+      while ((match = descPrPattern.exec(desc)) !== null) {
+        descPrUrls.push(match[0]);
+      }
+      if (descPrUrls.length > 0) {
+        log.info(`workflow-gate: found ${descPrUrls.length} PR URL(s) in issue description for ${issueId} (INF-121 description fallback)`);
+      }
+    }
+
+    const allPrUrls = [...attachmentPrUrls, ...descPrUrls];
+
+    // INF-132: If no PR is confirmed merged by Linear metadata, verify via
+    // GitHub API. Linear's GitHub integration syncs PR data asynchronously, so
+    // metadata can be stale — a merged PR may still show "open" in Linear for
+    // minutes or longer. The GitHub API is the source of truth. Check both
+    // attachment-based and description-scanned URLs for full coverage.
+    if (!hasMergedPR && allPrUrls.length > 0) {
+      hasMergedPR = await verifyPrMergeStateViaGitHub(allPrUrls);
+    }
     return {
       // Attachments cannot see branches directly; a PR implies a pushed branch.
       hasBranch: hasPR,
@@ -1773,6 +1827,68 @@ async function fetchBranchAndPRStatus(
     log.warn(`workflow-gate: branch/PR fetch failed for ${issueId}: ${msg}`);
     return null;
   }
+}
+
+/**
+ * Verify PR merge state directly via the GitHub API (INF-132).
+ *
+ * Linear's GitHub integration attachment metadata can be stale — a merged PR
+ * may still show "open" in Linear for an extended period. This function queries
+ * the GitHub REST API for each PR URL to get the authoritative merge state.
+ *
+ * Returns true when ANY of the given PR URLs has been merged on GitHub.
+ * Returns false when all PRs are open/closed-without-merge, or on any API
+ * error (fail-open: a GitHub API failure does not block the release gate;
+ * Linear's metadata is the primary source, GitHub is a fallback).
+ *
+ * Supports optional GITHUB_TOKEN / GH_TOKEN env var for authenticated requests
+ * (higher rate limit, private repo access). Falls back to unauthenticated
+ * requests when no token is available.
+ */
+async function verifyPrMergeStateViaGitHub(prUrls: string[]): Promise<boolean> {
+  for (const prUrl of prUrls) {
+    const parsed = parseGitHubPrUrl(prUrl);
+    if (!parsed) continue;
+    const { owner, repo, number } = parsed;
+    try {
+      const headers: Record<string, string> = {
+        Accept: "application/vnd.github.v3+json",
+        "User-Agent": "fancy-openclaw-linear-connector",
+      };
+      if (GITHUB_TOKEN) {
+        headers.Authorization = `Bearer ${GITHUB_TOKEN}`;
+      }
+      // GET /repos/{owner}/{repo}/pulls/{pull_number}
+      // Response includes `merged` (boolean) and `merged_at` (ISO timestamp).
+      const res = await fetch(`${GITHUB_API_BASE}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${number}`, { headers });
+      if (!res.ok) {
+        log.warn(`INF-132: GitHub API returned ${res.status} for ${owner}/${repo}#${number} — skipping GitHub verification (falling back to Linear metadata)`);
+        continue;
+      }
+      type GitHubPrResponse = { merged?: boolean };
+      const prData = (await res.json()) as GitHubPrResponse;
+      if (prData.merged === true) {
+        log.info(`INF-132: GitHub API confirmed PR ${owner}/${repo}#${number} is merged, overriding stale Linear metadata`);
+        return true;
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`INF-132: GitHub API fetch failed for ${owner}/${repo}#${number}: ${msg} — skipping GitHub verification (falling back to Linear metadata)`);
+      continue;
+    }
+  }
+  return false;
+}
+
+/**
+ * Extract owner, repo, and PR number from a GitHub PR URL.
+ * Example: https://github.com/fancymatt/fancy-openclaw-linear-connector/pull/307
+ * Returns null if the URL doesn't match the expected pattern.
+ */
+function parseGitHubPrUrl(url: string): { owner: string; repo: string; number: number } | null {
+  const m = /^https?:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?\/pull\/(\d+)(?:\/.*)?$/i.exec(url.trim());
+  if (!m) return null;
+  return { owner: m[1], repo: m[2], number: parseInt(m[3], 10) };
 }
 
 // ── Repo resolution for the no-CI-auto-deploy guard (AI-1795) ─────────────
