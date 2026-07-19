@@ -508,6 +508,19 @@ export function validateFanoutSpec(
         `Add a '## ${config.spec_source}' section with at least one bullet (e.g. "- **Title**: detail") and retry the spawn.`,
     };
   }
+  // INF-136: max_findings guard — enforce an upper bound on spec entries per
+  // fan-out cycle. When set, a spec with more entries than the limit is refused
+  // (not truncated). Intended to enforce "one child per cycle" invariants
+  // (e.g. sprint-spawner's launching fanout with max_findings: 1).
+  if (config.max_findings !== undefined && findings.length > config.max_findings) {
+    return {
+      ok: false,
+      reason:
+        `fan-out spec has ${findings.length} entries, but max_findings=${config.max_findings} limits each cycle to ${config.max_findings}. ` +
+        `Reduce the '## ${config.spec_source}' section to at most ${config.max_findings} bullet(s) and retry the spawn.`,
+    };
+  }
+
   // AI-2199: validate per-entry child workflow ids against the registry.
   // When registeredWorkflows is provided, every finding with child_workflow
   // set must reference a registered workflow id. Fail-closed: one unregistered
@@ -1031,6 +1044,22 @@ export async function executeFanout(
       findingIndex: -1,
       message: `No '${config.spec_source}' entries found — fan-out requires at least one parseable spec entry`,
     });
+    return result;
+  }
+
+  // INF-136: max_findings runtime safety net — enforce upper bound even if
+  // the pre-flight validateFanoutSpec was bypassed (e.g. direct executeFanout
+  // call with findingsOverride). The pre-flight check in validateFanoutSpec is
+  // the primary gate; this is defense-in-depth.
+  if (config.max_findings !== undefined && findings.length > config.max_findings) {
+    result.refused = true;
+    result.errors.push({
+      findingIndex: -1,
+      message:
+        `Refusing fan-out: spec has ${findings.length} entries, but max_findings=${config.max_findings} ` +
+        `limits this cycle to ${config.max_findings} — one cycle, one child`,
+    });
+    log.warn(`fanout: REFUSED — max_findings=${config.max_findings} exceeded (${findings.length} entries) for ${parentIssueId}`);
     return result;
   }
 

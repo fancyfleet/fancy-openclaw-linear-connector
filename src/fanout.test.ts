@@ -11,7 +11,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { extractFindings, executeFanout, shouldTriggerFanout, type Finding } from "./fanout.js";
+import { extractFindings, executeFanout, shouldTriggerFanout, validateFanoutSpec, type Finding } from "./fanout.js";
 import { applyStateTransition, resetWorkflowCache, type WorkflowDef, type FanoutConfig } from "./workflow-gate.js";
 import { reloadAgents } from "./agents.js";
 import { resetPolicyCache } from "./escalation-gate.js";
@@ -246,6 +246,98 @@ describe("shouldTriggerFanout (AI-1992: config-driven)", () => {
 
   it("returns falsy for all wrong", () => {
     expect(shouldTriggerFanout(devImplDef, "implementation", "submit")).toBeFalsy();
+  });
+});
+
+// ── INF-136: max_findings guard ────────────────────────────────────────────
+
+describe("validateFanoutSpec — max_findings guard (INF-136)", () => {
+  // AC3: a two-bullet ## sprint section with max_findings=1 is refused
+  it("refuses when findings exceed max_findings", () => {
+    const desc = [
+      "## sprint",
+      "- **Sprint 1**: Theme A",
+      "- **Sprint 2**: Theme B",
+    ].join("\n");
+
+    const config: FanoutConfig = {
+      spec_source: "sprint",
+      child_workflow: "wf:dev-sprint",
+      max_findings: 1,
+    };
+
+    const result = validateFanoutSpec(desc, config);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("max_findings=1");
+      expect(result.reason).toContain("2 entries");
+    }
+  });
+
+  // AC3: a single-bullet ## sprint section with max_findings=1 passes
+  it("allows single finding within max_findings limit", () => {
+    const desc = [
+      "## sprint",
+      "- **Sprint 1**: Theme A",
+    ].join("\n");
+
+    const config: FanoutConfig = {
+      spec_source: "sprint",
+      child_workflow: "wf:dev-sprint",
+      max_findings: 1,
+    };
+
+    const result = validateFanoutSpec(desc, config);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.findings).toHaveLength(1);
+      expect(result.findings[0].title).toBe("Sprint 1");
+    }
+  });
+
+  // AC3: backward compat — max_findings undefined allows multiple
+  it("allows multiple findings when max_findings is undefined (backward compat)", () => {
+    const desc = [
+      "## sprint",
+      "- **Sprint A**: Theme X",
+      "- **Sprint B**: Theme Y",
+      "- **Sprint C**: Theme Z",
+    ].join("\n");
+
+    const config: FanoutConfig = {
+      spec_source: "sprint",
+      child_workflow: "wf:dev-sprint",
+      // max_findings deliberately omitted
+    };
+
+    const result = validateFanoutSpec(desc, config);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.findings).toHaveLength(3);
+    }
+  });
+
+  it("refuses with correct count in error message", () => {
+    const desc = [
+      "## sprint",
+      "- **One**: First",
+      "- **Two**: Second",
+      "- **Three**: Third",
+      "- **Four**: Fourth",
+    ].join("\n");
+
+    const config: FanoutConfig = {
+      spec_source: "sprint",
+      child_workflow: "wf:dev-sprint",
+      max_findings: 2,
+    };
+
+    const result = validateFanoutSpec(desc, config);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("4 entries");
+      expect(result.reason).toContain("max_findings=2");
+    }
   });
 });
 
@@ -732,6 +824,75 @@ describe("executeFanout — mocked Linear API", () => {
     // Preview comment was posted
     const commentCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("commentCreate"));
     expect(commentCalls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  // ── INF-136: max_findings runtime safety net in executeFanout ──────────
+
+  it("INF-136: executeFanout refuses when max_findings exceeded (defense-in-depth)", async () => {
+    const config: FanoutConfig = {
+      spec_source: "findings",
+      child_workflow: "wf:dev-impl",
+      max_findings: 1,
+    };
+    const findings: Finding[] = [
+      { title: "Finding One" },
+      { title: "Finding Two" },
+    ];
+
+    globalThis.fetch = makeFanoutFetch({});
+
+    const result = await executeFanout("AI-1439", "Bearer tok", config, {
+      findingsOverride: findings,
+      skipPreview: true,
+    });
+
+    expect(result.refused).toBe(true);
+    expect(result.created).toBe(0);
+    expect(result.childIdentifiers).toHaveLength(0);
+    expect(result.errors[0].message).toContain("max_findings=1");
+  });
+
+  it("INF-136: executeFanout allows findings within max_findings limit", async () => {
+    const config: FanoutConfig = {
+      spec_source: "findings",
+      child_workflow: "wf:dev-impl",
+      max_findings: 3,
+    };
+    const findings: Finding[] = [
+      { title: "Finding One" },
+      { title: "Finding Two" },
+    ];
+
+    globalThis.fetch = makeFanoutFetch({});
+
+    const result = await executeFanout("AI-1439", "Bearer tok", config, {
+      findingsOverride: findings,
+      skipPreview: true,
+    });
+
+    expect(result.refused).toBe(false);
+    expect(result.created).toBe(2);
+  });
+
+  it("INF-136: executeFanout max_findings undefined allows any count", async () => {
+    const config: FanoutConfig = {
+      spec_source: "findings",
+      child_workflow: "wf:dev-impl",
+      // max_findings deliberately omitted
+    };
+    const findings: Finding[] = Array.from({ length: 10 }, (_, i) => ({
+      title: `Finding ${i + 1}`,
+    }));
+
+    globalThis.fetch = makeFanoutFetch({});
+
+    const result = await executeFanout("AI-1439", "Bearer tok", config, {
+      findingsOverride: findings,
+      skipPreview: true,
+    });
+
+    expect(result.refused).toBe(false);
+    expect(result.created).toBe(10);
   });
 });
 

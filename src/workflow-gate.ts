@@ -171,6 +171,13 @@ export interface FanoutConfig {
    *  ONLY if the predicate evaluates to true. When absent, unconditional spawn
    *  behavior is preserved (no regression). */
   spawn_if?: SpawnIfConfig;
+  /** INF-136: maximum number of findings/spec entries allowed per fan-out cycle.
+   *  When set, a `## <spec_source>` section with more entries than this limit is
+   *  refused with a loud alert — no children are minted. Intended to enforce the
+   *  "one sprint child per cycle" invariant on sprint-spawner's launching fanout
+   *  (max_findings: 1), but available generically for any fanout state.
+   *  Default (undefined): no limit, existing behavior preserved. */
+  max_findings?: number;
 }
 
 export interface WorkflowState {
