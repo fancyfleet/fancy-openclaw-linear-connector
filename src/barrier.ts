@@ -504,13 +504,15 @@ export async function evaluateBarrier(
     if (filtered.length === 0) {
       // No expected children found — treat as zero, which means
       // all-terminal (vacuous satisfaction for the expected set).
-      return { allTerminal: true, totalChildren: 0, terminalCount: 0, children: [] };
+      return { allTerminal: true, totalChildren: 0, terminalCount: 0, orphanedCount: 0, children: [] };
     }
     const terminalCount = filtered.filter((c) => c.isTerminal).length;
+    const orphanedCount = filtered.filter((c) => c.isOrphaned).length;
     return {
-      allTerminal: terminalCount === filtered.length,
+      allTerminal: orphanedCount === 0 && terminalCount === filtered.length,
       totalChildren: filtered.length,
       terminalCount,
+      orphanedCount,
       children: filtered,
     };
   }
