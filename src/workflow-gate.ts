@@ -1291,56 +1291,125 @@ async function findOrCreateLabel(
       `workflow-gate: B2 label create FAIL-CLOSED for '${labelName}' in team ${teamId} (${group ? `child of group '${groupName}'` : "flat"}): success=${result?.success ?? "null"} errors=${errorBody}`,
     );
 
-    // AI-2543 inherited-label promotion: Linear rejects a parent-team create with
-    // "conflicting inherited label" and tells us to use `replaceTeamLabels` to promote
-    // the label to this team. Retry with the promotion argument; the promoted label
-    // is then owned by this team and accepted on issueUpdate.
-    // (Replaces the AI-2176 fallback that borrowed the parent id — that id is rejected
-    // by Linear's issueUpdate, blocking all governed transitions on the sub-team.)
+    // INF-74: `replaceTeamLabels` is NOT a valid field on `IssueLabelCreateInput`
+    // (removed from the Linear GraphQL schema). Any retry with `replaceTeamLabels: true`
+    // returns a GraphQL validation error and always falls through to `return null`.
+    //
+    // Three-tier fallback (tried in order):
+    //
+    // Tier 1: Workspace-level create (omit `teamId`).
+    //   Creates a label visible to all teams with no ownership restrictions.
+    //   For workflow state labels (state:*) this is semantically correct — they
+    //   are universal, not team-specific. Works when the label name is unique
+    //   across the org.
+    //
+    // Tier 2: Existing-label search.
+    //   When workspace-level create fails with "duplicate label name" (name already
+    //   exists as a team-level label on GEN/BBS/etc.), search all org teams for
+    //   the existing label and return its ID as best-effort. Logs a warning that
+    //   issueUpdate may reject it ("labelIds for incorrect team") — the caller
+    //   should be prepared for this.
+    //
+    // Tier 3: Manual migration warning.
+    //   If nothing can be found, logs a clear error directing to manual migration
+    //   steps (archive conflicting team-level labels, create workspace-level versions).
     const isInheritedConflict = createData.errors &&
       Array.isArray(createData.errors) &&
       createData.errors.some((e: Record<string, unknown>) =>
         typeof e.message === "string" && e.message.includes("conflicting inherited label"),
       );
     if (isInheritedConflict) {
-      log.info(`workflow-gate: attempting inherited-label promotion for '${labelName}' on team ${teamId}`);
-      const promoteMutation = group
-        ? `
-        mutation PromoteLabel($teamId: String!, $name: String!, $color: String!, $parentId: String!, $replaceTeamLabels: Boolean!) {
-          issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color, parentId: $parentId, replaceTeamLabels: $replaceTeamLabels }) {
-            success
-            issueLabel { id }
-          }
-        }
-      `
-        : `
-        mutation PromoteLabel($teamId: String!, $name: String!, $color: String!, $replaceTeamLabels: Boolean!) {
-          issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color, replaceTeamLabels: $replaceTeamLabels }) {
+      log.info(`workflow-gate: inherited-conflict for '${labelName}' on team ${teamId} — trying three-tier fallback`);
+
+      // ── Tier 1: Workspace-level create (omit teamId) ──
+      const wsMutation = `
+        mutation WsLabelCreate($name: String!, $color: String!) {
+          issueLabelCreate(input: { name: $name, color: $color }) {
             success
             issueLabel { id }
           }
         }
       `;
-      const promoteVars = group
-        ? { teamId, name: createName, color: "#94a3b8", parentId: group.id, replaceTeamLabels: true }
-        : { teamId, name: createName, color: "#94a3b8", replaceTeamLabels: true };
+      const wsVars = { name: createName, color: "#94a3b8" };
       try {
-        const promoteRes = await fetch(LINEAR_API_URL, {
+        const wsRes = await fetch(LINEAR_API_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: authToken },
-          body: JSON.stringify({ query: promoteMutation, variables: promoteVars }),
+          body: JSON.stringify({ query: wsMutation, variables: wsVars }),
         });
-        const promoteData = (await promoteRes.json()) as CreateResp;
-        const promoteResult = promoteData.data?.issueLabelCreate;
-        if (promoteResult?.success && promoteResult.issueLabel) {
-          log.info(`workflow-gate: promoted inherited label '${labelName}' to team ${teamId} as id=${promoteResult.issueLabel.id}`);
-          return promoteResult.issueLabel.id;
+        const wsData = (await wsRes.json()) as CreateResp;
+        const wsResult = wsData.data?.issueLabelCreate;
+        if (wsResult?.success && wsResult.issueLabel) {
+          log.info(`workflow-gate: workspace-level create succeeded for '${labelName}' as id=${wsResult.issueLabel.id}`);
+          return wsResult.issueLabel.id;
         }
-        const errBody = promoteData.errors ? JSON.stringify(promoteData.errors) : "none";
-        log.warn(`workflow-gate: inherited-label promotion FAILED for '${labelName}' on team ${teamId}: success=${promoteResult?.success ?? "null"} errors=${errBody}`);
-      } catch (promoteErr) {
-        const promoteMsg = promoteErr instanceof Error ? promoteErr.message : String(promoteErr);
-        log.warn(`workflow-gate: inherited-label promotion query failed: ${promoteMsg}`);
+        const wsErrBody = wsData.errors ? JSON.stringify(wsData.errors) : "none";
+        log.warn(`workflow-gate: workspace-level create failed for '${labelName}': success=${wsResult?.success ?? "null"} errors=${wsErrBody}`);
+
+        // ── Tier 2: Org-wide search for the existing label ──
+        const isDuplicateName = Array.isArray(wsData.errors) &&
+          wsData.errors.some((e: Record<string, unknown>) =>
+            typeof e.message === "string" && e.message.includes("duplicate label name"),
+          );
+        if (isDuplicateName) {
+          // Fetch all teams in the org
+          const orgTeamsQuery = `
+            query OrgTeams {
+              teams { nodes { id } }
+            }
+          `;
+          const teamsRes = await fetch(LINEAR_API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: authToken },
+            body: JSON.stringify({ query: orgTeamsQuery }),
+          });
+          const teamsData = (await teamsRes.json()) as { data?: { teams?: { nodes: Array<{ id: string }> } }; errors?: unknown };
+          const orgTeamIds = teamsData.data?.teams?.nodes?.map((t) => t.id) ?? [];
+          log.info(`workflow-gate: searching ${orgTeamIds.length} teams for existing label '${labelName}'`);
+
+          for (const tid of orgTeamIds) {
+            // Skip the requesting team — we already know it doesn't own the label
+            if (tid === teamId) continue;
+            const otherTeamQuery = `
+              query OtherTeamLabels($tid: String!) {
+                team(id: $tid) { labels(first: 250) { nodes { id name isGroup team { id } parent { id name } } } }
+              }
+            `;
+            const otherRes = await fetch(LINEAR_API_URL, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Authorization: authToken },
+              body: JSON.stringify({ query: otherTeamQuery, variables: { tid } }),
+            });
+            const otherData = (await otherRes.json()) as { data?: { team?: { labels: { nodes: LabelNode[] } } }; errors?: unknown };
+            const otherNodes = otherData.data?.team?.labels?.nodes ?? [];
+            // Match logic: flat name match or group-child match
+            const flatMatch = otherNodes.find((n) => n.name === labelName && !n.isGroup && (n.team == null || n.team.id === tid));
+            if (flatMatch) {
+              log.warn(`workflow-gate: found existing label '${labelName}' in team ${tid} as id=${flatMatch.id} — this is a best-effort fallback; issueUpdate may reject inherited label IDs`);
+              return flatMatch.id;
+            }
+            if (groupName) {
+              const childMatch = otherNodes.find(
+                (n) => !n.isGroup && n.parent?.name === groupName && n.name === childName && (n.team == null || n.team.id === tid),
+              );
+              if (childMatch) {
+                log.warn(`workflow-gate: found existing label '${labelName}' in team ${tid} as id=${childMatch.id} (group-child) — this is a best-effort fallback; issueUpdate may reject inherited label IDs`);
+                return childMatch.id;
+              }
+            }
+          }
+
+          // ── Tier 3: Nothing found — manual migration required ──
+          log.error(
+            `workflow-gate: MANUAL MIGRATION REQUIRED — label '${labelName}' exists as a team-level label ` +
+            `somewhere in the org but could not be resolved. Archive the conflicting team-level label(s) ` +
+            `and create workspace-level versions, or use the Linear UI to create the label on team ${teamId}.`,
+          );
+          return null;
+        }
+      } catch (wsErr) {
+        const wsMsg = wsErr instanceof Error ? wsErr.message : String(wsErr);
+        log.warn(`workflow-gate: workspace-level create query failed: ${wsMsg}`);
       }
     }
 
