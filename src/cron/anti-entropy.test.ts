@@ -68,7 +68,7 @@ function writeWorkflowDef(overrides: Partial<Record<string, unknown>> = {}): str
       { id: "intake",   native_state: "todo",     owner_role: "steward" },
       { id: "auditing", native_state: "doing",    owner_role: "dev" },
       { id: "spawning", native_state: "doing",    owner_role: "dev" },
-      { id: "managing", native_state: "managing", owner_role: "dev" },
+      { id: "managing", native_state: "managing", owner_role: "dev", barrier: true, transitions: [{ command: "complete", to: "review" }] },
       { id: "review",   native_state: "thinking", owner_role: "code-review" },
       { id: "done",     native_state: "done" },
       { id: "escape",   native_state: "invalid" },
