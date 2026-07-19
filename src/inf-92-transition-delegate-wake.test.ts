@@ -164,6 +164,7 @@ function makeStatefulMock(captured: CapturedWrites): {
     labelNames: string[],
     delegateId: string | null,
     delegateName: string | null,
+    identifierOverride?: string,
   ) {
     const labels = labelNames.map((name) => ({
       id: teamLabels.get(name) ?? `label-${name}`,
@@ -175,7 +176,7 @@ function makeStatefulMock(captured: CapturedWrites): {
     const stateLabelName = stateLabel?.name ?? "state:implementation";
 
     issues.set(id, {
-      identifier: id,
+      identifier: identifierOverride ?? id,
       labels,
       delegateId,
       delegateName,
@@ -189,8 +190,11 @@ function makeStatefulMock(captured: CapturedWrites): {
     return issues.get(id)?.delegateId ?? null;
   }
 
-  // Initialize a default issue
-  setIssue(ISSUE_UUID, ["wf:dev-impl", "state:implementation"], "user-igor", "igor");
+  // Initialize a default issue — internal GraphQL id is ISSUE_UUID but
+  // the human-readable identifier is TEST_IDENTIFIER ("LIF-54"), matching
+  // how the Linear API returns both the UUID internal id and a short
+  // human-friendly identifier.
+  setIssue(ISSUE_UUID, ["wf:dev-impl", "state:implementation"], "user-igor", "igor", TEST_IDENTIFIER);
 
   const fetch = async (url: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const urlStr = url.toString();

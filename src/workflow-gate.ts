@@ -3177,6 +3177,22 @@ export interface TransitionFeedback {
   wakeId?: string | null;
 }
 
+/**
+ * INF-92: Payload for the onTransitionWake callback — emitted when a governed
+ * transition stamps a delegate on a work-eligible state so the dispatch layer
+ * can wake the newly-assigned agent.
+ */
+export interface TransitionWakeData {
+  /** Agent name that was stamped as delegate (e.g. "cra"). */
+  agentName: string;
+  /** Human-readable ticket identifier (e.g. "LIF-54"). */
+  ticketIdentifier: string;
+  /** Destination workflow state name (e.g. "code-review"). */
+  workflowState: string;
+  /** Source of this wake trigger — always "transition" for this path. */
+  source: "transition";
+}
+
 export interface ApplyStateTransitionOptions {
   /** Agent/body issuing the transition (the reviewer). */
   bodyId?: string;
@@ -3209,6 +3225,13 @@ export interface ApplyStateTransitionOptions {
   enrolledTicketsStore?: EnrolledTicketsStore;
   /** AI-1762: operational-event sink for transition-write-failed events. */
   operationalEventStore?: OperationalEventStore;
+
+  /**
+   * INF-92: Callback invoked when a transition stamps a delegate on a work-eligible
+   * (non-terminal) state, so the dispatch layer can wake the newly-assigned agent.
+   * The callback is called after the atomic write is confirmed applied.
+   */
+  onTransitionWake?: (data: TransitionWakeData) => void;
 
   /**
    * AI-1977: Pre-computed delegateId to use instead of resolving via role/prior-implementer.
@@ -4218,6 +4241,31 @@ export async function applyStateTransition(
       const msg = err instanceof Error ? err.message : String(err);
       log.warn(`workflow-gate: B-3 barrier check failed for ${issueId}: ${msg}`);
     }
+  }
+
+  // ── INF-92: Fire onTransitionWake when transition stamps a delegate on ──
+  // a work-eligible state. This bridges the gap between the governed
+  // transition path (which writes delegate + state atomically but never
+  // dispatched a wake) and the external delegate-mutation path (which
+  // routed through webhook → routeEventAll → dispatchRoute → wake).
+  // The wake is only fired when the destination is non-terminal (work-eligible)
+  // and a delegate was actually stamped.
+  if (applied && !isTerminal && resolvedDelegateId && options?.onTransitionWake) {
+    const allAgents = getAgents();
+    const delegateAgent = allAgents.find(
+      (a) => a.linearUserId === resolvedDelegateId,
+    );
+    const agentName = delegateAgent?.name ?? resolvedDelegateId;
+    options.onTransitionWake({
+      agentName,
+      ticketIdentifier: issue.identifier ?? issueId,
+      workflowState: toStateName,
+      source: "transition",
+    });
+    log.info(
+      `workflow-gate: INF-92: fired onTransitionWake for ${agentName} ` +
+      `on ${issue.identifier ?? ""} (state:${toStateName})`,
+    );
   }
 
   return { status: "applied", code: "transition-applied", from: currentStateName, to: toStateName };
