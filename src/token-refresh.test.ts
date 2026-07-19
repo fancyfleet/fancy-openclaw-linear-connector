@@ -16,6 +16,7 @@ import type { AgentConfig } from "./agents.js";
 const mockUpdateTokens = jest.fn<(name: string, at: string, rt: string) => void>();
 const mockIsAgentLocal = jest.fn<(agent: AgentConfig) => boolean>();
 const mockGetAgents = jest.fn<() => AgentConfig[]>();
+const mockRecordTokenFailure = jest.fn<(name: string, status: number, retriable: boolean, reason: string) => void>();
 let mockFetch: jest.Mock<typeof fetch>;
 let nextFetchId = 0;
 
@@ -23,6 +24,7 @@ jest.unstable_mockModule("./agents.js", () => ({
   isAgentLocal: mockIsAgentLocal,
   updateTokens: mockUpdateTokens,
   getAgents: mockGetAgents,
+  recordTokenFailure: mockRecordTokenFailure,
 }));
 
 // Dynamic import after mocks are registered
@@ -189,6 +191,7 @@ describe("refreshAgent", () => {
       "success-agent",
       TOKEN_OK.access_token,
       TOKEN_OK.refresh_token,
+      TOKEN_OK.expires_in,
     );
   });
 
@@ -249,6 +252,7 @@ describe("refreshAgent", () => {
       "single-flight-agent",
       TOKEN_OK.access_token,
       TOKEN_OK.refresh_token,
+      TOKEN_OK.expires_in,
     );
   });
 
