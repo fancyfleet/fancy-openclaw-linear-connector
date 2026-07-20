@@ -299,6 +299,30 @@ export function createWebhookRouter(
       // ── 9. Route to agent ─────────────────────────────────────────────────
       log.info(`Normalized event: type=${event.type} hasData=${"data" in event} dataKeys=${event.data ? Object.keys(event.data as object).join(',') : 'none'}`);
 
+      // Phase 5 / B-3: Barrier (N→1) — event-driven parent auto-advance.
+      // Triggered on ANY issue event (terminal or non-terminal) because:
+      //   • Terminal events: child reached done — normal path
+      //   • Non-terminal events: break-glass re-routed child to intake (dev-impl v9,
+      //     dev-sprint v4), stripping workflow labels. The barrier re-evaluates
+      //     via isChildTerminal's native-state-type fallback (NATIVE_TERMINAL_STATE_TYPES).
+      // Fire-and-forget: barrier errors are logged and never block dispatch.
+      if (event.type === "Issue") {
+        const identifier = issueIdentifierFromEvent(event);
+        if (identifier) {
+          const barrierToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+          if (barrierToken) {
+            const childId = identifier;
+            onChildTerminal(childId, barrierToken).then((result) => {
+              if (result?.transitioned) {
+                log.info(`Barrier: auto-advanced parent of ${childId}`);
+              }
+            }).catch((err) => {
+              log.warn(`Barrier check failed for ${childId}: ${err instanceof Error ? err.message : String(err)}`);
+            });
+          }
+        }
+      }
+
       if (isTerminalIssueEvent(event)) {
         const identifier = issueIdentifierFromEvent(event);
         if (identifier) {
@@ -310,21 +334,6 @@ export function createWebhookRouter(
             ` and ${removedQueued} queued signal${removedQueued === 1 ? "" : "s"}; skipping agent dispatch`,
           );
           appendOperationalEvent(operationalEventStore, { outcome: "terminal-pruned", type: event.type, key: sessionKey, sessionKey, detail: { removedBag, removedQueued } });
-
-          // Phase 5 / B-3: Barrier (N→1) — event-driven parent auto-advance.
-          // When a child reaches a terminal state, check if all siblings are
-          // terminal and auto-advance the parent managing → review.
-          // Fail-open: barrier errors are logged and never block the terminal prune.
-          const barrierToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
-          if (barrierToken) {
-            onChildTerminal(identifier, barrierToken).then((result) => {
-              if (result?.transitioned) {
-                log.info(`Barrier: auto-advanced parent of ${identifier} managing → review`);
-              }
-            }).catch((err) => {
-              log.warn(`Barrier check failed for terminal child ${identifier}: ${err instanceof Error ? err.message : String(err)}`);
-            });
-          }
         } else {
           log.info("Terminal issue event without identifier; skipping agent dispatch");
         }
