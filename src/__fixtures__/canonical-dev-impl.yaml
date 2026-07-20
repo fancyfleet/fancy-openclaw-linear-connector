@@ -54,7 +54,7 @@
 #   State spine unchanged from v10+ (merge/deploy).
 
 id: dev-impl
-version: 15
+version: 16
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
 
@@ -96,6 +96,11 @@ states:
         capture_ac: true
       - command: demote
         to: __ad_hoc__          # ticket leaves the workflow entirely (design.md §4.5)
+      # INF-150: handoff self-loop — re-attach delegate without changing state
+      - command: handoff
+        to: intake
+        assign:
+          mode: required
 
   - id: write-tests
     owner_role: test-author     # TestDrivenDevelopmentAgent; dev container (§16.2)
@@ -110,6 +115,11 @@ states:
       - command: tests-ready
         to: implementation
         assign: { mode: required }     # dev is multi-body (felix/noah/sage/igor) — target required, validated vs dev role
+      # INF-150: handoff self-loop — re-attach delegate without changing state
+      - command: handoff
+        to: write-tests
+        assign:
+          mode: required
 
   - id: implementation
     owner_role: dev
@@ -153,6 +163,7 @@ states:
         to: implementation
         generic: revision
         requires_comment: true
+        assign: { default: prior-implementer }
         feedback:
           required: true
           category_enum:
@@ -161,6 +172,11 @@ states:
             - scope-creep
             - correctness
             - ac-mismatch
+      # INF-150: handoff self-loop — re-attach delegate without changing state
+      - command: handoff
+        to: code-review
+        assign:
+          mode: required
 
   - id: merge
     owner_role: deployment      # filled by Hanzo; the deployment container (§16.2)
@@ -193,6 +209,11 @@ states:
             - scope-creep
             - correctness
             - ac-mismatch
+      # INF-150: handoff self-loop — re-attach delegate without changing state
+      - command: handoff
+        to: merge
+        assign:
+          mode: required
 
   - id: deploy
     owner_role: host-deploy     # filled by Grover for the connector fleet; configurable per project (§16.2)
@@ -224,6 +245,11 @@ states:
             - scope-creep
             - correctness
             - ac-mismatch
+      # INF-150: handoff self-loop — re-attach delegate without changing state
+      - command: handoff
+        to: deploy
+        assign:
+          mode: required
 
   - id: ac-validate
     owner_role: steward         # the SAME steward (Astrid) who validated AC at intake
@@ -240,6 +266,7 @@ states:
       - command: ac-fail
         to: implementation
         requires_comment: true
+        assign: { default: prior-implementer }
         feedback:
           required: true
           category_enum:
@@ -248,6 +275,11 @@ states:
             - scope-creep
             - correctness
             - ac-mismatch
+      # INF-150: handoff self-loop — re-attach delegate without changing state
+      - command: handoff
+        to: ac-validate
+        assign:
+          mode: required
 
   - id: done
     kind: terminal
