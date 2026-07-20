@@ -1884,6 +1884,23 @@ async function fetchBranchAndPRStatus(
 }
 
 /**
+ * Known GitHub repos to scan when no GH_TOKEN is available for the search API.
+ * These cover the fleet's primary repos. The list is deliberately broad; each
+ * repo check is a lightweight `GET /repos/{owner}/{repo}/pulls?state=all&...`
+ * call that works without auth for public repos.
+ *
+ * When GH_TOKEN IS available, the GitHub search API (
+ * `searchGitHubPRsByTicketRef`) is used instead, which handles all repos
+ * implicitly (including private) and is not limited to this list.
+ */
+const KNOWN_SCAN_REPOS: Array<{ owner: string; repo: string }> = [
+  { owner: "fancymatt", repo: "fancy-openclaw-linear-connector" },
+  { owner: "fancymatt", repo: "fancy-openclaw-linear-skill-cli" },
+  { owner: "fancymatt", repo: "fancy-openclaw-workflow-skill" },
+  { owner: "fancyfleet", repo: "gen" },
+];
+
+/**
  * Search GitHub for merged pull requests that reference a Linear ticket
  * identifier (e.g. "GEN-231") in their title or body (INF-144).
  *
@@ -1893,10 +1910,18 @@ async function fetchBranchAndPRStatus(
  * for PRs mentioning the ticket ID, we can find the PR evidence that
  * the merge gate requires.
  *
- * Uses the GitHub issue/PR search API (which indexes PRs by title,
- * body, and comments). Returns an array of PR URLs that mention the
- * ticket identifier. Returns empty array when:
- *   - No GH_TOKEN / GITHUB_TOKEN is configured
+ * Strategy (INF-151):
+ *   - When GH_TOKEN / GITHUB_TOKEN is available: use the GitHub Search API
+ *     (accurate, handles private repos, searches all org repos).
+ *   - When no token is available: fall back to scanning known public repos
+ *     via `GET /repos/{owner}/{repo}/pulls` (no auth needed, works for
+ *     public repos). The fleet removed long-lived GH_TOKENs in AI-2521
+ *     in favor of GitHub App auth, so the unauthenticated fallback is the
+ *     active code path for most deployments.
+ *
+ * Returns an array of PR URLs that mention the ticket identifier.
+ * Returns empty array when:
+ *   - No token is configured AND no known repos match
  *   - The GitHub API returns an error
  *   - No PRs match the search
  *
@@ -1906,8 +1931,11 @@ async function fetchBranchAndPRStatus(
 async function searchGitHubPRsByTicketRef(identifier: string): Promise<string[]> {
   const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? null;
   if (!token) {
-    log.info(`workflow-gate: INF-144 GitHub search skipped for ${identifier} — no GH_TOKEN configured`);
-    return [];
+    // INF-151: When no GH_TOKEN is configured, fall back to scanning known
+    // public repos via the unauthenticated pulls API instead of returning
+    // empty. This matches the fleet's GitHub App auth model (AI-2521).
+    log.info(`workflow-gate: INF-151: no GH_TOKEN configured — falling back to per-repo PR scan for ${identifier}`);
+    return searchGitHubPRsByPerRepoScan(identifier);
   }
   try {
     // Search for merged PRs that explicitly mention the ticket identifier.
@@ -2005,6 +2033,78 @@ async function searchGitHubPRsByTicketRef(identifier: string): Promise<string[]>
     log.warn(`workflow-gate: INF-144 GitHub search failed for ${identifier}: ${msg}`);
     return [];
   }
+}
+
+/**
+ * Fallback for `searchGitHubPRsByTicketRef` when no GH_TOKEN is configured
+ * (INF-151). Scans known public repos via the unauthenticated GitHub API
+ * for merged PRs that reference the ticket identifier in their title or
+ * branch name (head.ref).
+ *
+ * GitHub's `/repos/{owner}/{repo}/pulls` endpoint works without auth for
+ * public repos (rate-limited to 60 req/hr). The fleet does not use long-lived
+ * GH_TOKENs (removed AI-2521), so this fallback is the primary code path.
+ *
+ * Strategy:
+ *   1. For each repo in KNOWN_SCAN_REPOS, fetch recent merged PRs via
+ *      `GET /repos/{owner}/{repo}/pulls?state=all&sort=updated&direction=desc&per_page=30`.
+ *   2. Check each PR's title and head.ref for the ticket identifier.
+ *   3. If the PR is merged (merged_at is not null), include its URL.
+ *
+ * The 30-PR window per repo is sufficient: the window is ordered by
+ * updated-at descending, so the relevant PR (created/merged within the
+ * same session) will be near the top.
+ *
+ * @param identifier - Linear ticket identifier (e.g. "GEN-231")
+ * @returns Array of GitHub PR URLs matching the ticket identifier
+ */
+async function searchGitHubPRsByPerRepoScan(identifier: string): Promise<string[]> {
+  const matchingPrUrls: string[] = [];
+  for (const { owner, repo } of KNOWN_SCAN_REPOS) {
+    try {
+      const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls?state=all&sort=updated&direction=desc&per_page=30`;
+      const headers: Record<string, string> = {
+        Accept: "application/vnd.github.v3+json",
+        "User-Agent": "fancy-openclaw-linear-connector",
+      };
+      const res = await fetch(url, { headers });
+      if (!res.ok) {
+        log.info(`workflow-gate: INF-151: per-repo scan returned ${res.status} for ${owner}/${repo} — skipping`);
+        continue;
+      }
+      type GitHubPrListItem = {
+        html_url?: string;
+        title?: string;
+        head?: { ref?: string };
+        merged_at?: string | null;
+        state?: string;
+      };
+      const prs = (await res.json()) as GitHubPrListItem[];
+      if (!Array.isArray(prs) || prs.length === 0) continue;
+      for (const pr of prs) {
+        if (!pr.html_url) continue;
+        // Only consider merged PRs.
+        if (!pr.merged_at && pr.state !== "merged") continue;
+        // Check title and branch name (head.ref) for the ticket identifier.
+        const title = pr.title ?? "";
+        const headRef = pr.head?.ref ?? "";
+        if (title.includes(identifier) || headRef.includes(identifier)) {
+          log.info(`workflow-gate: INF-151: per-repo scan found PR ${owner}/${repo}#${pr.html_url.split("/").pop()} for ${identifier} (${title})`);
+          matchingPrUrls.push(pr.html_url);
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`workflow-gate: INF-151: per-repo scan failed for ${owner}/${repo}: ${msg}`);
+      continue;
+    }
+  }
+  if (matchingPrUrls.length === 0) {
+    log.info(`workflow-gate: INF-151: per-repo scan found no PRs for ${identifier} across ${KNOWN_SCAN_REPOS.length} repos`);
+  } else {
+    log.info(`workflow-gate: INF-151: per-repo scan found ${matchingPrUrls.length} PR(s) for ${identifier} across ${KNOWN_SCAN_REPOS.length} repos`);
+  }
+  return matchingPrUrls;
 }
 
 /**
