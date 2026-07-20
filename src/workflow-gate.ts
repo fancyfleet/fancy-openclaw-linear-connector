@@ -2693,6 +2693,25 @@ export async function checkWorkflowRules(
     log.info(`workflow-gate: unknown caller '${bodyId}' on wf:${workflowId} — human sign-off path, allowing through`);
   }
 
+  // INF-148: cycle-roll resilience guard for sprint-spawner.
+  // A `retrospecting → evaluating` cycle-roll must never terminate the
+  // spawner. Escape from `retrospecting` on a sprint-spawner ticket requires
+  // explicit break-glass override even for the delegate/steward — prevents
+  // accidental termination during a cycle-roll (GEN-208 repro: three dead
+  // Gen loops, each terminated at or around a cycle-roll).
+  if (intent === breakGlassCommand && workflowId === "sprint-spawner" && !breakGlassOverride) {
+    const rollState = getCurrentState(labels);
+    if (rollState === "retrospecting") {
+      log.warn(`workflow-gate: INF-148 cycle-roll guard — blocking escape on ${issueId} from state '${rollState}' (wf:sprint-spawner) — requires explicit break-glass override`);
+      return (
+        `[Proxy] 'escape' blocked on wf:sprint-spawner ticket in state 'retrospecting': ` +
+        `a cycle-roll must never terminate the spawner. ` +
+        `Use the explicit break-glass flag (--break-glass or X-Openclaw-Break-Glass header) ` +
+        `if you intentionally need to terminate.`
+      );
+    }
+  }
+
   // §4.4 / AI-1668: break-glass escape is caller-gated.
   // The delegate can always escape their own ticket; the workflow steward
   // (break_glass.owner_role) can escape any ticket. All other known agents
