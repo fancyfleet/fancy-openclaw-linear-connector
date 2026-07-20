@@ -271,6 +271,20 @@ async function fetchLastComment(
  * AI-1708: Label fetch now uses fetchLabelsWithRetry. If all retries are
  * exhausted, a WARN is logged with the failure reason before returning null.
  */
+// INF-204: workflow-transition verbs the CLI actually ships (fancy-openclaw-linear-skill-cli
+// ≥0.4.4). A dispatch may only advertise `linear <verb> <id>` for these; any other workflow
+// move renders as the generic `linear transition <id> <move>`, which carries the move name in
+// the intent header. That keeps every dispatched command executable without a CLI release —
+// if this list drifts stale, the fallback form still executes (dedicated verbs are aliases
+// of their transition-form), so drift fails safe instead of stranding tickets (LIF-143).
+const DEDICATED_CLI_VERBS = new Set([
+  "accept", "ac-fail", "approve", "begin-work", "brief-ready", "cancel", "complete",
+  "consider-work", "continue-workflow", "demote", "deploy", "duplicate", "escape", "filed",
+  "handoff-host-deploy", "handoff-work", "host-deployed", "manage", "needs-human", "note",
+  "park", "refuse-work", "reject", "request-changes", "request-revision", "steward-takeover",
+  "submit", "tests-ready", "transition", "undelegate", "validated",
+]);
+
 export async function tryBuildWorkflowMessage(
   actionText: string,
   identifier: string,
@@ -341,9 +355,16 @@ export async function tryBuildWorkflowMessage(
           ? 'request-revision'
           : t.command;
 
-      let cmd = `linear ${commandName} ${identifier}`;
+      // INF-204: a verb the CLI does not ship must not be advertised — `linear hold <id>`
+      // was dispatched verbatim and died with "unknown command 'hold'". Non-dedicated
+      // moves go through the generic transition verb; its target is a --target flag,
+      // not a positional.
+      const dedicated = DEDICATED_CLI_VERBS.has(commandName);
+      let cmd = dedicated
+        ? `linear ${commandName} ${identifier}`
+        : `linear transition ${identifier} ${commandName}`;
       if (mode === 'required') {
-        cmd += ` <${bodies.join('|')}>`;
+        cmd += dedicated ? ` <${bodies.join('|')}>` : ` --target <${bodies.join('|')}>`;
       }
       if (t.requires_comment || t.feedback?.required) {
         cmd += ` --comment-file <path>`;
