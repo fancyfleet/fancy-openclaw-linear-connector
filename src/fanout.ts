@@ -1325,6 +1325,7 @@ async function createChildIssue(
   labelIds: string[],
   authToken: string,
   delegateId?: string | null,
+  stateId?: string | null,
 ): Promise<{ internalId: string; identifier: string } | null> {
   const mutation = `
     mutation CreateChild($input: IssueCreateInput!) {
@@ -1342,6 +1343,9 @@ async function createChildIssue(
     parentId: parentIssueId,
   };
   if (delegateId) input.delegateId = delegateId;
+  // INF-194: pass stateId so the issue lands at the correct native Linear
+  // workflow state (e.g. To Do) instead of the team default (often Backlog).
+  if (stateId) input.stateId = stateId;
 
   try {
     const res = await fetch(LINEAR_API_URL, {
@@ -1464,6 +1468,14 @@ export async function executeFanout(
      * auto-migrate children to escape (terminal).
      */
     lookupEntryState?: (workflowLabel: string) => Promise<string | undefined>;
+    /**
+     * INF-194: resolve the Linear native state UUID for a child workflow's
+     * entry state. Given a wf:* label (e.g. "wf:dev-sprint"), should return
+     * the native Linear stateId (UUID) for the target team. When omitted,
+     * children are created without a stateId and Linear defaults to the
+     * team's first workflow state (often Backlog).
+     */
+    lookupNativeState?: (workflowLabel: string, teamId: string) => Promise<string | undefined>;
   },
 ): Promise<FanoutResult> {
   const result: FanoutResult = {
@@ -1808,6 +1820,13 @@ export async function executeFanout(
       log.warn(`fanout: per-entry delegate '${finding.delegate}' for finding "${childTitle}" did not resolve — spawning undelegated`);
     }
 
+    // INF-194: resolve native state UUID for this child's entry state.
+    // When set, the issueCreate mutation lands the ticket at the correct
+    // Linear workflow state (e.g. To Do) instead of the team default (Backlog).
+    const childNativeStateId = options?.lookupNativeState
+      ? await options.lookupNativeState(findingWorkflow, parentCtx.teamId)
+      : undefined;
+
     // INF-113: Build child description with load-bearing machine markers placed
     // BELOW the human body. The markers are HTML comments on the assumption
     // they'd be invisible — but Linear renders them as visible text. Placing
@@ -1840,6 +1859,7 @@ export async function executeFanout(
       labelIds,
       authToken,
       delegateId,
+      childNativeStateId,
     );
 
     if (child) {
