@@ -326,7 +326,7 @@ describe("AI-2620: git-remote-liveness critical suppression window override", ()
 
     // Only one push — the second call folded into the existing burst
     expect(pushes).toHaveLength(1);
-    expect(pushes[0]).toContain("git-remote-liveness:critical:AI-2189");
+    expect(pushes[0]).toContain("[git-remote-liveness] PUSH-DEAD: 12 repos");
 
     // Also verify store reflects a single burst with count=2 (folded)
     const stored = store.query();
