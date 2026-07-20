@@ -5075,6 +5075,17 @@ export async function applyStateTransition(
           const def = await loadWorkflowDefById(defId);
           return def?.entry_state ? `state:${def.entry_state}` : undefined;
         },
+        // INF-194: resolve native Linear state UUID for child workflow's
+        // entry state, so issueCreate lands at To Do instead of Backlog.
+        lookupNativeState: async (wfLabel: string, teamId: string) => {
+          const defId = wfLabel.startsWith("wf:") ? wfLabel.slice(3) : wfLabel;
+          const def = await loadWorkflowDefById(defId);
+          if (!def?.entry_state) return undefined;
+          const entryState = def.states.find((s) => s.id === def.entry_state);
+          if (!entryState?.native_state) return undefined;
+          const id = await resolveNativeStateId(teamId, entryState.native_state, authToken);
+          return id ?? undefined;
+        },
       });
       spawnIfEvaluationFailed = fanoutResult.spawnIfResult?.outcome === "failed";
       if (fanoutResult.created > 0) {
