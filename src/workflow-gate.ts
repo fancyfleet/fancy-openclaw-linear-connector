@@ -3954,18 +3954,17 @@ export async function applyStateTransition(
   // the nulls (stripNullDelegateAssigneeFields) so they reach Linear directly.
   if (intent === breakGlassCommand) {
     toStateName = def.break_glass?.to ?? "escape";
-    // INF-135: escape-wedge fix — when the ticket is already in the break-glass
-    // target state, escape must restart the workflow rather than no-opping
-    // idempotently. The escape verb is the only legal verb from this state;
-    // an idempotent escape silently strands the ticket with no forward path.
-    // Transition to the workflow's entry_state to resume, or demote to ad-hoc
-    // if no entry_state is defined.
-    const breakGlassTarget = def.break_glass?.to ?? "escape";
-    if (currentStateName && currentStateName === breakGlassTarget) {
-      toStateName = def.entry_state ?? "__ad_hoc__";
+    // INF-146/INF-135: break-glass escape from the break-glass target state
+    // itself (e.g. `intake` for dev-impl) is a self-loop that no-ops through
+    // the idempotency check below. Redirect: if entry_state differs from the
+    // target, restart the workflow via entry_state; otherwise exit entirely.
+    if (currentStateName && currentStateName === toStateName) {
+      toStateName = def.entry_state && def.entry_state !== toStateName
+        ? def.entry_state
+        : "__ad_hoc__";
       log.info(
-        `workflow-gate: INF-135 escape-wedge: ${issueId} already at break-glass target '${currentStateName}'; ` +
-        `re-entering at '${toStateName}' instead of no-opping idempotently`,
+        `workflow-gate: B2 apply: ${issueId} break-glass escape from state '${currentStateName}' ` +
+        `which IS the break-glass target — redirecting to '${toStateName}'`,
       );
     }
   } else if (intent === "park") {
@@ -3978,12 +3977,7 @@ export async function applyStateTransition(
       log.warn(`workflow-gate: B2 apply: handoff on ${issueId} has no state:* label — skipping`);
       return { status: "failed", code: "no-state-label", detail: `handoff on ticket ${issueId} has no state:* label` };
     }
-    // INF-124: always a self-loop regardless of def transitions. The delegate
-    // write arrives via the mutation or delegateOverride; B2 only preserves
-    // the state projection and native state, which don't change for a self-loop.
     log.info(`workflow-gate: B2 apply: ${issueId} handoff self-loop at state '${currentStateName}'`);
-    // Use matchedTransition if it exists (for def-aware routing), otherwise
-    // treat as a self-loop (delegate-only change, no label swap).
     matchedTransition = def.states.find((s) => s.id === currentStateName)?.transitions?.find((t) => t.command === intent);
     toStateName = currentStateName;
   } else {
