@@ -35,6 +35,7 @@
  */
 
 import { createLogger, componentLogger } from "../logger.js";
+import { isNativelyTerminal } from "../terminality.js";
 import { getAccessToken, getAgents, isAgentLocal, isPolledForLinear, type AgentConfig } from "../agents.js";
 import { loadWorkflowDef, getCurrentState, getWorkflowId, type WorkflowDef } from "../workflow-gate.js";
 import type { OperationalEventStore } from "../store/operational-event-store.js";
@@ -182,9 +183,6 @@ function parseEnvInt(name: string, defaultVal: number): number {
 
 /** Terminal workflow `state:*` labels that satisfy a parent's N→1 barrier. */
 const TERMINAL_CHILD_STATES = new Set(["done", "escape"]);
-/** Native Linear state types that count as terminal (issue closed). INF-203:
- * "duplicate" is a distinct first-class Linear state type, not "canceled". */
-const TERMINAL_NATIVE_STATE_TYPES = new Set(["completed", "canceled", "duplicate"]);
 
 /**
  * Is a child issue in a terminal state? A child satisfies the parent barrier if
@@ -194,7 +192,7 @@ const TERMINAL_NATIVE_STATE_TYPES = new Set(["completed", "canceled", "duplicate
  * agree on when a barrier is closed.
  */
 function isChildTerminal(nativeStateType: string | null, labels: string[]): boolean {
-  if (nativeStateType && TERMINAL_NATIVE_STATE_TYPES.has(nativeStateType)) return true;
+  if (isNativelyTerminal(nativeStateType)) return true;
   const workflowState = getCurrentState(labels);
   return workflowState !== null && TERMINAL_CHILD_STATES.has(workflowState);
 }
@@ -675,6 +673,12 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
 
       // Skip terminal states (done, escape)
       if (currentState === "done" || currentState === "escape") continue;
+
+      // INF-205: skip natively-closed subjects (completed/canceled/duplicate).
+      // A ticket moved natively to Duplicate keeps its stale state:* label, and
+      // without this guard the detector would flag its delegate as stuck and
+      // re-prompt them on a closed ticket forever.
+      if (isNativelyTerminal(issue.state?.type)) continue;
 
       // Find when the current state:* label was last set (state entry time)
       // In the new Linear schema, IssueLabelPayload no longer exists as a fragment type.

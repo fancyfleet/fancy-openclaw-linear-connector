@@ -21,6 +21,7 @@
  */
 
 import { componentLogger, createLogger } from "./logger.js";
+import { isNativelyTerminal } from "./terminality.js";
 import {
   fetchIssueContext,
   applyBootstrapToIssue,
@@ -81,6 +82,8 @@ interface GovernedTicket {
   delegateId: string | null;
   delegateName: string | null;
   teamId: string;
+  /** INF-205: native Linear state type, or null when unavailable. */
+  nativeStateType: string | null;
 }
 
 // ── Terminal state detection ─────────────────────────────────────────────────
@@ -120,6 +123,7 @@ async function queryGovernedTickets(
           identifier
           updatedAt
           title
+          state { type }
           labels { nodes { id name } }
           delegate { id name }
           team { id }
@@ -144,6 +148,7 @@ async function queryGovernedTickets(
           id: string;
           identifier: string;
           updatedAt: string;
+          state?: { type: string } | null;
           labels: { nodes: Array<{ id: string; name: string }> };
           delegate: { id: string; name: string } | null;
           team: { id: string };
@@ -168,6 +173,7 @@ async function queryGovernedTickets(
     delegateId: n.delegate?.id ?? null,
     delegateName: n.delegate?.name ?? null,
     teamId: n.team.id,
+    nativeStateType: n.state?.type ?? null,
   }));
 }
 
@@ -359,8 +365,10 @@ export async function runDelegationReconciliationSweep(
 
   // ── Process each ticket ───────────────────────────────────────────────
   for (const ticket of filtered) {
-    // Skip terminal tickets
-    if (isTerminal(ticket.labels)) continue;
+    // Skip terminal tickets. INF-205: natively-closed tickets (completed/
+    // canceled/duplicate) are terminal even when the state:* label is stale
+    // or absent — a closed ticket must not be re-bootstrapped or re-delegated.
+    if (isTerminal(ticket.labels) || isNativelyTerminal(ticket.nativeStateType)) continue;
 
     // ── AC2: wf:* but no state:* and no delegate (dropped enrollment) ────
     if (!hasStateLabel(ticket.labels) && !ticket.delegateId) {

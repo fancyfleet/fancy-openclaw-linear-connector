@@ -327,30 +327,40 @@ describe("AC1 — classifyTicket: produces correct classification from labels + 
 });
 
 // ══════════════════════════════════════════════════════════════════════════
-// AC3 — classification must NOT depend on native Linear status
+// AC3 — classification must NOT depend on OPEN native Linear status
+//
+// INF-205 refined this contract: a TERMINAL native state type (completed/
+// canceled/duplicate) now classifies as "terminal" — a natively-closed ticket
+// must never be rescued. The original AC3 concern stands for open statuses:
+// a 'Doing'/'Todo'/'Backlog' native state still must not override the
+// label+delegate classification (e.g. mask a null delegate as healthy).
 // ══════════════════════════════════════════════════════════════════════════
 
-describe("AC3 — classifyTicket ignores native Linear status entirely", () => {
-  it("classifyTicket receives no native-status parameter — no such param in signature", () => {
-    // The function must classify correctly using only labels + delegate + def.
-    // If classifyTicket accepted a nativeState param and used it, this test
-    // verifies that a 'Doing' status does not override a null delegate.
-    // We verify the signature has exactly 4 parameters.
-    expect(classifyTicket.length).toBe(4);
-  });
-
-  it("dormant regardless of whether the native state is Doing, Todo, or Backlog", () => {
-    // All three should be dormant — no delegate set — not affected by native status
-    const states = ["Doing", "Todo", "Backlog", "Thinking"] as const;
-    for (const _nativeState of states) {
-      // classifyTicket does not receive nativeState — always uses only labels + delegate
+describe("AC3 — classifyTicket ignores OPEN native Linear status (INF-205: terminal types classify terminal)", () => {
+  it("dormant regardless of whether the open native state type is started, unstarted, or backlog", () => {
+    const openTypes = ["started", "unstarted", "backlog", "triage", null, undefined] as const;
+    for (const nativeType of openTypes) {
       const result = classifyTicket(
         ["wf:dev-impl", "state:write-tests"],
         null, // no delegate
         TEST_WORKFLOW_DEF,
         DEFAULT_ROLE_RESOLVER,
+        nativeType,
       );
       expect(result).toBe<TicketClassification>("dormant");
+    }
+  });
+
+  it("terminal native state types classify terminal even with a stale open label (INF-205)", () => {
+    for (const nativeType of ["completed", "canceled", "duplicate"]) {
+      const result = classifyTicket(
+        ["wf:dev-impl", "state:write-tests"],
+        null,
+        TEST_WORKFLOW_DEF,
+        DEFAULT_ROLE_RESOLVER,
+        nativeType,
+      );
+      expect(result).toBe<TicketClassification>("terminal");
     }
   });
 });

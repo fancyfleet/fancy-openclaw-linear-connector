@@ -20,6 +20,7 @@
 import fs from "node:fs";
 import yaml from "js-yaml";
 import { createLogger, componentLogger } from "./logger.js";
+import { isNativelyTerminal } from "./terminality.js";
 import { defaultCapabilityPolicyPath } from "./instance-config.js";
 import { getLinearUserIdForAgent } from "./agents.js";
 import type { OperationalEventInput } from "./store/operational-event-store.js";
@@ -48,6 +49,8 @@ export interface SweepTicket {
   delegateId: string | null;
   /** Display name of the current delegate (optional, for logging) */
   delegateName?: string | null;
+  /** INF-205: native Linear state type (completed/canceled/duplicate/…), if known. */
+  nativeStateType?: string | null;
 }
 
 export interface RescueAction {
@@ -144,9 +147,15 @@ export function classifyTicket(
   delegateId: string | null,
   workflowDef: { entry_state?: string; states: Array<{ id: string; owner_role?: string }> },
   roleBodiesForRole: (roleId: string) => string[],
+  nativeStateType?: string | null,
 ): TicketClassification {
   const stateLabel = labels.find((l) => l.startsWith("state:"));
   const stateId = stateLabel?.slice("state:".length);
+
+  // INF-205: a natively-closed ticket (completed/canceled/duplicate) is
+  // terminal regardless of its labels — a stale non-terminal state:* label or
+  // a missing one must not get a closed ticket "rescued" back onto a workflow.
+  if (isNativelyTerminal(nativeStateType)) return "terminal";
 
   // Terminal: done or escape — checked first, regardless of delegate
   if (stateId === "done" || stateId === "escape") return "terminal";
@@ -223,7 +232,7 @@ async function fetchWfTickets(authToken: string): Promise<FetchedTicket[]> {
           id
           identifier
           updatedAt
-          state { name }
+          state { name type }
           labels { nodes { id name } }
           delegate { id name }
           team { id }
@@ -241,6 +250,7 @@ async function fetchWfTickets(authToken: string): Promise<FetchedTicket[]> {
       id: string;
       identifier: string;
       updatedAt?: string;
+      state?: { name: string; type: string } | null;
       labels: { nodes: Array<{ id: string; name: string }> };
       delegate: { id: string; name: string } | null;
       team: { id: string } | null;
@@ -256,6 +266,7 @@ async function fetchWfTickets(authToken: string): Promise<FetchedTicket[]> {
       delegateId: n.delegate?.id ?? null,
       delegateName: n.delegate?.name ?? null,
       teamId: n.team?.id ?? "",
+      nativeStateType: n.state?.type ?? null,
     }));
   } catch (err) {
     log.error(`fetchWfTickets failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -428,7 +439,7 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
     }
 
     const wfDef = workflowRegistry.get(wfId)!;
-    const classification = classifyTicket(ticket.labels, ticket.delegateId, wfDef, roleBodiesForRole);
+    const classification = classifyTicket(ticket.labels, ticket.delegateId, wfDef, roleBodiesForRole, ticket.nativeStateType);
     byClassification[classification] = (byClassification[classification] ?? 0) + 1;
 
     // Terminal and healthy tickets need no rescue

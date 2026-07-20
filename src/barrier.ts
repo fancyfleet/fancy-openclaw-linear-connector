@@ -36,6 +36,7 @@
  */
 
 import { componentLogger, createLogger } from "./logger.js";
+import { isNativelyTerminal } from "./terminality.js";
 import { loadWorkflowDef, loadWorkflowDefById, loadWorkflowRegistry, getWorkflowId, getCurrentState, type WorkflowDef, type WorkflowState } from "./workflow-gate.js";
 import { getFanoutOutcome } from "./fanout-outcome-store.js";
 import {
@@ -95,6 +96,13 @@ export interface ChildState {
   isTerminal: boolean;
   /** The child's workflow state (from state:* label), or null. */
   workflowState: string | null;
+  /**
+   * INF-205: the child's native Linear state type (completed/canceled/
+   * duplicate/started/…), or null when unavailable. Native terminality is
+   * checked alongside the state:* label so a child closed natively (e.g.
+   * moved to Duplicate, which strips no labels) still satisfies the barrier.
+   */
+  nativeStateType?: string | null;
   /**
    * INF-108: true when the child has no `state:*` label (demoted off its
    * workflow mid-flight). An orphaned child cannot contribute to the barrier
@@ -264,11 +272,19 @@ export const deferralAccountant = new DeferralAccountant();
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 /**
- * Is a child in a terminal state based on its labels?
- * Terminal states: done, escape (from the ux-audit and dev-impl workflow defs).
- * Also checks if the child has a `state:*` label matching a terminal state.
+ * Is a child in a terminal state?
+ *
+ * Terminal workflow labels: done, escape (from the ux-audit and dev-impl
+ * workflow defs), read from the child's `state:*` label.
+ *
+ * INF-205: native Linear state types completed/canceled/duplicate also count —
+ * checked first, so a natively-closed child satisfies the barrier even when
+ * its `state:*` label is stale (native moves don't strip labels) or absent.
+ * Mirrors stuck-delegate-detector's isChildTerminal so barrier auto-advance
+ * and stuck-suppression agree on when a child is closed.
  */
-export function isChildTerminal(labels: string[]): boolean {
+export function isChildTerminal(labels: string[], nativeStateType?: string | null): boolean {
+  if (isNativelyTerminal(nativeStateType)) return true;
   const state = getCurrentState(labels);
   if (!state) return false;
   return TERMINAL_WORKFLOW_STATES.has(state);
@@ -338,6 +354,7 @@ export async function fetchChildren(
         children {
           nodes {
             identifier
+            state { name type }
             labels { nodes { name } }
           }
         }
@@ -403,16 +420,21 @@ export async function fetchChildren(
     return nodes.map((node) => {
       const labels = (node.labels?.nodes ?? []).map((l) => l.name);
       const workflowState = getCurrentState(labels);
+      const nativeStateType = node.state?.type ?? null;
+      const isTerminal = isChildTerminal(labels, nativeStateType);
       // INF-108: a child is orphaned when it has no state:* label (it was
       // demoted off its workflow mid-flight). Such children can never reach a
       // terminal workflow state and hold the barrier indefinitely — the parent
       // steward needs to know about this to manually resolve the deadlock.
-      const isOrphaned = workflowState === null && labels.length > 0;
+      // INF-205: a natively-closed child is terminal, not orphaned — losing
+      // its label on the way to Duplicate/Canceled must not hold the barrier.
+      const isOrphaned = !isTerminal && workflowState === null && labels.length > 0;
       return {
         identifier: node.identifier,
         labels,
-        isTerminal: isChildTerminal(labels),
+        isTerminal,
         workflowState,
+        nativeStateType,
         isOrphaned,
       };
     });

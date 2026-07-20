@@ -27,6 +27,7 @@ import { isBarrierState, resolveBarrierTarget } from "../barrier.js";
 import fs from "node:fs/promises";
 import yaml from "js-yaml";
 import { createLogger, componentLogger } from "../logger.js";
+import { isNativelyTerminal } from "../terminality.js";
 import { type WorkflowDef } from "../workflow-gate.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "anti-entropy");
@@ -57,6 +58,7 @@ interface LabelNode {
 
 interface ChildNode {
   identifier: string;
+  state?: { type: string } | null;
   labels: { nodes: Array<{ name: string }> };
 }
 
@@ -134,7 +136,14 @@ function getWorkflowId(labels: Array<{ name: string }>): string | null {
   return null;
 }
 
-function isChildTerminal(labels: Array<{ name: string }>): boolean {
+function isChildTerminal(
+  labels: Array<{ name: string }>,
+  nativeStateType?: string | null,
+): boolean {
+  // INF-205: a natively-closed child (completed/canceled/duplicate) satisfies
+  // the barrier even when its state:* label is stale or absent — matches
+  // barrier.ts so the AC2 missed-barrier heal agrees with live evaluation.
+  if (isNativelyTerminal(nativeStateType)) return true;
   return labels.some((l) => {
     const m = l.name.match(/^state:(.+)$/);
     return m ? TERMINAL_STATE_NAMES.has(m[1]) : false;
@@ -204,6 +213,7 @@ async function fetchWorkflowIssues(authToken: string): Promise<IssueNode[]> {
           children {
             nodes {
               identifier
+              state { type }
               labels { nodes { name } }
             }
           }
@@ -308,7 +318,7 @@ async function processIssue(
     const children = issue.children.nodes;
     if (children.length === 0) return;
 
-    const allTerminal = children.every((c) => isChildTerminal(c.labels.nodes));
+    const allTerminal = children.every((c) => isChildTerminal(c.labels.nodes, c.state?.type ?? null));
     if (!allTerminal) return;
 
     result.barrierMissedFound++;

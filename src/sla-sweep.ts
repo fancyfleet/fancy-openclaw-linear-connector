@@ -22,6 +22,7 @@ import path from "node:path";
 import yaml from "js-yaml";
 import { getWorkflowId, getCurrentState, type WorkflowDef } from "./workflow-gate.js";
 import { isManagedBarrierFromLabels } from "./barrier.js";
+import { isNativelyTerminal } from "./terminality.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
 import { registerCron, formatIntervalMs } from "./cron/registry.js";
 
@@ -151,6 +152,7 @@ interface GovernedTicketNode {
   id: string;
   identifier: string;
   team: { id: string };
+  state?: { type: string } | null;
   labels: { nodes: Array<{ id?: string; name: string }> };
   history: { nodes: Array<{ createdAt: string }> };
   parent: {
@@ -201,6 +203,7 @@ export async function runSlaSweep(opts: SlaSweepOptions): Promise<SlaSweepResult
           id
           identifier
           team { id }
+          state { type }
           labels { nodes { id name } }
           history(first: 1) { nodes { createdAt } }
           parent {
@@ -239,8 +242,11 @@ export async function runSlaSweep(opts: SlaSweepOptions): Promise<SlaSweepResult
 
       if (!wfId || !stateId) continue;
 
-      // Terminal states have no SLA — skip (AC4)
+      // Terminal states have no SLA — skip (AC4). INF-205: natively-closed
+      // tickets (completed/canceled/duplicate) are terminal even when a stale
+      // non-terminal state:* label survives — never breach-alert a closed ticket.
       if (stateId === "done" || stateId === "escape") continue;
+      if (isNativelyTerminal(node.state?.type)) continue;
 
       // Look up workflow def — unknown workflow → skip (AC4)
       const def = defs.get(wfId);
