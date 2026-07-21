@@ -48,6 +48,7 @@ import { registerValidationWatchdogCron } from "./validation-sla-watchdog.js";
 import { registerLabelSyncAuditCron } from "./cron/label-sync-audit.js";
 import { registerAntiEntropyCron } from "./cron/anti-entropy.js";
 import { registerOobReconcileCron } from "./oob-reconcile-sweep.js";
+import { createBacklogController } from "./cron/backlog-controller.js";
 import { registerConfigSanityAlertCron, getConfigSanityAlertLiveness } from "./config-sanity-alert.js";
 import { registerMatrixApprovalGate, getMatrixApprovalGateLiveness } from "./matrix-approval-gate.js";
 import { MutationAuditStore } from "./store/mutation-audit-store.js";
@@ -222,6 +223,18 @@ export interface CreateAppOptions {
   deadLetterQueueDbPath?: string;
 }
 
+function bindReturnedCloseMethods<T extends Record<string, unknown>>(created: T): T {
+  for (const value of Object.values(created)) {
+    if (!value || typeof value !== "object") continue;
+
+    const close = (value as { close?: unknown }).close;
+    if (typeof close === "function") {
+      (value as { close: () => void }).close = close.bind(value);
+    }
+  }
+  return created;
+}
+
 export function createApp(options?: CreateAppOptions) {
   // Reset module-level singleton so per-test AC_RECORDS_PATH is picked up.
   clearAcRecordStore();
@@ -235,6 +248,11 @@ export function createApp(options?: CreateAppOptions) {
   // states, workflow defs). Used via module-level liveness helpers so /health
   // can report cache state without threading this reference through every layer.
   const ttlCache = new TtlCache<unknown>({ defaultTtlMs: 300_000 });
+
+  // INF-219 / INF-247: cron-backlog stampede protection. This live controller
+  // is exposed on createApp() and /health so cron drivers can share the same
+  // concurrency, dedup, and recovery-rate guard.
+  const backlogController = createBacklogController();
 
   // AI-2036 AC1.5/AC1.6: register the observation write path here, on the same
   // code path that hands the store to the proxy's transition options below.
@@ -378,6 +396,9 @@ export function createApp(options?: CreateAppOptions) {
       // scheduler timer is armed and the cache-flush route is mounted, both
       // observable at /health without waiting for a stale-resolution event.
       cache: buildFullCacheLiveness(ttlCache),
+      // INF-247 AC6: backlog-controller liveness — surfaces the live controller
+      // state at /health so bootstrap wiring is observable without a trigger.
+      backlogController: backlogController.getStats(),
       // AI-2091 §9 (AI-1808 addendum): dispatch-integrity gate liveness. Each of
       // the four gates (delivery-time recipient resolution, phantom fetchability,
       // wake→session dedup, pre-mutation compare-and-swap) reports `active: true`
@@ -905,9 +926,9 @@ export function createApp(options?: CreateAppOptions) {
         // Ticket has a state label — check the workflow registry for a forward verb
         try {
           const registry = await loadWorkflowRegistry();
-          for (const [, def_] of registry) {
-            for (const stateDef_ of (def_.states ?? [])) {
-              if (stateLabels.includes(`state:${stateDef_.id}`)) {
+          for (const [_defId, def_] of registry) {
+            for (const [stateName, stateDef_] of Object.entries(def_.states ?? {})) {
+              if (stateLabels.includes(`state:${stateName}`)) {
                 const forwardVerb = stateDef_.transitions?.[0]?.command ?? null;
                 return { inWorkflow: true, resolvableVerb: forwardVerb };
               }
@@ -1428,7 +1449,7 @@ export function createApp(options?: CreateAppOptions) {
   registerTtlInvalidationCron(ttlCache, 60_000);
   log.info("INF-193: TTL cache invalidation cron registered (every 60s)");
 
-  return { app, agentQueue, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, transcriptRedactionHealth: getTranscriptRedactionHealth() };
+  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, transcriptRedactionHealth: getTranscriptRedactionHealth() });
 }
 
 /**
