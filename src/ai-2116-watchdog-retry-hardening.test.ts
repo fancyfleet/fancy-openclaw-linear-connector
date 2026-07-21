@@ -102,9 +102,9 @@ describe("AC1: exponential backoff on re-dispatch", () => {
     const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
     const reDispatchTimes: number[] = [];
 
-    bag.add("emi", "linear-AI-2116-B", "Issue");
-    sessionTracker.startSession("emi", "linear-AI-2116-B");
-    ackTracker.recordDispatch("emi", "linear-AI-2116-B");
+    bag.add("emi", "linear-AI-2117", "Issue");
+    sessionTracker.startSession("emi", "linear-AI-2117");
+    ackTracker.recordDispatch("emi", "linear-AI-2117");
 
     // Backoff base 1ms — keep tests fast
     const watchdog = new DispatchWatchdog(
@@ -199,13 +199,13 @@ describe("AC2: attempt counter increments on each re-dispatch", () => {
   it("each markResignaled increments the attempt count without resetting to 1", async () => {
     const { ackTracker } = setupDeps(dir);
 
-    ackTracker.recordDispatch("astrid", "linear-AI-2116-AC2");
+    ackTracker.recordDispatch("astrid", "linear-AI-2118");
     expect(ackTracker.getPendingTimedOut(0)[0].attemptCount).toBe(1);
 
-    ackTracker.markResignaled("astrid", "linear-AI-2116-AC2");
+    ackTracker.markResignaled("astrid", "linear-AI-2118");
     expect(ackTracker.getPendingTimedOut(0)[0].attemptCount).toBe(2);
 
-    ackTracker.markResignaled("astrid", "linear-AI-2116-AC2");
+    ackTracker.markResignaled("astrid", "linear-AI-2118");
     expect(ackTracker.getPendingTimedOut(0)[0].attemptCount).toBe(3);
 
     ackTracker.close();

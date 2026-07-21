@@ -400,9 +400,9 @@ describe("All precondition guards: resolve + delegate + workflow fire together",
     const dispatched: string[] = [];
 
     // Ticket 1: passes all guards → should be resignaled
-    bag.add("emi", "linear-AI-2116-A", "Issue");
-    sessionTracker.startSession("emi", "linear-AI-2116-A");
-    ackTracker.recordDispatch("emi", "linear-AI-2116-A");
+    bag.add("emi", "linear-AI-2119", "Issue");
+    sessionTracker.startSession("emi", "linear-AI-2119");
+    ackTracker.recordDispatch("emi", "linear-AI-2119");
 
     // Ticket 2: phantom (fails resolve check) → should be dropped
     bag.add("astrid", "linear-AI-2014", "Issue");
@@ -410,9 +410,9 @@ describe("All precondition guards: resolve + delegate + workflow fire together",
     ackTracker.recordDispatch("astrid", "linear-AI-2014");
 
     // Ticket 3: wrong delegate → should be skipped
-    bag.add("igor", "linear-AI-2116-B", "Issue");
-    sessionTracker.startSession("igor", "linear-AI-2116-B");
-    ackTracker.recordDispatch("igor", "linear-AI-2116-B");
+    bag.add("igor", "linear-AI-2117", "Issue");
+    sessionTracker.startSession("igor", "linear-AI-2117");
+    ackTracker.recordDispatch("igor", "linear-AI-2117");
 
     const watchdog = new DispatchWatchdog(
       {
@@ -421,8 +421,8 @@ describe("All precondition guards: resolve + delegate + workflow fire together",
         linearResolveCheck: async (ticketId: string) => ticketId !== "linear-AI-2014",
 
         delegateCheck: async (_ticketId: string, agentId: string) => {
-          // Ticket B moved to a different delegate
-          if (_ticketId === "linear-AI-2116-B") return agentId === "sage";
+          // Ticket B (now AI-2117) moved to a different delegate
+          if (_ticketId === "linear-AI-2117") return agentId === "sage";
           return agentId === "emi";
         },
 
@@ -443,9 +443,9 @@ describe("All precondition guards: resolve + delegate + workflow fire together",
 
     // Only ticket A (which passes all guards) should be resignaled
     expect(result.resignaled).toBe(1);
-    expect(dispatched).toContain("linear-AI-2116-A");
+    expect(dispatched).toContain("linear-AI-2119");
     expect(dispatched).not.toContain("linear-AI-2014");
-    expect(dispatched).not.toContain("linear-AI-2116-B");
+    expect(dispatched).not.toContain("linear-AI-2117");
 
     watchdog.stop();
     bag.close();
