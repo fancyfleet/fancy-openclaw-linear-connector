@@ -306,6 +306,23 @@ export async function checkLinearIssueRouting(
         );
         return { actionable: false, failOpen: false };
       }
+      // ── INF-226 Defect A: STALE-DELEGATE prune (roster-fanout only) ──────
+      // A department-prefix / steward-escalation fanout targets the STATIC
+      // department default, blind to who currently holds the ticket. After an
+      // ad-hoc `handoff-work` moves the delegate to a different agent, every
+      // subsequent non-routing event (comment, label edit) re-fans-out to the
+      // old default and — absent this guard — re-wakes it in a loop (INF-221:
+      // Felix woken 5x after INF-221 was handed to Sage). Mirror Gate 2b's
+      // ownership re-verification: when a live delegate exists and is verifiably
+      // NOT the agent being woken, this fanout is stale. The null-delegate case
+      // falls through untouched, so genuinely unrouted departmental work still
+      // wakes the default.
+      if (issue.delegate && agent?.linearUserId && issue.delegate.id !== agent.linearUserId) {
+        log.info(
+          `Dropping ${routingReason} event for ${identifier}: delegated to ${issue.delegate.name ?? "another agent"}, not ${agentId} — stale department fanout`,
+        );
+        return { actionable: false, failOpen: false };
+      }
       return { actionable: true, failOpen: false };
     }
 
