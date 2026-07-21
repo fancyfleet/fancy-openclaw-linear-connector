@@ -1002,6 +1002,10 @@ export function createWebhookRouter(
       const agentLivenessCfg = getAgent(route.agentId);
       if (agentLivenessCfg?.hooksUrl) livenessConfig.hooksUrl = agentLivenessCfg.hooksUrl;
       if (agentLivenessCfg?.hooksToken) livenessConfig.hooksToken = agentLivenessCfg.hooksToken;
+      // AI-2515: if the agent has a gatewayUrl configured, pass it as a fallback
+      // for liveness checks. The gateway health endpoint is reachable from the
+      // connector's runtime even when hooksUrl uses a container-only hostname.
+      if (agentLivenessCfg?.gatewayUrl) livenessConfig.gatewayUrl = agentLivenessCfg.gatewayUrl;
 
       const liveness = await checkAgentLiveness(route.agentId, livenessConfig);
       if (!liveness.available) {

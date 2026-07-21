@@ -4,7 +4,7 @@ import { createWebhookRouter } from "./webhook/index.js";
 import { handleProxyRequest } from "./proxy.js";
 import { handleProxyUploadRequest } from "./proxy-upload.js";
 import { startTokenRefresh } from "./token-refresh.js";
-import { getAgents, watchAgentsFile } from "./agents.js";
+import { getAgents, watchAgentsFile, getEncryptionKeyValidation } from "./agents.js";
 import { createLogger, componentLogger } from "./logger.js";
 import { handleOAuthCallback } from "./oauth-callback.js";
 import { EventStore } from "./store/event-store.js";
@@ -490,6 +490,11 @@ export function createApp(options?: CreateAppOptions) {
         },
         totalCycles: watchdog.totalCycles,
       },
+      // INF-272: encryption-key match validation — confirms the configured .env
+      // encryption key can decrypt the stored agents.json. An invalid key means
+      // the .env has the wrong LINEAR_CONNECTOR_ENCRYPTION_KEY / KEY_FILE reference;
+      // every token refresh save() would silently corrupt the token store.
+      encryptionKey: getEncryptionKeyValidation(),
     });
   });
 
