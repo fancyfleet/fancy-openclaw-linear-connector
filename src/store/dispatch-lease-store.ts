@@ -77,6 +77,32 @@ export interface LeaseStoreCounters {
   stalePurged: number;
 }
 
+/**
+ * Simplified lease entry shape for the reconciliation wake path (INF-282).
+ * Maps from the internal LeaseRecord to a friendlier shape.
+ */
+export interface LeaseEntry {
+  agentId: string;
+  ticketId: string;
+  acquiredAt: number;
+  ttlMs: number;
+}
+
+/**
+ * Simplified interface for the reconciliation wake path (INF-282).
+ *
+ * The full DispatchLeaseStore class also implements this interface (via TS
+ * declaration merging), so callers that only need the simplified API can
+ * accept a DispatchLeaseStore instance.
+ */
+export interface DispatchLeaseStore {
+  hasActiveLease(agentId: string, ticketId: string): boolean;
+  acquireLease(agentId: string, ticketId: string, ttlMs: number): boolean;
+  releaseLease(agentId: string, ticketId: string): void;
+  getLease(agentId: string, ticketId: string): LeaseEntry | null;
+  pruneExpired(): number;
+}
+
 export class DispatchLeaseStore {
   private db: Database.Database;
   private readonly leaseTtlMs: number;
@@ -362,6 +388,52 @@ export class DispatchLeaseStore {
       released: this._released,
       stalePurged: this._stalePurged,
     };
+  }
+
+  // ── DispatchLeaseStore interface adapters (INF-282) ───────────────────────
+
+  /**
+   * Simplified interface: returns true if an unexpired lease exists for (agentId, ticketKey).
+   */
+  hasActiveLease(agentId: string, ticketKey: string): boolean {
+    return this.isActive(agentId, ticketKey) !== null;
+  }
+
+  /**
+   * Simplified interface: acquire a lease for (agentId, ticketKey) with explicit TTL.
+   * Returns true if acquired, false if refused.
+   */
+  acquireLease(agentId: string, ticketKey: string, ttlMs: number): boolean {
+    const result = this.acquire(agentId, ticketKey, { ttlOverrideMs: ttlMs });
+    return result.acquired;
+  }
+
+  /**
+   * Simplified interface: release a lease (void return).
+   */
+  releaseLease(agentId: string, ticketKey: string): void {
+    this.release(agentId, ticketKey);
+  }
+
+  /**
+   * Simplified interface: get lease entry or null.
+   */
+  getLease(agentId: string, ticketKey: string): LeaseEntry | null {
+    const record = this.get(agentId, ticketKey);
+    if (!record) return null;
+    const acquired = new Date(record.dispatched_at).getTime();
+    const expires = new Date(record.expires_at).getTime();
+    return {
+      agentId: record.agent_id,
+      ticketId: record.ticket_key,
+      acquiredAt: acquired,
+      ttlMs: expires - acquired,
+    };
+  }
+
+  /** Alias for purgeExpired — fulfills DispatchLeaseStore.pruneExpired(). */
+  pruneExpired(): number {
+    return this.purgeExpired();
   }
 
   close(): void {
