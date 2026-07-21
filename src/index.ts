@@ -422,6 +422,22 @@ export function createApp(options?: CreateAppOptions) {
       // console token panel (AI-1955 AC3) and operator triage without log access.
       tokens: getAllTokenStatuses(),
       dispatchCircuitBreaker: getCircuitBreakerHealth(),
+      // AI-2116 AC8/AC9: dispatch watchdog hardening liveness — confirms the
+      // retry-hardening and precondition-guard features are wired and active,
+      // observable at ac-validate without waiting for a re-dispatch cycle.
+      dispatchWatchdog: {
+        scheduled: true,
+        config: {
+          exponentialBackoffMs: (watchdog as any).config?.exponentialBackoffMs ?? 0,
+          maxResignals: (watchdog as any).config?.maxResignals ?? 0,
+          preconditionGuards: {
+            resolveCheck: true,
+            delegateMatch: true,
+            workflowState: true,
+          },
+        },
+        totalCycles: watchdog.totalCycles,
+      },
     });
   });
 
@@ -774,8 +790,141 @@ export function createApp(options?: CreateAppOptions) {
     }
   }
 
+  // AI-2116: precondition guard — verify the target ticket resolves in Linear
+  // before re-dispatching. Uses the same steward-first token strategy as
+  // postLinearComment. Called by the watchdog for each timed-out entry.
+  const linearResolveCheck = async (_ticketId: string): Promise<boolean> => {
+    const identifier = _ticketId.replace(/^linear-/, "");
+    const tokenCandidates: Array<{ source: string; token: string | undefined }> = [
+      { source: "steward:astrid", token: getAccessToken("astrid") },
+      { source: "env", token: process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY },
+    ];
+    for (const { source, token } of tokenCandidates) {
+      if (!token) continue;
+      const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
+      try {
+        const res = await fetch("https://api.linear.app/graphql", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: authHeader },
+          body: JSON.stringify({
+            query: `query($id: String!) { issue(id: $id) { id } }`,
+            variables: { id: identifier },
+          }),
+        });
+        const body = (await res.json()) as { data?: { issue?: { id: string } | null }; errors?: Array<{ message?: string }> };
+        if (body.data?.issue?.id != null) return true;
+        log.warn(`linearResolveCheck: ${identifier} not found via ${source}: ${JSON.stringify(body.errors ?? "no errors")}`);
+      } catch {
+        continue;
+      }
+    }
+    return false;
+  };
+
+  // AI-2116: precondition guard — verify the dispatch target is still the
+  // ticket's current delegate before re-waking.
+  const delegateCheck = async (_ticketId: string, agentId: string): Promise<boolean> => {
+    const identifier = _ticketId.replace(/^linear-/, "");
+    const tokenCandidates: Array<{ source: string; token: string | undefined }> = [
+      { source: "steward:astrid", token: getAccessToken("astrid") },
+      { source: "env", token: process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY },
+    ];
+    let lastError: string | null = null;
+    for (const { source, token } of tokenCandidates) {
+      if (!token) continue;
+      const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
+      try {
+        const res = await fetch("https://api.linear.app/graphql", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: authHeader },
+          body: JSON.stringify({
+            query: `query($id: String!) { issue(id: $id) { id, assignee { id name } } }`,
+            variables: { id: identifier },
+          }),
+        });
+        const body = (await res.json()) as { data?: { issue?: { id: string; assignee?: { id: string; name: string } | null } | null }; errors?: Array<{ message?: string }> };
+        if (!body.data?.issue) { lastError = `issue not found via ${source}`; continue; }
+        const delegate = body.data.issue.assignee;
+        // Compare the Linear assignee name with the agentId
+        if (delegate?.name === agentId) return true;
+        const linearUserId = getLinearUserIdForAgent(agentId);
+        if (linearUserId && delegate?.id === linearUserId) return true;
+        return false;
+      } catch (err) {
+        lastError = `delegate check via ${source} threw: ${err instanceof Error ? err.message : String(err)}`;
+        continue;
+      }
+    }
+    log.warn(`delegateCheck: could not verify delegate for ${identifier} against ${agentId}: ${lastError ?? "no token"}`);
+    throw new Error(lastError ?? "no token available for delegate check");
+  };
+
+  // AI-2116: precondition guard — verify the ticket is in a workflow with a
+  // resolvable forward verb before emitting a "run pending transition" wake.
+  const workflowStateCheck = async (_ticketId: string): Promise<{ inWorkflow: boolean; resolvableVerb: string | null }> => {
+    const identifier = _ticketId.replace(/^linear-/, "");
+    const tokenCandidates: Array<{ source: string; token: string | undefined }> = [
+      { source: "steward:astrid", token: getAccessToken("astrid") },
+      { source: "env", token: process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY },
+    ];
+    let lastError: string | null = null;
+    for (const { source, token } of tokenCandidates) {
+      if (!token) continue;
+      const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
+      try {
+        const res = await fetch("https://api.linear.app/graphql", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: authHeader },
+          body: JSON.stringify({
+            query: `query($id: String!) { issue(id: $id) { id, labels { nodes { name } } } }`,
+            variables: { id: identifier },
+          }),
+        });
+        const body = (await res.json()) as { data?: { issue?: { id: string; labels?: { nodes?: Array<{ name: string }> } } | null }; errors?: Array<{ message?: string }> };
+        if (!body.data?.issue) { lastError = `issue not found via ${source}`; continue; }
+        const labels = body.data.issue.labels?.nodes?.map((n) => n.name) ?? [];
+        const stateLabels = labels.filter((l) => l.startsWith("state:"));
+        if (stateLabels.length === 0) return { inWorkflow: false, resolvableVerb: null };
+        // Ticket has a state label — check the workflow registry for a forward verb
+        try {
+          const registry = loadWorkflowRegistry();
+          for (const [_defId, def_] of Object.entries(registry)) {
+            for (const [stateName, stateDef_] of Object.entries(def_.states ?? {})) {
+              if (stateLabels.includes(`state:${stateName}`)) {
+                const forwardVerb = stateDef_.transitions?.[0] ?? null;
+                return { inWorkflow: true, resolvableVerb: forwardVerb };
+              }
+            }
+          }
+          // state label exists but not in any known workflow def
+          return { inWorkflow: true, resolvableVerb: null };
+        } catch {
+          // Registry not loadable — fail open: assume it's in a workflow
+          return { inWorkflow: true, resolvableVerb: "continue-workflow" };
+        }
+      } catch (err) {
+        lastError = `workflow check via ${source} threw: ${err instanceof Error ? err.message : String(err)}`;
+        continue;
+      }
+    }
+    log.warn(`workflowStateCheck: could not verify workflow for ${identifier}: ${lastError ?? "no token"}`);
+    throw new Error(lastError ?? "no token available for workflow state check");
+  };
+
   const watchdog = new DispatchWatchdog(
-    { bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig, wakeConfigForAgent, resignalOptions },
+    {
+      bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig, wakeConfigForAgent,
+      resignalOptions,
+      linearResolveCheck,
+      delegateCheck,
+      workflowStateCheck,
+    },
+    {
+      exponentialBackoffMs:
+        process.env.WATCHDOG_EXPONENTIAL_BACKOFF_MS
+          ? parseInt(process.env.WATCHDOG_EXPONENTIAL_BACKOFF_MS, 10)
+          : 30_000,
+    },
   );
   watchdog.start();
 
