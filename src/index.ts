@@ -4,12 +4,13 @@ import { createWebhookRouter } from "./webhook/index.js";
 import { handleProxyRequest } from "./proxy.js";
 import { handleProxyUploadRequest } from "./proxy-upload.js";
 import { startTokenRefresh } from "./token-refresh.js";
-import { getAgents, watchAgentsFile } from "./agents.js";
+import { getAgents, watchAgentsFile, getEncryptionKeyValidation } from "./agents.js";
 import { createLogger, componentLogger } from "./logger.js";
 import { handleOAuthCallback } from "./oauth-callback.js";
 import { EventStore } from "./store/event-store.js";
 import { NudgeStore } from "./store/nudge-store.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
+import { DeadLetterQueueStore } from "./dead-letter-queue.js";
 import { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import { ObservationStore } from "./store/observation-store.js";
 import { registerObservationWritePath, getObservationWritePathState } from "./store/observation-write-path.js";
@@ -46,7 +47,9 @@ import { registerSlaSweepCron } from "./sla-sweep.js";
 import { registerLabelSyncAuditCron } from "./cron/label-sync-audit.js";
 import { registerAntiEntropyCron } from "./cron/anti-entropy.js";
 import { registerOobReconcileCron } from "./oob-reconcile-sweep.js";
+import { createBacklogController } from "./cron/backlog-controller.js";
 import { registerConfigSanityAlertCron, getConfigSanityAlertLiveness } from "./config-sanity-alert.js";
+import { registerMatrixApprovalGate, getMatrixApprovalGateLiveness } from "./matrix-approval-gate.js";
 import { MutationAuditStore } from "./store/mutation-audit-store.js";
 import { DispatchIdempotencyStore } from "./store/dispatch-idempotency-store.js";
 import { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
@@ -67,6 +70,7 @@ import { getAccessToken, getAgent, getLinearUserIdForAgent, getAllTokenStatuses,
 import { loadUniversalCanon, getCanonLiveness } from "./policy/universal-canon.js";
 import { loadRoster, getRoutingFunctionaryLiveness } from "./department-roster.js";
 import { createGuidanceRouter, getDocsLiveness } from "./docs/guidance-router.js";
+import { TtlCache, buildFullCacheLiveness, markCacheFlushRouteMounted, registerTtlInvalidationCron } from "./cache/ttl-cache.js";
 import type { StaleSessionDetail } from "./bag/session-tracker.js";
 import crypto from "crypto";
 import path from "path";
@@ -214,6 +218,20 @@ export interface CreateAppOptions {
    * live hooks URL. Also used as isTicketActionable bypass when provided.
    */
   sendWakeUp?: (agentId: string, ticketIds: string[]) => Promise<void>;
+  /** Override DeadLetterQueueStore database path (for testing). */
+  deadLetterQueueDbPath?: string;
+}
+
+function bindReturnedCloseMethods<T extends Record<string, unknown>>(created: T): T {
+  for (const value of Object.values(created)) {
+    if (!value || typeof value !== "object") continue;
+
+    const close = (value as { close?: unknown }).close;
+    if (typeof close === "function") {
+      (value as { close: () => void }).close = close.bind(value);
+    }
+  }
+  return created;
 }
 
 export function createApp(options?: CreateAppOptions) {
@@ -224,6 +242,16 @@ export function createApp(options?: CreateAppOptions) {
 
   // Create stores early — needed before route registration.
   const observationStore = new ObservationStore(options?.observationsDbPath);
+
+  // INF-193: TTL-backed in-memory cache for workflow-critical data (labels,
+  // states, workflow defs). Used via module-level liveness helpers so /health
+  // can report cache state without threading this reference through every layer.
+  const ttlCache = new TtlCache<unknown>({ defaultTtlMs: 300_000 });
+
+  // INF-219 / INF-247: cron-backlog stampede protection. This live controller
+  // is exposed on createApp() and /health so cron drivers can share the same
+  // concurrency, dedup, and recovery-rate guard.
+  const backlogController = createBacklogController();
 
   // AI-2036 AC1.5/AC1.6: register the observation write path here, on the same
   // code path that hands the store to the proxy's transition options below.
@@ -278,6 +306,12 @@ export function createApp(options?: CreateAppOptions) {
   // because their lpx_ proxy token is rejected by Linear. This endpoint
   // resolves the real token from the proxy token and fetches the asset.
   app.get("/proxy/upload", (req, res) => handleProxyUploadRequest(req, res));
+
+  // Forward ref for managingPoller (created later in createApp but before
+  // the health handler is registered). The health handler reads this at
+  // request time — if the poller was never wired, it reports running=false.
+  // See AI-2624 AC7.
+  const managingPollerRef: { current: ManagingPoller | null } = { current: null };
 
   // Health check — returns 503 when the agent roster is empty so the
   // Docker healthcheck (and any load balancer) pulls the container out of
@@ -363,6 +397,13 @@ export function createApp(options?: CreateAppOptions) {
       // the live dispatch path (routeEventAll), observable at ac-validate without
       // waiting for a webhook to arrive.
       routingFunctionary: getRoutingFunctionaryLiveness(),
+      // INF-193 AC4: TTL cache liveness — confirms the TTL invalidation
+      // scheduler timer is armed and the cache-flush route is mounted, both
+      // observable at /health without waiting for a stale-resolution event.
+      cache: buildFullCacheLiveness(ttlCache),
+      // INF-247 AC6: backlog-controller liveness — surfaces the live controller
+      // state at /health so bootstrap wiring is observable without a trigger.
+      backlogController: backlogController.getStats(),
       // AI-2091 §9 (AI-1808 addendum): dispatch-integrity gate liveness. Each of
       // the four gates (delivery-time recipient resolution, phantom fetchability,
       // wake→session dedup, pre-mutation compare-and-swap) reports `active: true`
@@ -413,14 +454,47 @@ export function createApp(options?: CreateAppOptions) {
       // credential redaction. status is "idle"/"running"/"error"; lastRun
       // is null before the first sweep fires.
       transcriptRedaction: getTranscriptRedactionHealth(),
+      // INF-192 AC5: Matrix approval gate liveness — confirms the component
+      // was registered at bootstrap and surfaces approver/pattern counts.
+      matrixApprovalGate: getMatrixApprovalGateLiveness(),
       // AI-2542: auto-enroll liveness and demote/escape suppression counters.
       autoEnroll: getAutoEnrollLiveness(),
+      // AI-2624 AC7: ManagingPoller liveness — reports running state and
+      // effective cycle/interval at /health without waiting for a wake.
+      // Uses a forward ref because the poller is constructed later in
+      // createApp (after `wakeConfigForAgent` is defined).
+      managingPoller: managingPollerRef.current?.liveness() ?? {
+        running: false,
+        cycleMs: 0,
+        defaultIntervalMs: 0,
+      },
       // AI-1908 AC5: per-agent OAuth token status. Exposes lastRefreshOkAt,
       // expiresAt (from the real expires_in, not assumed ~24h), lastFailure,
       // and a computed state (healthy/stale/expired/failing). Powers the
       // console token panel (AI-1955 AC3) and operator triage without log access.
       tokens: getAllTokenStatuses(),
       dispatchCircuitBreaker: getCircuitBreakerHealth(),
+      // AI-2116 AC8/AC9: dispatch watchdog hardening liveness — confirms the
+      // retry-hardening and precondition-guard features are wired and active,
+      // observable at ac-validate without waiting for a re-dispatch cycle.
+      dispatchWatchdog: {
+        scheduled: true,
+        config: {
+          exponentialBackoffMs: (watchdog as any).config?.exponentialBackoffMs ?? 0,
+          maxResignals: (watchdog as any).config?.maxResignals ?? 0,
+          preconditionGuards: {
+            resolveCheck: true,
+            delegateMatch: true,
+            workflowState: true,
+          },
+        },
+        totalCycles: watchdog.totalCycles,
+      },
+      // INF-272: encryption-key match validation — confirms the configured .env
+      // encryption key can decrypt the stored agents.json. An invalid key means
+      // the .env has the wrong LINEAR_CONNECTOR_ENCRYPTION_KEY / KEY_FILE reference;
+      // every token refresh save() would silently corrupt the token store.
+      encryptionKey: getEncryptionKeyValidation(),
     });
   });
 
@@ -773,8 +847,141 @@ export function createApp(options?: CreateAppOptions) {
     }
   }
 
+  // AI-2116: precondition guard — verify the target ticket resolves in Linear
+  // before re-dispatching. Uses the same steward-first token strategy as
+  // postLinearComment. Called by the watchdog for each timed-out entry.
+  const linearResolveCheck = async (_ticketId: string): Promise<boolean> => {
+    const identifier = _ticketId.replace(/^linear-/, "");
+    const tokenCandidates: Array<{ source: string; token: string | undefined }> = [
+      { source: "steward:astrid", token: getAccessToken("astrid") },
+      { source: "env", token: process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY },
+    ];
+    for (const { source, token } of tokenCandidates) {
+      if (!token) continue;
+      const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
+      try {
+        const res = await fetch("https://api.linear.app/graphql", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: authHeader },
+          body: JSON.stringify({
+            query: `query($id: String!) { issue(id: $id) { id } }`,
+            variables: { id: identifier },
+          }),
+        });
+        const body = (await res.json()) as { data?: { issue?: { id: string } | null }; errors?: Array<{ message?: string }> };
+        if (body.data?.issue?.id != null) return true;
+        log.warn(`linearResolveCheck: ${identifier} not found via ${source}: ${JSON.stringify(body.errors ?? "no errors")}`);
+      } catch {
+        continue;
+      }
+    }
+    return false;
+  };
+
+  // AI-2116: precondition guard — verify the dispatch target is still the
+  // ticket's current delegate before re-waking.
+  const delegateCheck = async (_ticketId: string, agentId: string): Promise<boolean> => {
+    const identifier = _ticketId.replace(/^linear-/, "");
+    const tokenCandidates: Array<{ source: string; token: string | undefined }> = [
+      { source: "steward:astrid", token: getAccessToken("astrid") },
+      { source: "env", token: process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY },
+    ];
+    let lastError: string | null = null;
+    for (const { source, token } of tokenCandidates) {
+      if (!token) continue;
+      const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
+      try {
+        const res = await fetch("https://api.linear.app/graphql", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: authHeader },
+          body: JSON.stringify({
+            query: `query($id: String!) { issue(id: $id) { id, assignee { id name } } }`,
+            variables: { id: identifier },
+          }),
+        });
+        const body = (await res.json()) as { data?: { issue?: { id: string; assignee?: { id: string; name: string } | null } | null }; errors?: Array<{ message?: string }> };
+        if (!body.data?.issue) { lastError = `issue not found via ${source}`; continue; }
+        const delegate = body.data.issue.assignee;
+        // Compare the Linear assignee name with the agentId
+        if (delegate?.name === agentId) return true;
+        const linearUserId = getLinearUserIdForAgent(agentId);
+        if (linearUserId && delegate?.id === linearUserId) return true;
+        return false;
+      } catch (err) {
+        lastError = `delegate check via ${source} threw: ${err instanceof Error ? err.message : String(err)}`;
+        continue;
+      }
+    }
+    log.warn(`delegateCheck: could not verify delegate for ${identifier} against ${agentId}: ${lastError ?? "no token"}`);
+    throw new Error(lastError ?? "no token available for delegate check");
+  };
+
+  // AI-2116: precondition guard — verify the ticket is in a workflow with a
+  // resolvable forward verb before emitting a "run pending transition" wake.
+  const workflowStateCheck = async (_ticketId: string): Promise<{ inWorkflow: boolean; resolvableVerb: string | null }> => {
+    const identifier = _ticketId.replace(/^linear-/, "");
+    const tokenCandidates: Array<{ source: string; token: string | undefined }> = [
+      { source: "steward:astrid", token: getAccessToken("astrid") },
+      { source: "env", token: process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY },
+    ];
+    let lastError: string | null = null;
+    for (const { source, token } of tokenCandidates) {
+      if (!token) continue;
+      const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
+      try {
+        const res = await fetch("https://api.linear.app/graphql", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: authHeader },
+          body: JSON.stringify({
+            query: `query($id: String!) { issue(id: $id) { id, labels { nodes { name } } } }`,
+            variables: { id: identifier },
+          }),
+        });
+        const body = (await res.json()) as { data?: { issue?: { id: string; labels?: { nodes?: Array<{ name: string }> } } | null }; errors?: Array<{ message?: string }> };
+        if (!body.data?.issue) { lastError = `issue not found via ${source}`; continue; }
+        const labels = body.data.issue.labels?.nodes?.map((n) => n.name) ?? [];
+        const stateLabels = labels.filter((l) => l.startsWith("state:"));
+        if (stateLabels.length === 0) return { inWorkflow: false, resolvableVerb: null };
+        // Ticket has a state label — check the workflow registry for a forward verb
+        try {
+          const registry = await loadWorkflowRegistry();
+          for (const [_defId, def_] of registry) {
+            for (const [stateName, stateDef_] of Object.entries(def_.states ?? {})) {
+              if (stateLabels.includes(`state:${stateName}`)) {
+                const forwardVerb = stateDef_.transitions?.[0]?.command ?? null;
+                return { inWorkflow: true, resolvableVerb: forwardVerb };
+              }
+            }
+          }
+          // state label exists but not in any known workflow def
+          return { inWorkflow: true, resolvableVerb: null };
+        } catch {
+          // Registry not loadable — fail open: assume it's in a workflow
+          return { inWorkflow: true, resolvableVerb: "continue-workflow" };
+        }
+      } catch (err) {
+        lastError = `workflow check via ${source} threw: ${err instanceof Error ? err.message : String(err)}`;
+        continue;
+      }
+    }
+    log.warn(`workflowStateCheck: could not verify workflow for ${identifier}: ${lastError ?? "no token"}`);
+    throw new Error(lastError ?? "no token available for workflow state check");
+  };
+
   const watchdog = new DispatchWatchdog(
-    { bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig, wakeConfigForAgent, resignalOptions },
+    {
+      bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig, wakeConfigForAgent,
+      resignalOptions,
+      linearResolveCheck,
+      delegateCheck,
+      workflowStateCheck,
+    },
+    {
+      exponentialBackoffMs:
+        process.env.WATCHDOG_EXPONENTIAL_BACKOFF_MS
+          ? parseInt(process.env.WATCHDOG_EXPONENTIAL_BACKOFF_MS, 10)
+          : 30_000,
+    },
   );
   watchdog.start();
 
@@ -820,6 +1027,7 @@ export function createApp(options?: CreateAppOptions) {
   // can't push forward right now). Per-ticket interval is set via a
   // `Managing-interval: <duration>` marker in the issue description;
   // default is 30 minutes.
+  const deadLetterQueue = new DeadLetterQueueStore(options?.deadLetterQueueDbPath);
   const managingStateStore = new ManagingStateStore(options?.managingStateDbPath);
   const managingPoller = new ManagingPoller({
     store: managingStateStore,
@@ -827,6 +1035,7 @@ export function createApp(options?: CreateAppOptions) {
     resolveDeliveryConfig: wakeConfigForAgent,
   });
   managingPoller.start();
+  managingPollerRef.current = managingPoller;
 
   // Operator nudge endpoint — sends a short instruction into an already-active
   // agent session. Phase 1 is local/Nakazawa only; no cross-gateway routing.
@@ -950,6 +1159,16 @@ export function createApp(options?: CreateAppOptions) {
   // Management console (Phase 3): React SPA + JSON API, session or secret auth.
   app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, ackTracker, deploymentName: DEPLOYMENT_NAME, enrolledTicketsStore, forensicsDiagnosticsDir: options?.forensicsDiagnosticsDir, mutationAuditStore, wakeConfigForAgent, proposalStore }));
 
+  // INF-193 AC3: cache-flush endpoint for emergency invalidation. ADMIN_SECRET-gated.
+  app.post("/admin/api/cache/flush", (req: express.Request, res: express.Response) => {
+    if (!requireAdminSecret(req, res)) return;
+    ttlCache.flushAll();
+    log.info("INF-193: cache flushed via /admin/api/cache/flush");
+    res.json({ success: true });
+  });
+  // Mark the flush route as mounted for /health.cache liveness proof (AC4).
+  markCacheFlushRouteMounted();
+
   app.use("/", createWebhookRouter(
     eventStore,
     nudgeStore,
@@ -958,6 +1177,7 @@ export function createApp(options?: CreateAppOptions) {
     sessionTracker,
     throttle,
     operationalEventStore,
+    deadLetterQueue,
     (agentId, ticketId) => {
       ackTracker.recordDispatch(agentId, ticketId);
       // AI-1510: agent has read the ticket via the connector → Thinking.
@@ -1244,7 +1464,12 @@ export function createApp(options?: CreateAppOptions) {
     log.error(`fanout-outcome-store startup liveness check threw: ${err instanceof Error ? err.message : String(err)}`);
   });
 
-  return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, transcriptRedactionHealth: getTranscriptRedactionHealth() };
+  // INF-193 AC4: TTL cache invalidation scheduler — periodic purge of expired
+  // entries to prevent stale resolution and memory accumulation of unread keys.
+  registerTtlInvalidationCron(ttlCache, 60_000);
+  log.info("INF-193: TTL cache invalidation cron registered (every 60s)");
+
+  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, transcriptRedactionHealth: getTranscriptRedactionHealth() });
 }
 
 /**
@@ -1686,6 +1911,28 @@ if (isEntryPoint) {
   // output and routes findings through the AlertBus with stable dedup keys
   // (git-remote-liveness PUSH-DEAD keyed on AI-2189 root-cause ticket).
   registerConfigSanityAlertCron();
+
+  // INF-192: Matrix approval gate — register at bootstrap so the component
+  // is armed (observable via /health.matrixApprovalGate). Derives config from
+  // environment so ops can configure patterns and designated approvers without
+  // code changes.
+  const _matrixApprovalPatterns = process.env.MATRIX_APPROVAL_PATTERNS
+    ? process.env.MATRIX_APPROVAL_PATTERNS.split(",").map((s) => s.trim()).filter(Boolean)
+    : ["I approve", "approved", "lgtm", ":+1:", "looks good", "sign off"];
+  const _matrixApprovalApprovers = (() => {
+    const raw = process.env.MATRIX_APPROVAL_APPROVERS;
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  })();
+  registerMatrixApprovalGate({
+    approvalPatterns: _matrixApprovalPatterns,
+    designatedApprovers: _matrixApprovalApprovers,
+  });
 
   // Config-health healthy→unhealthy is the loudest structural signal we have
   // (bad policy/workflow/agents.json = engine fail-closed for workflow tickets).

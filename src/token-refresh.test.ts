@@ -19,8 +19,17 @@ const mockGetAgents = jest.fn<() => AgentConfig[]>();
 const mockRecordTokenFailure = jest.fn<(name: string, status: number, retriable: boolean, reason: string) => void>();
 const mockGetTokenStatus = jest.fn<(name: string) => TokenStatus | undefined>();
 const mockNotify = jest.fn<(alert: unknown) => void>();
+const mockValidateEncryptionKeyMatch = jest.fn<() => { valid: boolean; agentsEncrypted: boolean; lastValidationAt: string | null; error?: string }>();
 let mockFetch: jest.Mock<typeof fetch>;
 let nextFetchId = 0;
+
+// Default: validation passes (no encrypted agents file to mismatch)
+mockValidateEncryptionKeyMatch.mockReturnValue({
+  valid: true,
+  agentsEncrypted: false,
+  lastValidationAt: new Date().toISOString(),
+  error: "No agents file — no key validation possible",
+});
 
 jest.unstable_mockModule("./agents.js", () => ({
   isAgentLocal: mockIsAgentLocal,
@@ -28,6 +37,7 @@ jest.unstable_mockModule("./agents.js", () => ({
   getAgents: mockGetAgents,
   recordTokenFailure: mockRecordTokenFailure,
   getTokenStatus: mockGetTokenStatus,
+  validateEncryptionKeyMatch: mockValidateEncryptionKeyMatch,
 }));
 
 jest.unstable_mockModule("./alerts/alert-bus.js", () => ({

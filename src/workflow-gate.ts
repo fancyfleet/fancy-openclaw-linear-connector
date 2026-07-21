@@ -39,12 +39,13 @@ import path from "node:path";
 import yaml from "js-yaml";
 import { componentLogger, createLogger, type Logger } from "./logger.js";
 import { defaultWorkflowDefPath } from "./instance-config.js";
-import { bodyHasCapability, resolveBodiesForRole } from "./escalation-gate.js";
+import { bodyHasCapability, resolveBodiesForRole, resolveBodiesWithCapability } from "./escalation-gate.js";
+import { isTerminalIssueState } from "./linear-actionable.js";
 import type { ObservationStore } from "./store/observation-store.js";
 import { recordObservation } from "./store/observation-write-path.js";
 import { isBodyKnown } from "./escalation-gate.js";
 import { getAgent, getAgents } from "./agents.js";
-import { executeFanout, shouldTriggerFanout, validateFanoutSpec, extractSpecFindings, autoDeriveArmFindings, deriveSpecFromPriorChildren, upsertDerivedSpecSection, updateIssueDescription, type Finding } from "./fanout.js";
+import { executeFanout, shouldTriggerFanout, validateFanoutSpec, extractSpecFindings, autoDeriveArmFindings, deriveSpecFromPriorChildren, deriveStructuredFromChildren, upsertDerivedSpecSection, updateIssueDescription, type Finding } from "./fanout.js";
 import { recordFanoutOutcome } from "./fanout-outcome-store.js";
 import { onChildTerminal, onManagingEntry, isTerminalState } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
@@ -1894,7 +1895,7 @@ async function fetchBranchAndPRStatus(
  * implicitly (including private) and is not limited to this list.
  */
 const KNOWN_SCAN_REPOS: Array<{ owner: string; repo: string }> = [
-  { owner: "fancymatt", repo: "fancy-openclaw-linear-connector" },
+  { owner: "fancyfleet", repo: "fancy-openclaw-linear-connector" },
   { owner: "fancymatt", repo: "fancy-openclaw-linear-skill-cli" },
   { owner: "fancymatt", repo: "fancy-openclaw-workflow-skill" },
   { owner: "fancyfleet", repo: "gen" },
@@ -2887,6 +2888,33 @@ export async function checkWorkflowRules(
     // No branch/PR evidence at all — fresh intake, not blocking
   }
 
+  // INF-271: `retire` — steward-only verb that strips wf:* and state:* labels
+  // from a workflow ticket whose native Linear state is already terminal
+  // (Duplicate/Canceled/Done). This is a governed jailbreak: it exits the
+  // workflow without reactivating it. Guard: caller must be a workflow steward
+  // (workflow:steward capability). The native-state terminal check happens in
+  // applyStateTransition (B2) so we don't double-fetch here.
+  if (intent === "retire") {
+    const hasStewardCap = await bodyHasCapability(bodyId, "workflow:steward");
+    if (!hasStewardCap) {
+      log.warn(`workflow-gate: retire blocked — '${bodyId}' lacks workflow:steward on ${issueId}`);
+      return (
+        `[Proxy] 'retire' blocked: caller '${bodyId}' is not a workflow steward. ` +
+        `Only a workflow steward (workflow:steward capability) may retire a ticket from workflow governance.`
+      );
+    }
+    // Must be a workflow ticket
+    if (!workflowId) {
+      log.warn(`workflow-gate: retire blocked — ${issueId} has no wf:* label (not a workflow ticket)`);
+      return (
+        `[Proxy] 'retire' blocked: ticket ${issueId} is not a workflow ticket ` +
+        `(no wf:* label found). Retire only applies to tickets enrolled in a governed workflow.`
+      );
+    }
+    log.info(`workflow-gate: retire allowed — steward '${bodyId}' retiring ${issueId} from wf:${workflowId}`);
+    return null;
+  }
+
   // AI-1397: delegate-only enforcement at proxy (CLI-version-agnostic).
   // If both the caller's Linear user ID and the ticket's delegate ID are known,
   // block any agent that is not the current delegate. Fails open when either is
@@ -3069,6 +3097,22 @@ export async function checkWorkflowRules(
     const allowed = await bodyHasCapability(bodyId, match.requires_capability);
     if (!allowed) {
       const legalMoves = [...transitions.map((t) => t.command), breakGlassCommand].join(", ");
+      // INF-197: designated_approver gates need a more specific message naming
+      // the approver so the steward knows who to handoff to (the generic
+      // "deployment body" was unactionable).
+      if (match.designated_approver === true) {
+        const approverBodies = await resolveBodiesWithCapability(match.requires_capability);
+        const approverNames = approverBodies.length > 0
+          ? approverBodies.join(", ")
+          : `the body holding '${match.requires_capability}'`;
+        return (
+          `[Proxy] '${intent}' requires the '${match.requires_capability}' capability ` +
+          `(designated approver: ${approverNames}). ` +
+          `Use \`linear handoff-work ${issueId} ${approverBodies[0] ?? "<approver>"}\` to route ` +
+          `the ticket to the approver for sign-off, then the approver re-runs '${intent}'. ` +
+          `Legal moves: ${legalMoves}.`
+        );
+      }
       return (
         `[Proxy] '${intent}' requires the '${match.requires_capability}' capability; ` +
         `handoff to the deployment body to proceed. ` +
@@ -3584,8 +3628,18 @@ export async function checkRawMutationInterception(
     log.warn(`workflow-gate: raw delegate null (self-clear) block agent=${bodyId} ticket=${issueId}`);
     return delegateClearRejection();
   }
+  // INF-197: Removed !hasAssigneeChange from the delegate-routing condition.
+  // `linear handoff-work <ID> <agent>` sends a raw issueUpdate changing BOTH
+  // delegateId AND assigneeId. Previously the assignee field made this
+  // non-delegate-only, causing it to fall through to the generic "direct
+  // changes blocked" rejection — creating a circular deadlock at signoff gates
+  // where propose-brief says "handoff instead" and handoff-work says "use
+  // propose-brief." The isClearingDelegate check above already catches
+  // {delegateId:null, assigneeId:null} (complete/undelegate), so removing the
+  // assignee exclusion does not re-open the AI-1835 bypass. State and label
+  // protections remain: hasStateChange and hasLabelChange still gate here.
   const delegateOnlyChange =
-    hasDelegateChange && !hasStateChange && !hasAssigneeChange && !hasLabelChange;
+    hasDelegateChange && !hasStateChange && !hasLabelChange;
   if (delegateOnlyChange) {
     if (callerLinearUserId && delegateId && callerLinearUserId === delegateId) {
       if (isClearingDelegate) {
@@ -4240,6 +4294,12 @@ export async function applyStateTransition(
   } else if (intent === "park") {
     toStateName = "__ad_hoc__";
     log.info(`workflow-gate: B2 apply: ${issueId} parking — demoting to __ad_hoc__`);
+  } else if (intent === "retire") {
+    // INF-271: retire exits the workflow entirely (like park) but is a steward-only
+    // verb for terminal native-state tickets. The native-state terminal check runs
+    // inside the __retired__ handler below. Go straight to the retire target.
+    toStateName = "__retired__";
+    log.info(`workflow-gate: B2 apply: ${issueId} retiring — exiting workflow governance`);
   } else if (intent === "handoff") {
     // INF-124: handoff is a delegate-routing meta-command — self-loop, same state.
     // Skip state label swap; delegate resolution still runs below.
@@ -4301,6 +4361,72 @@ export async function applyStateTransition(
     return { status: "applied", code: "demoted-ad-hoc", from: currentStateName, to: "__ad_hoc__" };
   }
 
+  // ── Special target: __retired__ (INF-271) ──────────────────────────────
+  // Ticket is retired from workflow governance — same label stripping as
+  // __ad_hoc__ but additionally validates that the native Linear state is
+  // already terminal, and calls retire() on the enrollment store so the mirror
+  // reflects the terminal disposition.
+  if (toStateName === "__retired__") {
+    // Fetch native state to verify it's terminal before stripping labels
+    const stateQuery = `query($id: String!) { issue(id: $id) { id state { type name } } }`;
+    let nativeStateTerminal = false;
+    try {
+      const res = await fetch(LINEAR_API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authToken },
+        body: JSON.stringify({ query: stateQuery, variables: { id: issueId } }),
+      });
+      const data = (await res.json()) as {
+        data?: { issue?: { state?: { type?: string; name?: string } | null } | null };
+      };
+      const state = data.data?.issue?.state;
+      if (state) {
+        nativeStateTerminal = isTerminalIssueState(state);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`workflow-gate: B2 apply: retire native-state fetch failed for ${issueId}: ${msg} — proceeding anyway (fail-open)`);
+      nativeStateTerminal = true; // fail-open: allow retire even if we can't check
+    }
+
+    if (!nativeStateTerminal) {
+      log.warn(`workflow-gate: B2 apply: retire blocked — ${issueId} native state is not terminal`);
+      return {
+        status: "blocked",
+        code: "native-state-not-terminal",
+        detail: `'retire' refused: ${issueId} native Linear state is not terminal. Retire is only valid for tickets already in a terminal native state (Done/Canceled/Duplicate).`,
+        from: currentStateName,
+        to: "__retired__",
+      };
+    }
+
+    // Strip all wf:* and state:* labels
+    const keepIds = issue.labels
+      .filter((l) => !l.name.startsWith("state:") && !l.name.startsWith("wf:"))
+      .map((l) => l.id);
+    const labelsApplied = await issueUpdateLabels(issue.internalId, keepIds, authToken);
+    if (!labelsApplied) {
+      log.error(`workflow-gate: B2 apply: FAILED — ${issueId} retired but label mutation returned false`);
+      emitTransitionWriteFailure({
+        identifier: issue.identifier ?? issueId,
+        from: currentStateName,
+        to: "__retired__",
+        intent,
+        agent: options?.bodyId ?? null,
+        outcome: { ok: false, attempts: 1, failureKind: "mutation", divergent: [], unverified: false },
+        operationalEventStore: options?.operationalEventStore,
+      });
+      return { status: "failed", code: "atomic-mutation-failed", detail: `__retired__ label mutation did not apply`, from: currentStateName, to: "__retired__" };
+    }
+    clearAppliedState(issue.identifier);
+    // INF-271: mirror — mark the ticket as retired.
+    options?.enrolledTicketsStore?.retire(issue.identifier ?? issueId);
+    log.info(
+      `workflow-gate: B2 apply: ${issueId} retired — removed state:* and wf:* labels, cleared delegate`,
+    );
+    return { status: "applied", code: "retired", from: currentStateName, to: "__retired__" };
+  }
+
   // ── AI-1992: Pre-transition fan-out spec gate (AC5) ──────────────────────
   // When the current state declares a `fanout` block, the spawn spec must be
   // fully validated BEFORE the atomic state mutation. A malformed, ambiguous,
@@ -4359,6 +4485,42 @@ export async function applyStateTransition(
         }
       }
 
+      // INF-258: auto-derive ## Structured section from existing children before refusing.
+      // When spec_source is "structured" and validation fails, look for existing arm
+      // children of the parent ticket that were pre-created (by sprint-spawner or
+      // manual creation) and derive a ## Structured section from their titles.
+      // This mirrors the INF-123 pattern for the findings spec_source.
+      if (fanoutConfig.spec_source === "structured" && attempt === 0) {
+        log.info(
+          `workflow-gate: INF-258: attempting auto-derive structured spec for ${issueId} ` +
+          `(state '${currentStateName}' → '${toStateName}') after validation failure`,
+        );
+        const derivedStructured = await deriveStructuredFromChildren(issue.internalId, authToken);
+        if (derivedStructured.length > 0) {
+          const { autoPopulateFindingsSection } = await import("./fanout.js");
+          const structuredSection = derivedStructured.map(
+            (f) => `- **${f.title}**${f.description ? `: ${f.description}` : ""}`
+          ).join("\n");
+          const descWithSection = specDescription
+            ? `${specDescription}\n\n## Structured\n\n${structuredSection}`
+            : `## Structured\n\n${structuredSection}`;
+          try {
+            await updateIssueDescription(issue.internalId, descWithSection, authToken);
+            log.info(
+              `workflow-gate: INF-258: auto-derived ${derivedStructured.length} structured entry(ies) ` +
+              `for ${issueId} — re-validating`,
+            );
+            continue; // Re-fetch and re-validate
+          } catch (err) {
+            const writeErr = err instanceof Error ? err.message : String(err);
+            log.warn(
+              `workflow-gate: INF-258: auto-derived ${derivedStructured.length} structured entry(ies) ` +
+              `but failed to write description for ${issueId}: ${writeErr}`,
+            );
+          }
+        }
+      }
+
       // Refusal: validation failed and auto-derivation did not (or could not) resolve it
       log.warn(
         `workflow-gate: AI-1992: fan-out spec REFUSED for ${issueId} (state '${currentStateName}' → '${toStateName}'): ${validation.reason}`,
@@ -4389,6 +4551,64 @@ export async function applyStateTransition(
         from: currentStateName,
         to: toStateName,
       };
+    }
+  }
+
+  // ── INF-212: Pre-transition destination fan-out spec gate ────────────────
+  // When the DESTINATION state declares a `fanout` with `spec_source` but the
+  // current state does not have one (so the AI-1992 block above did not already
+  // validate), pre-validate the spec before allowing the advance. This prevents
+  // the LIF-153 class of stall: advancing product-definition → spawn-arms without
+  // the required `## structured` section, which would silently wedge the sprint
+  // inside spawn-arms with no output.
+  //
+  // The existing AI-1992 block validates the CURRENT state's fanout at spawn time
+  // (the consumer boundary), but the spec is authored one state earlier (the
+  // producer boundary). This gate catches an absent or unparseable spec at the
+  // authoring boundary, so the failure lands on the session that owns writing it.
+  if (!pendingFanout && intent !== breakGlassCommand && currentStateName !== toStateName) {
+    const destState = def.states.find((s) => s.id === toStateName);
+    if (destState?.fanout?.spec_source) {
+      const specSource = destState.fanout.spec_source;
+      const specDescription = await fetchFanoutSpecDescription(issueId, authToken);
+      const findings = extractSpecFindings(specDescription, specSource);
+      if (findings.length === 0) {
+        const msg =
+          `The \`${intent}\` transition advances into \`${toStateName}\`, ` +
+          `which fans out into \`${destState.fanout.child_workflow}\` children, ` +
+          `but the \`## ${specSource}\` spawn spec section is missing or empty in the ticket description. ` +
+          `Add a \`## ${specSource}\` section with at least one bullet ` +
+          `(e.g. \`- **Title**: detail\`) and retry the transition.`;
+        log.warn(
+          `workflow-gate: INF-212: pre-transition dest-fanout spec gate REFUSED for ${issueId} ` +
+          `(state '${currentStateName}' → '${toStateName}'): empty or unparseable '${specSource}' spec`,
+        );
+        await postComment(
+          issue.internalId,
+          `\u26d4\ufe0f **Transition refused — spawn spec required.**\n\n` +
+          msg,
+          authToken,
+        );
+        notify({
+          severity: "warning",
+          source: "fanout-spec",
+          title: `transition refused on ${issueId}: empty or unparseable '${specSource}' spec heading into '${toStateName}'`,
+          detail: msg,
+          ticket: issueId,
+          dedupKey: `pre-fanout-spec-refused|${issueId}|${toStateName}`,
+        });
+        return {
+          status: "failed",
+          code: "pre-fanout-spec-invalid",
+          detail: msg,
+          from: currentStateName,
+          to: toStateName,
+        };
+      }
+      log.info(
+        `workflow-gate: INF-212: pre-transition dest-fanout spec gate PASSED for ${issueId} ` +
+        `(state '${currentStateName}' → '${toStateName}'): ${findings.length} finding(s) in '${specSource}'`,
+      );
     }
   }
 
