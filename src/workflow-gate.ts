@@ -2709,6 +2709,7 @@ export async function checkWorkflowRules(
       "migrate-state",
       "rewind",
       "handoff-work",
+      "refuse-work",
       "set-state",
       "complete",
       "cancel",
