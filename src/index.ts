@@ -20,6 +20,7 @@ import { deliverToAgent, deliverMessageToAgent, type DeliveryConfig, DeliveryThr
 import { buildWorkflowAwareDeliveryMessage } from "./delivery/build-message.js";
 import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, StuckDelegateDetector, HoldRetryTracker, resignalPendingTickets, replayPendingBag, ManagingPoller } from "./bag/index.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
+import { reconciliationWakeFn as reconciliationWakeWithLeaseCheck } from "./bag/reconciliation-wake.js";
 import { getAutoEnrollLiveness, getTicketNoActivityTimeoutMs, getWorkflowRegistryLiveness, loadWorkflowRegistry } from "./workflow-gate.js";
 import { getDefStateMigrationLiveness, registerDefStateMigrationRunner } from "./def-state-migration.js";
 import { getFixtureDriftLiveness, runFixtureDriftCheck } from "./fixture-drift-detector.js";
@@ -1613,7 +1614,20 @@ if (isEntryPoint) {
     const message =
       (await buildWorkflowAwareDeliveryMessage(ticketIdentifier, reconciliationAuthToken, actionText)) ??
       actionText;
-    await deliverMessageToAgent(agentName, sessionKey, message, deliveryConfig);
+
+    // INF-282: Wire DispatchLeaseStore check into reconciliation wake path.
+    // Call the module version which checks hasActiveLease and acquires a lease
+    // before delivering, preventing duplicate wakes on connector restart.
+    await reconciliationWakeWithLeaseCheck({
+      agentId: agentName,
+      ticketId: ticketIdentifier,
+      leaseStore: dispatchLeaseStore,
+      leaseTtlMs: 30_000,
+      deliveryConfig,
+      sendWake: async (agId, _tId, msg, cfg) => {
+        return await deliverMessageToAgent(agId, sessionKey, msg, cfg);
+      },
+    });
   };
 
   registerBootstrapReconciliationCron({
