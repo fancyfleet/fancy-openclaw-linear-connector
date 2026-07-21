@@ -10,6 +10,7 @@ import { handleOAuthCallback } from "./oauth-callback.js";
 import { EventStore } from "./store/event-store.js";
 import { NudgeStore } from "./store/nudge-store.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
+import { DeadLetterQueueStore } from "./dead-letter-queue.js";
 import { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import { ObservationStore } from "./store/observation-store.js";
 import { registerObservationWritePath, getObservationWritePathState } from "./store/observation-write-path.js";
@@ -216,6 +217,8 @@ export interface CreateAppOptions {
    * live hooks URL. Also used as isTicketActionable bypass when provided.
    */
   sendWakeUp?: (agentId: string, ticketIds: string[]) => Promise<void>;
+  /** Override DeadLetterQueueStore database path (for testing). */
+  deadLetterQueueDbPath?: string;
 }
 
 export function createApp(options?: CreateAppOptions) {
@@ -983,6 +986,7 @@ export function createApp(options?: CreateAppOptions) {
   // can't push forward right now). Per-ticket interval is set via a
   // `Managing-interval: <duration>` marker in the issue description;
   // default is 30 minutes.
+  const deadLetterQueue = new DeadLetterQueueStore(options?.deadLetterQueueDbPath);
   const managingStateStore = new ManagingStateStore(options?.managingStateDbPath);
   const managingPoller = new ManagingPoller({
     store: managingStateStore,
@@ -1131,6 +1135,7 @@ export function createApp(options?: CreateAppOptions) {
     sessionTracker,
     throttle,
     operationalEventStore,
+    deadLetterQueue,
     (agentId, ticketId) => {
       ackTracker.recordDispatch(agentId, ticketId);
       // AI-1510: agent has read the ticket via the connector → Thinking.
@@ -1422,7 +1427,7 @@ export function createApp(options?: CreateAppOptions) {
   registerTtlInvalidationCron(ttlCache, 60_000);
   log.info("INF-193: TTL cache invalidation cron registered (every 60s)");
 
-  return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, transcriptRedactionHealth: getTranscriptRedactionHealth() };
+  return { app, agentQueue, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, transcriptRedactionHealth: getTranscriptRedactionHealth() };
 }
 
 /**
