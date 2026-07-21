@@ -39,7 +39,7 @@ import path from "node:path";
 import yaml from "js-yaml";
 import { componentLogger, createLogger, type Logger } from "./logger.js";
 import { defaultWorkflowDefPath } from "./instance-config.js";
-import { bodyHasCapability, resolveBodiesForRole } from "./escalation-gate.js";
+import { bodyHasCapability, resolveBodiesForRole, resolveBodiesWithCapability } from "./escalation-gate.js";
 import type { ObservationStore } from "./store/observation-store.js";
 import { recordObservation } from "./store/observation-write-path.js";
 import { isBodyKnown } from "./escalation-gate.js";
@@ -1894,7 +1894,7 @@ async function fetchBranchAndPRStatus(
  * implicitly (including private) and is not limited to this list.
  */
 const KNOWN_SCAN_REPOS: Array<{ owner: string; repo: string }> = [
-  { owner: "fancymatt", repo: "fancy-openclaw-linear-connector" },
+  { owner: "fancyfleet", repo: "fancy-openclaw-linear-connector" },
   { owner: "fancymatt", repo: "fancy-openclaw-linear-skill-cli" },
   { owner: "fancymatt", repo: "fancy-openclaw-workflow-skill" },
   { owner: "fancyfleet", repo: "gen" },
@@ -3068,6 +3068,22 @@ export async function checkWorkflowRules(
     const allowed = await bodyHasCapability(bodyId, match.requires_capability);
     if (!allowed) {
       const legalMoves = [...transitions.map((t) => t.command), breakGlassCommand].join(", ");
+      // INF-197: designated_approver gates need a more specific message naming
+      // the approver so the steward knows who to handoff to (the generic
+      // "deployment body" was unactionable).
+      if (match.designated_approver === true) {
+        const approverBodies = await resolveBodiesWithCapability(match.requires_capability);
+        const approverNames = approverBodies.length > 0
+          ? approverBodies.join(", ")
+          : `the body holding '${match.requires_capability}'`;
+        return (
+          `[Proxy] '${intent}' requires the '${match.requires_capability}' capability ` +
+          `(designated approver: ${approverNames}). ` +
+          `Use \`linear handoff-work ${issueId} ${approverBodies[0] ?? "<approver>"}\` to route ` +
+          `the ticket to the approver for sign-off, then the approver re-runs '${intent}'. ` +
+          `Legal moves: ${legalMoves}.`
+        );
+      }
       return (
         `[Proxy] '${intent}' requires the '${match.requires_capability}' capability; ` +
         `handoff to the deployment body to proceed. ` +
@@ -3583,8 +3599,18 @@ export async function checkRawMutationInterception(
     log.warn(`workflow-gate: raw delegate null (self-clear) block agent=${bodyId} ticket=${issueId}`);
     return delegateClearRejection();
   }
+  // INF-197: Removed !hasAssigneeChange from the delegate-routing condition.
+  // `linear handoff-work <ID> <agent>` sends a raw issueUpdate changing BOTH
+  // delegateId AND assigneeId. Previously the assignee field made this
+  // non-delegate-only, causing it to fall through to the generic "direct
+  // changes blocked" rejection — creating a circular deadlock at signoff gates
+  // where propose-brief says "handoff instead" and handoff-work says "use
+  // propose-brief." The isClearingDelegate check above already catches
+  // {delegateId:null, assigneeId:null} (complete/undelegate), so removing the
+  // assignee exclusion does not re-open the AI-1835 bypass. State and label
+  // protections remain: hasStateChange and hasLabelChange still gate here.
   const delegateOnlyChange =
-    hasDelegateChange && !hasStateChange && !hasAssigneeChange && !hasLabelChange;
+    hasDelegateChange && !hasStateChange && !hasLabelChange;
   if (delegateOnlyChange) {
     if (callerLinearUserId && delegateId && callerLinearUserId === delegateId) {
       if (isClearingDelegate) {

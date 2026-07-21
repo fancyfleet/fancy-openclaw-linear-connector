@@ -17,7 +17,7 @@
  *      token validity, not just timestamp expiry. See INF-51.
  */
 
-import { getAgents, getTokenStatus, updateTokens, recordTokenFailure, isAgentLocal } from "./agents.js";
+import { getAgents, getTokenStatus, updateTokens, recordTokenFailure, isAgentLocal, validateEncryptionKeyMatch } from "./agents.js";
 import type { AgentConfig } from "./agents.js";
 import { notify } from "./alerts/alert-bus.js";
 import { createLogger, componentLogger } from "./logger.js";
@@ -399,6 +399,41 @@ async function refreshAll(skipHealthy = false): Promise<void> {
 // ── Startup ────────────────────────────────────────────────────────────────
 
 export function startTokenRefresh(): void {
+  // ── INF-272: Boot-time encryption-key pre-flight check (#2: .env key-reference validation) ──
+  // Before starting any token refresh cycle, verify that the configured encryption key
+  // can decrypt the stored agents.json. If the .env carries the wrong key reference
+  // (the root cause of the 07-21 fleet-wide OAuth revocation), every save() in the
+  // refresh cycle would silently re-encrypt with the wrong key, corrupting the token
+  // store. The write guard in save() rejects it anyway, but catching it here at boot
+  // gives a clear critical alert BEFORE the first refresh fires 5s later — rather than
+  // an auth-tag exception deep in the refresh loop of an individual agent.
+  try {
+    const validation = validateEncryptionKeyMatch();
+    if (!validation.valid) {
+      log.error(
+        `Boot-time encryption-key validation FAILED: ${validation.error}. ` +
+        `Token refresh cycle BLOCKED — the encryption key does not match the stored ` +
+        `agents.json. Fix LINEAR_CONNECTOR_ENCRYPTION_KEY / LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE ` +
+        `or restore the correct .env. No tokens will be refreshed until this is resolved.`,
+      );
+      notify({
+        severity: "critical",
+        source: "token-refresh",
+        title: "Boot-time encryption-key validation FAILED — token refresh BLOCKED",
+        detail: `${validation.error}. Token refresh cycle will not start. Fix LINEAR_CONNECTOR_ENCRYPTION_KEY / LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE or restore the correct .env.`,
+        dedupKey: "encryption-key|boot-validation-failed",
+      });
+      return; // Do NOT start the refresh cycle — every save() would corrupt the store
+    }
+    if (validation.agentsEncrypted) {
+      log.info(`Boot-time encryption-key validation passed: key matches encrypted agents.json`);
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log.error(`Boot-time encryption-key validation threw: ${message}. Token refresh cycle BLOCKED.`);
+    return;
+  }
+
   // Initial refresh shortly after startup, with boot-skip: agents that have
   // ample TTL remaining are not refreshed. This avoids the boot-time storm.
   setTimeout(() => void refreshAll(true), 5000);
