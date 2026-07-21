@@ -29,12 +29,13 @@
 
 import { createLogger, componentLogger } from "./logger.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
-import { getAccessToken } from "./agents.js";
+import { getAccessToken, getLinearUserIdForAgent } from "./agents.js";
 
 const log = componentLogger(createLogger(), "delegate-ping-pong-detector");
 
 const DEFAULT_MAX_BOUNCES = 3;
 const DEFAULT_WINDOW_MS = 30 * 60 * 1000; // 30 minutes
+const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -123,41 +124,49 @@ export class DelegateChainTracker {
    * Record a delegate assignment for a ticket.
    */
   recordAssignment(ticketId: string, delegateId: string, agentName: string, now?: number): void {
-    // STUB: Implementation returns immediately without recording.
-    // TODO: Record the assignment to the in-memory chain, push to the
-    // ticket's chain array, and retain only entries within the configured
-    // sliding window (config.windowMs).
-    void log;
-    void ticketId;
-    void delegateId;
-    void agentName;
-    void now;
+    const timestampMs = now ?? Date.now();
+    const assignment: DelegateAssignment = {
+      ticketId,
+      delegateId,
+      agentName,
+      timestamp: new Date(timestampMs).toISOString(),
+      timestampMs,
+    };
+    const chain = this.pruneChain(this.chains.get(ticketId) ?? [], timestampMs);
+    chain.push(assignment);
+    this.chains.set(ticketId, chain);
   }
 
   /**
    * Get the delegate assignment chain for a ticket (within the configured window).
    */
   getChain(ticketId: string): DelegateAssignment[] {
-    // STUB: Returns empty array — implement by reading this.chains.
-    void ticketId;
-    return [];
+    return [...(this.chains.get(ticketId) ?? [])];
   }
 
   /**
    * Detect whether a ticket's delegate chain shows a ping-pong cycle.
    */
   detectCycle(ticketId: string, now?: number): CycleDetectionResult {
-    // STUB: Returns no-cycle — implement by:
-    // 1. Pruning entries outside config.windowMs from `now`.
-    // 2. Counting occurrences of each delegateId in the chain.
-    // 3. Finding delegates with count >= config.maxBounces.
-    void now;
+    const timestampMs = now ?? Date.now();
+    const chain = this.pruneChain(this.chains.get(ticketId) ?? [], timestampMs);
+    this.chains.set(ticketId, chain);
+
+    const bounceCounts: Record<string, number> = {};
+    for (const assignment of chain) {
+      bounceCounts[assignment.delegateId] = (bounceCounts[assignment.delegateId] ?? 0) + 1;
+    }
+
+    const cyclingDelegates = Object.entries(bounceCounts)
+      .filter(([, count]) => count >= this.config.maxBounces)
+      .map(([delegateId]) => delegateId);
+
     return {
-      hasCycle: false,
-      cyclingDelegates: [],
-      bounceCounts: {},
+      hasCycle: cyclingDelegates.length > 0,
+      cyclingDelegates,
+      bounceCounts,
       maxAllowed: this.config.maxBounces,
-      chain: this.getChain(ticketId),
+      chain,
     };
   }
 
@@ -165,15 +174,19 @@ export class DelegateChainTracker {
    * Clear the chain for a ticket.
    */
   clearTicket(ticketId: string): void {
-    // STUB: Does nothing — implement by deleting from this.chains.
-    void ticketId;
+    this.chains.delete(ticketId);
   }
 
   /**
    * Clear all chains.
    */
   clearAll(): void {
-    // STUB: Does nothing — implement by clearing this.chains.
+    this.chains.clear();
+  }
+
+  private pruneChain(chain: DelegateAssignment[], now: number): DelegateAssignment[] {
+    const cutoff = now - this.config.windowMs;
+    return chain.filter((assignment) => assignment.timestampMs >= cutoff);
   }
 }
 
@@ -189,20 +202,136 @@ export async function fireEscalation(
   bounceCount: number,
   authToken?: string,
 ): Promise<EscalationResult> {
-  // STUB: Returns not-fired — implement by:
-  // 1. Acquiring an auth token (via getAccessToken("ai"), process.env, or authToken param).
-  // 2. Resolving the Linear internal issue ID from ticketId.
-  // 3. Posting a comment describing the cycle detection and escalation.
-  // 4. Reassigning the delegate to the steward (Ai) via Linear API.
-  // 5. Logging the event at warn level.
-  void authToken;
+  const token =
+    authToken ??
+    getAccessToken("ai") ??
+    process.env.LINEAR_OAUTH_TOKEN ??
+    process.env.LINEAR_API_KEY;
+
+  if (!token) {
+    log.error(`ping-pong escalation: no auth token for ${ticketId}`);
+    return {
+      fired: false,
+      ticketId,
+      escalatedTo: "ai",
+      bounceCount,
+      cyclingDelegates,
+    };
+  }
+
+  const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
+  const issueId = await resolveIssueId(ticketId, authHeader);
+  if (!issueId) {
+    log.error(`ping-pong escalation: could not resolve issue ID for ${ticketId}`);
+    return {
+      fired: false,
+      ticketId,
+      escalatedTo: "ai",
+      bounceCount,
+      cyclingDelegates,
+    };
+  }
+
+  const delegates = cyclingDelegates.join(", ");
+  const body =
+    `[Connector] Delegate ping-pong cycle detected on ${ticketId}: ` +
+    `${delegates} reached ${bounceCount} assignment(s) within the configured window. ` +
+    "Suppressing this dispatch and escalating to steward (Ai).";
+  const commentPosted = await postComment(issueId, body, authHeader);
+
+  const stewardUserId = getLinearUserIdForAgent("ai");
+  const delegateChanged = stewardUserId
+    ? await updateDelegate(issueId, stewardUserId, authHeader)
+    : false;
+
+  if (!stewardUserId) {
+    log.error("ping-pong escalation: steward 'ai' has no Linear user ID");
+  }
+
+  const fired = commentPosted && delegateChanged;
+  log.warn(
+    `PING_PONG_CYCLE_DETECTED: issue=${ticketId} delegates=${delegates} ` +
+    `bounceCount=${bounceCount} escalatedTo=ai fired=${fired}`,
+  );
+
   return {
-    fired: false,
+    fired,
     ticketId,
     escalatedTo: "ai",
     bounceCount,
     cyclingDelegates,
   };
+}
+
+async function resolveIssueId(
+  identifier: string,
+  authHeader: string,
+): Promise<string | null> {
+  const query = `query($id: String!) { issue(id: $id) { id } }`;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: authHeader },
+      body: JSON.stringify({ query, variables: { id: identifier } }),
+    });
+    type Resp = { data?: { issue?: { id: string } | null } };
+    const data = (await res.json()) as Resp;
+    return data.data?.issue?.id ?? null;
+  } catch (err) {
+    log.error(`ping-pong escalation: issue lookup failed for ${identifier}: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+async function postComment(
+  issueId: string,
+  body: string,
+  authHeader: string,
+): Promise<boolean> {
+  const mutation = `
+    mutation($issueId: ID!, $body: String!) {
+      commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: authHeader },
+      body: JSON.stringify({ query: mutation, variables: { issueId, body } }),
+    });
+    type Resp = { data?: { commentCreate?: { success: boolean } } };
+    const data = (await res.json()) as Resp;
+    return data.data?.commentCreate?.success === true;
+  } catch (err) {
+    log.error(`ping-pong escalation: comment post failed for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
+async function updateDelegate(
+  issueId: string,
+  delegateId: string,
+  authHeader: string,
+): Promise<boolean> {
+  const mutation = `
+    mutation UpdateDelegate($issueId: String!, $delegateId: String!) {
+      issueUpdate(id: $issueId, input: { delegateId: $delegateId }) {
+        success
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authHeader },
+      body: JSON.stringify({ query: mutation, variables: { issueId, delegateId } }),
+    });
+    const data = (await res.json()) as { data?: { issueUpdate?: { success: boolean } } };
+    return Boolean(data.data?.issueUpdate?.success);
+  } catch (err) {
+    log.error(`ping-pong escalation: delegate update failed for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
 }
 
 // ── Main Detector ────────────────────────────────────────────────────────────
@@ -247,19 +376,12 @@ export class DelegatePingPongDetector {
     agentName: string,
     now?: number,
   ): Promise<PingPongHandlingResult> {
-    // STUB: Delegates to chain tracker but won't detect cycles until
-    // the tracker is fully implemented.
-    void delegateId;
-    void agentName;
-
     this.chainTracker.recordAssignment(ticketId, delegateId, agentName, now);
     const detection = this.chainTracker.detectCycle(ticketId, now);
     let escalation: EscalationResult | null = null;
     let suppressDispatch = false;
 
     if (detection.hasCycle) {
-      suppressionExpected:
-      // Cycle detected — fire escalation (stub returns not-fired until implemented).
       escalation = await fireEscalation(
         ticketId,
         detection.cyclingDelegates,
@@ -272,7 +394,7 @@ export class DelegatePingPongDetector {
       if (this.operationalEventStore) {
         try {
           this.operationalEventStore.append({
-            outcome: "ping-pong-cycle-detected" as any,
+            outcome: "ping-pong-cycle-detected",
             agent: agentName,
             key: ticketId,
             sessionKey: ticketId,
