@@ -1,0 +1,65 @@
+# dev-sprint — Test fixture for INF-212 / INF-283 integration tests
+# Simplified version of the deployed workflow for CI.
+# Only contains states needed to test the product-definition → spawn-arms gate.
+
+id: dev-sprint
+version: 1
+archetype: orchestrator
+entry_state: intake
+
+break_glass:
+  command: escape
+  to: escape
+  owner_role: steward
+
+states:
+
+  - id: intake
+    owner_role: steward
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: accept
+        to: product-definition
+        generic: continue
+
+  - id: product-definition
+    owner_role: steward
+    kind: normal
+    native_state: doing
+    transitions:
+      - command: continue
+        to: spawn-arms
+        generic: continue
+
+  - id: spawn-arms
+    owner_role: engine
+    kind: normal
+    native_state: doing
+    fanout:
+      spec_source: structured
+      child_workflow: wf:sprint-arm-scope
+      initial_delegate: astrid
+    transitions:
+      - command: spawn
+        to: managing-arms
+        generic: continue
+
+  - id: managing-arms
+    owner_role: steward
+    kind: barrier
+    barrier: true
+    native_state: managing
+    transitions:
+      - command: continue
+        to: done
+        generic: continue
+
+  - id: done
+    kind: terminal
+    native_state: done
+    satisfies_parent_barrier: true
+
+  - id: escape
+    kind: terminal
+    native_state: invalid

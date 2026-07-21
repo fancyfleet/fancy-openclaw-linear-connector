@@ -1071,3 +1071,401 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     expect(childCreateCalls.length).toBeGreaterThanOrEqual(2);
   });
 });
+
+// ── INF-212 / INF-283: Pre-transition fanout spec gate (dest state) ──────
+
+describe("INF-212: pre-transition dest-fanout spec gate (dev-sprint product-definition → spawn-arms)", () => {
+  let originalFetch: typeof globalThis.fetch;
+  let fetchCalls: Array<{ url: string; body: Record<string, unknown> }>;
+  let testDir: string;
+  let originalWorkflowDefsDir: string | undefined;
+  let originalPolicyPath: string | undefined;
+  let originalAgentsFile: string | undefined;
+
+  const CANONICAL_DEV_SPRINT_FIXTURE = path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-sprint.yaml");
+  const CANONICAL_SPRINT_ARM_SCOPE_FIXTURE = path.resolve(process.cwd(), "src/__fixtures__/canonical-sprint-arm-scope.yaml");
+
+  beforeAll(() => {
+    originalWorkflowDefsDir = process.env.WORKFLOW_DEFS_DIR;
+    originalPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+    originalAgentsFile = process.env.AGENTS_FILE;
+
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf212-test-"));
+    const policyFile = path.join(testDir, "capability-policy.yaml");
+    fs.writeFileSync(
+      policyFile,
+      `
+capabilities:
+  - id: linear:transition
+
+containers:
+  - id: steward
+    grants: [linear:transition]
+
+roles:
+  - id: steward
+    requires: [linear:transition]
+
+bodies:
+  - id: astrid
+    container: steward
+    fills_roles: [steward]
+`,
+      "utf8",
+    );
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const agentsFile = path.join(testDir, "agents.json");
+    fs.writeFileSync(
+      agentsFile,
+      JSON.stringify({
+        agents: [
+          { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-c", clientSecret: "a-s", accessToken: "a-t", refreshToken: "a-r" },
+        ],
+      }),
+      "utf8",
+    );
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+
+    fs.copyFileSync(CANONICAL_DEV_SPRINT_FIXTURE, path.join(testDir, "canonical-dev-sprint.yaml"));
+    fs.copyFileSync(CANONICAL_SPRINT_ARM_SCOPE_FIXTURE, path.join(testDir, "canonical-sprint-arm-scope.yaml"));
+    process.env.WORKFLOW_DEFS_DIR = testDir;
+    delete process.env.WORKFLOW_DEF_PATH;
+  });
+
+  afterAll(() => {
+    if (originalWorkflowDefsDir !== undefined) {
+      process.env.WORKFLOW_DEFS_DIR = originalWorkflowDefsDir;
+    } else {
+      delete process.env.WORKFLOW_DEFS_DIR;
+    }
+    delete process.env.WORKFLOW_DEF_PATH;
+    if (originalPolicyPath !== undefined) {
+      process.env.CAPABILITY_POLICY_PATH = originalPolicyPath;
+    } else {
+      delete process.env.CAPABILITY_POLICY_PATH;
+    }
+    if (originalAgentsFile !== undefined) {
+      process.env.AGENTS_FILE = originalAgentsFile;
+    } else {
+      delete process.env.AGENTS_FILE;
+    }
+    // Clean up temp dir
+    try { fs.rmSync(testDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    reloadAgents();
+  });
+
+  beforeEach(() => {
+    resetWorkflowCache();
+    resetPolicyCache();
+    originalFetch = globalThis.fetch;
+    fetchCalls = [];
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  function makeDevSprintFetch(opts: {
+    description?: string;
+  }): typeof globalThis.fetch {
+    const description = opts.description ?? "";
+
+    return async (url, init) => {
+      if (typeof url !== "string" || !url.includes("api.linear.app")) {
+        throw new Error("unexpected fetch call");
+      }
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(bodyText) as { query?: string; variables?: Record<string, unknown> };
+      fetchCalls.push({ url, body: parsed });
+
+      const query = parsed.query ?? "";
+
+      // B2: fetch issue with labels — at product-definition state
+      if (query.includes("IssueWithLabels")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                id: "dev-sprint-internal-id",
+                team: { id: "team-uuid" },
+                labels: {
+                  nodes: [
+                    { id: "wf-lbl", name: "wf:dev-sprint" },
+                    { id: "state-lbl", name: "state:product-definition" },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // TeamStates for native state resolution (AI-1498)
+      if (query.includes("TeamStates")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              team: {
+                states: {
+                  nodes: [
+                    { id: "state-todo-uuid", name: "Todo", type: "unstarted" },
+                    { id: "state-doing-uuid", name: "Doing", type: "started" },
+                    { id: "state-thinking-uuid", name: "Thinking", type: "started" },
+                    { id: "state-managing-uuid", name: "Managing", type: "started" },
+                    { id: "state-done-uuid", name: "Done", type: "completed" },
+                    { id: "state-invalid-uuid", name: "Invalid", type: "canceled" },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // INF-212: fetchFanoutSpecDescription — issue(id) { id description }
+      if (query.includes("issue(") && query.includes("description")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                id: "dev-sprint-internal-id",
+                description,
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Team label lookup — no labels pre-exist, so they'll be created below
+      if (query.includes("TeamLabels")) {
+        return new Response(
+          JSON.stringify({ data: { team: { labels: { nodes: [] } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Label create (for state:spawn-arms and similar)
+      if (query.includes("issueLabelCreate") && !query.includes("issueCreate")) {
+        const name = (parsed.variables as Record<string, unknown>).name as string;
+        return new Response(
+          JSON.stringify({
+            data: { issueLabelCreate: { success: true, issueLabel: { id: `label-${name}` } } },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // B2: state transition — single atomic writer (AI-1498)
+      if (query.includes("ApplyAtomicTransition")) {
+        return new Response(
+          JSON.stringify({ data: { issueUpdate: { success: true } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // commentCreate (for refusal notice)
+      if (query.includes("commentCreate")) {
+        return new Response(
+          JSON.stringify({ data: { commentCreate: { success: true, comment: { id: "comment-id" } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      throw new Error(`unexpected query: ${query.slice(0, 120)}`);
+    };
+  }
+
+  // AC1: transition guard refuses when ## Structured is absent (INF-283)
+  it("AC1: refuses product-definition → spawn-arms when ## Structured section is missing", async () => {
+    globalThis.fetch = makeDevSprintFetch({
+      description: "Sprint to implement user authentication and profile management.",
+    });
+
+    // B2 apply: product-definition → spawn-arms via 'continue' intent
+    const result = await applyStateTransition("continue", "INF-283-TEST-1", "Bearer tok");
+
+    // The INF-212 gate should refuse with 'pre-fanout-spec-invalid'
+    expect(result).toMatchObject({
+      status: "failed",
+      code: "pre-fanout-spec-invalid",
+    });
+
+    // Should have posted a comment explaining the missing section
+    const commentCall = fetchCalls.find((c) => (c.body.query ?? "").includes("commentCreate"));
+    expect(commentCall).toBeDefined();
+    const commentVars = commentCall!.body.variables as Record<string, unknown>;
+    expect(commentVars.body as string).toContain("## structured");
+  });
+
+  // AC2: transition guard allows when ## Structured is present
+  it("AC2: allows product-definition → spawn-arms when ## Structured section is present", async () => {
+    globalThis.fetch = makeDevSprintFetch({
+      description:
+        "Sprint description.\n" +
+        "## Structured\n" +
+        "- **Auth flow**: Implement OAuth2 login.\n" +
+        "- **Profile page**: User profile management UI.\n",
+    });
+
+    const result = await applyStateTransition("continue", "INF-283-TEST-2", "Bearer tok");
+
+    // The INF-212 gate should pass (allows transition to proceed)
+    expect(result).toMatchObject({
+      status: "applied",
+    });
+
+    // Should have executed the state transition (ApplyAtomicTransition)
+    const stateTransitionCall = fetchCalls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(stateTransitionCall).toBeDefined();
+  });
+
+  // AC3: transition refuses when ## Structured exists but has no parseable entries
+  it("AC3: refuses when ## Structured section has no parseable bullet entries", async () => {
+    globalThis.fetch = makeDevSprintFetch({
+      description:
+        "Sprint description.\n" +
+        "## Structured\n" +
+        "This section is just narrative text without bullet points.\n",
+    });
+
+    const result = await applyStateTransition("continue", "INF-283-TEST-3", "Bearer tok");
+
+    expect(result).toMatchObject({
+      status: "failed",
+      code: "pre-fanout-spec-invalid",
+    });
+  });
+
+  // AC4: the gate does not fire when the current state has its own fanout (pendingFanout is set)
+  it("AC4: does not fire when current state has its own fanout (pendingFanout is set)", async () => {
+    // When the current state declares a fanout (e.g. spawn-arms' own fanout), the
+    // AI-1992 block sets pendingFanout, so the INF-212 dest-state gate is skipped.
+    // Verify that the existing fanout path still works (the gate doesn't interfere).
+    
+    // Test from spawn-arms (has fanout) doing a spawn
+    // We use the same dev-sprint fixture but with the ticket at spawn-arms state
+    const spawnFetch = async (url: string | URL | Request, init?: RequestInit) => {
+      if (typeof url !== "string" || !url.includes("api.linear.app")) {
+        throw new Error("unexpected fetch call");
+      }
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(bodyText) as { query?: string; variables?: Record<string, unknown> };
+      fetchCalls.push({ url, body: parsed });
+      const query = parsed.query ?? "";
+
+      if (query.includes("IssueWithLabels")) {
+        return new Response(JSON.stringify({
+          data: {
+            issue: {
+              id: "dev-sprint-id",
+              team: { id: "team-uuid" },
+              labels: {
+                nodes: [
+                  { id: "wf-lbl", name: "wf:dev-sprint" },
+                  { id: "state-lbl", name: "state:spawn-arms" },
+                ],
+              },
+            },
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      if (query.includes("TeamStates")) {
+        return new Response(JSON.stringify({
+          data: { team: { states: { nodes: [
+            { id: "ts-todo", name: "Todo", type: "unstarted" },
+            { id: "ts-doing", name: "Doing", type: "started" },
+            { id: "ts-managing", name: "Managing", type: "started" },
+            { id: "ts-done", name: "Done", type: "completed" },
+            { id: "ts-invalid", name: "Invalid", type: "canceled" },
+          ] } } },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      if (query.includes("issue(") && query.includes("description")) {
+        return new Response(JSON.stringify({
+          data: {
+            issue: {
+              id: "dev-sprint-id",
+              description: "## Structured\n- **Auth**: Impl.\n",
+            },
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      if (query.includes("TeamLabels")) {
+        return new Response(JSON.stringify({
+          data: { team: { labels: { nodes: [
+            { id: "wf-sprint-arm-scope", name: "wf:sprint-arm-scope" },
+            { id: "state-managing-arms", name: "state:managing-arms" },
+          ] } } },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      if (query.includes("issueLabelCreate") && !query.includes("issueCreate")) {
+        const name = (parsed.variables as Record<string, unknown>).name as string;
+        return new Response(JSON.stringify({
+          data: { issueLabelCreate: { success: true, issueLabel: { id: `label-${name}` } } },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      if (query.includes("ApplyAtomicTransition")) {
+        return new Response(JSON.stringify({ data: { issueUpdate: { success: true } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      if (query.includes("IssueTeamParent")) {
+        return new Response(JSON.stringify({
+          data: {
+            issue: {
+              id: "dev-sprint-id",
+              title: "Dev Sprint",
+              description: "## Structured\n- **Auth**: Impl.\n",
+              team: { id: "team-uuid" },
+              parent: null,
+            },
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      if (query.includes("issueCreate")) {
+        return new Response(JSON.stringify({
+          data: { issueCreate: { success: true, issue: { id: "child-id", identifier: "AI-3001" } } },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      if (query.includes("commentCreate")) {
+        return new Response(JSON.stringify({ data: { commentCreate: { success: true, comment: { id: "c-id" } } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      // IssueParent for spawn-preview
+      if (query.includes("IssueParent") && !query.includes("IssueTeamParent")) {
+        return new Response(JSON.stringify({ data: { issue: { parent: null } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      // issue(id:) resolver for fan-out
+      if (query.includes("issue(id: $id) { id }") && !query.includes("team") && !query.includes("parent") && !query.includes("labels")) {
+        return new Response(JSON.stringify({ data: { issue: { id: "dev-sprint-id" } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      throw new Error(`unexpected: ${query.slice(0, 120)}`);
+    };
+
+    globalThis.fetch = spawnFetch;
+    resetWorkflowCache();
+
+    const result = await applyStateTransition("spawn", "INF-283-AC4", "Bearer tok");
+    // Should work since spawn-arms has its own fanout (pendingFanout path)
+    // The INF-212 gate is skipped when pendingFanout is set.
+    // The state itself transitions, and the fanout engine runs at the pendingFanout
+    // boundary — the ACCEPT test is just that the state transition was applied.
+    expect(result).toMatchObject({ status: "applied" });
+
+    // The INF-212 gate's code does not appear in the result (no pre-fanout-spec-invalid)
+    expect(result).not.toHaveProperty("pre-fanout-spec-invalid");
+  });
+});
