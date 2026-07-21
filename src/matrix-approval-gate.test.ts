@@ -452,7 +452,7 @@ describe("INF-192 AC5: liveness observable at ac-validate without waiting for tr
     expect(liveness).toHaveProperty("active");
     expect(typeof liveness.active).toBe("boolean");
     expect(liveness).toHaveProperty("approvers");
-    expect(Array.isArray(liveness.approvers)).toBe(true);
+    expect(typeof liveness.approvers).toBe("number");
     // Must surface the registered approval patterns and approver count so
     // ac-validate can confirm the component is live without firing a real approval
     expect(liveness).toHaveProperty("patterns");

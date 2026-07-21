@@ -47,6 +47,7 @@ import { registerLabelSyncAuditCron } from "./cron/label-sync-audit.js";
 import { registerAntiEntropyCron } from "./cron/anti-entropy.js";
 import { registerOobReconcileCron } from "./oob-reconcile-sweep.js";
 import { registerConfigSanityAlertCron, getConfigSanityAlertLiveness } from "./config-sanity-alert.js";
+import { registerMatrixApprovalGate, getMatrixApprovalGateLiveness } from "./matrix-approval-gate.js";
 import { MutationAuditStore } from "./store/mutation-audit-store.js";
 import { DispatchIdempotencyStore } from "./store/dispatch-idempotency-store.js";
 import { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
@@ -413,6 +414,9 @@ export function createApp(options?: CreateAppOptions) {
       // credential redaction. status is "idle"/"running"/"error"; lastRun
       // is null before the first sweep fires.
       transcriptRedaction: getTranscriptRedactionHealth(),
+      // INF-192 AC5: Matrix approval gate liveness — confirms the component
+      // was registered at bootstrap and surfaces approver/pattern counts.
+      matrixApprovalGate: getMatrixApprovalGateLiveness(),
       // AI-2542: auto-enroll liveness and demote/escape suppression counters.
       autoEnroll: getAutoEnrollLiveness(),
       // AI-1908 AC5: per-agent OAuth token status. Exposes lastRefreshOkAt,
@@ -1686,6 +1690,28 @@ if (isEntryPoint) {
   // output and routes findings through the AlertBus with stable dedup keys
   // (git-remote-liveness PUSH-DEAD keyed on AI-2189 root-cause ticket).
   registerConfigSanityAlertCron();
+
+  // INF-192: Matrix approval gate — register at bootstrap so the component
+  // is armed (observable via /health.matrixApprovalGate). Derives config from
+  // environment so ops can configure patterns and designated approvers without
+  // code changes.
+  const _matrixApprovalPatterns = process.env.MATRIX_APPROVAL_PATTERNS
+    ? process.env.MATRIX_APPROVAL_PATTERNS.split(",").map((s) => s.trim()).filter(Boolean)
+    : ["I approve", "approved", "lgtm", ":+1:", "looks good", "sign off"];
+  const _matrixApprovalApprovers = (() => {
+    const raw = process.env.MATRIX_APPROVAL_APPROVERS;
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  })();
+  registerMatrixApprovalGate({
+    approvalPatterns: _matrixApprovalPatterns,
+    designatedApprovers: _matrixApprovalApprovers,
+  });
 
   // Config-health healthy→unhealthy is the loudest structural signal we have
   // (bad policy/workflow/agents.json = engine fail-closed for workflow tickets).
