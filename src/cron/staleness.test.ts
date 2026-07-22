@@ -69,6 +69,12 @@ describe("cron staleness", () => {
     expect(parseCronScheduleMs("every 90s")).toBe(90 * 1000);
   });
 
+  test("parses compact schedules and ignores registry detail suffixes", () => {
+    expect(parseCronScheduleMs("5m")).toBe(5 * 60 * 1000);
+    expect(parseCronScheduleMs("every 5m (300000ms)")).toBe(5 * 60 * 1000);
+    expect(parseCronScheduleMs("every 5m (stale=15m)")).toBe(5 * 60 * 1000);
+  });
+
   test("reads staleness multiplier from env with default fallback", () => {
     expect(getCronStalenessMultiplier({ CRON_STALENESS_MULTIPLIER: "4" })).toBe(4);
     expect(getCronStalenessMultiplier({ CRON_STALENESS_MULTIPLIER: "0" })).toBe(3);

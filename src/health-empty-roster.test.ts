@@ -11,6 +11,7 @@
  *    indirectly via the health endpoint, since the exit guard is in the
  *    isEntryPoint block which tests don't exercise).
  */
+import { jest } from "@jest/globals";
 import request from "supertest";
 import fs from "node:fs";
 import os from "node:os";
@@ -120,5 +121,35 @@ describe("health endpoint — empty-roster guard (AI-1767)", () => {
     expect(res.status).toBe(200);
     expect(res.body).toHaveProperty("staleCrons");
     expect(res.body.staleCrons).toEqual([]);
+  });
+
+  test("INF-343: /health includes staleCrons entries with human-readable overdueBy", async () => {
+    jest.useFakeTimers();
+    try {
+      jest.setSystemTime(new Date("2026-07-22T12:00:00.000Z"));
+      dir = tempDir();
+      process.env.AGENTS_FILE = writeAgentsFile(dir, [sampleAgent]);
+      reloadAgents();
+      appState = createApp({
+        bagDbPath: path.join(dir, "pending-bag.db"),
+        agentQueueDbPath: path.join(dir, "agent-queue.db"),
+        operationalEventsDbPath: path.join(dir, "operational-events.db"),
+      });
+      registerCron("lagging-driver", "every 5m (300000ms)");
+      markCronRun("lagging-driver", new Date("2026-07-22T12:00:00.000Z"));
+      jest.setSystemTime(new Date("2026-07-22T12:20:00.000Z"));
+
+      const res = await request(appState.app).get("/health");
+      expect(res.status).toBe(200);
+      expect(res.body.staleCrons).toContainEqual({
+        name: "lagging-driver",
+        schedule: "every 5m (300000ms)",
+        lastRunAt: "2026-07-22T12:00:00.000Z",
+        overdueBy: "5m",
+      });
+      expect(res.body.staleCrons.find((cron: { name: string }) => cron.name === "lagging-driver")).not.toHaveProperty("overdueByMs");
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });

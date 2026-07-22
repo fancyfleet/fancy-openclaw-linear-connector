@@ -26,7 +26,7 @@ export function getCronStalenessMultiplier(env: NodeJS.ProcessEnv = process.env)
 
 export function parseCronScheduleMs(schedule: string): number | null {
   const normalized = schedule.trim().toLowerCase().replace(/^every\s+/, "");
-  const match = normalized.match(/^(\d+(?:\.\d+)?)\s*(ms|msec|millisecond|milliseconds|s|sec|second|seconds|m|min|minute|minutes|h|hr|hour|hours)$/);
+  const match = normalized.match(/^(\d+(?:\.\d+)?)\s*(ms|msec|millisecond|milliseconds|s|sec|second|seconds|m|min|minute|minutes|h|hr|hour|hours|d|day|days)(?:\b|(?=\s*\())/);
   if (!match) return null;
 
   const value = Number(match[1]);
@@ -37,6 +37,7 @@ export function parseCronScheduleMs(schedule: string): number | null {
   if (unit === "s" || unit === "sec" || unit.startsWith("second")) return value * 1_000;
   if (unit === "m" || unit === "min" || unit.startsWith("minute")) return value * 60_000;
   if (unit === "h" || unit === "hr" || unit.startsWith("hour")) return value * 3_600_000;
+  if (unit === "d" || unit.startsWith("day")) return value * 86_400_000;
   return null;
 }
 
