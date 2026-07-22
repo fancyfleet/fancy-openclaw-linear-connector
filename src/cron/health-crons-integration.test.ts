@@ -34,10 +34,12 @@ const EXPECTED_CRONS = [
   "dispatch-delivery-scheduler", // AI-2008: acknowledged dispatch delivery + retry driver
   "first-action-watchdog",
   "g20-canary",
+  "label-sync-audit", // AI-2554: label-sync audit cron
   "oob-reconcile-sweep",
   "p4-metrics-distillation",
   "rescue-sweep",
   "sla-sweep",
+  "stall-liveness-sweep", // INF-314: stall detection liveness sweep
 ].sort();
 
 const PORT = 4100 + (process.pid % 400);

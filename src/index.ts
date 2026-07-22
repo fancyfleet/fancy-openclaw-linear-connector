@@ -30,6 +30,8 @@ import { assertDispatchTargetFetchable } from "./delivery/index.js";
 import { markDispatchIntegrityGateActive, getDispatchIntegrityState } from "./dispatch-integrity-state.js";
 import { registerDistillationCron, createProdGenerationContext } from "./cron/p4-metrics-distillation.js";
 import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
+import { registerStallSweepCron } from "./cron/stall-sweep-cron.js";
+import { getStallDetectionState, DEFAULT_STALL_CONFIG } from "./stall-detection-state.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
 import { registerBootstrapReconciliationCron } from "./bootstrap-reconciliation-sweep.js";
 import { registerDelegationReconciliationCron, runDelegationReconciliationSweep } from "./delegation-reconciliation-sweep.js";
@@ -331,6 +333,9 @@ export function createApp(options?: CreateAppOptions) {
       observations: getObservationWritePathState(),
       // AI-1857 AC3: rescue-sweep last-run visibility — "did it run" without log access.
       rescueSweep: getRescueSweepState(),
+      // INF-314 AC9: stall detection liveness — active state + thresholds
+      // observable at /health without waiting for a stall to occur.
+      stallDetection: getStallDetectionState(),
       // AI-2009 AC7: first-action watchdog liveness — scheduled + armedCount,
       // observable at ac-validate without waiting for a deadline breach.
       firstActionWatchdog: getFirstActionWatchdogState(),
@@ -1537,6 +1542,21 @@ if (isEntryPoint) {
   } else {
     log.warn("AI-2554: label-sync audit cron NOT registered — no Linear auth token available");
   }
+
+  // INF-314 AC8: stall-liveness sweep — periodic classification of ticket
+  // liveness records. Detects null-delegate, no-ack, and no-progress stalls.
+  // Data plane integration (wiring real liveness records from sessionTracker)
+  // is a follow-up; this registration proves the component is armed at the
+  // production entry point (AI-1808 dead-code-in-prod guard).
+  registerStallSweepCron({
+    livenessRecords: () => {
+      // Collect records from sessionTracker/dispatch state.
+      // For now, returns empty since the data plane integration
+      // is a separate ticket; the wiring + /health is what matters.
+      return [];
+    },
+    config: { ...DEFAULT_STALL_CONFIG },
+  });
 
   // G-20: scheduled gate-silently-off canary (AI-1552, §5.1)
   registerG20CanaryCron();
