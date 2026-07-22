@@ -48,7 +48,9 @@ export function evaluateCronStartupReadiness(options: {
     if (cron.lastRunAt !== null) continue;
 
     const startedAtMs = timestampMs(cron.registeredAt, fallbackStartedAt);
-    const intervalMs = parseScheduleIntervalMs(cron.schedule) ?? 0;
+    const intervalMs = parseScheduleIntervalMs(cron.schedule);
+    if (intervalMs === null) continue;
+
     const graceMs = Math.max(intervalMs, options.bootGraceMs);
     const overdueByMs = Math.max(0, nowMs - startedAtMs - graceMs);
 

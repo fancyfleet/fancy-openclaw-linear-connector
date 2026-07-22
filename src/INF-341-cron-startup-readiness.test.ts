@@ -124,6 +124,30 @@ describe("INF-341 startup readiness evaluator", () => {
     expect(result.neverVerifiedCrons).toEqual([]);
     expect(error).not.toHaveBeenCalled();
   });
+
+  test("AC3: on-demand registrations without schedule intervals do not degrade startup readiness", async () => {
+    const { evaluateCronStartupReadiness } = await loadStartupReadinessModule();
+    const error = jest.fn();
+    const result = evaluateCronStartupReadiness({
+      bootedAt: new Date("2026-07-22T21:00:00.000Z"),
+      now: new Date("2026-07-22T22:00:00.000Z"),
+      bootGraceMs: 30_000,
+      log: { error },
+      crons: [
+        {
+          id: "matrix-approval-gate",
+          name: "matrix-approval-gate",
+          schedule: "on-demand",
+          registeredAt: "2026-07-22T21:00:00.000Z",
+          lastRunAt: null,
+        },
+      ],
+    });
+
+    expect(result.status).toBe("ok");
+    expect(result.neverVerifiedCrons).toEqual([]);
+    expect(error).not.toHaveBeenCalled();
+  });
 });
 
 describe("INF-341 /health startup readiness surface", () => {
@@ -189,6 +213,25 @@ describe("INF-341 /health startup readiness surface", () => {
   test("AC3: /health stays green when registered crons have produced a first run", async () => {
     registerCron("inf-341-fresh", "every 1m");
     markCronRun("inf-341-fresh", new Date());
+
+    const res = await request(appState!.app).get("/health");
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("ok");
+    expect(res.body.cronReadiness).toEqual(
+      expect.objectContaining({
+        status: "ok",
+        neverVerifiedCrons: [],
+      }),
+    );
+  });
+
+  test("AC3: /health stays green for on-demand registrations with no first-run stamp", async () => {
+    registerCron("matrix-approval-gate", "on-demand");
+    ageRegisteredCron(
+      "matrix-approval-gate",
+      new Date(Date.now() - 3_600_000).toISOString(),
+    );
 
     const res = await request(appState!.app).get("/health");
 
