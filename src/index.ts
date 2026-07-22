@@ -55,6 +55,7 @@ import { getAccessToken, getAgent, getLinearUserIdForAgent, getAllTokenStatuses,
 import { loadUniversalCanon, getCanonLiveness } from "./policy/universal-canon.js";
 import { loadRoster, getRoutingFunctionaryLiveness } from "./department-roster.js";
 import { createGuidanceRouter, getDocsLiveness } from "./docs/guidance-router.js";
+import { createHealthSnapshotRouter, getSnapshotLiveness, registerSnapshot } from "./health/snapshot.js";
 import type { StaleSessionDetail } from "./bag/session-tracker.js";
 import crypto from "crypto";
 import path from "path";
@@ -374,8 +375,18 @@ export function createApp(options?: CreateAppOptions) {
       // and a computed state (healthy/stale/expired/failing). Powers the
       // console token panel (AI-1955 AC3) and operator triage without log access.
       tokens: getAllTokenStatuses(),
+      // INF-322 AC4: health snapshot endpoint liveness — confirms the route
+      // is wired at bootstrap, observable at ac-validate without waiting for
+      // a health event to fire.
+      healthSnapshot: getSnapshotLiveness(),
     });
   });
+
+  // INF-322: health snapshot endpoint — registered at bootstrap so GET
+  // /health/snapshot returns 200 immediately. Mark the route active so
+  // /health.healthSnapshot.active === true proves the wiring.
+  app.use("/health", createHealthSnapshotRouter());
+  registerSnapshot();
 
   // AI-1849 (Pillar 2 D2): docs endpoint — serves instance-config docs to
   // authenticated agents using their lpx proxy token (read-only, no admin secret).

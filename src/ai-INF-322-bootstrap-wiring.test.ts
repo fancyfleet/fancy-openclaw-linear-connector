@@ -105,8 +105,7 @@ describe("INF-322 AC3/AC4: health snapshot bootstrap wiring", () => {
     expect(res.status).toBe(200);
     // Must be valid JSON with expected shape, never a 5xx or error body.
     expect(res.body).toBeDefined();
-    expect(res.body.tasks).toBeUndefined(); // TEMPORARY: fails — the endpoint returns 404.
-    // Once wired: expect(Array.isArray(res.body.tasks)).toBe(true);
-    // Once wired: expect(res.body.tasks).toHaveLength(0);
+    expect(Array.isArray(res.body.tasks)).toBe(true);
+    expect(res.body.tasks).toHaveLength(0);
   });
 });
