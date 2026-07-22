@@ -33,6 +33,7 @@ import { checkLinearIssueRouting } from "./linear-actionable.js";
 import { assertDispatchTargetFetchable } from "./delivery/index.js";
 import { markDispatchIntegrityGateActive, getDispatchIntegrityState } from "./dispatch-integrity-state.js";
 import { getCircuitBreakerHealth } from "./dispatch-circuit-breaker.js";
+import { getRemediationHealth } from "./remediation/remediation-state.js";
 import { getPreFlightLiveness, registerSpawnerPreflight } from "./spawner-preflight.js";
 import { checkFanoutOutcomeStoreLiveness, getFanoutOutcomeStoreLiveness } from "./fanout-outcome-store.js";
 import { registerDistillationCron, createProdGenerationContext } from "./cron/p4-metrics-distillation.js";
@@ -511,6 +512,10 @@ export function createApp(options?: CreateAppOptions) {
       // the .env has the wrong LINEAR_CONNECTOR_ENCRYPTION_KEY / KEY_FILE reference;
       // every token refresh save() would silently corrupt the token store.
       encryptionKey: getEncryptionKeyValidation(),
+      // INF-320: remediation actor liveness — proves the component is wired
+      // at the production entry point (AI-1808 guard), observable at
+      // /health without waiting for a failure_class event.
+      remediationActor: getRemediationHealth(),
     });
   });
 
