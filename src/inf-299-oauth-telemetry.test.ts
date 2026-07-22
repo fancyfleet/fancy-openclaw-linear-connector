@@ -170,7 +170,7 @@ describe("INF-299: OAuth callback telemetry update", () => {
     return file;
   }
 
-  beforeEach(() => {
+  beforeEach(async () => {
     dir = tempDir();
     agentsFile = writeAgents(dir, [{
       name: "test-agent",
@@ -192,6 +192,10 @@ describe("INF-299: OAuth callback telemetry update", () => {
     process.env.AGENTS_FILE = agentsFile;
     process.env.ADMIN_SECRET = "test-secret";
     process.env.NODE_ENV = "test";
+
+    // Sync the ESM-cached agents module's in-memory _agents with our temp file.
+    const { reloadAgents } = await import("./agents.js");
+    reloadAgents();
 
     // Mock fetch for the OAuth token exchange and viewer query
     originalFetch = globalThis.fetch;
@@ -244,6 +248,8 @@ describe("INF-299: OAuth callback telemetry update", () => {
   // ── AC1: Telemetry update on successful re-auth ───────────────────────────
 
   it("AC1: updates expiresAt from the new token's expires_in after callback", async () => {
+    const { reloadAgents } = await import("./agents.js");
+    reloadAgents();
     const { createApp } = await import("./index.js");
     appState = createApp();
 
@@ -251,7 +257,6 @@ describe("INF-299: OAuth callback telemetry update", () => {
       .get("/oauth/callback")
       .query({ code: "valid-auth-code", state: "test-agent" });
 
-    const { reloadAgents } = await import("./agents.js");
     reloadAgents();
     const { getAgent } = await import("./agents.js");
     const agent = getAgent("test-agent");
