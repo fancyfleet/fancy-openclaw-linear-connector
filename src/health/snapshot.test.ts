@@ -52,6 +52,7 @@ describe("GET /health/snapshot — health snapshot endpoint", () => {
       bagDbPath: path.join(dir, "pending-bag.db"),
       agentQueueDbPath: path.join(dir, "agent-queue.db"),
       operationalEventsDbPath: path.join(dir, "operational-events.db"),
+      deadLetterQueueDbPath: path.join(dir, "dead-letter-queue.db"),
     });
   });
 
