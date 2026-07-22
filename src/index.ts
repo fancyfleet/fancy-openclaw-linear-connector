@@ -4,7 +4,7 @@ import { createWebhookRouter } from "./webhook/index.js";
 import { handleProxyRequest } from "./proxy.js";
 import { handleProxyUploadRequest } from "./proxy-upload.js";
 import { startTokenRefresh } from "./token-refresh.js";
-import { getAgents, watchAgentsFile } from "./agents.js";
+import { getAgents, watchAgentsFile, getEncryptionKeyValidation } from "./agents.js";
 import { createLogger, componentLogger } from "./logger.js";
 import { handleOAuthCallback } from "./oauth-callback.js";
 import { EventStore } from "./store/event-store.js";
