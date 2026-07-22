@@ -324,6 +324,13 @@ describe("proxy — AI-2035: reviewer Done is terminal against a same-turn trail
     globalThis.fetch = mf.fetch;
     mf.setWithIdsState("ac-validate");
 
+    // AI-2530 requires a per-invocation command nonce on the intent-resolving
+    // path. Both writes below are the SAME logical command (one turn: the
+    // issueUpdate plus its trailing same-turn chunk), which is exactly what the
+    // real CLI emits — one nonce per invocation, shared by that command's
+    // follow-up mutations. Minting a fresh nonce per request here would model
+    // two separate commands and misrepresent the race under test (AI-2536).
+    const commandId = "ai2035-ac3-same-turn";
     const send = (payload: object) =>
       request(appState.app)
         .post("/proxy/graphql")
@@ -331,6 +338,7 @@ describe("proxy — AI-2035: reviewer Done is terminal against a same-turn trail
         .set("X-Openclaw-Agent", "astrid")
         .set("X-Openclaw-Linear-Cli-Version", "0.3.6")
         .set("X-Openclaw-Linear-Intent", "continue-workflow")
+        .set("X-Openclaw-Command-Id", commandId)
         .send(payload);
 
     const res1 = await send(issueUpdateTriggerBody());
@@ -362,6 +370,8 @@ describe("proxy — AI-2035: reviewer Done is terminal against a same-turn trail
     globalThis.fetch = mf.fetch;
     mf.setWithIdsState("ac-validate");
 
+    // Same-command nonce shared by the trailing chunk — see AC3 above (AI-2536).
+    const commandId = "ai2035-ac2-same-turn";
     const send = (payload: object) =>
       request(appState.app)
         .post("/proxy/graphql")
@@ -369,6 +379,7 @@ describe("proxy — AI-2035: reviewer Done is terminal against a same-turn trail
         .set("X-Openclaw-Agent", "astrid")
         .set("X-Openclaw-Linear-Cli-Version", "0.3.6")
         .set("X-Openclaw-Linear-Intent", "continue-workflow")
+        .set("X-Openclaw-Command-Id", commandId)
         .send(payload);
 
     await send(issueUpdateTriggerBody());

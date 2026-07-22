@@ -17,3 +17,8 @@ agents.json.bak-*
 tmp/
 scripts/validate-story-defs.ts
 dist.pre-deploy-*/
+
+# Per-session dev worktrees (AI-2475) — created by scripts/connector-worktree.sh.
+# Never track these; a stray git add -A here re-commits worktrees as gitlinks.
+.worktrees/
+scripts/__pycache__/

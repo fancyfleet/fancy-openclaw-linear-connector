@@ -5,8 +5,9 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
+    "prebuild": "node scripts/guard-build-location.js && node scripts/guard-runtime-build.mjs",
+    "check:json-keys": "node scripts/check-duplicate-json-keys.js",
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
-    "prebuild": "node scripts/guard-build-location.js",
     "build": "tsc",
     "start": "node dist/index.js",
     "lint": "eslint src --ext .ts",
@@ -34,6 +35,6 @@
     "supertest": "^6.3.4",
     "ts-jest": "^29.4.9",
     "ts-node-dev": "^2.0.0",
-    "typescript": "^5.3.3"
+    "typescript": "^5.9.3"
   }
 }

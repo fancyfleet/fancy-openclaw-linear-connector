@@ -22,7 +22,7 @@ The connector is a standalone HTTP service that receives Linear webhook events a
 
 **Direction:** OpenClaw → Linear
 
-The [fancy-openclaw-linear-skill](https://github.com/fancymatt/fancy-openclaw-linear-skill) is an OpenClaw agent skill that gives agents the ability to interact with Linear. It answers the question: *"How does an agent take action on Linear issues?"*
+The [fancy-openclaw-linear-skill](https://github.com/fancyfleet/fancy-openclaw-linear-skill) is an OpenClaw agent skill that gives agents the ability to interact with Linear. It answers the question: *"How does an agent take action on Linear issues?"*
 
 **What it does:**
 - Lets agents query, create, update, and comment on Linear issues

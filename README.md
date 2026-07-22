@@ -40,7 +40,7 @@ For reference or when the wizard isn't available. The wizard above automates mos
 
 1. **Clone and install:**
    ```bash
-   git clone https://github.com/fancymatt/fancy-openclaw-linear-connector.git
+   git clone https://github.com/fancyfleet/fancy-openclaw-linear-connector.git
    cd fancy-openclaw-linear-connector
    npm install
    npm run build
@@ -202,7 +202,7 @@ Use this for a fresh OpenClaw + connector installation on a different server.
 
 **Steps:**
 1. Install OpenClaw on new machine
-2. Clone connector repo: `git clone https://github.com/fancymatt/fancy-openclaw-linear-connector.git`
+2. Clone connector repo: `git clone https://github.com/fancyfleet/fancy-openclaw-linear-connector.git`
 3. Copy `agents.json.example` to `agents.json` and configure all agents
 4. Set up nginx reverse proxy for `/linear-webhook` → `http://localhost:3100/`
 5. Update Linear webhook URL to point to your new domain
@@ -258,7 +258,7 @@ Linear webhook → nginx reverse proxy → connector (port 3100)
                                            └── Close agent session when agent process exits
 ```
 
-**Companion skill:** [fancy-openclaw-linear-skill](https://github.com/fancymatt/fancy-openclaw-linear-skill) — `linear` CLI that agents use to interact with Linear.
+**Companion skill:** [fancy-openclaw-linear-skill](https://github.com/fancyfleet/fancy-openclaw-linear-skill) — `linear` CLI that agents use to interact with Linear.
 
 ## Adding a New Agent (Playbook)
 
@@ -741,6 +741,64 @@ The gateway has a flawed `symlink-escape` check that compares the symlink target
 
 ---
 
+## linear-cli Version Management
+
+The connector repo stores the canonical linear-cli version in a single source of truth:
+
+| File | Purpose |
+|---|---|
+| `config/linear-cli-version` | Single file containing the exact semver (e.g. `0.4.3`). All container images source their linear-cli version from here. |
+
+### How to Update the linear-cli Version
+
+To change the linear-cli version across all 27 container Dockerfiles:
+
+1. **Edit the version file:**
+   ```bash
+   echo "1.2.3" > config/linear-cli-version
+   ```
+
+2. **Run the update script on the deployment host:**
+   ```bash
+   bash scripts/update-linear-cli-version.sh
+   ```
+
+   The script reads the version from `config/linear-cli-version`, finds all container
+   Dockerfiles under `/srv/containers`, and replaces the pinned tarball URL with the new
+   version. Pass `--dry-run` to preview changes without modifying files.
+
+3. **Rebuild container images** — the new version is baked in at build time.
+
+### CI Enforcement
+
+The `lint-linear-cli-version` CI job runs on every push and PR. It verifies:
+- `config/linear-cli-version` exists and contains a valid semver
+- No Dockerfile in the repository contains a hardcoded linear-cli tarball URL
+
+### Local Lint
+
+Run the same check locally:
+
+```bash
+bash scripts/lint-linear-cli-version.sh
+```
+
+### Container Build
+
+When building container images (`docker build`), pass the version as a build-arg:
+
+```bash
+docker build \
+  --build-arg LINEAR_CLI_VERSION="$(cat config/linear-cli-version)" \
+  -t my-image:latest .
+```
+
+The connector's `Dockerfile` accepts `LINEAR_CLI_VERSION` as a build-arg and records it
+as a Docker label (`linear-cli-version`). All 27 container Dockerfiles should follow the
+same pattern.
+
+---
+
 ## Running with Docker
 
 The connector can run as a Docker container instead of bare systemd + node. This is useful for deploying on cloud hosts, NAS devices, or anywhere you'd rather not manage node/nvm/systemd.
@@ -755,7 +813,7 @@ docker run -d \
   -v ./data:/data \
   -v ./secrets:/secrets \
   -v ./config/agents.json:/config/agents.json:ro \
-  ghcr.io/fancymatt/openclaw-linear-connector:latest
+  ghcr.io/fancyfleet/fancy-openclaw-linear-connector:latest
 ```
 
 ### Volume Mounts

@@ -140,138 +140,123 @@ export class DispatchIdempotencyStore {
     updatedAt: string,
     options?: IdempotencyOptions,
   ): IdempotencyCheckResult {
-    const now = this.now(options);
-    const incomingUpdatedAt = new Date(updatedAt).getTime();
+    // AI-2376: Wrap the entire read-check-write cycle in a SQLite IMMEDIATE
+    // transaction to eliminate the TOCTOU race. Concurrent callers with the
+    // same (ticketKey, workflowState, agent) are serialized: Handler A's
+    // exclusive write lock forces Handler B to wait, then read the committed
+    // row that A already wrote.
+    const checkAndRecordTx = this.db.transaction(
+      (): IdempotencyCheckResult => {
+        const now = this.now(options);
+        const incomingUpdatedAt = new Date(updatedAt).getTime();
 
-    // ── Delegate-change invalidation ────────────────────────────────────────
-    // Clear all prior rows for (ticket, agent) BEFORE the duplicate check, so
-    // a re-delegation to an agent that previously held the same (ticket, state)
-    // is treated as fresh, not suppressed.
-    if (options?.delegateChanged) {
-      // Check whether the incoming is same-or-older than what we already have
-      // for this (ticket, agent). An outdated or equal re-delivery should not
-      // trigger a re-wake — suppress as duplicate.
-      const latestForAgent = this.db
-        .prepare(
-          `SELECT MAX(updated_at) as max_updated_at FROM dispatch_idempotency
-           WHERE ticket_key = ? AND agent = ?`,
-        )
-        .get(ticketKey, agent) as { max_updated_at: string } | undefined;
+        // ── Delegate-change invalidation ────────────────────────────────────────
+        if (options?.delegateChanged) {
+          const latestForAgent = this.db
+            .prepare(
+              `SELECT MAX(updated_at) as max_updated_at FROM dispatch_idempotency
+               WHERE ticket_key = ? AND agent = ?`,
+            )
+            .get(ticketKey, agent) as { max_updated_at: string } | undefined;
 
-      if (latestForAgent?.max_updated_at) {
-        const latestUpdatedAt = new Date(latestForAgent.max_updated_at).getTime();
-        if (incomingUpdatedAt < latestUpdatedAt) {
-          // Older snapshot — drop as stale.
-          this._droppedStale++;
-          return { suppressed: false, stale: true };
+          if (latestForAgent?.max_updated_at) {
+            const latestUpdatedAt = new Date(latestForAgent.max_updated_at).getTime();
+            if (incomingUpdatedAt < latestUpdatedAt) {
+              this._droppedStale++;
+              return { suppressed: false, stale: true };
+            }
+            if (incomingUpdatedAt === latestUpdatedAt) {
+              this._suppressedDuplicates++;
+              return { suppressed: true, stale: false };
+            }
+          }
+
+          const deleteResult = this.db
+            .prepare(`DELETE FROM dispatch_idempotency WHERE ticket_key = ? AND agent = ?`)
+            .run(ticketKey, agent);
+          if (deleteResult.changes > 0) {
+            this._delegateChangeCleared += deleteResult.changes;
+          }
+
+          this.db
+            .prepare(
+              `INSERT INTO dispatch_idempotency
+               (ticket_key, workflow_state, agent, updated_at, created_at)
+               VALUES (?, ?, ?, ?, ?)`,
+            )
+            .run(ticketKey, workflowState, agent, updatedAt, now.toISOString());
+
+          return { suppressed: false, stale: false, clearedRows: deleteResult.changes };
         }
-        if (incomingUpdatedAt === latestUpdatedAt) {
-          // Same timestamp — suppress as duplicate (replay dedup).
-          this._suppressedDuplicates++;
-          return { suppressed: true, stale: false };
+
+        // ── Stale check (before TTL): snapshot freshness ────────────────────────
+        const latestTicketRow = this.db
+          .prepare(
+            `SELECT MAX(updated_at) as max_updated_at FROM dispatch_idempotency
+             WHERE ticket_key = ?`,
+          )
+          .get(ticketKey) as { max_updated_at: string } | undefined;
+
+        if (latestTicketRow && latestTicketRow.max_updated_at) {
+          const latestUpdatedAt = new Date(latestTicketRow.max_updated_at).getTime();
+          if (incomingUpdatedAt < latestUpdatedAt) {
+            this._droppedStale++;
+            return { suppressed: false, stale: true };
+          }
         }
-      }
 
-      const deleteResult = this.db
-        .prepare(`DELETE FROM dispatch_idempotency WHERE ticket_key = ? AND agent = ?`)
-        .run(ticketKey, agent);
-      if (deleteResult.changes > 0) {
-        this._delegateChangeCleared += deleteResult.changes;
-      }
+        // ── TTL-expired admit guard ─────────────────────────────────────────────
+        const ttlCutoffEpochSecs = Math.floor((now.getTime() - this.dedupTtlMs) / 1000);
+        const ttlDeleteResult = this.db
+          .prepare(
+            `DELETE FROM dispatch_idempotency
+             WHERE ticket_key = ? AND workflow_state = ? AND agent = ?
+               AND cast(strftime('%s', created_at) AS integer) < ?`,
+          )
+          .run(ticketKey, workflowState, agent, ttlCutoffEpochSecs);
+        const ttlDeletedRows = ttlDeleteResult.changes;
 
-      // Admit the new dispatch immediately: we just cleared all rows, so
-      // there's nothing to dedup against.
-      this.db
-        .prepare(
-          `INSERT INTO dispatch_idempotency
-           (ticket_key, workflow_state, agent, updated_at, created_at)
-           VALUES (?, ?, ?, ?, ?)`,
-        )
-        .run(ticketKey, workflowState, agent, updatedAt, now.toISOString());
+        // ── Duplicate check: exact (ticket, state, agent) key. ──
+        const row = this.db
+          .prepare(
+            `SELECT updated_at, created_at FROM dispatch_idempotency
+             WHERE ticket_key = ? AND workflow_state = ? AND agent = ?`,
+          )
+          .get(ticketKey, workflowState, agent) as
+          | { updated_at: string; created_at: string }
+          | undefined;
 
-      return { suppressed: false, stale: false, clearedRows: deleteResult.changes };
-    }
+        if (row) {
+          const existingUpdatedAt = new Date(row.updated_at).getTime();
+          if (incomingUpdatedAt < existingUpdatedAt) {
+            this._droppedStale++;
+            return { suppressed: false, stale: true };
+          }
+          if (incomingUpdatedAt === existingUpdatedAt) {
+            this._suppressedDuplicates++;
+            return { suppressed: true, stale: false };
+          }
+        }
 
-    // ── Stale check (before TTL): snapshot freshness ────────────────────
-    // If ANY agent has already seen a newer snapshot of this ticket, the
-    // incoming (older) dispatch is stale and must be dropped, regardless of
-    // TTL. This check must run BEFORE TTL purge so it can see all rows
-    // including those that will be purged below (AI-1973, stale-snapshot
-    // ordering ignores TTL).
-    const latestTicketRow = this.db
-      .prepare(
-        `SELECT MAX(updated_at) as max_updated_at FROM dispatch_idempotency
-         WHERE ticket_key = ?`,
-      )
-      .get(ticketKey) as { max_updated_at: string } | undefined;
+        // ── Admit: fresh dispatch. Persist the record. ──
+        this.db
+          .prepare(
+            `INSERT OR REPLACE INTO dispatch_idempotency
+             (ticket_key, workflow_state, agent, updated_at, created_at)
+             VALUES (?, ?, ?, ?, ?)`,
+          )
+          .run(ticketKey, workflowState, agent, updatedAt, now.toISOString());
 
-    if (latestTicketRow && latestTicketRow.max_updated_at) {
-      const latestUpdatedAt = new Date(latestTicketRow.max_updated_at).getTime();
-      if (incomingUpdatedAt < latestUpdatedAt) {
-        this._droppedStale++;
-        return { suppressed: false, stale: true };
-      }
-    }
+        const result: IdempotencyCheckResult = { suppressed: false, stale: false };
+        if (ttlDeletedRows > 0) {
+          result.ttlExpired = true;
+          this._ttlExpiredAdmits++;
+        }
+        return result;
+      },
+    );
 
-    // ── TTL-expired admit guard ─────────────────────────────────────────────
-    // Before the exact-key duplicate check, purge any row older than TTL.
-    // This allows a re-dispatch on the same (ticket, state, agent) after hours
-    // of silence without relying on delegate-change signaling.
-    const ttlCutoffEpochSecs = Math.floor((now.getTime() - this.dedupTtlMs) / 1000);
-    const ttlDeleteResult = this.db
-      .prepare(
-        `DELETE FROM dispatch_idempotency
-         WHERE ticket_key = ? AND workflow_state = ? AND agent = ?
-           AND cast(strftime('%s', created_at) AS integer) < ?`,
-      )
-      .run(ticketKey, workflowState, agent, ttlCutoffEpochSecs);
-    const ttlDeletedRows = ttlDeleteResult.changes;
-
-    // ── Duplicate check: exact (ticket, state, agent) key. ──
-    const row = this.db
-      .prepare(
-        `SELECT updated_at, created_at FROM dispatch_idempotency
-         WHERE ticket_key = ? AND workflow_state = ? AND agent = ?`,
-      )
-      .get(ticketKey, workflowState, agent) as
-      | { updated_at: string; created_at: string }
-      | undefined;
-
-    if (row) {
-      const existingUpdatedAt = new Date(row.updated_at).getTime();
-      if (incomingUpdatedAt < existingUpdatedAt) {
-        this._droppedStale++;
-        return { suppressed: false, stale: true };
-      }
-      // Duplicate: identical snapshot (webhook replay / restart echo) — don't
-      // re-dispatch. A strictly NEWER updatedAt is a genuinely new event
-      // (AI-1969: workflow re-entry — e.g. a second handoff to the same agent
-      // in the same state after a bounce cycle) and must be admitted; before
-      // this distinction, re-entry handoffs were suppressed forever and the
-      // target agent could never be woken again on that (ticket, state) key.
-      if (incomingUpdatedAt === existingUpdatedAt) {
-        this._suppressedDuplicates++;
-        return { suppressed: true, stale: false };
-      }
-      // Fall through to admit: the INSERT OR REPLACE below refreshes the
-      // stored updatedAt so the replay guard tracks the newest snapshot.
-    }
-
-    // ── Admit: fresh dispatch. Persist the record. ──
-    this.db
-      .prepare(
-        `INSERT OR REPLACE INTO dispatch_idempotency
-         (ticket_key, workflow_state, agent, updated_at, created_at)
-         VALUES (?, ?, ?, ?, ?)`,
-      )
-      .run(ticketKey, workflowState, agent, updatedAt, now.toISOString());
-
-    const result: IdempotencyCheckResult = { suppressed: false, stale: false };
-    if (ttlDeletedRows > 0) {
-      result.ttlExpired = true;
-      this._ttlExpiredAdmits++;
-    }
-    return result;
+    return checkAndRecordTx();
   }
 
   /**
