@@ -1,0 +1,32 @@
+# sprint-arm-scope — Test fixture stub for dev-sprint integration tests
+# Simplified stub required because dev-sprint's spawn-arms fanout references
+# wf:sprint-arm-scope as the child workflow.
+
+id: sprint-arm-scope
+version: 1
+archetype: task
+entry_state: intake
+
+break_glass:
+  command: escape
+  to: escape
+  owner_role: steward
+
+states:
+  - id: intake
+    owner_role: steward
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: accept
+        to: done
+        generic: continue
+
+  - id: done
+    kind: terminal
+    native_state: done
+    satisfies_parent_barrier: true
+
+  - id: escape
+    kind: terminal
+    native_state: invalid
