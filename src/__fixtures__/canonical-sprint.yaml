@@ -19,7 +19,7 @@ entry_state: intake
 
 break_glass:
   command: escape               # x-openclaw-linear-intent value that triggers break-glass (§4.4)
-  to: escape
+  to: intake
   owner_role: steward           # implicit escape edge from EVERY state (design.md §4.4)
 
 states:

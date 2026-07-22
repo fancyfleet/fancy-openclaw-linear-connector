@@ -5209,7 +5209,8 @@ export async function applyStateTransition(
   }
 
   // Clean up artifact binding and implementer record on escape/demote
-  if (toStateName === "escape" || toStateName === "__ad_hoc__") {
+  // INF-311: trigger on any escape intent, not just target "escape" state.
+  if (intent === "escape" || toStateName === "escape" || toStateName === "__ad_hoc__") {
     removeArtifact(issueId);
     await removeAcRecord(issueId);
   }

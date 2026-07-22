@@ -56,12 +56,11 @@ version: 1
 archetype: orchestrator
 entry_state: intake
 
-# BUG: break_glass.to: intake — when escape fires, the parent resets to
-# intake, which is destructive. The steward loses all completed child arm
-# progress.
+# INF-311: break_glass.to: product-definition — escape goes to a recovery
+# state, not intake, preserving completed child arm progress.
 break_glass:
   command: escape
-  to: intake
+  to: product-definition
   owner_role: steward
 
 states:
@@ -558,7 +557,7 @@ describe("INF-311 AC3: escape never leaves children in state:escape with zero le
     // The break_glass.to destination must have at least one transition so a
     // ticket landed there has a legal forward move.
     const yaml = DEV_SPRINT_WORKFLOW_YAML;
-    const breakGlassTo = "intake";
+    const breakGlassTo = "product-definition";
     
     const statesMatch = yaml.matchAll(/^\s+- id: (\S+)$/gm);
     const stateIds = Array.from(statesMatch, (m) => m[1]);

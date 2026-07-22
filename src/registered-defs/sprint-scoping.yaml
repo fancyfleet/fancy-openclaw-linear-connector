@@ -30,7 +30,7 @@ entry_state: intake
 
 break_glass:
   command: escape
-  to: escape
+  to: intake
   owner_role: steward
 
 states:
