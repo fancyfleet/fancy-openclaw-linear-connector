@@ -74,6 +74,10 @@ import { loadUniversalCanon, getCanonLiveness } from "./policy/universal-canon.j
 import { loadRoster, getRoutingFunctionaryLiveness } from "./department-roster.js";
 import { createGuidanceRouter, getDocsLiveness } from "./docs/guidance-router.js";
 import { TtlCache, buildFullCacheLiveness, markCacheFlushRouteMounted, registerTtlInvalidationCron } from "./cache/ttl-cache.js";
+import { DispatchRecordStore } from "./liveness-channel/dispatch-record-store.js";
+import { LivenessChannelEndpoint } from "./liveness-channel/index.js";
+import { SessionHealthProbe } from "./liveness-channel/session-health.js";
+import { TurnLivenessProbe } from "./liveness-channel/turn-liveness.js";
 import type { StaleSessionDetail } from "./bag/session-tracker.js";
 import crypto from "crypto";
 import path from "path";
@@ -213,6 +217,8 @@ export interface CreateAppOptions {
   dispatchLeaseDbPath?: string;
   /** Override ProposalStore database path (for testing). AI-2039. */
   proposalsDbPath?: string;
+  /** Override liveness dispatch record database path (for testing). INF-316. */
+  livenessDispatchDbPath?: string;
   /** Override forensics diagnostics base directory (for testing, AI-1953). */
   forensicsDiagnosticsDir?: string;
   /**
@@ -526,6 +532,20 @@ export function createApp(options?: CreateAppOptions) {
   const mutationAuditStore = new MutationAuditStore(options?.mutationAuditDbPath);
   const idempotencyStore = new DispatchIdempotencyStore(options?.idempotencyDbPath);
   const dispatchLeaseStore = new DispatchLeaseStore(options?.dispatchLeaseDbPath);
+  const livenessDispatchStore = new DispatchRecordStore(
+    options?.livenessDispatchDbPath ??
+      (options?.bagDbPath
+        ? path.join(path.dirname(options.bagDbPath), "liveness-dispatches.db")
+        : path.join(process.env.DATA_DIR ?? resolveStatePath("data"), "liveness-dispatches.db")),
+    {
+      probeCadenceMs: process.env.LIVENESS_PROBE_CADENCE_MS
+        ? parseInt(process.env.LIVENESS_PROBE_CADENCE_MS, 10)
+        : undefined,
+      ackTimeoutMs: process.env.LIVENESS_ACK_TIMEOUT_MS
+        ? parseInt(process.env.LIVENESS_ACK_TIMEOUT_MS, 10)
+        : undefined,
+    },
+  );
   // AI-2039 (P4-C4): learning-loop proposal queue + apply-outcome store. Backs
   // the /admin/api/proposals review console (C5) and the apply pipeline's
   // idempotency/retry surface (AC4.8).
@@ -723,6 +743,12 @@ export function createApp(options?: CreateAppOptions) {
         log.error(`Stale session processing failed for ${stale.agentId} [${stale.sessionKey}]: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
+  });
+  const livenessEndpoint = new LivenessChannelEndpoint({
+    dispatchRecordStore: livenessDispatchStore,
+    sessionHealthProbe: new SessionHealthProbe({ sessionTracker }),
+    turnLivenessProbe: new TurnLivenessProbe({ sessionTracker }),
+    config: livenessDispatchStore.config,
   });
   const throttle = new DeliveryThrottle();
 
@@ -1145,6 +1171,11 @@ export function createApp(options?: CreateAppOptions) {
     if (!parsed) return;
     const { agentId, ticketId } = parsed;
     ackTracker.recordDispatch(agentId, ticketId);
+    livenessDispatchStore.recordDispatch({
+      agentId,
+      ticketId,
+      sessionKey: normalizeSessionKey(ticketId),
+    });
     flipEngagementStatus(agentId, ticketId, "thinking");
     res.json({ ok: true });
   });
@@ -1162,8 +1193,35 @@ export function createApp(options?: CreateAppOptions) {
     if (!parsed) return;
     const { agentId, ticketId } = parsed;
     ackTracker.acknowledge(agentId, ticketId);
+    const livenessRecord = livenessDispatchStore.getDispatch(ticketId);
+    if (livenessRecord && livenessRecord.status === "pending") {
+      livenessDispatchStore.recordAck(livenessRecord.dispatchId, {
+        delivered: true,
+        target_identity: agentId,
+        status: "accepted",
+      });
+    }
     flipEngagementStatus(agentId, ticketId, "doing");
     res.json({ ok: true });
+  });
+
+  app.get("/liveness/:ticketId", (req: express.Request, res: express.Response) => {
+    const expectedAdmin = process.env.ADMIN_SECRET;
+    const expectedSession = process.env.SESSION_END_SECRET;
+    const candidates = [
+      adminSecretFromRequest(req),
+      typeof req.headers["x-session-end-secret"] === "string"
+        ? req.headers["x-session-end-secret"]
+        : null,
+    ].filter((value): value is string => Boolean(value));
+    if ((expectedAdmin || expectedSession) && !(
+      candidates.some((candidate) => expectedAdmin && verifySecret(candidate, expectedAdmin)) ||
+      candidates.some((candidate) => expectedSession && verifySecret(candidate, expectedSession))
+    )) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+    res.json(livenessEndpoint.snapshotForTicket(req.params.ticketId));
   });
 
   // Management console (Phase 3): React SPA + JSON API, session or secret auth.
@@ -1190,6 +1248,14 @@ export function createApp(options?: CreateAppOptions) {
     deadLetterQueue,
     (agentId, ticketId) => {
       ackTracker.recordDispatch(agentId, ticketId);
+      const livenessRecord = livenessDispatchStore.getDispatch(ticketId);
+      if (livenessRecord && livenessRecord.status === "pending") {
+        livenessDispatchStore.recordAck(livenessRecord.dispatchId, {
+          delivered: true,
+          target_identity: agentId,
+          status: "accepted",
+        });
+      }
       // AI-1510: agent has read the ticket via the connector → Thinking.
       flipEngagementStatus(agentId, ticketId, "thinking");
     },
@@ -1205,11 +1271,19 @@ export function createApp(options?: CreateAppOptions) {
     },
     // AI-1538: register a pending dispatch expectation at delivery-commit so a
     // swallowed delivery self-heals via the watchdog.
-    (agentId, ticketId) => ackTracker.ensurePending(agentId, ticketId),
+    (agentId, ticketId) => {
+      ackTracker.ensurePending(agentId, ticketId);
+      livenessDispatchStore.recordDispatch({
+        agentId,
+        ticketId,
+        sessionKey: normalizeSessionKey(ticketId),
+      });
+    },
     enrolledTicketsStore,
     mutationAuditStore,
     idempotencyStore,
     dispatchLeaseStore,
+    livenessDispatchStore,
   ));
 
   // ── v1.1: Session-end callback endpoint ──────────────────────────────
