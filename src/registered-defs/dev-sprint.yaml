@@ -26,17 +26,18 @@
 #   → 5. ac-definition → 6. spawn-impl → 7. managing-impl → 8. validation → done
 
 id: dev-sprint
-version: 7
+version: 8
 archetype: orchestrator
 entry_state: intake
 
-# v7 break-glass: escape → intake migration for in-flight tickets
+# INF-311: escape → product-definition recovery state (was intake)
+# Tickets already in escape state migrate to product-definition for recovery.
 migrations:
-  escape: intake
+  escape: product-definition
 
 break_glass:
   command: escape
-  to: intake
+  to: product-definition
   owner_role: steward
 
 states:
