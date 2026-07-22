@@ -11,9 +11,11 @@ import { jest } from "@jest/globals";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import * as cronRegistry from "./registry.js";
 import {
   registerCron,
   getRegisteredCrons,
+  markCronRun,
   resetCronRegistryForTest,
   formatIntervalMs,
 } from "./registry.js";
@@ -54,6 +56,108 @@ describe("cron registry (AI-1810)", () => {
     expect(formatIntervalMs(60 * 60 * 1000)).toBe("1h");
     expect(formatIntervalMs(90 * 1000)).toBe("90s");
     expect(formatIntervalMs(1500)).toBe("1500ms");
+  });
+});
+
+type StaleCronEntry = {
+  name: string;
+  schedule: string;
+  lastRunAt: string | null;
+  overdueByMs: number;
+};
+
+function getStaleCronsForTest(opts: { now: Date; staleFactor?: number }): StaleCronEntry[] {
+  const fn = (cronRegistry as unknown as {
+    getStaleCrons?: (opts: { now: Date; staleFactor?: number }) => StaleCronEntry[];
+  }).getStaleCrons;
+  expect(fn).toEqual(expect.any(Function));
+  return fn!(opts);
+}
+
+describe("INF-339 stale cron detection", () => {
+  beforeEach(() => {
+    resetCronRegistryForTest();
+    jest.useFakeTimers();
+  });
+
+  afterEach(() => {
+    resetCronRegistryForTest();
+    jest.useRealTimers();
+  });
+
+  test("AC2: register-but-never-fire cron is stale after its first expected fire", () => {
+    jest.setSystemTime(new Date("2026-07-22T12:00:00.000Z"));
+    registerCron("never-fired", "every 5m");
+
+    const stale = getStaleCronsForTest({
+      now: new Date("2026-07-22T12:06:00.000Z"),
+    });
+
+    expect(stale).toEqual([
+      {
+        name: "never-fired",
+        schedule: "every 5m",
+        lastRunAt: null,
+        overdueByMs: 60_000,
+      },
+    ]);
+  });
+
+  test("AC3: lagging cron appears when lastRunAt is older than schedule times default N=3", () => {
+    jest.setSystemTime(new Date("2026-07-22T12:00:00.000Z"));
+    registerCron("lagging-driver", "every 10m");
+    markCronRun("lagging-driver", new Date("2026-07-22T12:00:00.000Z"));
+
+    const stale = getStaleCronsForTest({
+      now: new Date("2026-07-22T12:31:00.000Z"),
+    });
+
+    expect(stale).toEqual([
+      {
+        name: "lagging-driver",
+        schedule: "every 10m",
+        lastRunAt: "2026-07-22T12:00:00.000Z",
+        overdueByMs: 60_000,
+      },
+    ]);
+  });
+
+  test("AC4: stale threshold N is configurable", () => {
+    jest.setSystemTime(new Date("2026-07-22T12:00:00.000Z"));
+    registerCron("configurable-driver", "every 10m");
+    markCronRun("configurable-driver", new Date("2026-07-22T12:00:00.000Z"));
+
+    expect(getStaleCronsForTest({
+      now: new Date("2026-07-22T12:31:00.000Z"),
+      staleFactor: 4,
+    })).toEqual([]);
+
+    expect(getStaleCronsForTest({
+      now: new Date("2026-07-22T12:41:00.000Z"),
+      staleFactor: 4,
+    })).toEqual([
+      {
+        name: "configurable-driver",
+        schedule: "every 10m",
+        lastRunAt: "2026-07-22T12:00:00.000Z",
+        overdueByMs: 60_000,
+      },
+    ]);
+  });
+
+  test("AC5: fresh crons and exact-threshold crons are not flagged", () => {
+    jest.setSystemTime(new Date("2026-07-22T12:00:00.000Z"));
+    registerCron("not-yet-due", "every 5m");
+    registerCron("fresh-driver", "every 10m");
+    markCronRun("fresh-driver", new Date("2026-07-22T12:20:00.000Z"));
+    registerCron("exact-threshold", "every 10m");
+    markCronRun("exact-threshold", new Date("2026-07-22T12:00:00.000Z"));
+
+    const stale = getStaleCronsForTest({
+      now: new Date("2026-07-22T12:30:00.000Z"),
+    });
+
+    expect(stale).toEqual([]);
   });
 });
 
