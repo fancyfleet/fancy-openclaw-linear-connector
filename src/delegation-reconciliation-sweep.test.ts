@@ -369,6 +369,90 @@ describe("AC1: sweep detects stranded delegations and re-dispatches", () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════
+// INF-334 AC2: Reconciliation discovers a plain delegated ticket whose
+//              dispatch was missed/failed and redispatches it.
+// ══════════════════════════════════════════════════════════════════════════
+
+describe("INF-334 AC2: reconciliation redispatches missed plain delegations", () => {
+  it("redispatches a plain delegated ticket with no wf:* labels and no dispatch record", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: Array<{ agentName: string; ticketIdentifier: string }> = [];
+    const { bus } = makeTestAlertBus();
+
+    globalThis.fetch = makeReconciliationFetch({
+      adhocDelegatedTickets: [
+        {
+          id: "issue-plain-missed",
+          identifier: "DSN-334",
+          updatedAt: OLD_TIMESTAMP,
+          labels: [],
+          delegateId: DELEGATE_LINEAR_ID,
+          delegateName: DELEGATE_AGENT_NAME,
+          teamId: TEAM_ID,
+        },
+      ],
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (agentName, ticketIdentifier) => {
+        wakeDispatches.push({ agentName, ticketIdentifier });
+      },
+    });
+
+    expect(result.healed).toBe(1);
+    expect(wakeDispatches).toEqual([
+      { agentName: DELEGATE_AGENT_NAME, ticketIdentifier: "DSN-334" },
+    ]);
+    eventStore.close();
+  });
+
+  it("redispatches a plain delegated ticket when the only prior dispatch after delegation failed", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: Array<{ agentName: string; ticketIdentifier: string }> = [];
+    const { bus } = makeTestAlertBus();
+
+    eventStore.append({
+      outcome: "delivery-failed",
+      agent: DELEGATE_AGENT_NAME,
+      key: "linear-DSN-335",
+      occurredAt: FRESH_TIMESTAMP,
+    });
+
+    globalThis.fetch = makeReconciliationFetch({
+      adhocDelegatedTickets: [
+        {
+          id: "issue-plain-failed",
+          identifier: "DSN-335",
+          updatedAt: OLD_TIMESTAMP,
+          labels: [],
+          delegateId: DELEGATE_LINEAR_ID,
+          delegateName: DELEGATE_AGENT_NAME,
+          teamId: TEAM_ID,
+        },
+      ],
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (agentName, ticketIdentifier) => {
+        wakeDispatches.push({ agentName, ticketIdentifier });
+      },
+    });
+
+    expect(result.healed).toBe(1);
+    expect(wakeDispatches).toEqual([
+      { agentName: DELEGATE_AGENT_NAME, ticketIdentifier: "DSN-335" },
+    ]);
+    eventStore.close();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
 // AC2: Detects wf-labeled tickets with no state:* label AND no delegate
 //      (dropped enrollment webhooks) and routes through bootstrap path.
 // ══════════════════════════════════════════════════════════════════════════
