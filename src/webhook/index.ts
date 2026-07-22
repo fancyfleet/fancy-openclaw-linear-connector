@@ -40,6 +40,8 @@ import { notify } from "../alerts/alert-bus.js";
 import { loadKnownHumans } from "../known-humans.js";
 import { emitStreamTopic } from "../admin-stream.js";
 import { DelegatePingPongDetector } from "../delegate-ping-pong-detector.js";
+import type { DispatchRecordStore } from "../liveness-channel/dispatch-record-store.js";
+import type { GatewayDispatchAck } from "../liveness-channel/gateway-ack-types.js";
 
 const log = componentLogger(createLogger(), "webhook");
 
@@ -206,6 +208,7 @@ export function createWebhookRouter(
   mutationAuditStore?: MutationAuditStore,
   idempotencyStore?: DispatchIdempotencyStore,
   dispatchLeaseStore?: DispatchLeaseStore,
+  livenessDispatchStore?: Pick<DispatchRecordStore, "recordDispatch" | "recordAck" | "getDispatch">,
 ): Router {
   const router = Router();
   const delegatePingPongDetector = new DelegatePingPongDetector(undefined, undefined, operationalEventStore);
@@ -690,6 +693,25 @@ export function createWebhookRouter(
       // AI-1799 AC2: mint a wake_id at route time so the full dispatch cycle
       // (routed → bag-added → dispatch-accepted → delivered) can be correlated.
       const wakeId = crypto.randomUUID();
+      let livenessDispatchId: string | null = null;
+
+      function recordLivenessDispatch(): string | null {
+        if (!livenessDispatchStore) return null;
+        if (livenessDispatchId) return livenessDispatchId;
+        const record = livenessDispatchStore.recordDispatch({
+          agentId: route.agentId,
+          ticketId: route.sessionKey,
+          sessionKey: route.sessionKey,
+        });
+        livenessDispatchId = record.dispatchId;
+        return livenessDispatchId;
+      }
+
+      function recordLivenessAck(ack: GatewayDispatchAck): void {
+        const dispatchId = recordLivenessDispatch();
+        if (!dispatchId) return;
+        livenessDispatchStore?.recordAck(dispatchId, ack);
+      }
 
       // ── AI-1918: Dispatch idempotency + stale-dispatch guard ───────────
       // Check (ticket, workflowState, agent) against the persistent idempotency
@@ -1235,6 +1257,13 @@ export function createWebhookRouter(
         }
         if (queueResult.action === "queued") {
           log.info(`Agent queue: queued event for ${route.agentId} [${ticketId}] (active task for different ticket)`);
+          recordLivenessAck({
+            delivered: true,
+            target_identity: route.agentId,
+            status: "queued",
+            queue_depth: 1,
+            queue_age: 0,
+          });
           appendOperationalEvent(operationalEventStore, { outcome: "queued", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "agent-queue" });
           return;
         }
