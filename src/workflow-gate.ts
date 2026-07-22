@@ -4283,12 +4283,12 @@ export async function applyStateTransition(
     toStateName = def.break_glass?.to ?? "escape";
     // INF-146/INF-135: break-glass escape from the break-glass target state
     // itself (e.g. `intake` for dev-impl) is a self-loop that no-ops through
-    // the idempotency check below. Redirect: if entry_state differs from the
-    // target, restart the workflow via entry_state; otherwise exit entirely.
+    // the idempotency check below. INF-311: escape from the recovery target
+    // itself must never redirect to entry_state (which destroys completed arm
+    // progress). Instead, exit the workflow cleanly via __ad_hoc__ — tickets
+    // already in the recovery state have nothing more to recover.
     if (currentStateName && currentStateName === toStateName) {
-      toStateName = def.entry_state && def.entry_state !== toStateName
-        ? def.entry_state
-        : "__ad_hoc__";
+      toStateName = "__ad_hoc__";
       log.info(
         `workflow-gate: B2 apply: ${issueId} break-glass escape from state '${currentStateName}' ` +
         `which IS the break-glass target — redirecting to '${toStateName}'`,
@@ -4329,6 +4329,15 @@ export async function applyStateTransition(
       return { status: "failed", code: "no-transition", detail: `no transition for '${intent}' in state '${currentStateName}'`, from: currentStateName };
     }
     toStateName = matchedTransition.to;
+  }
+
+  // INF-311: clean up artifact binding and implementer record BEFORE the
+  // __ad_hoc__ early return — escape may redirect here (self-loop edge case),
+  // and the cleanup at §5.7 must still run even though we never reach the
+  // post-transition section below.
+  if (toStateName === "__ad_hoc__" && intent === "escape") {
+    removeArtifact(issueId);
+    await removeAcRecord(issueId);
   }
 
   // ── Special target: __ad_hoc__ ─────────────────────────────────────────

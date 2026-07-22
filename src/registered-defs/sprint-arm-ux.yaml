@@ -22,7 +22,7 @@ entry_state: doing
 
 break_glass:
   command: escape
-  to: escape
+  to: doing
   owner_role: steward
 
 states:

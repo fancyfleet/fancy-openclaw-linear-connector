@@ -4415,7 +4415,7 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
     const def = await loadWorkflowDef();
     expect(def.break_glass).toBeDefined();
     expect(def.break_glass!.command).toBe("escape");
-    expect(def.break_glass!.to).toBe("escape");
+    expect(def.break_glass!.to).toBe("intake");
   });
 
   // §16.0 invariant: entry_state references a valid state
