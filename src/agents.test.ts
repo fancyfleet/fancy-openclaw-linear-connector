@@ -4,16 +4,19 @@ import path from "node:path";
 import {
   getAccessToken,
   getAgentByProxyToken,
+  getEncryptionKeyValidation,
   getAgents,
   getTokenStatus,
   isAgentLocal,
   isPolledForLinear,
+  mintProxyToken,
   recordTokenFailure,
   reloadAgents,
   safeReloadAgents,
   updateAgentMetadata,
   updateTokens,
   upsertAgent,
+  validateEncryptionKeyMatch,
   type AgentConfig,
 } from "./agents.js";
 
@@ -171,6 +174,83 @@ describe("agents credential file encryption", () => {
     reloadAgents();
     expect(getAccessToken("charles")).toBe("access-token-1");
   });
+
+  test("INF-272: save() refuses to re-encrypt with a wrong encryption key (prevents token-store corruption)", () => {
+    process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = key;
+    upsertAgent(makeAgent(path.join(dir, "linear.env")));
+
+    // Confirm the file is encrypted with the original key
+    const raw = fs.readFileSync(agentsFile, "utf8");
+    expect(raw).toContain('"version": 2');
+
+    // Now set a DIFFERENT key — simulate a stale .env with wrong key reference
+    process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = Buffer.alloc(32, 42).toString("base64");
+
+    // updateTokens calls save() which must throw because the new key doesn't
+    // match the encrypted data on disk
+    expect(() => {
+      updateTokens("charles", "access-token-wrong", "refresh-token-wrong");
+    }).toThrow(/Encryption key mismatch/);
+
+    // After the rejected save, the file must still contain the ORIGINAL data
+    // encrypted with the original key — nothing was corrupted
+    process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = key;
+    reloadAgents();
+    expect(getAccessToken("charles")).toBe("access-token-1");
+    expect(getAgents()).toHaveLength(1);
+  });
+
+  test("INF-272: validateEncryptionKeyMatch reports valid=true for matching key", () => {
+    process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = key;
+    upsertAgent(makeAgent(path.join(dir, "linear.env")));
+
+    const result = validateEncryptionKeyMatch();
+    expect(result.valid).toBe(true);
+    expect(result.agentsEncrypted).toBe(true);
+    expect(result.lastValidationAt).toBeTruthy();
+  });
+
+  test("INF-272: validateEncryptionKeyMatch reports valid=false for wrong key", () => {
+    process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = key;
+    upsertAgent(makeAgent(path.join(dir, "linear.env")));
+
+    // Switch to wrong key
+    process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = Buffer.alloc(32, 42).toString("base64");
+
+    const result = validateEncryptionKeyMatch();
+    expect(result.valid).toBe(false);
+    expect(result.agentsEncrypted).toBe(true);
+    expect(result.error).toMatch(/Encryption key mismatch/);
+  });
+
+  test("INF-272: validateEncryptionKeyMatch reports valid=true for unencrypted file", () => {
+    delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
+    upsertAgent(makeAgent(path.join(dir, "linear.env")));
+
+    const result = validateEncryptionKeyMatch();
+    expect(result.valid).toBe(true);
+    expect(result.agentsEncrypted).toBe(false);
+  });
+
+  test("INF-272: getEncryptionKeyValidation returns cached result from latest validation", () => {
+    process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = key;
+    upsertAgent(makeAgent(path.join(dir, "linear.env")));
+    validateEncryptionKeyMatch();
+
+    const after = getEncryptionKeyValidation();
+    expect(after.valid).toBe(true);
+    expect(after.agentsEncrypted).toBe(true);
+    expect(after.lastValidationAt).toBeTruthy();
+
+    // Switch to wrong key and re-validate — cache should now show the failure
+    process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = Buffer.alloc(32, 42).toString("base64");
+    const failed = validateEncryptionKeyMatch();
+    expect(failed.valid).toBe(false);
+
+    const cached = getEncryptionKeyValidation();
+    expect(cached.valid).toBe(false);
+    expect(cached.error).toMatch(/Encryption key mismatch/);
+  });
 });
 
 describe("broker proxy-token model", () => {
@@ -219,13 +299,19 @@ describe("broker proxy-token model", () => {
     expect(env).not.toContain("real-secret-token");
   });
 
-  test("syncWorkspaceSecrets keeps legacy direct-token behavior when no proxy token is set", () => {
+  test("new agent with no proxyToken gets one minted, proxyUrl auto-set, and real token never lands in env", () => {
     const secretsPath = path.join(dir, "linear.env");
-    upsertAgent({ ...makeAgent(secretsPath), accessToken: "real-secret-token" });
+    const result = upsertAgent({ ...makeAgent(secretsPath), accessToken: "real-secret-token" });
+    expect(result.isNew).toBe(true);
+
+    const agent = getAgents().find((a) => a.name === "charles")!;
+    expect(agent.proxyToken).toMatch(/^lpx_/);
+    expect(agent.proxyUrl).toBeTruthy();
 
     const env = fs.readFileSync(secretsPath, "utf8");
-    expect(env.trim()).toBe("LINEAR_OAUTH_TOKEN=real-secret-token");
-    expect(env).not.toContain("LINEAR_PROXY_URL");
+    expect(env).toContain(agent.proxyToken!);
+    expect(env).toContain("LINEAR_PROXY_URL=http://localhost:3100/proxy/graphql");
+    expect(env).not.toContain("real-secret-token");
   });
 
   test("token refresh does not leak the real token into a provisioned agent's env", () => {
@@ -244,6 +330,68 @@ describe("broker proxy-token model", () => {
     expect(env).not.toContain("rotated-real-token");
     // The rotated real token still lands in the vault for the proxy to use.
     expect(getAccessToken("charles")).toBe("rotated-real-token");
+  });
+
+  test("LINEAR_CONNECTOR_PROXY_URL env var overrides default proxyUrl", () => {
+    const originalProxyUrl = process.env.LINEAR_CONNECTOR_PROXY_URL;
+    process.env.LINEAR_CONNECTOR_PROXY_URL = "http://proxy.internal:9999/graphql";
+    const secretsPath = path.join(dir, "linear.env");
+    const result = upsertAgent({ ...makeAgent(secretsPath), accessToken: "real-secret-token" });
+    expect(result.isNew).toBe(true);
+
+    const agent = getAgents().find((a) => a.name === "charles")!;
+    expect(agent.proxyUrl).toBe("http://proxy.internal:9999/graphql");
+
+    const env = fs.readFileSync(secretsPath, "utf8");
+    expect(env).toContain("LINEAR_PROXY_URL=http://proxy.internal:9999/graphql");
+
+    process.env.LINEAR_CONNECTOR_PROXY_URL = originalProxyUrl;
+  });
+
+  test("explicit proxyUrl in config is preserved, not overwritten by default", () => {
+    const secretsPath = path.join(dir, "linear.env");
+    const result = upsertAgent({
+      ...makeAgent(secretsPath),
+      accessToken: "real-secret-token",
+      proxyToken: "lpx_manual",
+      proxyUrl: "http://custom:4000/proxy",
+    });
+    expect(result.isNew).toBe(true);
+
+    const agent = getAgents().find((a) => a.name === "charles")!;
+    expect(agent.proxyToken).toBe("lpx_manual");
+    expect(agent.proxyUrl).toBe("http://custom:4000/proxy");
+
+    const env = fs.readFileSync(secretsPath, "utf8");
+    expect(env).toContain("LINEAR_PROXY_URL=http://custom:4000/proxy");
+  });
+
+  test("partial agent transitioning to full credentials gets both proxyToken and proxyUrl", () => {
+    const secretsPath = path.join(dir, "linear.env");
+    // Create a partial entry (no accessToken yet — like the onboarding wizard)
+    const partial = makeAgent(secretsPath);
+    upsertAgent({
+      ...partial,
+      accessToken: "",
+      refreshToken: "",
+    });
+
+    // Now OAuth callback fills tokens — partial→full transition
+    const result = upsertAgent({
+      ...partial,
+      accessToken: "real-oauth-token",
+      refreshToken: "real-refresh-token",
+    });
+    expect(result.isNew).toBe(false);
+
+    const agent = getAgents().find((a) => a.name === "charles")!;
+    expect(agent.proxyToken).toMatch(/^lpx_/);
+    expect(agent.proxyUrl).toBeTruthy();
+
+    const env = fs.readFileSync(secretsPath, "utf8");
+    expect(env).toContain("LINEAR_OAUTH_TOKEN=lpx_");
+    expect(env).toContain("LINEAR_PROXY_URL");
+    expect(env).not.toContain("real-oauth-token");
   });
 });
 
@@ -445,5 +593,88 @@ describe("agents.json file mode hardening (AI-2305)", () => {
     expect(getAccessToken("charles")).toBe("access-token-3");
     expect(fs.readFileSync(agentsFile, "utf8")).not.toContain("access-token-3");
     expect(modeOf(agentsFile)).toBe(0o600);
+  });
+});
+
+describe("mintProxyToken — broker credential generation (AI-2308)", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "agents-mint-proxy-test-"));
+    process.env.AGENTS_FILE = path.join(dir, "agents.json");
+    delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
+    delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
+    delete process.env.SECRETS_DIR;
+    reloadAgents();
+  });
+
+  afterEach(() => {
+    delete process.env.AGENTS_FILE;
+    reloadAgents();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("mintProxyToken returns a non-empty lpx_-prefixed string", () => {
+    const token = mintProxyToken();
+    expect(token).toMatch(/^lpx_[a-f0-9]+$/);
+    expect(token.length).toBeGreaterThan("lpx_".length + 10);
+  });
+
+  test("mintProxyToken produces unique tokens on each call", () => {
+    const t1 = mintProxyToken();
+    const t2 = mintProxyToken();
+    expect(t1).not.toBe(t2);
+  });
+
+  test("upsertAgent mints a proxyToken for a new agent with none provided", () => {
+    const secretsPath = path.join(dir, "linear.env");
+    const result = upsertAgent({ ...makeAgent(secretsPath) });
+
+    expect(result.isNew).toBe(true);
+
+    const agent = getAgents().find((a) => a.name === "charles");
+    expect(agent).toBeDefined();
+    expect(agent!.proxyToken).toMatch(/^lpx_/);
+
+    // The env file must contain the proxy token, never the raw access token.
+    const env = fs.readFileSync(secretsPath, "utf8");
+    expect(env).toContain(agent!.proxyToken!);
+    expect(env).not.toContain("access-token");
+  });
+
+  test("upsertAgent does not overwrite an existing proxyToken on re-provision", () => {
+    const secretsPath = path.join(dir, "linear.env");
+    const originalToken = "lpx_preexisting_token_abc";
+
+    // First call with an explicit proxyToken
+    upsertAgent({
+      ...makeAgent(secretsPath),
+      proxyToken: originalToken,
+    });
+
+    const agent1 = getAgents().find((a) => a.name === "charles");
+    expect(agent1!.proxyToken).toBe(originalToken);
+
+    // Second call (update, not new) with no proxyToken in config
+    const result = upsertAgent({ ...makeAgent(secretsPath) });
+    expect(result.isNew).toBe(false);
+
+    // The original proxy token must survive; the mint must not fire.
+    const agent2 = getAgents().find((a) => a.name === "charles");
+    expect(agent2!.proxyToken).toBe(originalToken);
+  });
+
+  test("upsertAgent preserves an explicit proxyToken on the new-agent path", () => {
+    const secretsPath = path.join(dir, "linear.env");
+    const explicitToken = "lpx_explicitly_provided";
+
+    const result = upsertAgent({
+      ...makeAgent(secretsPath),
+      proxyToken: explicitToken,
+    });
+    expect(result.isNew).toBe(true);
+
+    const agent = getAgents().find((a) => a.name === "charles");
+    expect(agent!.proxyToken).toBe(explicitToken);
   });
 });

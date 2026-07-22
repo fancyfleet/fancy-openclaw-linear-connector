@@ -550,6 +550,11 @@ describe("proxy — AI-1731 comment requirement integration", () => {
       .set("Authorization", "Bearer test-token")
       .set("X-Openclaw-Agent", "reviewer")
       .set("X-Openclaw-Linear-Intent", "request-revision")
+      // AI-2530 gates the intent-resolving path (continue-workflow /
+      // request-revision) on a per-invocation nonce. Without it this request is
+      // rejected at the header guard and never reaches the comment requirement
+      // this test exists to prove (AI-2536).
+      .set("X-Openclaw-Command-Id", "ai1731-ac4-request-revision")
       .set("X-Openclaw-Feedback-Category", "style")
       .send({
         query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }",
@@ -559,6 +564,10 @@ describe("proxy — AI-1731 comment requirement integration", () => {
     expect(res.status).toBe(200);
     expect(res.body.errors).toBeDefined();
     expect(res.body.errors[0].message).toContain("comment");
+    // Pin the rejection to the comment requirement itself. If the AI-2530 header
+    // guard ever rejects this request again, the assertion above fails for the
+    // wrong reason and this one names it — the silent coverage loss of AI-2536.
+    expect(res.body.errors[0].message).not.toContain("X-Openclaw-Command-Id");
   });
 
   // ── AI-1769 AC2: X-Openclaw-Comment-Satisfied-By ──────────────────────

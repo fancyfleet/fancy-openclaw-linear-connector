@@ -30,16 +30,19 @@ const DIST_ENTRY = path.resolve(__dirname, "../../dist/index.js");
 // Every driver the production bootstrap is expected to schedule.
 const EXPECTED_CRONS = [
   "bootstrap-reconciliation-sweep",
+  "config-sanity-alert", // AI-2619: config-sanity watchdog alert consumer
   "delegation-reconciliation-sweep",
   "dispatch-delivery-scheduler", // AI-2008: acknowledged dispatch delivery + retry driver
   "first-action-watchdog",
   "g20-canary",
-  "label-sync-audit", // AI-2554: label-sync audit cron
+  "label-sync-audit", // AI-2554: periodic proxy-store vs Linear label divergence check
   "oob-reconcile-sweep",
   "p4-metrics-distillation",
+  "registry-integrity-check", // AI-2359: periodic registry⇄policy integrity check (registered in createApp)
   "rescue-sweep",
   "sla-sweep",
   "stall-liveness-sweep", // INF-314: stall detection liveness sweep
+  "transcript-redaction", // AI-2582: periodic .trajectory.jsonl credential redaction sweep
 ].sort();
 
 const PORT = 4100 + (process.pid % 400);
@@ -166,6 +169,15 @@ describe("AI-1810: production entry point registers all crons in /health", () =>
       expect(typeof body.universalCanon.loaded).toBe("boolean");
       expect(body.universalCanon).toHaveProperty("version");
       expect(body.universalCanon).toHaveProperty("path");
+
+      // AI-2619: config-sanity-alert liveness field is present from the
+      // production entry point (bootstrap registration proof). The test env
+      // has no watchdog JSON file, so scheduled=true.
+      expect(body.configSanityAlert).toBeDefined();
+      expect(body.configSanityAlert.scheduled).toBe(true);
+      expect(body.configSanityAlert).toHaveProperty("lastReadAt");
+      expect(body.configSanityAlert).toHaveProperty("lastFindingCount");
+      expect(body.configSanityAlert).toHaveProperty("lastAlertAt");
 
       // AC1: every entry carries a human-readable schedule and a timestamp.
       for (const cron of crons) {

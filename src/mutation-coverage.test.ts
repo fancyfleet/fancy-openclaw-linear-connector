@@ -658,11 +658,12 @@ states:
     expect(result).toBeNull();
   });
 
-  // ── AC2-WG-8: ad-hoc ticket full pass-through (§4.6) ─────────────────
-  // A ticket with no wf:* label must pass through regardless of intent.
-  // A mutant inverting the workflowId null check would enforce ALL tickets.
+  // ── AC2-WG-8: ad-hoc ticket rejection for non-safe verbs (INF-35) ────
+  // A ticket with no wf:* label must reject non-safe transition verbs.
+  // A mutant inverting the workflowId null check would either reject safe verbs
+  // or allow non-safe verbs through.
 
-  it("passes through any intent on an ad-hoc (non-workflow) ticket", async () => {
+  it("rejects non-safe intent on an ad-hoc (non-workflow) ticket (INF-35)", async () => {
     const policyFile = writeTmpYaml(dir, "policy.yaml", POLICY_SINGLE_DEV);
     const wfFile = writeTmpYaml(dir, "wf.yaml", WORKFLOW_DEV_IMPL);
     process.env.CAPABILITY_POLICY_PATH = policyFile;
@@ -681,6 +682,38 @@ states:
 
     const result = await checkWorkflowRules(
       "random-command-not-in-workflow",
+      "TICKET-AD",
+      "tok",
+      "charles",
+    );
+
+    expect(result).not.toBeNull();
+    expect(result).toEqual(expect.stringContaining("only valid on workflow tickets"));
+  });
+
+  // ── AC2-WG-8b: ad-hoc ticket safe verb pass-through (INF-35 exception) ─
+  // Safe verbs (note, begin-work, observe-issue) must pass through even on
+  // ad-hoc tickets — they serve as enrollment/read-only entry points.
+
+  it("allows safe verbs through on an ad-hoc (non-workflow) ticket", async () => {
+    const policyFile = writeTmpYaml(dir, "policy.yaml", POLICY_SINGLE_DEV);
+    const wfFile = writeTmpYaml(dir, "wf.yaml", WORKFLOW_DEV_IMPL);
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+    process.env.WORKFLOW_DEF_PATH = wfFile;
+
+    globalThis.fetch = makeFetch({
+      "TICKET-AD": {
+        data: {
+          issue: {
+            labels: { nodes: [{ name: "bug" }, { name: "priority:high" }] },
+            delegate: null,
+          },
+        },
+      },
+    });
+
+    const result = await checkWorkflowRules(
+      "note",
       "TICKET-AD",
       "tok",
       "charles",
@@ -1479,7 +1512,9 @@ describe("agents.ts: uncovered branches (G-21)", () => {
     const expectedPath = path.join(secretsDir, "noah", "linear.env");
     expect(fs.existsSync(expectedPath)).toBe(true);
     const contents = fs.readFileSync(expectedPath, "utf8");
-    expect(contents).toContain("LINEAR_OAUTH_TOKEN=tok-noah");
+    // AI-2308: new agents get a minted proxy token instead of the raw upstream token.
+    expect(contents).toMatch(/LINEAR_OAUTH_TOKEN=lpx_/);
+    expect(contents).not.toContain("LINEAR_OAUTH_TOKEN=tok-noah");
   });
 
   // AC2-AG-3: proxyToken set without proxyUrl — only token line written (line 291-292)
@@ -1547,10 +1582,12 @@ describe("agents.ts: uncovered branches (G-21)", () => {
     expect(tok).toBeUndefined();
   });
 
-  // AC2-AG-7: upsertAgent matches existing by linearUserId when name differs (line 312)
-  // The upsert first matches by name; if no name match, it falls through to linearUserId.
-  // A mutant removing the fallback lookup would create a duplicate instead of updating.
-  it("updates an existing agent matched by linearUserId when the name also matches", () => {
+  // AC2-AG-7: upsertAgent updates an existing agent on the name-match path.
+  // Note this does NOT reach the linearUserId fallback despite its original
+  // name: both upserts below pass name "igor", so the name match short-circuits
+  // and a mutant removing the fallback lookup survives here. The fallback and
+  // its falsy-id guard are covered in ai-2453-upsert-rename-write.test.ts.
+  it("updates an existing agent matched by name", () => {
     const secretsPath = path.join(dir, "existing.env");
     upsertAgent({
       name: "igor",

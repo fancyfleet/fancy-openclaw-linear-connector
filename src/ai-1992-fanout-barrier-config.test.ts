@@ -65,6 +65,7 @@ import {
 import { shouldTriggerFanout, executeFanout, type Finding } from "./fanout.js";
 import { attemptBarrierTransition } from "./barrier.js";
 import { resetPolicyCache } from "./escalation-gate.js";
+import { reloadAgents } from "./agents.js";
 
 // ── Synthetic workflow defs (self-contained fixtures) ──────────────────────
 
@@ -420,10 +421,25 @@ describe("AI-1992 executeFanout — child workflow type comes from config, wf:* 
         );
       }
       if (query.includes("TeamLabels")) {
-        return new Response(JSON.stringify({ data: { team: { labels: { nodes: [] } } } }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
+        // INF-27 AC2 mint guard: return the common workflow labels so fan-out
+        // minting is not refused by the pre-mint guard check.
+        return new Response(
+          JSON.stringify({
+            data: {
+              team: {
+                labels: {
+                  nodes: [
+                    { id: "lbl-wf-dev-impl", name: "wf:dev-impl" },
+                    { id: "lbl-wf-custom-child", name: "wf:custom-child" },
+                    { id: "lbl-wf-sprint-arm", name: "wf:sprint-arm" },
+                    { id: "lbl-wf-sprint-arm-ux", name: "wf:sprint-arm-ux" },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
       }
       if (query.includes("issueLabelCreate")) {
         const name = (parsed.variables as Record<string, unknown>).name as string;
@@ -467,10 +483,16 @@ describe("AI-1992 executeFanout — child workflow type comes from config, wf:* 
     const result = await executeFanout("AI-1992", "Bearer tok", config, { skipPreview: true });
 
     expect(result.created).toBeGreaterThanOrEqual(1);
+    // INF-27 AC2 mint guard: workflow labels are pre-resolved via TeamLabels lookup
+    // and cached as label IDs in workflowLabelIds. The mint guard uses findLabel
+    // (lookup-only), so issueLabelCreate is NOT called for wf:* labels anymore.
+    // Instead, the cached label ID is passed directly in the issueCreate mutation.
     const madeCustomLabel = fetchCalls.some(
       (c) => c.query.includes("issueLabelCreate") && c.variables.name === "wf:custom-child",
     );
-    expect(madeCustomLabel).toBe(true);
+    expect(madeCustomLabel).toBe(false);
+    // The child issue was created (label applied via cached ID in labelIds).
+    expect(fetchCalls.some((c) => c.query.includes("issueCreate"))).toBe(true);
     // Must NOT fall back to the old hardcoded child label.
     const madeHardcoded = fetchCalls.some(
       (c) => c.query.includes("issueLabelCreate") && c.variables.name === "wf:dev-impl",
@@ -532,6 +554,8 @@ function makeFanoutIntegrationFetch(opts: {
   currentState: string;
   parentDescription: string;
   record: Array<{ query: string; variables: Record<string, unknown> }>;
+  /** Extra team labels to include beyond common wf:* labels (INF-27 mint guard). */
+  extraTeamLabels?: Array<{ id: string; name: string }>;
 }): typeof globalThis.fetch {
   const parentLabels = [
     { id: "wf-lbl", name: `wf:${opts.workflowId}` },
@@ -551,7 +575,14 @@ function makeFanoutIntegrationFetch(opts: {
     opts.record.push({ query, variables: parsed.variables ?? {} });
 
     if (query.includes("IssueWithLabels")) {
-      return json({ issue: { id: "parent-internal-id", team: { id: "team-uuid" }, labels: { nodes: parentLabels } } });
+      return json({
+        issue: {
+          id: "parent-internal-id",
+          identifier: "AI-1992",
+          team: { id: "team-uuid" },
+          labels: { nodes: parentLabels },
+        },
+      });
     }
     if (query.includes("TeamStates")) {
       return json({
@@ -587,7 +618,16 @@ function makeFanoutIntegrationFetch(opts: {
       });
     }
     if (query.includes("TeamLabels")) {
-      return json({ team: { labels: { nodes: [] } } });
+      const commonLabels = [
+        { id: "lbl-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "lbl-wf-sprint-arm", name: "wf:sprint-arm" },
+        { id: "lbl-wf-sprint-arm-ux", name: "wf:sprint-arm-ux" },
+        { id: "lbl-wf-custom-child", name: "wf:custom-child" },
+      ];
+      const nodes = opts.extraTeamLabels
+        ? [...commonLabels, ...opts.extraTeamLabels]
+        : commonLabels;
+      return json({ team: { labels: { nodes } } });
     }
     if (query.includes("issueLabelCreate") && !query.includes("issueCreate")) {
       const name = (parsed.variables as Record<string, unknown>).name as string;
@@ -599,6 +639,11 @@ function makeFanoutIntegrationFetch(opts: {
     }
     if (query.includes("commentCreate")) {
       return json({ commentCreate: { success: true, comment: { id: "cm" } } });
+    }
+    // INF-27/INF-32: fan-out dedup reads existing children before minting.
+    if (query.includes("FanoutChildren")) {
+      // First fan-out on a fresh parent: no existing children.
+      return json({ issue: { children: { nodes: [] } } });
     }
     throw new Error(`unexpected query: ${query.slice(0, 80)}`);
   };
@@ -643,7 +688,16 @@ function makeBarrierFetch(opts: {
       return json({ issue: { id: "parent-internal-id", team: { id: "team-uuid" }, labels: { nodes: parentLabels } } });
     }
     if (query.includes("TeamLabels")) {
-      return json({ team: { labels: { nodes: [] } } });
+      const commonLabels = [
+        { id: "lbl-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "lbl-wf-sprint-arm", name: "wf:sprint-arm" },
+        { id: "lbl-wf-sprint-arm-ux", name: "wf:sprint-arm-ux" },
+        { id: "lbl-wf-custom-child", name: "wf:custom-child" },
+      ];
+      const nodes = opts.extraTeamLabels
+        ? [...commonLabels, ...opts.extraTeamLabels]
+        : commonLabels;
+      return json({ team: { labels: { nodes } } });
     }
     if (query.includes("issueLabelCreate")) {
       const name = (parsed.variables as Record<string, unknown>).name as string;
@@ -681,6 +735,17 @@ describe("AI-1992 malformed/empty spawn spec refuses the transition", () => {
     fs.writeFileSync(path.join(dir, "synthetic-fanout.yaml"), SYNTHETIC_FANOUT_YAML, "utf8");
     policyFile = path.join(dir, "capability-policy.yaml");
     fs.writeFileSync(policyFile, CAPABILITY_POLICY_YAML, "utf8");
+    // Agents with linearUserId for singleton delegate resolution (AI-2359 fail-closed)
+    const agentsFile = path.join(dir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-client", clientSecret: "a-secret", accessToken: "a-token", refreshToken: "a-refresh" },
+        { name: "engine-1", linearUserId: "engine1-linear-uuid", clientId: "e1-client", clientSecret: "e1-secret", accessToken: "e1-token", refreshToken: "e1-refresh" },
+        { name: "igor", linearUserId: "igor-linear-uuid", clientId: "i-client", clientSecret: "i-secret", accessToken: "i-token", refreshToken: "i-refresh" },
+      ],
+    }, null, 2), "utf8");
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
     process.env.WORKFLOW_DEFS_DIR = dir;
     process.env.CAPABILITY_POLICY_PATH = policyFile;
   });
@@ -740,13 +805,52 @@ describe("AI-1992 two-phase synthetic def — end to end", () => {
   let originalFetch: typeof globalThis.fetch;
   const FINDINGS = "## Findings\n- **A**: alpha\n- **B**: beta\n";
 
+  /** Minimal workflow def to register for child_workflow validation (INF-41). */
+  function registerChildWorkflow(id: string, defsDir: string): void {
+    const yaml = `
+id: ${id}
+version: 1
+entry_state: intake
+states:
+  - id: intake
+    owner_role: steward
+    native_state: todo
+    transitions:
+      - { command: accept, to: doing }
+  - id: doing
+    owner_role: engine
+    native_state: doing
+    transitions:
+      - { command: complete, to: done }
+  - id: done
+    kind: terminal
+    native_state: done
+`;
+    fs.writeFileSync(path.join(defsDir, `${id}.yaml`), yaml, "utf8");
+  }
+
   beforeAll(() => {
     origDefsDir = process.env.WORKFLOW_DEFS_DIR;
     origPolicy = process.env.CAPABILITY_POLICY_PATH;
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1992-2phase-"));
     fs.writeFileSync(path.join(dir, "synthetic-two-phase.yaml"), SYNTHETIC_TWO_PHASE_YAML, "utf8");
+    // Register child workflow defs so INF-41 registry validation doesn't reject
+    // the two-phase def's child_workflow references (wf:sprint-arm, wf:dev-impl).
+    registerChildWorkflow("sprint-arm", dir);
+    registerChildWorkflow("dev-impl", dir);
     policyFile = path.join(dir, "capability-policy.yaml");
     fs.writeFileSync(policyFile, CAPABILITY_POLICY_YAML, "utf8");
+    // Agents with linearUserId for singleton delegate resolution (AI-2359 fail-closed)
+    const agentsFile = path.join(dir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-client", clientSecret: "a-secret", accessToken: "a-token", refreshToken: "a-refresh" },
+        { name: "engine-1", linearUserId: "engine1-linear-uuid", clientId: "e1-client", clientSecret: "e1-secret", accessToken: "e1-token", refreshToken: "e1-refresh" },
+        { name: "igor", linearUserId: "igor-linear-uuid", clientId: "i-client", clientSecret: "i-secret", accessToken: "i-token", refreshToken: "i-refresh" },
+      ],
+    }, null, 2), "utf8");
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
     process.env.WORKFLOW_DEFS_DIR = dir;
     process.env.CAPABILITY_POLICY_PATH = policyFile;
   });
@@ -805,8 +909,14 @@ describe("AI-1992 two-phase synthetic def — end to end", () => {
     expect(record.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(true);
     const childCreates = record.filter((c) => c.query.includes("issueCreate"));
     expect(childCreates.length).toBeGreaterThanOrEqual(2);
-    // Children are minted under the phase-1 child workflow label.
-    expect(record.some((c) => c.query.includes("issueLabelCreate") && c.variables.name === "wf:sprint-arm")).toBe(true);
+    // INF-27 AC2 mint guard: wf:* labels are pre-resolved from TeamLabels and
+    // cached. issueLabelCreate is NOT called for them — the cached label ID is
+    // passed directly in issueCreate's labelIds. Only non-wf labels like
+    // state:intake (findOrCreateLabel) are still created inline.
+    const wfLabelCreates = record.filter(
+      (c) => c.query.includes("issueLabelCreate") && /"name":\s*"wf:/.test(JSON.stringify(c.variables)),
+    );
+    expect(wfLabelCreates).toHaveLength(0);
   });
 
   it("AC4 barrier 1: all phase-1 children terminal advances managing-arm → impl (config-driven, non-hardcoded workflow)", async () => {
@@ -838,7 +948,11 @@ describe("AI-1992 two-phase synthetic def — end to end", () => {
     expect(record.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(true);
     const childCreates = record.filter((c) => c.query.includes("issueCreate"));
     expect(childCreates.length).toBeGreaterThanOrEqual(2);
-    expect(record.some((c) => c.query.includes("issueLabelCreate") && c.variables.name === "wf:dev-impl")).toBe(true);
+    // INF-27 AC2 mint guard: wf:* labels pre-resolved, not created inline.
+    const wfLabelCreates = record.filter(
+      (c) => c.query.includes("issueLabelCreate") && /"name":\s*"wf:/.test(JSON.stringify(c.variables)),
+    );
+    expect(wfLabelCreates).toHaveLength(0);
   });
 
   it("AC4 barrier 2: all phase-2 children terminal advances managing-impl → done", async () => {

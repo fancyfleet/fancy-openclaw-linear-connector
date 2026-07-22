@@ -37,6 +37,7 @@
 
 import { componentLogger, createLogger } from "./logger.js";
 import { loadWorkflowDef, loadWorkflowDefById, loadWorkflowRegistry, getWorkflowId, getCurrentState, type WorkflowDef, type WorkflowState } from "./workflow-gate.js";
+import { getFanoutOutcome } from "./fanout-outcome-store.js";
 import {
   LINEAR_API_URL,
   findOrCreateLabel,
@@ -94,6 +95,14 @@ export interface ChildState {
   isTerminal: boolean;
   /** The child's workflow state (from state:* label), or null. */
   workflowState: string | null;
+  /**
+   * INF-108: true when the child has no `state:*` label (demoted off its
+   * workflow mid-flight). An orphaned child cannot contribute to the barrier
+   * evaluation — it is neither terminal nor active — and holds the barrier
+   * indefinitely. The parent steward needs to know about this condition to
+   * manually resolve the deadlock.
+   */
+  isOrphaned: boolean;
 }
 
 /** Result of a barrier evaluation. */
@@ -104,8 +113,17 @@ export interface BarrierResult {
   totalChildren: number;
   /** Number of children in terminal states. */
   terminalCount: number;
+  /** Number of orphaned children (demoted off workflow, INF-108). */
+  orphanedCount: number;
   /** Details of each child. */
   children: ChildState[];
+  /**
+   * INF-34: the child set could not be read. Distinct from a successful read of
+   * zero children — `totalChildren: 0` alone cannot tell the two apart, and
+   * reading an unreadable set as empty satisfies the barrier vacuously.
+   * When true, `allTerminal` is false and the barrier must not advance.
+   */
+  readFailed?: boolean;
 }
 
 /** Result of a barrier auto-transition attempt. */
@@ -298,11 +316,22 @@ export async function fetchParentIdentifier(
 /**
  * Fetch all children of a parent issue with their labels.
  * Returns the children's identifiers and label names.
+ *
+ * INF-34: returns **null** when the child set could not be read, and `[]` only
+ * for a successful read of a parent that genuinely has no children. The two are
+ * not interchangeable: `evaluateBarrier` reads `[]` as vacuous satisfaction
+ * (the AI-1730 contract, which is correct), so reporting a failed read as an
+ * empty one advances a parent past a barrier whose children it never read.
+ *
+ * A read is a failure if the request throws, the response is non-2xx, the body
+ * is unparseable, the body carries GraphQL `errors`, or the issue/children
+ * connection is absent — the last is malformed for a connection field, and
+ * guessing "empty" from it is the same fail-open in a different disguise.
  */
 export async function fetchChildren(
   parentIdentifier: string,
   authToken: string,
-): Promise<ChildState[]> {
+): Promise<ChildState[] | null> {
   const query = `
     query ParentChildren($id: String!) {
       issue(id: $id) {
@@ -315,38 +344,80 @@ export async function fetchChildren(
       }
     }
   `;
+  const failed = (reason: string): null => {
+    log.error(
+      `barrier: failed to fetch children for ${parentIdentifier}: ${reason} — ` +
+      `treating as UNREADABLE (not zero children); barrier will not advance`,
+    );
+    return null;
+  };
+
   try {
     const res = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({ query, variables: { id: parentIdentifier } }),
     });
+
+    if (!res.ok) {
+      return failed(`HTTP ${res.status} ${res.statusText}`);
+    }
+
     type Resp = {
+      errors?: Array<{ message?: string }>;
       data?: {
         issue?: {
           children?: {
             nodes?: Array<{
               identifier: string;
+              state?: { name: string; type: string } | null;
               labels?: { nodes?: Array<{ name: string }> };
             }>;
           };
-        };
+        } | null;
       };
     };
-    const data = (await res.json()) as Resp;
-    const nodes = data.data?.issue?.children?.nodes ?? [];
+
+    let data: Resp;
+    try {
+      data = (await res.json()) as Resp;
+    } catch (err) {
+      return failed(`unparseable response body: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // A GraphQL error is a failed read even at HTTP 200 — Linear returns
+    // `{ errors: [...] }` with no usable `data` on an internal error.
+    if (data.errors?.length) {
+      const messages = data.errors.map((e) => e.message ?? "unknown").join("; ");
+      return failed(`GraphQL errors: ${messages}`);
+    }
+
+    // Belt-and-braces: without this the `.map` below throws on undefined and the
+    // outer catch reaches the same `null`, but via a TypeError that reads like a
+    // code bug rather than the read failure it is. Explicit beats incidental.
+    const nodes = data.data?.issue?.children?.nodes;
+    if (!nodes) {
+      return failed("response contained no issue.children.nodes connection");
+    }
+
     return nodes.map((node) => {
       const labels = (node.labels?.nodes ?? []).map((l) => l.name);
+      const workflowState = getCurrentState(labels);
+      // INF-108: a child is orphaned when it has no state:* label (it was
+      // demoted off its workflow mid-flight). Such children can never reach a
+      // terminal workflow state and hold the barrier indefinitely — the parent
+      // steward needs to know about this to manually resolve the deadlock.
+      const isOrphaned = workflowState === null && labels.length > 0;
       return {
         identifier: node.identifier,
         labels,
         isTerminal: isChildTerminal(labels),
-        workflowState: getCurrentState(labels),
+        workflowState,
+        isOrphaned,
       };
     });
   } catch (err) {
-    log.error(`barrier: failed to fetch children for ${parentIdentifier}: ${err instanceof Error ? err.message : String(err)}`);
-    return [];
+    return failed(err instanceof Error ? err.message : String(err));
   }
 }
 
@@ -404,25 +475,162 @@ async function fetchParentState(
  * a terminal workflow state. Returns the evaluation result.
  *
  * This is a pure evaluation — it does not mutate anything.
+ *
+ * INF-34: an unreadable child set is reported as `readFailed` and never as
+ * satisfaction. Fail-closed is the correct posture here specifically, against
+ * this codebase's general fail-open lean: failing open on a *read* of barrier
+ * state converts a transient network blip into silent state corruption that
+ * nothing downstream can detect, because the parent has already moved on.
  */
+/**
+ * INF-28: optional set of expected child identifiers for barrier evaluation.
+ * When provided, only these children are considered — all others are ignored.
+ * This prevents stale siblings (from prior cycles) from pre-satisfying the
+ * barrier. When absent, all children are evaluated (current behavior).
+ */
+export type ExpectedChildrenFilter = string[] | undefined;
+
 export async function evaluateBarrier(
   parentIdentifier: string,
   authToken: string,
+  expectedChildren?: ExpectedChildrenFilter,
 ): Promise<BarrierResult> {
   const children = await fetchChildren(parentIdentifier, authToken);
 
+  // INF-28: filter to the expected set if provided. This is the core fix:
+  // waiting on exactly the children this cycle's fan-out produced, not the
+  // accumulated history of all children the parent has ever had.
+  if (children !== null && expectedChildren && expectedChildren.length > 0) {
+    const filtered = children.filter((c) => expectedChildren.includes(c.identifier));
+    if (filtered.length === 0) {
+      // No expected children found — treat as zero, which means
+      // all-terminal (vacuous satisfaction for the expected set).
+      return { allTerminal: true, totalChildren: 0, terminalCount: 0, orphanedCount: 0, children: [] };
+    }
+    const terminalCount = filtered.filter((c) => c.isTerminal).length;
+    const orphanedCount = filtered.filter((c) => c.isOrphaned).length;
+    return {
+      allTerminal: orphanedCount === 0 && terminalCount === filtered.length,
+      totalChildren: filtered.length,
+      terminalCount,
+      orphanedCount,
+      children: filtered,
+    };
+  }
+
+  // INF-34: could not read the children ≠ has no children. Must precede the
+  // zero-children check below, which would otherwise read this as satisfied.
+  if (children === null) {
+    return { allTerminal: false, totalChildren: 0, terminalCount: 0, orphanedCount: 0, children: [], readFailed: true };
+  }
+
   // AI-1730: zero children = vacuous satisfaction (barrier is trivially met).
   if (children.length === 0) {
-    return { allTerminal: true, totalChildren: 0, terminalCount: 0, children: [] };
+    return { allTerminal: true, totalChildren: 0, terminalCount: 0, orphanedCount: 0, children: [] };
   }
 
   const terminalCount = children.filter((c) => c.isTerminal).length;
+  const orphanedCount = children.filter((c) => c.isOrphaned).length;
+  // INF-108: orphaned children can never reach terminal and hold the barrier
+  // indefinitely. Treat the barrier as not-all-terminal if any orphan exists.
+  const allTerminal = orphanedCount === 0 && terminalCount === children.length;
   return {
-    allTerminal: terminalCount === children.length,
+    allTerminal,
     totalChildren: children.length,
     terminalCount,
+    orphanedCount,
     children,
   };
+}
+
+const UNREADABLE_CHILDREN_ERROR = "Failed to read child set — barrier held (INF-34)";
+
+/**
+ * INF-34: surface an unreadable child set. The barrier holds the parent in
+ * place, which is recoverable — but a barrier that silently stops evaluating
+ * is its own failure mode, so the hold is alarmed at error level and named on
+ * the ticket. A parent that stays put is recoverable; one that has fallen
+ * through is LIF-2.
+ *
+ * Best-effort: a comment failure must not mask the read failure it reports.
+ */
+async function alarmUnreadableChildren(
+  parentIdentifier: string,
+  authToken: string,
+): Promise<void> {
+  log.error(
+    `barrier: ${parentIdentifier} — child set unreadable; holding the barrier. ` +
+    `The parent stays in its barrier state until the children can be read.`,
+  );
+  try {
+    const internalId = await resolveInternalId(parentIdentifier, authToken);
+    if (!internalId) {
+      log.error(`barrier: cannot alarm unreadable child set — failed to resolve ${parentIdentifier}`);
+      return;
+    }
+    await postComment(
+      internalId,
+      `[Barrier] **Child set unreadable — barrier held on ${parentIdentifier}.**\n\n` +
+      `The barrier could not read this parent's children (Linear API read failed). ` +
+      `It is holding rather than advancing: an unreadable child set is not an empty one, ` +
+      `and advancing on a read that never happened would move this parent past children ` +
+      `that may still be in progress.\n\n` +
+      `No action is required if this was a transient API error — the barrier re-evaluates ` +
+      `on the next child transition. If this repeats, the read itself is broken and needs ` +
+      `investigation. See the connector logs for the underlying error.`,
+      authToken,
+    );
+  } catch (err) {
+    log.error(
+      `barrier: failed to post unreadable-child-set alarm for ${parentIdentifier}: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/**
+ * INF-108: alarm when the barrier evaluation finds orphaned children (children
+ * that have been demoted off their workflow mid-flight). Orphaned children
+ * hold the barrier indefinitely because they can never reach a terminal
+ * workflow state. The parent steward needs to know which children are orphaned
+ * and a clear escape path.
+ *
+ * Best-effort: a comment failure must not propagate.
+ */
+async function alarmOrphanedChildren(
+  parentIdentifier: string,
+  orphaned: Array<{ identifier: string; labels: string[] }>,
+  authToken: string,
+): Promise<void> {
+  const orphanList = orphaned.map((c) => `- ${c.identifier}`).join("\n");
+  log.error(
+    `barrier: INF-108 orphaned-children-detected on ${parentIdentifier}: ` +
+    `${orphaned.length} child(ren) demoted off their workflow — barrier held indefinitely. ` +
+    `Orphaned: ${orphaned.map((c) => c.identifier).join(", ")}`,
+  );
+  try {
+    const internalId = await resolveInternalId(parentIdentifier, authToken);
+    if (!internalId) {
+      log.error(`barrier: INF-108 cannot alarm orphaned children — failed to resolve ${parentIdentifier}`);
+      return;
+    }
+    await postComment(
+      internalId,
+      `[Barrier] **Orphaned child(ren) detected — barrier held on ${parentIdentifier} (INF-108).**\n\n` +
+      `The barrier found ${orphaned.length} child(ren) that have been demoted off their workflow:\n\n` +
+      `${orphanList}\n\n` +
+      `These children can never reach a terminal workflow state, so the barrier will NOT ` +
+      `auto-advance. To resolve the deadlock, the steward must manually complete or escape ` +
+      `the parent (\`linear complete ${parentIdentifier}\` or \`linear escape ${parentIdentifier}\`).\n\n` +
+      `After resolving, consider whether the orphaned children need re-enrollment or closure.`,
+      authToken,
+    );
+  } catch (err) {
+    log.error(
+      `barrier: INF-108 failed to post orphaned-children alarm for ${parentIdentifier}: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 }
 
 /**
@@ -441,11 +649,19 @@ export async function evaluateBarrier(
  * AC1: Last child terminal → parent auto-moves managing → review with no
  *      manual nudge.
  */
+/**
+ * INF-28: attempt a barrier transition, optionally scoped to an expected child set.
+ * When `expectedChildren` is provided, only those children are evaluated.
+ * When absent, reads the recorded fan-out outcome from the store (if any) and
+ * uses the `awaiting` set as the filter. Falls back to all children (current
+ * behavior) when no outcome or the outcome has no child set.
+ */
 export async function attemptBarrierTransition(
   parentIdentifier: string,
   authToken: string,
   workflowDef?: WorkflowDef,
   prefetchedParentState?: { labels: string[]; internalId: string; teamId: string } | null,
+  expectedChildren?: ExpectedChildrenFilter,
 ): Promise<BarrierTransitionResult> {
   const result: BarrierTransitionResult = {
     transitioned: false,
@@ -454,10 +670,68 @@ export async function attemptBarrierTransition(
     totalChildren: 0,
   };
 
+  // INF-28: resolve expected children from the store if not provided.
+  // This handles the onChildTerminal path where the outcome was recorded
+  // when the parent entered the barrier state.
+  let childFilter = expectedChildren;
+  let outcomeType: string | undefined;
+  if (childFilter === undefined) {
+    const outcome = await getFanoutOutcome(parentIdentifier);
+    if (outcome) {
+      outcomeType = outcome.outcome;
+      if (outcome.outcome === "awaiting" && outcome.childIdentifiers && outcome.childIdentifiers.length > 0) {
+        childFilter = outcome.childIdentifiers;
+        log.info(
+          `barrier: INF-28 attemptBarrierTransition scoped to recorded set for ${parentIdentifier}: ` +
+          `${childFilter.join(", ")}`,
+        );
+      }
+    }
+  }
+
+  // INF-28: a recorded non-proceed outcome (refused, failed, or pending-approval)
+  // means the barrier must not advance from this path either. Even if the
+  // children list is empty (AI-1730 vacuous satisfaction), the outcome tells us
+  // the parent is blocked deliberately — the fan-out did not produce a valid set.
+  if (outcomeType === "refused" || outcomeType === "failed") {
+    result.error = `Fan-out ${outcomeType} — barrier held (INF-28, from recorded outcome)`;
+    log.warn(
+      `barrier: INF-28 attemptBarrierTransition: ${parentIdentifier} has recorded outcome ` +
+      `'${outcomeType}' — barrier will not advance`,
+    );
+    return result;
+  }
+  if (outcomeType === "pending-approval") {
+    result.error = "Fan-out pending steward approval — barrier held (INF-28)";
+    log.info(
+      `barrier: INF-28 attemptBarrierTransition: ${parentIdentifier} has recorded outcome ` +
+      `'pending-approval' — barrier will not advance`,
+    );
+    return result;
+  }
+
   // 1. Evaluate barrier
-  const barrier = await evaluateBarrier(parentIdentifier, authToken);
+  const barrier = await evaluateBarrier(parentIdentifier, authToken, childFilter);
   result.terminalCount = barrier.terminalCount;
   result.totalChildren = barrier.totalChildren;
+
+  // INF-34: fail closed on an unreadable child set. Checked before allTerminal
+  // so the hold is alarmed rather than logged as a routine not-ready-yet.
+  if (barrier.readFailed) {
+    result.error = UNREADABLE_CHILDREN_ERROR;
+    await alarmUnreadableChildren(parentIdentifier, authToken);
+    return result;
+  }
+
+  // INF-108: detect orphaned children before the generic not-all-terminal log.
+  // Orphaned children (demoted off their workflow) can never reach a terminal
+  // state and hold the barrier indefinitely. Surface them as a named condition.
+  if (barrier.orphanedCount > 0) {
+    const orphanedChildren = barrier.children.filter((c) => c.isOrphaned);
+    await alarmOrphanedChildren(parentIdentifier, orphanedChildren, authToken);
+    result.error = `INF-108: ${barrier.orphanedCount} orphaned child(ren) detected — barrier held indefinitely`;
+    return result;
+  }
 
   // AI-1730: zero children is now a valid barrier state (vacuous satisfaction);
   // do NOT early-return — fall through to the managing-state check.
@@ -469,7 +743,7 @@ export async function attemptBarrierTransition(
     return result; // Not an error — just not ready yet
   }
 
-  // 2. Verify parent is in managing state
+  // 2. Verify parent is in a barrier state
   //    Use pre-fetched state if provided (avoids redundant API call)
   const parentState = prefetchedParentState ?? await fetchParentState(parentIdentifier, authToken);
   if (!parentState) {
@@ -575,8 +849,12 @@ export async function attemptBarrierTransition(
  * to when the barrier is satisfied. Prefers the `complete` command (the canonical
  * barrier edge), else the first transition that is not the def's break-glass
  * command. Returns undefined when the state has no eligible forward transition.
+ *
+ * INF-122: exported for anti-entropy AC2 (barrier missed) and engine-watch
+ * detection paths, which re-evaluate barriers on a periodic sweep rather than
+ * relying solely on the event-driven webhook path.
  */
-function resolveBarrierTarget(def: WorkflowDef, state: WorkflowState): string | undefined {
+export function resolveBarrierTarget(def: WorkflowDef, state: WorkflowState): string | undefined {
   const transitions = state.transitions ?? [];
   const complete = transitions.find((t) => t.command === "complete");
   if (complete) return complete.to;
@@ -586,17 +864,19 @@ function resolveBarrierTarget(def: WorkflowDef, state: WorkflowState): string | 
 }
 
 /**
- * AI-1730: Entry-time barrier check for a parent entering the managing state.
+ * AI-1730 / INF-28: Entry-time barrier check for a parent entering a barrier state.
  *
  * Called unconditionally after the fan-out block in workflow-gate.ts.
- * This is a no-op when children are in-progress — it only fires when
- * the barrier is already satisfied (zero children or all children already
- * terminal at entry time).
  *
- * Steps:
- *   1. Fetch children of the parent.
- *   2. If evaluateBarrier reports allTerminal, attempt the transition.
- *   3. Otherwise return null (children still in progress, normal flow).
+ * INF-28: Before evaluating children, reads the recorded fan-out outcome from the
+ * store. The outcome tells the barrier what happened at fan-out time:
+ *
+ * | Outcome | Behavior |
+ * |---------|----------|
+ * | `awaiting:[ids]` | Filter children to the recorded set; wait on those only |
+ * | `not-declared` / `waived` / absent | Current behavior (all children all-terminal) |
+ * | `refused` / `failed` | Block + alarm (barrier cannot advance) |
+ * | `pending-approval` | Block, no alarm (steward will wake it) |
  *
  * Returns BarrierTransitionResult if a transition was attempted,
  * null if the barrier is not yet satisfied (not an error).
@@ -605,8 +885,129 @@ export async function onManagingEntry(
   parentIdentifier: string,
   authToken: string,
 ): Promise<BarrierTransitionResult | null> {
-  // 1. Evaluate the barrier
+  // INF-28: Read the recorded fan-out outcome, if any.
+  const outcome = await getFanoutOutcome(parentIdentifier);
+
+  // INF-28: Handle non-advancing outcomes that block with or without alarm.
+  if (outcome) {
+    switch (outcome.outcome) {
+      case "refused": {
+        log.warn(
+          `barrier: INF-28 outcome 'refused' for ${parentIdentifier} — ` +
+          `fan-out was refused (bad spec / cap violation). Barrier will not advance.`,
+        );
+        return {
+          transitioned: false,
+          parentIdentifier,
+          terminalCount: 0,
+          totalChildren: 0,
+          error: "Fan-out refused — barrier held (INF-28)",
+        };
+      }
+      case "failed": {
+        log.error(
+          `barrier: INF-28 outcome 'failed' for ${parentIdentifier} — ` +
+          `fan-out attempted but failed to create children. Barrier will not advance.`,
+        );
+        return {
+          transitioned: false,
+          parentIdentifier,
+          terminalCount: 0,
+          totalChildren: 0,
+          error: "Fan-out failed — barrier held (INF-28)",
+        };
+      }
+      case "pending-approval": {
+        log.info(
+          `barrier: INF-28 outcome 'pending-approval' for ${parentIdentifier} — ` +
+          `steward approval outstanding. Barrier will not advance until approved.`,
+        );
+        return {
+          transitioned: false,
+          parentIdentifier,
+          terminalCount: 0,
+          totalChildren: 0,
+          error: "Fan-out pending steward approval — barrier held (INF-28)",
+        };
+      }
+      case "awaiting": {
+        // Use the recorded set as the expected children filter.
+        // All other children (stale siblings from prior cycles) are ignored.
+        if (outcome.childIdentifiers && outcome.childIdentifiers.length > 0) {
+          log.info(
+            `barrier: INF-28 outcome 'awaiting' for ${parentIdentifier} — ` +
+            `evaluating barrier against ${outcome.childIdentifiers.length} recorded child(ren) ` +
+            `(${outcome.childIdentifiers.join(", ")})`,
+          );
+          const barrier = await evaluateBarrier(parentIdentifier, authToken, outcome.childIdentifiers);
+
+          if (barrier.readFailed) {
+            await alarmUnreadableChildren(parentIdentifier, authToken);
+            return {
+              transitioned: false,
+              parentIdentifier,
+              terminalCount: 0,
+              totalChildren: 0,
+              error: UNREADABLE_CHILDREN_ERROR,
+            };
+          }
+
+          if (!barrier.allTerminal) {
+            return null;
+          }
+
+          log.info(
+            `barrier: INF-28 onManagingEntry: awaiting set all-terminal for ${parentIdentifier} ` +
+            `(${barrier.terminalCount}/${barrier.totalChildren}) — attempting transition`,
+          );
+          return attemptBarrierTransition(parentIdentifier, authToken);
+        }
+        // fall through: empty awaiting set → treat as claimed (no children to wait on)
+        break;
+      }
+      case "not-declared":
+      case "waived": {
+        log.info(
+          `barrier: INF-28 outcome '${outcome.outcome}' for ${parentIdentifier} — ` +
+          `using current behavior (no spec-matched children to constrain)`,
+        );
+        break; // fall through to current behavior
+      }
+    }
+  }
+
+  // 1. Evaluate the barrier (current behavior for absent / not-declared / waived)
   const barrier = await evaluateBarrier(parentIdentifier, authToken);
+
+  // INF-34: an unreadable child set is not "children still active" — returning
+  // null here would be logged by the caller as normal flow, which is how the
+  // original fail-open deleted its own alarm. Return a result carrying the
+  // error instead, and hold the parent in place.
+  if (barrier.readFailed) {
+    await alarmUnreadableChildren(parentIdentifier, authToken);
+    return {
+      transitioned: false,
+      parentIdentifier,
+      terminalCount: 0,
+      totalChildren: 0,
+      error: UNREADABLE_CHILDREN_ERROR,
+    };
+  }
+
+  // INF-108: orphaned children (demoted off workflow mid-flight) hold the
+  // barrier indefinitely. Surface them as a named condition rather than
+  // returning null (which looks like normal "children still active").
+  if (barrier.orphanedCount > 0) {
+    const orphanedChildren = barrier.children.filter((c) => c.isOrphaned);
+    await alarmOrphanedChildren(parentIdentifier, orphanedChildren, authToken);
+    return {
+      transitioned: false,
+      parentIdentifier,
+      terminalCount: barrier.terminalCount,
+      totalChildren: barrier.totalChildren,
+      error: `INF-108: ${barrier.orphanedCount} orphaned child(ren) detected — barrier held indefinitely`,
+    };
+  }
 
   // 2. If barrier is not satisfied, return null (normal flow — children still active)
   if (!barrier.allTerminal) {
@@ -967,6 +1368,17 @@ export async function detectStalledChildren(
   accountant?: DeferralAccountant,
 ): Promise<StalledChild[]> {
   const children = await fetchChildren(parentIdentifier, authToken);
+  // INF-34: an unreadable child set yields no stall detection this round rather
+  // than a confident "nothing is stalled". Stall detection is advisory and
+  // re-runs on the next poll, so holding is not required here — but the empty
+  // result must not be mistaken for a healthy read.
+  if (children === null) {
+    log.error(
+      `barrier: cannot detect stalled children for ${parentIdentifier} — child set unreadable; ` +
+      `skipping this round (no stall conclusions drawn)`,
+    );
+    return [];
+  }
   const stalled: StalledChild[] = [];
 
   // Load workflow def if not provided
@@ -1085,7 +1497,11 @@ export async function surfaceStalledChildren(
 
   const events: StallEvent[] = stalled.map((child) => buildStallEvent(child));
 
-  const children = await fetchChildren(parentIdentifier, authToken);
+  // INF-34: `stalled` is non-empty here, so the child set read moments ago in
+  // detectStalledChildren succeeded. A failure on this second read is transient;
+  // report the stall events without the full-roster context rather than dropping
+  // detections that were made against a good read.
+  const children = await fetchChildren(parentIdentifier, authToken) ?? [];
   const message = buildShepherdingMessage(parentIdentifier, children, stalled);
 
   const internalId = await resolveInternalId(parentIdentifier, authToken);

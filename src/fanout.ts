@@ -17,11 +17,18 @@
  *
  * This module is called from workflow-gate's applyStateTransition when the `spawn`
  * command is processed for a ux-audit ticket in the `spawning` state.
+ *
+ * AI-2523: spawn_if predicate — conditional child spawning. A state declaring
+ * `spawn_if: { label_present: "ui-impact" }` spawns its child_workflow ONLY when
+ * a closed child ticket carries that label. When no child carries the label, the
+ * gate auto-waives and the parent proceeds with no steward action. The predicate
+ * evaluation result is recorded on FanoutResult for inspection.
  */
 
 import { componentLogger, createLogger } from "./logger.js";
+import { findLabel, findOrCreateLabel } from "./linear-helpers.js";
 import { generateSpawnPreview, checkCaps, formatPreviewComment, formatCapRefusalComment, parseSpawnCaps, type SpawnPreview, type CapCheckResult, type SpawnCaps } from "./spawn-preview.js";
-import type { FanoutConfig, WorkflowDef } from "./workflow-gate.js";
+import type { FanoutConfig, SpawnIfConfig, WorkflowDef } from "./workflow-gate.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "fanout");
 
@@ -34,6 +41,17 @@ const LINEAR_API_URL = "https://api.linear.app/graphql";
  */
 const SPEC_ENTRY_MARKER_PREFIX = "<!-- ai-1994:spec-entry-id: ";
 const SPEC_ENTRY_MARKER_RE = /<!--\s*ai-1994:spec-entry-id:\s*(\S+?)\s*-->/;
+
+/**
+ * INF-32: marker binding a spawned child to the `wf:*` workflow that minted it.
+ * Full form: `<!-- inf-32:child-workflow: wf:dev-impl -->`. Written alongside the
+ * AI-1994 spec-entry marker; read back so dedup can key on
+ * `(specEntryId, child_workflow)` instead of the content-addressed id alone.
+ * Children minted before INF-32 carry no such marker — the read path falls back
+ * to the child's own `wf:*` label, then to an id-only match.
+ */
+const CHILD_WORKFLOW_MARKER_PREFIX = "<!-- inf-32:child-workflow: ";
+const CHILD_WORKFLOW_MARKER_RE = /<!--\s*inf-32:child-workflow:\s*(\S+?)\s*-->/;
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -80,6 +98,46 @@ export interface ExistingChild {
   specEntryId: string;
   /** Current workflow state (any state suppresses re-spawn — informational). */
   state?: string;
+  /**
+   * INF-32: the `wf:*` workflow that minted this child. Spec-entry ids are
+   * content-addressed, so two fan-outs on one parent sharing a `spec_source`
+   * derive identical ids; without this field the second fan-out reads the
+   * first's children as its own and mints nothing. Optional: children minted
+   * before INF-32 carry no workflow marker — see {@link dedupeSpawnSpec} for
+   * the legacy read path.
+   */
+  childWorkflow?: string;
+}
+
+/**
+ * INF-37: The outcome of a spawn_if predicate evaluation.
+ *
+ * `waived` and `failed` both mean "no children spawned" but are NOT
+ * interchangeable: `waived` is an answer, `failed` is the absence of one.
+ * A barrier may vacuously satisfy on `waived`; it must never do so on `failed`.
+ */
+export type SpawnIfOutcome =
+  /** The predicate evaluated true on a successful read — spawn. */
+  | "fire"
+  /** The predicate evaluated false on a successful read — legitimately skip. */
+  | "waived"
+  /** The predicate could not be evaluated (read/transport/GraphQL error). */
+  | "failed";
+
+/** AI-2523: Result of a spawn_if predicate evaluation. */
+export interface SpawnIfResult {
+  /**
+   * INF-37: the discriminant. `waived` vs `failed` is a load-bearing
+   * distinction — see SpawnIfOutcome. Prefer this over `reason`, which is
+   * human-readable prose and not a contract.
+   */
+  outcome: SpawnIfOutcome;
+  /** Whether the predicate passed — children should be spawned. Equivalent to `outcome === "fire"`. */
+  shouldSpawn: boolean;
+  /** Human-readable explanation of the evaluation outcome. */
+  reason: string;
+  /** Identifiers of closed children that carried the target label (empty when waived). */
+  matchedChildren: string[];
 }
 
 /** Result of a fan-out operation. */
@@ -102,7 +160,27 @@ export interface FanoutResult {
    * human/steward-driven) — the engine posts a note listing them instead.
    */
   unmatchedChildren: string[];
+  /**
+   * AI-2523: result of spawn_if predicate evaluation, if configured.
+   */
+  spawnIfResult?: SpawnIfResult;
+  /**
+   * INF-28: number of spec entries the fan-out attempted to spawn (toSpawn.length).
+   * Distinguished from `created` — attempted > 0 && created === 0 means the mint
+   * failed, not that the spec was empty or waived.
+   */
+  attempted: number;
+  /**
+   * INF-28: identifiers of all children that match the current spec (newly minted ∪
+   * existing children whose specEntryId is in the current spec). Unlike
+   * `childIdentifiers` (new mints only), this includes pre-existing spec-matched
+   * children, so the barrier can wait on the correct set rather than re-querying
+   * accumulated history.
+   */
+  specMatchedChildren: string[];
 }
+
+
 
 export interface FanoutError {
   findingIndex: number;
@@ -274,7 +352,7 @@ export function extractSpecFindings(
    * Matches: [wf:sprint-arm-ux → signe] or [wf:sprint-arm-ux]
    * The arrow (→ or ->) separates workflow id from optional delegate.
    */
-  const PER_ENTRY_MARKER_RE = /^\[wf:([^\]\s]+)(?:\s*[→>-]\s*(\S+))?\]\s*/;
+  const PER_ENTRY_MARKER_RE = /^\\?\[wf:([^\s\\\]]+)(?:\s*[→>-]\s*([^\s\\\]]+))?\\?\]\s*/;
 
   if (sectionMatch) {
     const sectionBody = sectionMatch[1];
@@ -330,34 +408,322 @@ export function extractSpecFindings(
   return withStableIds(findings);
 }
 
+// ── INF-123: Auto-derive Findings from completed arm children ──────────────
+
+/**
+ * INF-123: Query a parent issue's children and auto-derive `## Findings` entries
+ * from the terminal descriptions of completed `wf:sprint-arm-*` children.
+ *
+ * The sprint workflow spawns arm children via `spawn-arms`. When those arms
+ * complete, their terminal descriptions contain the findings they produced.
+ * `spawn-impl` traditionally required the steward to hand-transcribe these into
+ * a `## Findings` section on the parent. This function fills that gap by reading
+ * the completed arms and synthesizing Finding entries.
+ *
+ * Returns the derived findings (with stable IDs) or an empty array if no
+ * completed arm children with findings are found. Fail-open: errors (network,
+ * parse) are logged and return [].
+ */
+export async function autoDeriveArmFindings(
+  parentInternalId: string,
+  authToken: string,
+): Promise<Finding[]> {
+  const query = `
+    query ParentChildrenForArmFindings($id: String!) {
+      issue(id: $id) {
+        children {
+          nodes {
+            identifier
+            description
+            state { name type }
+            labels { nodes { name } }
+          }
+        }
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: parentInternalId } }),
+    });
+    type ArmChild = {
+      identifier: string;
+      description?: string | null;
+      state?: { name: string; type: string } | null;
+      labels?: { nodes?: Array<{ name?: string }> } | null;
+    };
+    type Resp = {
+      data?: {
+        issue?: {
+          children?: {
+            nodes?: ArmChild[];
+          } | null;
+        } | null;
+      };
+    };
+    const data = (await res.json()) as Resp;
+    const nodes = data.data?.issue?.children?.nodes ?? [];
+
+    // Filter to terminal children with wf:sprint-arm-* labels
+    const armChildren = nodes.filter((n) => {
+      const isTerminal = n.state?.type === "completed";
+      const hasArmLabel = (n.labels?.nodes ?? []).some(
+        (l) => typeof l.name === "string" && /^wf:sprint-arm-/.test(l.name),
+      );
+      return isTerminal && hasArmLabel && n.description;
+    });
+
+    if (armChildren.length === 0) {
+      log.info(`autoDeriveArmFindings: no terminal wf:sprint-arm-* children found for ${parentInternalId}`);
+      return [];
+    }
+
+    // Extract findings from each arm's description
+    const allFindings: Finding[] = [];
+    const seenTitles = new Set<string>();
+
+    for (const child of armChildren) {
+      // Each arm's terminal description should contain a `## Findings` section
+      const armFindings = extractSpecFindings(child.description, "findings");
+      for (const f of armFindings) {
+        // Deduplicate by title across arms
+        if (!seenTitles.has(f.title)) {
+          seenTitles.add(f.title);
+          allFindings.push(f);
+        }
+      }
+    }
+
+    log.info(
+      `autoDeriveArmFindings: derived ${allFindings.length} finding(s) from ${armChildren.length} completed arm child(ren) for ${parentInternalId}: ${allFindings.map((f) => f.title).join(", ")}`,
+    );
+    return withStableIds(allFindings);
+  } catch (err) {
+    log.warn(
+      `autoDeriveArmFindings: failed for ${parentInternalId}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return [];
+  }
+}
+
+/**
+ * INF-258: Derive structured spec entries from children of the parent ticket.
+ *
+ * When a parent ticket enters a fan-out state with `spec_source: structured`
+ * but has no `## Structured` section in its description (e.g. pre-existing
+ * children created by sprint-spawner), this function examines the parent's
+ * existing children with workflow labels matching wf:sprint-arm-* patterns
+ * and creates structured entries from their titles.
+ *
+ * Returns an array of Finding objects (title + optional description) that can
+ * be formatted into a `## Structured` section. Returns empty array when no
+ * suitable children are found.
+ */
+export async function deriveStructuredFromChildren(
+  parentInternalId: string,
+  authToken: string,
+): Promise<Pick<Finding, "title" | "description">[]> {
+  const query = `
+    query Inf258StructuredChildren($id: String!) {
+      issue(id: $id) {
+        children {
+          nodes {
+            identifier
+            title
+            labels { nodes { name } }
+          }
+        }
+      }
+    }
+  `;
+  type ChildNode = {
+    identifier: string;
+    title?: string | null;
+    labels?: { nodes?: Array<{ name?: string }> } | null;
+  };
+  let nodes: ChildNode[] = [];
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: parentInternalId } }),
+    });
+    const data = (await res.json()) as {
+      data?: { issue?: { children?: { nodes?: ChildNode[] } | null } | null };
+    };
+    nodes = data.data?.issue?.children?.nodes ?? [];
+  } catch (err) {
+    log.warn(
+      `fanout: INF-258: failed to fetch children for ${parentInternalId}: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return [];
+  }
+
+  const derived: Pick<Finding, "title" | "description">[] = [];
+  for (const child of nodes) {
+    const wfLabel = (child.labels?.nodes ?? [])
+      .map((l) => l.name)
+      .find((name): name is string => typeof name === "string" && name.startsWith("wf:sprint-arm-"));
+    if (!wfLabel) continue;
+
+    const title = (child.title ?? child.identifier).trim();
+    const description = `spawned from ${child.identifier}`;
+    derived.push({ title, description });
+  }
+
+  if (derived.length > 0) {
+    log.info(
+      `fanout: INF-258: derived ${derived.length} structured entry(ies) from children of ${parentInternalId}`,
+    );
+  }
+  return derived;
+}
+
+/**
+ * INF-123: Auto-populate (or replace) a `## Findings` section on an issue's
+ * description from an array of findings. Uses the Linear API to update the
+ * description.
+ *
+ * When the description already has a `## Findings` section, it is replaced.
+ * Otherwise the section is prepended to the existing content (or becomes the
+ * full description). Returns true if the update succeeded.
+ */
+export async function autoPopulateFindingsSection(
+  parentInternalId: string,
+  findings: Finding[],
+  existingDescription: string | null | undefined,
+  authToken: string,
+): Promise<boolean> {
+  // Format the findings as a markdown section
+  const lines: string[] = ["## Findings\n"];
+  for (const f of findings) {
+    if (f.description) {
+      lines.push(`- **${f.title}**: ${f.description}`);
+    } else {
+      lines.push(`- **${f.title}**`);
+    }
+  }
+  const findingsSection = lines.join("\n");
+
+  // Build the new description
+  let newDescription: string;
+  const existingDesc = existingDescription ?? "";
+  const findingsRegex = /^##\s+Findings[\s\S]*?(?=\n##\s|\n*$)/im;
+
+  if (findingsRegex.test(existingDesc)) {
+    // Replace existing ## Findings section
+    newDescription = existingDesc.replace(findingsRegex, findingsSection);
+  } else if (existingDesc.trim()) {
+    // Prepend to existing content
+    newDescription = `${findingsSection}\n\n${existingDesc}`;
+  } else {
+    // Empty description — just the findings section
+    newDescription = findingsSection;
+  }
+
+  // Import here to avoid circular dependency at module level
+  const { issueUpdateDescription } = await import("./linear-helpers.js");
+  const ok = await issueUpdateDescription(parentInternalId, newDescription, authToken);
+  if (ok) {
+    log.info(`autoPopulateFindingsSection: wrote ${findings.length} finding(s) to description of ${parentInternalId}`);
+  } else {
+    log.warn(`autoPopulateFindingsSection: failed to update description for ${parentInternalId}`);
+  }
+  return ok;
+}
+
 // ── Incremental re-spawn dedup (AI-1994) ────────────────────────────────────
 
 /**
  * AI-1994: pure dedup core for incremental re-spawn.
+ * INF-32: scoped by the minting workflow, not the spec-entry id alone.
  *
  * The dev-sprint rework loop re-enters a fan-out state. Without dedup, re-entry
  * would duplicate already-spawned children. This partitions the current spec
  * against the children that already exist:
  *
- *  - `toSpawn` — spec entries with NO existing child (matched by
- *    `finding.id === child.specEntryId`). Only these are minted; existing
- *    children in ANY state (including terminal) suppress re-spawn.
- *  - `unmatchedChildren` — existing children whose spec entry is gone from the
- *    current spec. These are NEVER cancelled here — destructive actions stay
+ *  - `toSpawn` — spec entries with no child minted by THIS workflow. Only these
+ *    are minted; a matching child in ANY state (including terminal) suppresses
+ *    re-spawn.
+ *  - `unmatchedChildren` — this workflow's children whose spec entry is gone from
+ *    the current spec. These are NEVER cancelled here — destructive actions stay
  *    human/steward-driven — the caller surfaces them in a note instead.
+ *  - `legacyIdOnlyMatches` — children that suppressed a spawn on an id-only
+ *    match because their minting workflow could not be resolved (see below).
+ *
+ * INF-32: `deriveFindingId` is content-addressed (FNV-1a over title+description)
+ * and knows nothing about the fan-out that consumed the entry. So two fan-out
+ * states on one parent sharing a `spec_source` derive IDENTICAL ids, and an
+ * id-only key made the second fan-out read the first's children as its own:
+ * `toSpawn` emptied, the engine logged a "legitimate no-op", and zero children
+ * spawned into a barrier that vacuously satisfied. The dedup key is therefore
+ * `(specEntryId, effective child_workflow)`. "Effective" means
+ * `finding.child_workflow ?? childWorkflow` — the per-entry AI-2199 override is
+ * what the child is actually labeled with at mint time, so it is what dedup must
+ * compare against.
+ *
+ * Legacy read path (AC1 back-compat): children minted before INF-32 carry no
+ * workflow. An unresolvable-workflow child still SUPPRESSES via an id-only match
+ * — the conservative choice, since double-minting against a real pre-INF-32
+ * parent is worse than a missed spawn — but every such match is reported in
+ * `legacyIdOnlyMatches` so the caller can surface it. Suppression is not the
+ * defect; silence is. Legacy children are likewise still eligible to be reported
+ * unmatched, preserving the AI-1994 orphan note for them.
+ *
+ * Orphan scoping: only children minted by this fan-out's own workflow (or legacy
+ * children of unknown provenance) can be unmatched here. Another workflow's child
+ * is not this fan-out's to orphan — reporting it would trade the silent no-op for
+ * a spurious note pointing a steward at a ticket doing exactly what it should.
  *
  * Pure and side-effect free: given the same inputs it always returns the same
  * partition, which is what makes re-entry idempotent.
+ *
+ * @param childWorkflow This fan-out config's `child_workflow` default. Omitted by
+ *   pre-INF-32 callers, which degrades to the id-only legacy path throughout.
  */
 export function dedupeSpawnSpec(
   findings: Finding[],
   existingChildren: ExistingChild[],
-): { toSpawn: Finding[]; unmatchedChildren: ExistingChild[] } {
-  const existingIds = new Set(existingChildren.map((c) => c.specEntryId));
+  childWorkflow?: string,
+): { toSpawn: Finding[]; unmatchedChildren: ExistingChild[]; legacyIdOnlyMatches: ExistingChild[] } {
+  const toSpawn: Finding[] = [];
+  const legacyIdOnlyMatches: ExistingChild[] = [];
+
+  for (const f of findings) {
+    // AI-2199: the per-entry override is what the child is labeled with at mint
+    // time (see the mint loop's `findingWorkflow`), so it is the dedup key.
+    const effectiveWorkflow = f.child_workflow ?? childWorkflow;
+    const sameEntry = existingChildren.filter((c) => c.specEntryId === f.id);
+
+    const scopedMatch = sameEntry.find(
+      (c) => c.childWorkflow !== undefined && c.childWorkflow === effectiveWorkflow,
+    );
+    if (scopedMatch) continue; // this workflow already minted it
+
+    const legacyMatch = sameEntry.find((c) => c.childWorkflow === undefined);
+    if (legacyMatch) {
+      // Unknown provenance: suppress conservatively, but never silently.
+      legacyIdOnlyMatches.push(legacyMatch);
+      continue;
+    }
+
+    toSpawn.push(f);
+  }
+
+  // Orphan detection, scoped in both directions: a child of ANOTHER workflow is
+  // never unmatched here (its spec belongs to a fan-out this one cannot see),
+  // while this workflow's own child with a vanished entry still is (AI-1994 AC2).
   const specIds = new Set(findings.map((f) => f.id));
-  const toSpawn = findings.filter((f) => !existingIds.has(f.id as string));
-  const unmatchedChildren = existingChildren.filter((c) => !specIds.has(c.specEntryId));
-  return { toSpawn, unmatchedChildren };
+  const unmatchedChildren = existingChildren.filter(
+    (c) =>
+      !specIds.has(c.specEntryId) &&
+      (c.childWorkflow === undefined || c.childWorkflow === childWorkflow),
+  );
+
+  return { toSpawn, unmatchedChildren, legacyIdOnlyMatches };
 }
 
 /**
@@ -405,8 +771,268 @@ export function validateFanoutSpec(
         }
       }
     }
+
+    // INF-41: validate config default child_workflow against the registry.
+    // When at least one finding lacks a per-entry [wf:...] marker, the config
+    // default applies to that finding — the default must be registered.
+    // Marker-less findings have child_workflow undefined; the default is
+    // applied at spawn time (finding.child_workflow ?? childWorkflowLabel).
+    const hasMarkerLessFindings = findings.some((f) => !f.child_workflow);
+    if (hasMarkerLessFindings && config.child_workflow) {
+      const defId = config.child_workflow.startsWith("wf:") ? config.child_workflow.slice(3) : config.child_workflow;
+      if (!registeredWorkflows.has(config.child_workflow) && !registeredWorkflows.has(defId)) {
+        return {
+          ok: false,
+          reason: `fan-out config default child_workflow '${config.child_workflow}' is not a registered workflow. ` +
+            `The config default applies to marker-less spec entries (no [wf:...] per-entry override), but no workflow ` +
+            `definition for '${config.child_workflow}' was found. Register the workflow def or ensure all spec entries ` +
+            `declare an explicit [wf:...] marker referencing a registered workflow, then retry.`,
+        };
+      }
+    }
   }
   return { ok: true, findings };
+}
+
+// ── Spawn-if predicate ─────────────────────────────────────────────────────
+
+/**
+ * AI-2523: GraphQL query to fetch a parent issue's children with their
+ * identifiers, labels, and native workflow state (type). This lets us
+ * determine which children are closed (terminal) and what labels they carry.
+ */
+const PARENT_CHILDREN_QUERY = `
+  query ParentChildrenLabels($id: String!) {
+    issue(id: $id) {
+      children {
+        nodes {
+          identifier
+          state { name type }
+          labels { nodes { id name } }
+        }
+      }
+    }
+  }
+`;
+
+interface ChildNode {
+  identifier: string;
+  state: { name: string; type: string } | null;
+  labels: { nodes: Array<{ id: string; name: string }> };
+}
+
+interface ParentChildrenResponse {
+  data?: {
+    issue?: {
+      children: {
+        nodes: ChildNode[];
+      };
+    } | null;
+  };
+  errors?: Array<{ message: string }>;
+}
+
+/**
+ * AI-2523: Evaluate a spawn_if predicate for a parent issue.
+ *
+ * Queries the parent's children (via ParentChildrenLabels), filters to closed
+ * children (native state type === "completed"), then checks if any closed child
+ * carries the configured label.
+ *
+ * The result is a SpawnIfResult indicating whether the spawn should proceed,
+ * a human-readable reason, and the list of matched child identifiers.
+ *
+ * On query failure, an error is returned (fail-closed: no spawn), and the
+ * caller (executeFanout) is expected to post a failure comment.
+ *
+ * INF-37: every failure path yields `outcome: "failed"` — distinct from
+ * `"waived"`, which requires a *successful* read whose predicate was false.
+ * Callers must branch on `outcome`, never on `reason`: "no children spawned"
+ * is the same observable for both, so a caller that cannot tell them apart
+ * will let a transient API error satisfy a barrier that never ran.
+ */
+export async function evaluateSpawnIf(
+  parentInternalId: string,
+  authToken: string,
+  spawnIf: SpawnIfConfig,
+): Promise<SpawnIfResult> {
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: PARENT_CHILDREN_QUERY, variables: { id: parentInternalId } }),
+    });
+
+    // INF-37: a non-2xx is an unreadable response, not an empty child set. A
+    // body that happens to parse (or a 5xx HTML error page that doesn't) must
+    // never reach the `?? []` waive path below.
+    if (!res.ok) {
+      return {
+        outcome: "failed",
+        shouldSpawn: false,
+        reason: `spawn_if evaluation failed: children query returned HTTP ${res.status}`,
+        matchedChildren: [],
+      };
+    }
+
+    const data = (await res.json()) as ParentChildrenResponse;
+
+    if (data.errors?.length) {
+      const errorMsg = data.errors.map((e) => e.message).join("; ");
+      return {
+        outcome: "failed",
+        shouldSpawn: false,
+        reason: `spawn_if evaluation failed: GraphQL error — ${errorMsg}`,
+        matchedChildren: [],
+      };
+    }
+
+    // INF-37: Linear returns 200 + `issue: null` for an unreadable/absent
+    // parent. `?? []` used to launder that into "no children" → waive. A
+    // missing issue means the predicate has no input, which is a failure.
+    const issueNode = data.data?.issue;
+    if (!issueNode?.children) {
+      return {
+        outcome: "failed",
+        shouldSpawn: false,
+        reason: `spawn_if evaluation failed: children query returned no issue/children payload for the parent`,
+        matchedChildren: [],
+      };
+    }
+
+    const children = issueNode.children.nodes ?? [];
+    const targetLabel = spawnIf.label_present;
+
+    // Filter to closed children (native state type === "completed")
+    const closedChildren = children.filter((c) => c.state?.type === "completed");
+
+    // Find those carrying the target label
+    const matchedChildren = closedChildren
+      .filter((c) => c.labels.nodes.some((l) => l.name === targetLabel))
+      .map((c) => c.identifier);
+
+    if (matchedChildren.length > 0) {
+      return {
+        outcome: "fire",
+        shouldSpawn: true,
+        reason: `spawn_if predicate matched: ${matchedChildren.length} closed child(ren) carry the '${targetLabel}' label (${matchedChildren.join(", ")})`,
+        matchedChildren,
+      };
+    }
+
+    // No match found — determine the right diagnostic. Every branch below is a
+    // genuine `waived`: the children query succeeded and the predicate is false.
+    if (children.length === 0) {
+      return {
+        outcome: "waived",
+        shouldSpawn: false,
+        reason: `spawn_if predicate waived: parent has no children — no '${targetLabel}' label found anywhere`,
+        matchedChildren: [],
+      };
+    }
+
+    const closedCount = closedChildren.length;
+    if (closedCount === 0) {
+      const openChildren = children.map((c) => c.identifier).join(", ");
+      return {
+        outcome: "waived",
+        shouldSpawn: false,
+        reason: `spawn_if predicate waived: no closed children yet (${children.length} open child(ren) — ${openChildren}) — none carry '${targetLabel}'`,
+        matchedChildren: [],
+      };
+    }
+
+    return {
+      outcome: "waived",
+      shouldSpawn: false,
+      reason: `spawn_if predicate waived: ${closedCount} closed child(ren) checked, none carry the '${targetLabel}' label`,
+      matchedChildren: [],
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      outcome: "failed",
+      shouldSpawn: false,
+      reason: `spawn_if evaluation failed: query error — ${msg}`,
+      matchedChildren: [],
+    };
+  }
+}
+
+/**
+ * Post a spawn_if outcome comment on the parent ticket.
+ * Fail-open: errors are logged but don't block the operation.
+ */
+async function postSpawnIfComment(
+  issueInternalId: string,
+  spawnIfResult: SpawnIfResult,
+  authToken: string,
+): Promise<void> {
+  const emoji = spawnIfResult.shouldSpawn ? "✅" : "⏭️";
+  const body = [
+    `${emoji} **spawn_if Evaluation** (label_present: "${spawnIfResult.matchedChildren.length > 0 ? spawnIfResult.reason.match(/'([^']+)'/)?.[1] ?? "—" : "—"}")`,
+    ``,  // "ui-impact" not stable — just explain clearly
+    `**Outcome:** ${spawnIfResult.shouldSpawn ? "FIRE — spawning children" : "WAIVE — skipping spawn"}`,
+    `**Reason:** ${spawnIfResult.reason}`,
+    spawnIfResult.matchedChildren.length > 0
+      ? `**Matched children:** ${spawnIfResult.matchedChildren.join(", ")}`
+      : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const mutation = `
+    mutation($issueId: ID!, $body: String!) {
+      commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
+    }
+  `;
+  try {
+    await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: mutation, variables: { issueId: issueInternalId, body } }),
+    });
+    log.info(`fanout: spawn_if comment posted on ${issueInternalId} (${spawnIfResult.shouldSpawn ? "fire" : "waive"})`);
+  } catch (err) {
+    log.warn(`fanout: failed to post spawn_if comment: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * Post a spawn_if error comment on the parent ticket when the children query fails.
+ */
+async function postSpawnIfErrorComment(
+  issueInternalId: string,
+  errorMessage: string,
+  authToken: string,
+): Promise<void> {
+  const body = [
+    `❌ **spawn_if Evaluation Error**`,
+    ``,  // blank line
+    `The spawn_if predicate could not be evaluated because the children query failed.`,
+    `**Error:** ${errorMessage}`,
+    ``,  // blank line
+    // INF-37: this used to claim "the parent ticket transition was refused",
+    // which was never true — the transition is applied before fan-out runs, and
+    // the barrier then advanced the parent anyway. Describe what actually happens.
+    `**No children were spawned.** Because the predicate could not be evaluated, the zero-child result is unverified — it is NOT treated as a waive, and the parent's barrier will not auto-advance on it. The parent is holding at this state pending a steward retry.`,
+  ].join("\n");
+
+  const mutation = `
+    mutation($issueId: ID!, $body: String!) {
+      commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
+    }
+  `;
+  try {
+    await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: mutation, variables: { issueId: issueInternalId, body } }),
+    });
+    log.info(`fanout: spawn_if error comment posted on ${issueInternalId}`);
+  } catch (err) {
+    log.warn(`fanout: failed to post spawn_if error comment: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 // ── Linear API helpers ────────────────────────────────────────────────────
@@ -464,74 +1090,6 @@ async function fetchIssueTeamAndParent(
 }
 
 /**
- * Resolve a label ID by name within a team. Creates the label if it doesn't exist.
- */
-async function ensureLabel(
-  teamId: string,
-  labelName: string,
-  authToken: string,
-): Promise<string | null> {
-  // Look up existing
-  const lookupQuery = `
-    query TeamLabels($teamId: String!) {
-      team(id: $teamId) {
-        labels { nodes { id name } }
-      }
-    }
-  `;
-  try {
-    const lookupRes = await fetch(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({ query: lookupQuery, variables: { teamId } }),
-    });
-    type LookupResp = { data?: { team?: { labels: { nodes: Array<{ id: string; name: string }> } } } };
-    const lookupData = (await lookupRes.json()) as LookupResp;
-    const existing = (lookupData.data?.team?.labels?.nodes ?? []).find(
-      (n) => n.name === labelName,
-    );
-    if (existing) return existing.id;
-  } catch (err) {
-    log.error(`fanout: label lookup failed for ${labelName}: ${err instanceof Error ? err.message : String(err)}`);
-    return null;
-  }
-
-  // Create
-  const createMutation = `
-    mutation CreateLabel($teamId: String!, $name: String!, $color: String!) {
-      issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color }) {
-        success
-        issueLabel { id }
-      }
-    }
-  `;
-  try {
-    const createRes = await fetch(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({
-        query: createMutation,
-        variables: { teamId, name: labelName, color: "#94a3b8" },
-      }),
-    });
-    type CreateResp = {
-      data?: { issueLabelCreate?: { success: boolean; issueLabel?: { id: string } } };
-    };
-    const createData = (await createRes.json()) as CreateResp;
-    const result = createData.data?.issueLabelCreate;
-    if (result?.success && result.issueLabel) {
-      log.info(`fanout: created label '${labelName}' in team ${teamId}`);
-      return result.issueLabel.id;
-    }
-    return null;
-  } catch (err) {
-    log.error(`fanout: label creation failed for ${labelName}: ${err instanceof Error ? err.message : String(err)}`);
-    return null;
-  }
-}
-
-/**
- * Create a single child issue in Linear.
  * Returns the child's human-readable identifier (e.g. "AI-1443") on success.
  */
 async function createChildIssue(
@@ -645,7 +1203,7 @@ async function resolveInitialDelegate(bodyId: string): Promise<string | null> {
  * Steps:
  *   1. Fetch the parent issue's team, title, and description.
  *   2. Extract findings from the description.
- *   3. Ensure required labels exist (wf:dev-impl, state:intake).
+ *   3. Resolve entry-state labels per child workflow and create child issues.
  *   4. Create one child issue per finding, each linked to the parent.
  *   5. Return the result with created count and any partial errors.
  *
@@ -653,8 +1211,8 @@ async function resolveInitialDelegate(bodyId: string): Promise<string | null> {
  * after a successful fan-out (or logs a warning on partial failure).
  *
  * AC4 (§5.4): Minting is uniform — children are always created as dev-impl
- * at intake, regardless of whether the child itself might be an orchestrator
- * archetype. No special-casing.
+ * at the child workflow's entry_state, regardless of whether the child itself
+ * might be an orchestrator archetype. No special-casing.
  */
 export async function executeFanout(
   parentIssueId: string,
@@ -671,6 +1229,16 @@ export async function executeFanout(
      * dedups in production too.
      */
     existingChildren?: ExistingChild[];
+    /**
+     * INF-111: function to resolve the entry state label for a child workflow.
+     * Given a wf:* label (e.g. "wf:sprint-arm-scope"), should return the
+     * appropriate state label (e.g. "state:doing"). When omitted, children
+     * are minted at "state:intake" (legacy default).
+     * This fixes the def-skew bug where mint used "state:intake" while the
+     * live workflow defs had a different entry_state, causing the proxy to
+     * auto-migrate children to escape (terminal).
+     */
+    lookupEntryState?: (workflowLabel: string) => Promise<string | undefined>;
   },
 ): Promise<FanoutResult> {
   const result: FanoutResult = {
@@ -681,6 +1249,8 @@ export async function executeFanout(
     refused: false,
     pendingApproval: false,
     unmatchedChildren: [],
+    attempted: 0,
+    specMatchedChildren: [],
   };
 
   // AI-1992 AC7 (spawn time): the child workflow type is config-driven and MUST
@@ -730,8 +1300,35 @@ export async function executeFanout(
   // parent's children (fail-open → first spawn sees none, spawns everything).
   const existingChildren =
     options?.existingChildren ?? (await fetchExistingSpawnChildren(parentCtx.internalId, authToken));
-  const { toSpawn, unmatchedChildren } = dedupeSpawnSpec(findings, existingChildren);
+  // INF-32: scope the dedup to this fan-out's own workflow — spec-entry ids are
+  // content-addressed, so a sibling fan-out sharing this spec_source has children
+  // carrying the very ids we are about to mint.
+  const { toSpawn, unmatchedChildren, legacyIdOnlyMatches } = dedupeSpawnSpec(
+    findings,
+    existingChildren,
+    childWorkflowLabel,
+  );
   result.unmatchedChildren = unmatchedChildren.map((c) => c.identifier);
+  result.attempted = toSpawn.length;
+
+  // INF-28: compute the spec-matched set = existing children whose specEntryId
+  // matches a current finding. New mints are appended later. This is the set
+  // the barrier waits on — not accumulated history (which includes stale siblings).
+  const specFindingIds = new Set(findings.map((f) => f.id).filter(Boolean));
+  const matchedExisting = existingChildren.filter(
+    (c) => specFindingIds.has(c.specEntryId),
+  );
+  result.specMatchedChildren = matchedExisting.map((c) => c.identifier);
+
+  if (legacyIdOnlyMatches.length > 0) {
+    // INF-32 AC1: a workflow-less child suppressed a spawn on an id-only match.
+    // Conservative, but never silent — that silence is the bug this fixes.
+    log.warn(
+      `fanout: ${legacyIdOnlyMatches.length} child(ren) of ${parentIssueId} suppressed a spawn via the ` +
+      `pre-INF-32 id-only fallback (no child-workflow marker or wf:* label to scope against ` +
+      `'${childWorkflowLabel}'): ${legacyIdOnlyMatches.map((c) => c.identifier).join(", ")}`,
+    );
+  }
 
   if (unmatchedChildren.length > 0) {
     // AC2: never cancel — just post a note listing the orphaned children.
@@ -750,6 +1347,44 @@ export async function executeFanout(
       `(${findings.length} spec entr${findings.length === 1 ? "y" : "ies"}, all already spawned)`,
     );
     return result;
+  }
+
+  // ── AI-2523: spawn_if predicate evaluation ─────────────────────────
+  // Evaluate the spawn_if predicate BEFORE spawn-preview/caps checks but AFTER
+  // the dedup (both are independent — dedup partitions the spec, spawn_if
+  // queries children by label). When spawn_if is configured and evaluates to
+  // shouldSpawn: false, we short-circuit — no children are created.
+  if (config.spawn_if) {
+    const siResult = await evaluateSpawnIf(parentCtx.internalId, authToken, config.spawn_if);
+    result.spawnIfResult = siResult;
+
+    if (!siResult.shouldSpawn) {
+      // INF-37: keyed on the `outcome` discriminant. This used to prefix-match
+      // the human-readable `reason` string — a silent trap, since reworded prose
+      // would reclassify a failure as a waive.
+      const isError = siResult.outcome === "failed";
+
+      if (isError) {
+        result.errors.push({
+          findingIndex: -1,
+          message: siResult.reason,
+        });
+        await postSpawnIfErrorComment(parentCtx.internalId, siResult.reason, authToken);
+      } else {
+        await postSpawnIfComment(parentCtx.internalId, siResult, authToken);
+      }
+
+      log.info(
+        `fanout: spawn_if ${isError ? "failed" : "waived"} for ${parentIssueId} — ${siResult.reason}`,
+      );
+      return result;
+    }
+
+    await postSpawnIfComment(parentCtx.internalId, siResult, authToken);
+
+    log.info(
+      `fanout: spawn_if fired for ${parentIssueId} — ${siResult.reason}`,
+    );
   }
 
   // ── Phase 6.5 / H-2: Spawn-preview gate + hard recursion caps ──────
@@ -804,15 +1439,36 @@ export async function executeFanout(
     }
   }
 
-  // 3. Ensure the state:intake label exists (shared by all children).
-  const stateLabelId = await ensureLabel(parentCtx.teamId, "state:intake", authToken);
-  if (!stateLabelId) {
-    result.errors.push({
-      findingIndex: -1,
-      message: `Failed to resolve required label state:intake`,
-    });
+  // INF-27 AC2: workflow labels are governed routing contracts. Refuse the
+  // whole fan-out before any mint if the target team lacks any referenced wf:*.
+  const workflowLabelIds = new Map<string, string>();
+  const distinctWorkflowLabels = [...new Set(toSpawn.map((f) => f.child_workflow ?? childWorkflowLabel))];
+  for (const labelName of distinctWorkflowLabels) {
+    const labelId = await findLabel(parentCtx.teamId, labelName, authToken);
+    if (labelId) {
+      workflowLabelIds.set(labelName, labelId);
+    }
+  }
+  const missingWorkflowLabels = distinctWorkflowLabels.filter((labelName) => !workflowLabelIds.has(labelName));
+  if (missingWorkflowLabels.length > 0) {
+    result.refused = true;
+    for (let i = 0; i < toSpawn.length; i++) {
+      const labelName = toSpawn[i].child_workflow ?? childWorkflowLabel;
+      if (!missingWorkflowLabels.includes(labelName)) continue;
+      const message =
+        `Refusing fan-out (INF-27 AC2): workflow label '${labelName}' does not exist in team ${parentCtx.teamId}. ` +
+        "Minting there would produce an inert ticket that no workflow engine picks up. " +
+        "Create the label in the target team, or mint into a team that defines it.";
+      result.errors.push({ findingIndex: i, message });
+      log.error(`fanout: ${message}`);
+    }
     return result;
   }
+
+  // 3. State labels are resolved per-workflow in the mint loop below.
+  //    Cache resolved label ids by state name to avoid redundant API calls
+  //    when multiple children share the same workflow entry_state.
+  const stateLabelCache = new Map<string, string>();
 
   // AI-1992: optional initial delegate from config (used as default when
   // per-entry delegate is not set). Resolve once for reuse.
@@ -832,9 +1488,25 @@ export async function executeFanout(
     const finding = toSpawn[i];
     const childTitle = finding.title;
 
+    // INF-307 AC1: reject spec-hash marker titles (dangling -->).
+    // The Cycle 4 spawner leak materialized internal HTML-comment spec-registry
+    // entries as standalone issues with titles like
+    // "inf-131:spec-hash:f7d9e2c4 for structured (updated for Cycle 3) -->".
+    // The trailing --> proves the minter took a <!-- ... --> spec marker body
+    // and wrote it as the issue title. Guard by refusing to mint any child
+    // whose title contains a dangling --> (spec-hash marker pattern).
+    if (/-->/.test(childTitle)) {
+      result.errors.push({
+        findingIndex: i,
+        message: `Refusing to spawn: title "${childTitle}" contains a spec-hash marker (dangling -->) — spec-registry entries must remain internal HTML-comment markers, not standalone issues`,
+      });
+      log.warn(`fanout: REFUSED — spec-hash marker title for finding ${i + 1}/${toSpawn.length}: "${childTitle}"`);
+      continue;
+    }
+
     // AI-2199: per-entry child workflow override. Falls back to config default.
     const findingWorkflow = finding.child_workflow ?? childWorkflowLabel;
-    const wfLabelId = await ensureLabel(parentCtx.teamId, findingWorkflow, authToken);
+    const wfLabelId = workflowLabelIds.get(findingWorkflow);
     if (!wfLabelId) {
       result.errors.push({
         findingIndex: i,
@@ -842,7 +1514,29 @@ export async function executeFanout(
       });
       continue;
     }
-    const labelIds = [wfLabelId, stateLabelId];
+    // INF-111: resolve entry state label for this child's workflow.
+    // If the caller provided lookupEntryState, use it to get the correct
+    // state label from the workflow definition. Otherwise fall back to
+    // "state:intake" (legacy default). Cache by state name for efficiency.
+    const entryStateLabel = options?.lookupEntryState
+      ? await options.lookupEntryState(findingWorkflow)
+      : undefined;
+    const stateLabelName = entryStateLabel ?? "state:intake";
+    let entryStateLabelId: string | undefined | null = stateLabelCache.get(stateLabelName);
+    if (!entryStateLabelId) {
+      entryStateLabelId = await findOrCreateLabel(parentCtx.teamId, stateLabelName, authToken);
+      if (entryStateLabelId) {
+        stateLabelCache.set(stateLabelName, entryStateLabelId);
+      }
+    }
+    if (!entryStateLabelId) {
+      result.errors.push({
+        findingIndex: i,
+        message: `Failed to resolve required label ${stateLabelName} for workflow '${findingWorkflow}' in finding "${childTitle}"`,
+      });
+      continue;
+    }
+    const labelIds = [wfLabelId, entryStateLabelId];
 
     // AI-2199: per-entry delegate override. Falls back to config default.
     const delegateId = finding.delegate
@@ -859,6 +1553,9 @@ export async function executeFanout(
     const childDescription = [
       `Parent: ${parentIssueId}`,
       finding.id ? `${SPEC_ENTRY_MARKER_PREFIX}${finding.id} -->` : "",
+      // INF-32: record the minting workflow so a later fan-out sharing this
+      // spec_source can tell this child apart from one of its own.
+      finding.id ? `${CHILD_WORKFLOW_MARKER_PREFIX}${findingWorkflow} -->` : "",
       finding.description ? `\n${finding.description}` : "",
     ].filter(Boolean).join("\n");
 
@@ -885,6 +1582,10 @@ export async function executeFanout(
       log.warn(`fanout: failed to create child for finding ${i + 1}/${toSpawn.length}: "${childTitle}"`);
     }
   }
+
+  // INF-28: append newly created children to the spec-matched set so the barrier
+  // waits on all children that match the current spec — both existing and minted.
+  result.specMatchedChildren.push(...result.childIdentifiers);
 
   // AI-1992: optional sibling blocking relations (config-driven) — each sibling
   // blocks the next so the managed children run in a defined order. Fail-open:
@@ -937,6 +1638,12 @@ async function postPreviewComment(
  * or hand-created children have no marker and are ignored — they neither
  * suppress a spawn nor surface as unmatched.
  *
+ * INF-32: each child's minting workflow is resolved so dedup can scope to it —
+ * from the `inf-32:child-workflow` marker when present, else from the child's own
+ * `wf:*` label (which is why this query asks for labels). Children predating
+ * INF-32 have neither and are left `childWorkflow: undefined`, which
+ * {@link dedupeSpawnSpec} handles via its reported id-only fallback.
+ *
  * Fail-open: any error (network, unmocked query in a test) yields an empty list,
  * so dedup degrades to "spawn everything" — the pre-AI-1994 behaviour.
  */
@@ -947,7 +1654,7 @@ async function fetchExistingSpawnChildren(
   const query = `
     query FanoutChildren($id: String!) {
       issue(id: $id) {
-        children { nodes { identifier description state { name } } }
+        children { nodes { identifier description state { name } labels { nodes { name } } } }
       }
     }
   `;
@@ -961,7 +1668,12 @@ async function fetchExistingSpawnChildren(
       data?: {
         issue?: {
           children?: {
-            nodes?: Array<{ identifier: string; description?: string | null; state?: { name?: string } | null }>;
+            nodes?: Array<{
+              identifier: string;
+              description?: string | null;
+              state?: { name?: string } | null;
+              labels?: { nodes?: Array<{ name?: string }> } | null;
+            }>;
           } | null;
         } | null;
       };
@@ -972,7 +1684,19 @@ async function fetchExistingSpawnChildren(
     for (const n of nodes) {
       const m = SPEC_ENTRY_MARKER_RE.exec(n.description ?? "");
       if (m) {
-        children.push({ identifier: n.identifier, specEntryId: m[1], state: n.state?.name });
+        // INF-32: marker first (authoritative — written at mint time), then the
+        // child's live wf:* label. Neither ⇒ a pre-INF-32 child; leave undefined
+        // rather than guessing, and let dedupeSpawnSpec report the fallback.
+        const wfMarker = CHILD_WORKFLOW_MARKER_RE.exec(n.description ?? "");
+        const wfLabel = (n.labels?.nodes ?? [])
+          .map((l) => l.name)
+          .find((name): name is string => typeof name === "string" && /^wf:.+/.test(name));
+        children.push({
+          identifier: n.identifier,
+          specEntryId: m[1],
+          state: n.state?.name,
+          childWorkflow: wfMarker ? wfMarker[1] : wfLabel,
+        });
       }
     }
     return children;
@@ -1028,4 +1752,192 @@ export function shouldTriggerFanout(
   const isForwardCommand = (state.transitions ?? []).some((t) => t.command === intent);
   if (!isForwardCommand) return null;
   return state.fanout;
+}
+
+// ── INF-115: spec auto-derivation from prior-phase children ────────────────
+
+/**
+ * INF-115: the description section read from each prior-phase child when
+ * deriving. Arm children (wf:sprint-arm-*) carry their approved output in a
+ * `## Findings` section by convention — the same content the steward used to
+ * hand-transcribe into the sprint parent (engine-watch runs 95/97 on LIF-63).
+ */
+const DERIVE_CHILD_SPEC_SECTION = "findings";
+
+/** Marker comment written above an auto-derived spec section. */
+export const AUTO_DERIVED_SPEC_MARKER = "<!-- inf-115:auto-derived";
+
+/**
+ * Match a child's workflow label against an `auto_derive_from` glob.
+ * Supports a single trailing `*` (prefix match) or exact equality:
+ *   "wf:sprint-arm-*"     matches "wf:sprint-arm-scope", "wf:sprint-arm-ux", …
+ *   "wf:sprint-arm-scope" matches only itself.
+ */
+export function childWorkflowMatchesGlob(workflowLabel: string, glob: string): boolean {
+  if (glob.endsWith("*")) {
+    return workflowLabel.startsWith(glob.slice(0, -1));
+  }
+  return workflowLabel === glob;
+}
+
+/**
+ * INF-115: Derive a fan-out spec from a parent's completed prior-phase children.
+ *
+ * The steward used to hand-transcribe arm outputs into the sprint parent's
+ * spec section at every spawn phase. When the fanout config declares
+ * `auto_derive_from` (a glob over prior-phase child wf:* labels), the engine
+ * derives the section itself: each matching terminal child contributes its own
+ * `## Findings` entries (flattened with an `[<identifier>]` prefix), or — when
+ * the child has no structured section — a single entry from the child's title
+ * pointing back at the child ticket.
+ *
+ * Returns null when no matching terminal children exist — the caller leaves
+ * the spec section empty and the spawn refuses later exactly as before
+ * INF-115 (fail-loud path intact).
+ */
+export async function deriveSpecFromPriorChildren(
+  parentInternalId: string,
+  authToken: string,
+  opts: { fromChildWorkflow: string; requireTerminal?: boolean },
+): Promise<Finding[] | null> {
+  const requireTerminal = opts.requireTerminal !== false;
+  const query = `
+    query Inf115PriorPhaseChildren($id: String!) {
+      issue(id: $id) {
+        children {
+          nodes {
+            identifier
+            title
+            description
+            state { name type }
+            labels { nodes { name } }
+          }
+        }
+      }
+    }
+  `;
+  type ChildNode = {
+    identifier: string;
+    title?: string | null;
+    description?: string | null;
+    state?: { name?: string; type?: string } | null;
+    labels?: { nodes?: Array<{ name?: string }> } | null;
+  };
+  let nodes: ChildNode[] = [];
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: parentInternalId } }),
+    });
+    const data = (await res.json()) as {
+      data?: { issue?: { children?: { nodes?: ChildNode[] } | null } | null };
+    };
+    nodes = data.data?.issue?.children?.nodes ?? [];
+  } catch (err) {
+    log.warn(
+      `fanout: INF-115: failed to fetch prior-phase children for ${parentInternalId}: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
+  }
+
+  const findings: Finding[] = [];
+  for (const child of nodes) {
+    const wfLabel = (child.labels?.nodes ?? [])
+      .map((l) => l.name)
+      .find((name): name is string => typeof name === "string" && /^wf:.+/.test(name));
+    if (!wfLabel || !childWorkflowMatchesGlob(wfLabel, opts.fromChildWorkflow)) continue;
+    // "completed" is Linear's terminal state type (Done). Canceled/invalid
+    // children carry no approved output and are excluded with it.
+    if (requireTerminal && child.state?.type !== "completed") continue;
+
+    // Prefer the child's own structured output section; fall back to its title.
+    const childFindings = extractSpecFindings(child.description, DERIVE_CHILD_SPEC_SECTION);
+    if (childFindings.length > 0) {
+      for (const f of childFindings) {
+        findings.push({
+          title: `[${child.identifier}] ${f.title}`,
+          description: f.description,
+        });
+      }
+    } else {
+      const title = (child.title ?? child.identifier).trim();
+      findings.push({
+        title: `[${child.identifier}] ${title}`,
+        description: `Approved output lives on ${child.identifier} (no structured findings section — see the child ticket).`,
+      });
+    }
+  }
+
+  if (findings.length === 0) return null;
+  log.info(
+    `fanout: INF-115: derived ${findings.length} spec entr${findings.length === 1 ? "y" : "ies"} ` +
+    `from prior-phase children of ${parentInternalId} (glob '${opts.fromChildWorkflow}')`,
+  );
+  return findings;
+}
+
+/**
+ * INF-115: Render derived findings as a spec section and append it to the
+ * parent description. Returns the new description, or null when the section
+ * already exists with parseable entries — human-authored content always wins;
+ * derivation never overwrites.
+ */
+export function upsertDerivedSpecSection(
+  description: string | null | undefined,
+  specSource: string,
+  findings: Finding[],
+): string | null {
+  if (findings.length === 0) return null;
+  if (extractSpecFindings(description, specSource).length > 0) return null;
+
+  const heading = `## ${specSource.charAt(0).toUpperCase()}${specSource.slice(1)}`;
+  const lines = findings.map((f) => {
+    // Strip asterisks from titles so they can't break the "**Title**" parse.
+    const title = f.title.replace(/\*+/g, "").trim();
+    return f.description ? `- **${title}**: ${f.description}` : `- **${title}**`;
+  });
+  const section =
+    `${heading}\n\n` +
+    `${AUTO_DERIVED_SPEC_MARKER} — derived from completed prior-phase children; review/edit before spawning -->\n\n` +
+    lines.join("\n") +
+    "\n";
+
+  const base = (description ?? "").trimEnd();
+  return base ? `${base}\n\n${section}` : section;
+}
+
+/**
+ * INF-115: persist an updated description on an issue. Returns true on success.
+ * Fail-open: a failed write just means the steward authors the section by hand
+ * (the pre-INF-115 path).
+ */
+export async function updateIssueDescription(
+  internalIssueId: string,
+  description: string,
+  authToken: string,
+): Promise<boolean> {
+  const mutation = `
+    mutation Inf115UpdateDescription($issueId: String!, $description: String!) {
+      issueUpdate(id: $issueId, input: { description: $description }) {
+        success
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: mutation, variables: { issueId: internalIssueId, description } }),
+    });
+    const data = (await res.json()) as { data?: { issueUpdate?: { success?: boolean } } };
+    return data.data?.issueUpdate?.success === true;
+  } catch (err) {
+    log.warn(
+      `fanout: INF-115: failed to update description on ${internalIssueId}: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
 }
