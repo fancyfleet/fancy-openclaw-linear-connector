@@ -32,7 +32,8 @@ export type SimpleFailureClass =
   | { type: "stuck" }
   | { type: "delegate-nulled" }
   | { type: "agent-broken" }
-  | { type: "agent-broke-mid-task" };
+  | { type: "agent-broke-mid-task" }
+  | { type: "token-401" };
 
 /**
  * Discriminated union of every known failure_class.
@@ -53,6 +54,7 @@ export type RemediationActionKind =
   | "auto-advance"
   | "nudge-for-verb"
   | "restart-session"
+  | "refresh-token"
   | "no-action"
   | "escalate";
 

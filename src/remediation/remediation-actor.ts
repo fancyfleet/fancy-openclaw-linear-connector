@@ -63,6 +63,8 @@ function resolveActionMapping(
     case "agent-broken":
     case "agent-broke-mid-task":
       return { actionKind: "restart-session", actionClass: "CONFIRM" };
+    case "token-401":
+      return { actionKind: "refresh-token", actionClass: "AUTO" };
     case "healthy-suppressed":
       // healthy-suppressed is exempt from all policy; special-handled in executeRemediation.
       return null;
