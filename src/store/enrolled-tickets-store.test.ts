@@ -141,6 +141,15 @@ describe("AI-1799 AC1: EnrolledTicketsStore — mirror lifecycle", () => {
     expect(store.wasDemoted("AI-1009")).toBe(true);
   });
 
+  it("wasDemoted() ignores stale tombstones superseded by a later delegation", () => {
+    store.demoteEnrolled("INF-334-STUCK");
+
+    const staleTombstoneBypass = new Date(Date.now() + 1000).toISOString();
+
+    expect(store.wasDemoted("INF-334-STUCK")).toBe(true);
+    expect(store.wasDemoted("INF-334-STUCK", staleTombstoneBypass)).toBe(false);
+  });
+
   it("persisted rows survive store reopen (durable sqlite, not in-memory)", () => {
     store.enroll({ ticketId: "AI-1008", workflow: "dev-impl", state: "intake", delegate: "ai" });
     store.recordTransition({ ticketId: "AI-1008", toState: "write-tests", delegate: "tdd", eventKind: "accept" });
