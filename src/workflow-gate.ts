@@ -5236,6 +5236,7 @@ export async function applyStateTransition(
     resolvedDelegateId,
     resolvedNativeStateId,
     toStateName,
+    issue.identifier,
   );
   const applied = writeOutcome.ok;
 
@@ -5803,6 +5804,7 @@ async function issueUpdateAtomicVerified(
   delegateId: string | null | undefined,
   nativeStateId: string | null | undefined,
   expectedStateName: string,
+  issueIdentifier?: string | null,
 ): Promise<VerifiedWriteOutcome> {
   const { maxAttempts, retryDelayMs } = transitionWritePolicy;
   let failureKind: "mutation" | "verification" = "mutation";
@@ -5819,6 +5821,15 @@ async function issueUpdateAtomicVerified(
       log.warn(`workflow-gate: AI-1762: atomic mutation attempt ${attempt}/${maxAttempts} failed for ${internalId}${attempt < maxAttempts ? " — retrying" : ""}`);
       continue;
     }
+
+    if (issueIdentifier) {
+      // INF-424: record applied state immediately after a successful mutation
+      // but BEFORE verification. This ensures that any re-entrant reads
+      // (e.g. from child-creation webhooks during a fan-out) see the
+      // destination state even if verification has not yet completed.
+      recordAppliedState(issueIdentifier, expectedStateName);
+    }
+
     const verification = await verifyTransitionWritePersisted(
       internalId,
       { stateName: expectedStateName, delegateId, nativeStateId },
@@ -5834,6 +5845,28 @@ async function issueUpdateAtomicVerified(
     failureKind = "verification";
     divergent = verification;
     log.warn(`workflow-gate: AI-1762: write attempt ${attempt}/${maxAttempts} for ${internalId} reported success but did NOT fully persist — ${verification.join("; ")}${attempt < maxAttempts ? " — retrying" : ""}`);
+  }
+
+  // INF-424: a state-label read can stay lagged behind a genuinely-applied mutation
+  // (Linear's read replica catching up — the exact race that desynced INF-196's label).
+  // The applied-state-store already recorded the destination state right after the
+  // mutation succeeded (above), and every consumer of transition state (barrier
+  // checks, outbound delivery, fan-out) is required to prefer that authoritative
+  // record over a live label read. So when retries exhaust with ONLY the label
+  // still divergent — no delegate or native-state facet dropped — accept the write
+  // instead of failing the whole transition (and blocking its fan-out) on a read lag
+  // we already have a fix for. A dropped delegate/native-state facet (the AI-1759
+  // bug class) still fails loudly; that risk is unrelated to label read lag.
+  if (
+    failureKind === "verification" &&
+    divergent.length > 0 &&
+    divergent.every((d) => d.startsWith("state-label"))
+  ) {
+    log.warn(
+      `workflow-gate: AI-1762/INF-424: state-label verification stayed lagged after ${maxAttempts} attempt(s) for ${internalId} — ` +
+      `accepting on applied-state-store authority (mutation succeeded, no delegate/native-state divergence): ${divergent.join("; ")}`,
+    );
+    return { ok: true, attempts: maxAttempts, failureKind: "none", divergent, unverified: true };
   }
 
   return { ok: false, attempts: maxAttempts, failureKind, divergent, unverified: false };
