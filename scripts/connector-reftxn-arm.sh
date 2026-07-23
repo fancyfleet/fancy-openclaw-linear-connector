@@ -53,9 +53,9 @@ set -euo pipefail
 #   connector-reftxn-arm.sh --check      # drift check: 0 in-sync, 1 drift, 2 not-armed, 3 no-source
 #   connector-reftxn-arm.sh --disarm     # remove the installed hook + auto-arm hooks + deploy guard
 #
-# ALSO installs a post-checkout-deploy-guard hook (INF-55) that prevents the
+# ALSO installs a post-checkout-deploy-guard hook (INF-411) that prevents the
 # deploy worktree (fancy-openclaw-linear-connector-deploy) from being switched
-# to any branch other than release-1.4.
+# away from the canonical deploy ref, origin/main.
 # See scripts/git-hooks/post-checkout-deploy-guard.
 
 QUIET_MIN=15
@@ -87,7 +87,7 @@ case "$GIT_COMMON_DIR" in
 esac
 HOOK_DST="$GIT_COMMON_DIR/hooks/reference-transaction"
 
-# Deploy worktree guard hook (INF-55): prevents checkout off release-1.4.
+# Deploy worktree guard hook (INF-411): prevents checkout off origin/main.
 DEPLOY_GUARD_SRC="$REPO_ROOT/scripts/git-hooks/post-checkout-deploy-guard"
 DEPLOY_GUARD_DST="$GIT_COMMON_DIR/hooks/post-checkout"
 
@@ -175,9 +175,9 @@ install_hook() {
   install_autoarm_hooks      # keep the armed copy converged on future pulls (INF-19)
 }
 
-# Install the deploy worktree guard hook (INF-55) alongside the veto hook.
+# Install the deploy worktree guard hook (INF-411) alongside the veto hook.
 # This hook only fires in the deploy worktree (gated on GIT_DIR path) and
-# prevents checkout off release-1.4. Ungated — no quiescence check needed.
+# prevents checkout off origin/main. Ungated — no quiescence check needed.
 install_deploy_guard() {
   mkdir -p "$GIT_COMMON_DIR/hooks"
   if [ ! -e "$DEPLOY_GUARD_SRC" ]; then
@@ -290,5 +290,5 @@ clear_legacy_hookspath
 echo "ARMED: hook installed at $HOOK_DST (out of tree; core.hooksPath left unset)."
 echo "  version: $(hook_version "$HOOK_DST")"
 echo "  auto-re-arm on pull/rebase: ON (post-merge + post-rewrite installed) — armed copy self-converges now."
-echo "  deploy guard installed at $DEPLOY_GUARD_DST (INF-55) — deploy worktree locked to release-1.4"
+echo "  deploy guard installed at $DEPLOY_GUARD_DST (INF-411) — deploy worktree locked to origin/main"
 echo "  primary-tree detach/reset HEAD moves are now vetoed. Disarm: $0 --disarm ; drift check: $0 --check"
