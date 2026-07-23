@@ -79,6 +79,7 @@ states:
       - command: request
         to: routing
         generic: continue      # `linear continue-workflow` — routing auto-assigns the head (singleton)
+        assign: { mode: auto }
       - command: demote
         to: __ad_hoc__         # leaves the workflow entirely (design.md §4.5) — also the escape exit
 
@@ -104,6 +105,7 @@ states:
       - command: submit
         to: review
         generic: continue      # `linear continue-workflow` — review auto-assigns the head (singleton)
+        assign: { mode: auto }
 
   - id: review
     owner_role: department-head    # SAME body as routing (domain-routed, pinned)
@@ -114,6 +116,7 @@ states:
       - command: approve
         to: sign-off
         generic: continue      # `linear continue-workflow` — sign-off auto-assigns the requester (singleton)
+        assign: { mode: auto }
       - command: request-changes
         to: doing
         generic: revision      # `linear request-revision`
