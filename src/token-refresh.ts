@@ -448,3 +448,15 @@ export function startTokenRefresh(): void {
     `for ${getAgents().length} agent(s)`,
   );
 }
+
+/**
+ * INF-381 — Force a full token refresh for all agents.
+ *
+ * Used for manual remediation or recovery after a fleet-wide auth event.
+ * Skips nothing. Sequential.
+ */
+export async function forceRefreshAll(): Promise<void> {
+  log.info("forceRefreshAll: manual full refresh triggered for all agents");
+  await refreshAll(false);
+}
+

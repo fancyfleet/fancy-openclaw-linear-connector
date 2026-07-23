@@ -172,6 +172,15 @@ describe("AC1: each failure_class maps to the correct remediation action", () =>
     expect(result.actionClass).toBe("CONFIRM");
   });
 
+  it("token-401 → refresh token (AUTO)", async () => {
+    const result = await executeRemediation(
+      { type: "token-401" },
+      makeContext(),
+    );
+    expect(result.action.kind).toBe("refresh-token");
+    expect(result.actionClass).toBe("AUTO");
+  });
+
   it("healthy-suppressed:* → no action", async () => {
     const result = await executeRemediation(
       { type: "healthy-suppressed", subtype: "quiet-period" },

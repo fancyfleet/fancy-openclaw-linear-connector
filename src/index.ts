@@ -2122,6 +2122,7 @@ if (isEntryPoint) {
   // output and routes findings through the AlertBus with stable dedup keys
   // (git-remote-liveness PUSH-DEAD keyed on AI-2189 root-cause ticket).
   registerConfigSanityAlertCron();
+  registerTokenWatchdogCron();
 
   // INF-192: Matrix approval gate — register at bootstrap so the component
   // is armed (observable via /health.matrixApprovalGate). Derives config from
