@@ -10,7 +10,7 @@ export interface RouteResult {
   sessionKey: string;
   priority: number;
   event: LinearEvent;
-  routingReason?: "delegate" | "assignee" | "mention" | "body-mention" | "department-prefix" | "steward-escalation";
+  routingReason?: "delegate" | "assignee" | "mention" | "body-mention" | "department-prefix" | "steward-escalation" | "merge-gate";
   coalescedCount?: number;
   /**
    * INF-38: Canonical identifier resolved from the event UUID at delivery time.

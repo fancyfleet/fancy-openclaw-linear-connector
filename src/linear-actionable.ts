@@ -74,7 +74,8 @@ export type RoutingReason =
   | "mention"
   | "body-mention"
   | "department-prefix"
-  | "steward-escalation";
+  | "steward-escalation"
+  | "merge-gate";
 
 /**
  * Routing reasons that carry a delegate/assignee ownership claim on the ticket,
