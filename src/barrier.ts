@@ -37,6 +37,7 @@
 
 import { componentLogger, createLogger } from "./logger.js";
 import { loadWorkflowDef, loadWorkflowDefById, loadWorkflowRegistry, getWorkflowId, getCurrentState, type WorkflowDef, type WorkflowState } from "./workflow-gate.js";
+import { getFanoutOutcome } from "./fanout-outcome-store.js";
 import { getAppliedState } from "./store/applied-state-store.js";
 import {
   LINEAR_API_URL,
@@ -683,7 +684,7 @@ export async function attemptBarrierTransition(
         childFilter = outcome.childIdentifiers;
         log.info(
           `barrier: INF-28 attemptBarrierTransition scoped to recorded set for ${parentIdentifier}: ` +
-          `${childFilter.join(", ")}`,
+          `${childFilter?.join(", ") ?? "none"}`,
         );
       }
     }
