@@ -61,6 +61,11 @@ import { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import { ProposalStore } from "./store/proposal-store.js";
 import { clearAcRecordStore } from "./ac-record-store.js";
 import { getCronStalenessMultiplierFromEnv, getRegisteredCrons, getStaleCrons } from "./cron/registry.js";
+import {
+  getStaleCronSelfHealRetryCapFromEnv,
+  handleRegisteredStaleCronsOnce,
+  registerStaleCronReinitializer,
+} from "./cron/stale-cron-self-heal.js";
 import { evaluateCronStartupReadiness, parseCronStartupGraceMs } from "./cron/startup-readiness.js";
 import { getRescueSweepState } from "./rescue-sweep-state.js";
 import { getDetectorState } from "./done-ticket-detector-state.js";
@@ -334,16 +339,29 @@ export function createApp(options?: CreateAppOptions) {
   // /health returned 200, but 0 of 28 agents were loaded → fleet-wide 401s
   // and dropped webhooks.
   app.get("/health", async (_req: Request, res: Response) => {
+    const now = new Date();
     const agents = getAgents();
     const crons = getRegisteredCrons();
     const cronReadiness = evaluateCronStartupReadiness({
       crons,
       bootedAt,
-      now: new Date(),
+      now,
       bootGraceMs: parseCronStartupGraceMs(process.env.CRON_STARTUP_GRACE_MS),
       log,
     });
     const healthy = agents.length > 0 && cronReadiness.status === "ok";
+    const staleCrons = getStaleCrons({
+      now,
+      stalenessMultiplier: getCronStalenessMultiplierFromEnv(),
+    });
+    const staleCronSelfHeal = staleCrons.length > 0
+      ? await handleRegisteredStaleCronsOnce({
+          staleCrons,
+          now,
+          maxAttempts: getStaleCronSelfHealRetryCapFromEnv(),
+          log,
+        })
+      : { attempted: [], capped: [], staleCrons };
 
     // AI-2008 AC3: loud dispatch-undeliverable surfacing. Every dispatch that
     // exhausted its bounded retries is a first-class operational event; project
@@ -353,7 +371,7 @@ export function createApp(options?: CreateAppOptions) {
       outcome: "dispatch-undeliverable",
       limit: 100,
     });
-    const warnings = undeliverable.map((e) => {
+    const warnings: Array<Record<string, unknown>> = undeliverable.map((e) => {
       const detail = (e.detail ?? {}) as Record<string, unknown>;
       return {
         kind: "dispatch-undeliverable",
@@ -365,6 +383,18 @@ export function createApp(options?: CreateAppOptions) {
         occurredAt: e.occurredAt,
       };
     });
+    for (const capped of staleCronSelfHeal.capped) {
+      const cron = staleCrons.find((entry) => entry.name === capped.name);
+      warnings.push({
+        kind: "stale-cron-self-heal-capped",
+        cron: capped.name,
+        schedule: cron?.schedule ?? null,
+        lastRunAt: cron?.lastRunAt ?? null,
+        attempts: capped.attempts,
+        overdueByMs: cron?.overdueByMs ?? null,
+        occurredAt: now.toISOString(),
+      });
+    }
 
     res.status(healthy ? 200 : 503).json({
       status: healthy ? "ok" : "degraded",
@@ -393,7 +423,8 @@ export function createApp(options?: CreateAppOptions) {
       // missing from this list means it shipped without bootstrap wiring
       // (the AI-1773/AI-1775 dead-code-in-prod failure mode).
       crons,
-      staleCrons: getStaleCrons({ stalenessMultiplier: getCronStalenessMultiplierFromEnv() }),
+      staleCrons,
+      staleCronSelfHeal,
       cronReadiness,
       // AI-2036 AC1.6: observation write-path liveness. `wired`/`subscribed` are
       // true only because bootstrap called registerObservationWritePath() — never
@@ -1564,11 +1595,13 @@ export function createApp(options?: CreateAppOptions) {
   // AI-2359: periodic registry-integrity check — runs daily, cross-checks
   // capability-policy bodies against agents.json entries and alerts on mismatches.
   registerRegistryIntegrityCron();
+  registerStaleCronReinitializer("registry-integrity-check", () => registerRegistryIntegrityCron());
 
   // AI-2582: transcript redaction sweep — periodic .trajectory.jsonl
   // credential redaction. Registered here so the cron registry and /health
   // both prove wiring without waiting for a trigger.
   registerTranscriptRedaction();
+  registerStaleCronReinitializer("transcript-redaction", () => registerTranscriptRedaction());
 
   // INF-28 AC4: fanout-outcome-store liveness check at startup. An
   // unwritable DATA_DIR would silently produce N `absent` outcomes →
@@ -1581,6 +1614,7 @@ export function createApp(options?: CreateAppOptions) {
   // INF-193 AC4: TTL cache invalidation scheduler — periodic purge of expired
   // entries to prevent stale resolution and memory accumulation of unread keys.
   registerTtlInvalidationCron(ttlCache, 60_000);
+  registerStaleCronReinitializer("ttl-cache-invalidation", () => registerTtlInvalidationCron(ttlCache, 60_000));
   log.info("INF-193: TTL cache invalidation cron registered (every 60s)");
 
   return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, livenessDispatchStore, transcriptRedactionHealth: getTranscriptRedactionHealth() });
@@ -1693,9 +1727,13 @@ if (isEntryPoint) {
   // generation engine, persisted into the unified C4 store (AI-2070). The prod
   // context reads real step-guidance surfaces from the instance-config root.
   registerDistillationCron(observationStore, proposalStore, createProdGenerationContext());
+  registerStaleCronReinitializer("p4-metrics-distillation", () =>
+    registerDistillationCron(observationStore, proposalStore, createProdGenerationContext()),
+  );
   // AI-1566: periodic rescue sweep — detect and repair dormant/malformed wf:* tickets
   // AI-2093: pass the operationalEventStore so rescue:* outcomes are persisted + queryable.
   registerRescueSweepCron(operationalEventStore);
+  registerStaleCronReinitializer("rescue-sweep", () => registerRescueSweepCron(operationalEventStore));
 
   // AI-1775: periodic reconciliation sweep — heal wf:* tickets that never
   // enrolled (dropped Issue-update webhook). Safety net for the bootstrap path.
@@ -1747,6 +1785,12 @@ if (isEntryPoint) {
     authToken: reconciliationAuthToken,
     wakeFn: reconciliationWakeFn,
   });
+  registerStaleCronReinitializer("bootstrap-reconciliation-sweep", () =>
+    registerBootstrapReconciliationCron({
+      authToken: reconciliationAuthToken,
+      wakeFn: reconciliationWakeFn,
+    }),
+  );
 
   // AI-1807: delegation reconciliation sweep — detect and heal stranded
   // delegation wakes caused by webhook-ingress gaps. Complements AI-1775
@@ -1758,6 +1802,15 @@ if (isEntryPoint) {
     dispatchLeaseStore,
     enrolledTicketsStore,
   });
+  registerStaleCronReinitializer("delegation-reconciliation-sweep", () =>
+    registerDelegationReconciliationCron({
+      authToken: reconciliationAuthToken,
+      operationalEventStore,
+      wakeFn: reconciliationWakeFn,
+      dispatchLeaseStore,
+      enrolledTicketsStore,
+    }),
+  );
 
   // INF-168: stale-plain-delegate sweep — detect and re-dispatch plain
   // (non-wf) tickets with a delegate set that have been sitting in Thinking/
@@ -1768,6 +1821,14 @@ if (isEntryPoint) {
     alertBus: getAlertBus(),
     wakeFn: reconciliationWakeFn,
   });
+  registerStaleCronReinitializer("stale-plain-delegate-sweep", () =>
+    registerStalePlainDelegateCron({
+      authToken: reconciliationAuthToken,
+      operationalEventStore,
+      alertBus: getAlertBus(),
+      wakeFn: reconciliationWakeFn,
+    }),
+  );
 
   // AI-2009: first-action watchdog — arm a per-state deadline at dispatch
   // delivery and, on breach, walk the remediation ladder (re-dispatch →
@@ -1785,7 +1846,7 @@ if (isEntryPoint) {
     .then((p) => ({ bodies: p.bodies, roles: p.roles }))
     .catch(() => undefined);
   const firstActionAgentNames = new Set(getAgents().map((a) => a.name.toLowerCase()));
-  registerFirstActionWatchdogCron({
+  const registerFirstActionWatchdog = () => registerFirstActionWatchdogCron({
     authToken: reconciliationAuthToken,
     workflowDefPath: process.env.WORKFLOW_DEFS_DIR ?? process.env.WORKFLOW_DEF_DIR,
     capabilityPolicy: firstActionCapabilityPolicy,
@@ -1903,6 +1964,8 @@ if (isEntryPoint) {
       await reconciliationWakeFn(toAgent, ticket);
     },
   });
+  registerFirstActionWatchdog();
+  registerStaleCronReinitializer("first-action-watchdog", registerFirstActionWatchdog);
 
   // AI-1807 AC5: POST /redispatch — on-demand delegation reconciliation.
   // ADMIN_SECRET-gated. Supports single-ticket and time-window batch modes.
@@ -1991,6 +2054,21 @@ if (isEntryPoint) {
         }),
       wakeAgent: slaWakeAgent,
     });
+    registerStaleCronReinitializer("sla-sweep", () =>
+      registerSlaSweepCron({
+        authToken: resolveCronAuthToken,
+        workflowDefPath: slaWorkflowDefPath,
+        breachStorePath: slaBreachStorePath,
+        cadenceMs: slaCadenceMs,
+        notify: (alert) =>
+          notify({
+            ...alert,
+            severity: alert.severity as AlertSeverity,
+            dedupKey: `sla-sweep|${alert.ticket}`,
+          }),
+        wakeAgent: slaWakeAgent,
+      }),
+    );
     log.info(`AI-1773: SLA sweep cron registered (cadence=${slaCadenceMs ?? 300_000}ms, store=${slaBreachStorePath}, defs=${slaWorkflowDefPath})`);
   } else {
     log.warn("AI-1773: SLA sweep cron NOT registered — no Linear auth token available");
@@ -2047,6 +2125,18 @@ if (isEntryPoint) {
       cooldownMs: validationCooldownMs,
       watchedStates: validationWatchedStates,
     });
+    registerStaleCronReinitializer("validation-watchdog", () =>
+      registerValidationWatchdogCron({
+        authToken: resolveValidationAuthToken,
+        validatorLinearUserId: validationValidatorUserId,
+        wakeValidator: validationWakeAgent,
+        nudgeStorePath: validationNudgeStorePath,
+        cadenceMs: validationCadenceMs,
+        thresholdMs: validationThresholdMs,
+        cooldownMs: validationCooldownMs,
+        watchedStates: validationWatchedStates,
+      }),
+    );
     log.info(
       `INF-105: Validation watchdog cron registered ` +
       `(cadence=${validationCadenceMs ?? 300_000}ms, ` +
@@ -2068,6 +2158,12 @@ if (isEntryPoint) {
       authToken: labelSyncAuthToken,
       enrolledTicketsStore,
     });
+    registerStaleCronReinitializer("label-sync-audit", () =>
+      registerLabelSyncAuditCron({
+        authToken: labelSyncAuthToken,
+        enrolledTicketsStore,
+      }),
+    );
     log.info("AI-2554: label-sync audit cron registered (interval=15m)");
   } else {
     log.warn("AI-2554: label-sync audit cron NOT registered — no Linear auth token available");
@@ -2087,9 +2183,16 @@ if (isEntryPoint) {
     },
     config: { ...DEFAULT_STALL_CONFIG },
   });
+  registerStaleCronReinitializer("stall-liveness-sweep", () =>
+    registerStallSweepCron({
+      livenessRecords: () => [],
+      config: { ...DEFAULT_STALL_CONFIG },
+    }),
+  );
 
   // G-20: scheduled gate-silently-off canary (AI-1552, §5.1)
   registerG20CanaryCron();
+  registerStaleCronReinitializer("g20-canary", () => registerG20CanaryCron());
 
   // AI-2576: periodic done-ticket detector — flag Done tickets missing from main
   // (uses git log --grep <ticket-id> to check commit messages).
@@ -2099,6 +2202,14 @@ if (isEntryPoint) {
     graceHours: parseInt(process.env.DONE_DETECTOR_GRACE_HOURS ?? "4", 10),
     pollIntervalMs: parseInt(process.env.DONE_DETECTOR_POLL_INTERVAL_MS ?? String(60 * 60 * 1000), 10),
   });
+  registerStaleCronReinitializer("done-ticket-detector", () =>
+    registerDoneDetectorCron({
+      repoPath: process.env.DONE_DETECTOR_REPO_PATH ?? process.env.REPO_BASE_PATH,
+      lookbackDays: parseInt(process.env.DONE_DETECTOR_LOOKBACK_DAYS ?? "14", 10),
+      graceHours: parseInt(process.env.DONE_DETECTOR_GRACE_HOURS ?? "4", 10),
+      pollIntervalMs: parseInt(process.env.DONE_DETECTOR_POLL_INTERVAL_MS ?? String(60 * 60 * 1000), 10),
+    }),
+  );
 
   // INF-122: periodic anti-entropy reconciliation (G-7/G-17).
   // AC1 — native state desync heal; AC2 — missed barrier webhook auto-advance.
@@ -2106,6 +2217,7 @@ if (isEntryPoint) {
   const antiEntropyAuthToken = resolveCronAuthToken();
   if (antiEntropyAuthToken) {
     registerAntiEntropyCron({ authToken: resolveCronAuthToken });
+    registerStaleCronReinitializer("anti-entropy", () => registerAntiEntropyCron({ authToken: resolveCronAuthToken }));
     const intervalMs = process.env.ANTI_ENTROPY_INTERVAL
       ? parseInt(process.env.ANTI_ENTROPY_INTERVAL, 10)
       : 15 * 60 * 1000;
@@ -2117,11 +2229,15 @@ if (isEntryPoint) {
   // AI-1838: out-of-band mutation reconcile sweep. Detects state/label/delegate
   // changes that bypassed the proxy gate (raw token → api.linear.app direct).
   registerOobReconcileCron(mutationAuditStore, operationalEventStore);
+  registerStaleCronReinitializer("oob-reconcile-sweep", () =>
+    registerOobReconcileCron(mutationAuditStore, operationalEventStore),
+  );
 
   // AI-2619: config-sanity watchdog alert consumer — reads the watchdog JSON
   // output and routes findings through the AlertBus with stable dedup keys
   // (git-remote-liveness PUSH-DEAD keyed on AI-2189 root-cause ticket).
   registerConfigSanityAlertCron();
+  registerStaleCronReinitializer("config-sanity-alert", () => registerConfigSanityAlertCron());
 
   // INF-192: Matrix approval gate — register at bootstrap so the component
   // is armed (observable via /health.matrixApprovalGate). Derives config from
@@ -2144,6 +2260,12 @@ if (isEntryPoint) {
     approvalPatterns: _matrixApprovalPatterns,
     designatedApprovers: _matrixApprovalApprovers,
   });
+  registerStaleCronReinitializer("matrix-approval-gate", () =>
+    registerMatrixApprovalGate({
+      approvalPatterns: _matrixApprovalPatterns,
+      designatedApprovers: _matrixApprovalApprovers,
+    }),
+  );
 
   // Config-health healthy→unhealthy is the loudest structural signal we have
   // (bad policy/workflow/agents.json = engine fail-closed for workflow tickets).

@@ -22,12 +22,14 @@ async function loadSelfHealModule() {
       staleCrons: StaleCronForTest[];
       detectionWindowId: string;
       now: Date;
+      maxAttempts?: number;
       reinitializeCron: (cron: StaleCronForTest) => Promise<void> | void;
     }) => Promise<{
       attempted: Array<{ name: string; attempt: number }>;
       capped: Array<{ name: string; attempts: number }>;
       staleCrons: StaleCronForTest[];
     }>;
+    getStaleCronSelfHealRetryCapFromEnv: (env?: NodeJS.ProcessEnv) => number;
     resetStaleCronSelfHealForTest: () => void;
   }>;
 }
@@ -97,6 +99,53 @@ describe("INF-341 AC1: stale cron self-heal retry cap", () => {
     ]);
     expect(result.capped).toEqual([
       expect.objectContaining({ name: staleNeverFired.name, attempts: 1 }),
+    ]);
+  });
+
+  test("retry cap is configurable", async () => {
+    const {
+      getStaleCronSelfHealRetryCapFromEnv,
+      handleStaleCronsOnce,
+      resetStaleCronSelfHealForTest,
+    } = await loadSelfHealModule();
+    resetStaleCronSelfHealForTest();
+    const reinitializeCron = jest.fn(async () => undefined);
+
+    expect(getStaleCronSelfHealRetryCapFromEnv({
+      STALE_CRON_SELF_HEAL_RETRY_CAP: "2",
+    } as NodeJS.ProcessEnv)).toBe(2);
+    expect(getStaleCronSelfHealRetryCapFromEnv({
+      STALE_CRON_SELF_HEAL_RETRY_CAP: "0",
+    } as NodeJS.ProcessEnv)).toBe(1);
+
+    await handleStaleCronsOnce({
+      staleCrons: [staleNeverFired],
+      detectionWindowId: "configured-cap",
+      now: new Date("2026-07-22T21:44:00.000Z"),
+      maxAttempts: 2,
+      reinitializeCron,
+    });
+    const second = await handleStaleCronsOnce({
+      staleCrons: [staleNeverFired],
+      detectionWindowId: "configured-cap",
+      now: new Date("2026-07-22T21:45:00.000Z"),
+      maxAttempts: 2,
+      reinitializeCron,
+    });
+    const third = await handleStaleCronsOnce({
+      staleCrons: [staleNeverFired],
+      detectionWindowId: "configured-cap",
+      now: new Date("2026-07-22T21:46:00.000Z"),
+      maxAttempts: 2,
+      reinitializeCron,
+    });
+
+    expect(reinitializeCron).toHaveBeenCalledTimes(2);
+    expect(second.attempted).toEqual([
+      expect.objectContaining({ name: staleNeverFired.name, attempt: 2 }),
+    ]);
+    expect(third.capped).toEqual([
+      expect.objectContaining({ name: staleNeverFired.name, attempts: 2 }),
     ]);
   });
 });
