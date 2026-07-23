@@ -69,7 +69,7 @@ async function fetchLabelsWithRetry(
       lastError = err;
       if (err instanceof TransientLabelFetchError) {
         // INF-381: Trigger background token refresh on 401.
-        if (err.status === 401 && agentId) {
+        if (err.statusCode === 401 && agentId) {
           void remediateAgentToken(agentId);
         }
 

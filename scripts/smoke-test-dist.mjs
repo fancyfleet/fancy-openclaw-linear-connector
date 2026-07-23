@@ -1,18 +1,30 @@
 import { spawn } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import fs from 'fs';
+import os from 'os';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 
 async function smokeTest() {
-  console.log('🚀 Starting dist-boot smoke test...');
+  console.log('Starting dist-boot smoke test...');
 
-  // 1. Ensure dist/index.js exists
   const entryPoint = path.join(ROOT, 'dist', 'index.js');
-  
-  // 2. Spawn node dist/index.js
-  // We set a short timeout and look for "listening on port" or just wait to see if it crashes
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'connector-dist-smoke-'));
+  const agentsFile = path.join(tmpDir, 'agents.json');
+  const dataDir = path.join(tmpDir, 'data');
+
+  fs.writeFileSync(agentsFile, JSON.stringify({
+    agents: [{
+      name: 'smoke-test-agent',
+      linearUserId: 'u-smoke',
+      openclawAgent: 'ai',
+      accessToken: 'tok-smoke',
+      host: 'local'
+    }]
+  }));
+
   const child = spawn('node', [entryPoint], {
     cwd: ROOT,
     env: {
@@ -21,7 +33,8 @@ async function smokeTest() {
       NODE_ENV: 'production',
       ADMIN_SECRET: 'smoke-test-secret',
       LINEAR_CONNECTOR_ENCRYPTION_KEY: '0000000000000000000000000000000000000000000000000000000000000000',
-      DATA_DIR: '/tmp/smoke-test-data-' + Date.now(),
+      DATA_DIR: dataDir,
+      AGENTS_FILE: agentsFile,
     }
   });
 
@@ -46,7 +59,7 @@ async function smokeTest() {
 
   const bootPromise = new Promise((resolve, reject) => {
     const checkInterval = setInterval(() => {
-      if (output.includes('listening on port')) {
+      if (`${output}\n${errorOutput}`.includes('listening on port')) {
         clearInterval(checkInterval);
         resolve('SUCCESS');
       }
@@ -72,15 +85,17 @@ async function smokeTest() {
 
   try {
     await Promise.race([bootPromise, timeoutPromise]);
-    console.log('\n✅ Smoke test PASSED: Application booted successfully.');
+    console.log('\nSmoke test PASSED: Application booted successfully.');
     child.kill();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
     process.exit(0);
   } catch (err) {
-    console.error(`\n❌ Smoke test FAILED: ${err.message}`);
+    console.error(`\nSmoke test FAILED: ${err.message}`);
     if (errorOutput.includes('ReferenceError')) {
       console.error('Detected ReferenceError during bootstrap!');
     }
     child.kill();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
     process.exit(1);
   }
 }
