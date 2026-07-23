@@ -309,6 +309,16 @@ function stripNullDelegateAssigneeFields(body: GraphQLRequestBody | null, effect
   if (input.assigneeId === null) delete input.assigneeId;
 }
 
+function rejectStrippedAppUserHandoffShape(body: GraphQLRequestBody | null, effectiveIntent: string | null): string | null {
+  if (effectiveIntent !== "handoff-work" || !isIssueUpdateMutation(body)) return null;
+  const input = issueUpdateInput(body);
+  if (!input) return null;
+  if (input.assigneeId === null && !("delegateId" in input)) {
+    return "[Proxy] 'handoff-work' blocked: app-user delegate handoffs must include delegateId alongside assigneeId:null. This request looks like the known stripped delegateId fallback shape; update the Linear skill CLI and retry.";
+  }
+  return null;
+}
+
 /**
  * Build the ticket context string for log lines (empty string when no ID found).
  */
@@ -1077,6 +1087,12 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         // AI-2067: needs-human is exempt — it is the documented path for clearing delegate
         // while setting a human assignee.
         if (isIssueUpdateMutation(body)) {
+          const strippedAppUserHandoffRejection = rejectStrippedAppUserHandoffShape(body, effectiveIntent);
+          if (strippedAppUserHandoffRejection) {
+            log.warn(`app-user-handoff-stripped-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${strippedAppUserHandoffRejection}`);
+            res.status(200).json({ errors: [{ message: strippedAppUserHandoffRejection }] });
+            return;
+          }
           stripNullDelegateAssigneeFields(body, effectiveIntent);
         }
 
