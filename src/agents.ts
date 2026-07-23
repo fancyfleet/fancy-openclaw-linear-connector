@@ -654,7 +654,7 @@ export function getTokenStatus(agentName: string): TokenStatus | undefined {
     state = "expired";
   } else if (agent.lastFailure) {
     // Has a failure but also has a recent successful refresh
-    state = expiresAt != null && now >= expiresAt - 2 * 60 * 60 * 1000
+    state = expiresAt != null && now >= expiresAt - 4 * 60 * 60 * 1000
       ? "stale"
       : "healthy";
   } else if (agent.lastRefreshOkAt == null && expiresAt == null) {
@@ -679,6 +679,31 @@ export function getTokenStatus(agentName: string): TokenStatus | undefined {
 export function getAllTokenStatuses(): TokenStatus[] {
   return _agents.map((a) => getTokenStatus(a.name)!).filter(Boolean);
 }
+
+/**
+ * INF-381 — Remediate a failing agent token by triggering a background refresh.
+ *
+ * Called when a 401 is encountered in the live dispatch path. Triggers a
+ * sequential refresh for the agent. If the refresh token is still valid,
+ * the agent recovers; if revoked, the state becomes `revoked` and alerts.
+ */
+export async function remediateAgentToken(agentId: string): Promise<void> {
+  const agent = _agents.find((a) => a.name === agentId);
+  if (!agent) {
+    log.warn(`remediateAgentToken: unknown agent ${agentId} — skipping`);
+    return;
+  }
+
+  log.info(`remediateAgentToken: triggering background refresh for ${agentId} due to 401`);
+  try {
+    // Dynamic import to avoid circular dependency with token-refresh.ts
+    const { refreshAgent } = await import("./token-refresh.js");
+    await refreshAgent(agent);
+  } catch (err) {
+    log.error(`remediateAgentToken: refresh for ${agentId} failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 
 /**
  * Symlink target of `p`, or null if `p` is absent or a regular file.
