@@ -112,6 +112,8 @@ interface FetchScenario {
   governedTickets?: MockTicket[];
   /** Tickets returned by the ad-hoc (non-wf:*) delegated tickets query. */
   adhocDelegatedTickets?: MockTicket[];
+  /** Captures labelIds sent by enrollment/update mutations. */
+  labelUpdates?: string[][];
   /** Whether mutations succeed. */
   mutationSuccess?: boolean;
   /** If true, the query fetch throws a network error. */
@@ -119,10 +121,18 @@ interface FetchScenario {
 }
 
 function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
-  const { governedTickets = [], adhocDelegatedTickets = [], mutationSuccess = true, networkError = false } = scenario;
+  const { governedTickets = [], adhocDelegatedTickets = [], labelUpdates, mutationSuccess = true, networkError = false } = scenario;
+  const allTickets = [...governedTickets, ...adhocDelegatedTickets];
+  const labelsByIssueId = new Map<string, Array<{ id: string; name: string }>>();
+  for (const ticket of allTickets) {
+    labelsByIssueId.set(ticket.id, [...ticket.labels]);
+  }
+
   return async (_url: RequestInfo | URL, init?: RequestInit) => {
     if (networkError) throw new Error("simulated network error");
     const body = typeof init?.body === "string" ? init.body : "";
+    const parsed = body ? JSON.parse(body) as { variables?: Record<string, unknown> } : {};
+    const variables = parsed.variables ?? {};
 
     // Ad-hoc delegated-tickets query (non-wf:* tickets with delegate set)
     if (body.includes("AdhocDelegationReconciliation")) {
@@ -160,7 +170,10 @@ function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
 
     // Issue re-fetch
     if (body.includes("IssueWithLabels") || body.includes("IssueContext")) {
-      const ticket = governedTickets[0];
+      const requestedId = variables.id as string | undefined;
+      const ticket =
+        allTickets.find((t) => t.id === requestedId || t.identifier === requestedId) ??
+        allTickets[0];
       if (ticket) {
         return new Response(
           JSON.stringify({
@@ -169,7 +182,7 @@ function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
                 id: ticket.id,
                 identifier: ticket.identifier,
                 title: ticket.title ?? `Ticket ${ticket.identifier}`,
-                labels: { nodes: ticket.labels },
+                labels: { nodes: labelsByIssueId.get(ticket.id) ?? ticket.labels },
                 delegate: ticket.delegateId ? { id: ticket.delegateId, name: ticket.delegateName } : null,
                 team: { id: ticket.teamId },
               },
@@ -180,8 +193,44 @@ function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
       }
     }
 
+    if (body.includes("TeamLabels")) {
+      return new Response(
+        JSON.stringify({
+          data: {
+            team: {
+              labels: {
+                nodes: [
+                  { id: "label-wf-task", name: "wf:task", isGroup: false, team: { id: TEAM_ID }, parent: null },
+                  { id: "label-state-doing", name: "state:doing", isGroup: false, team: { id: TEAM_ID }, parent: null },
+                  { id: WF_LABEL.id, name: WF_LABEL.name, isGroup: false, team: { id: TEAM_ID }, parent: null },
+                  { id: STATE_IMPLEMENTATION_LABEL.id, name: STATE_IMPLEMENTATION_LABEL.name, isGroup: false, team: { id: TEAM_ID }, parent: null },
+                ],
+              },
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
     // issueUpdate mutation
-    if (body.includes("issueUpdate")) {
+    if (body.includes("ApplyAtomicTransition") || body.includes("issueUpdate")) {
+      const issueId = variables.issueId as string | undefined;
+      const labelIds = variables.labelIds as string[] | undefined;
+      if (issueId && Array.isArray(labelIds)) {
+        labelUpdates?.push(labelIds);
+        const namesById = new Map<string, string>([
+          ["label-wf-task", "wf:task"],
+          ["label-state-doing", "state:doing"],
+          [WF_LABEL.id, WF_LABEL.name],
+          [STATE_IMPLEMENTATION_LABEL.id, STATE_IMPLEMENTATION_LABEL.name],
+          [STATE_DONE_LABEL.id, STATE_DONE_LABEL.name],
+        ]);
+        labelsByIssueId.set(
+          issueId,
+          labelIds.map((id) => ({ id, name: namesById.get(id) ?? id })),
+        );
+      }
       return new Response(
         JSON.stringify({ data: { issueUpdate: { success: mutationSuccess } } }),
         { status: 200, headers: { "Content-Type": "application/json" } },
@@ -406,6 +455,12 @@ describe("INF-334 AC2: reconciliation redispatches missed plain delegations", ()
     expect(wakeDispatches).toEqual([
       { agentName: DELEGATE_AGENT_NAME, ticketIdentifier: "DSN-334" },
     ]);
+    const events = eventStore.query({ key: "linear-DSN-334", limit: 20 });
+    expect(events.some((e) =>
+      e.outcome === "auto-enrolled" &&
+      (e.detail as { workflowId?: string; entryState?: string } | null)?.workflowId === "task" &&
+      (e.detail as { workflowId?: string; entryState?: string } | null)?.entryState === "doing",
+    )).toBe(true);
     eventStore.close();
   });
 
@@ -448,6 +503,53 @@ describe("INF-334 AC2: reconciliation redispatches missed plain delegations", ()
     expect(wakeDispatches).toEqual([
       { agentName: DELEGATE_AGENT_NAME, ticketIdentifier: "DSN-335" },
     ]);
+    eventStore.close();
+  });
+
+  it("enrolls a plain delegated ticket even when a prior successful dispatch suppresses re-wake", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: Array<{ agentName: string; ticketIdentifier: string }> = [];
+    const { bus } = makeTestAlertBus();
+
+    eventStore.append({
+      outcome: "dispatch-accepted",
+      agent: DELEGATE_AGENT_NAME,
+      key: "linear-DSN-336",
+      occurredAt: FRESH_TIMESTAMP,
+    });
+
+    globalThis.fetch = makeReconciliationFetch({
+      adhocDelegatedTickets: [
+        {
+          id: "issue-plain-already-dispatched",
+          identifier: "DSN-336",
+          updatedAt: OLD_TIMESTAMP,
+          labels: [],
+          delegateId: DELEGATE_LINEAR_ID,
+          delegateName: DELEGATE_AGENT_NAME,
+          teamId: TEAM_ID,
+        },
+      ],
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (agentName, ticketIdentifier) => {
+        wakeDispatches.push({ agentName, ticketIdentifier });
+      },
+    });
+
+    expect(result.healed).toBe(0);
+    expect(result.skippedIdempotent).toBeGreaterThanOrEqual(1);
+    expect(wakeDispatches).toEqual([]);
+    const events = eventStore.query({ key: "linear-DSN-336", limit: 20 });
+    expect(events.some((e) =>
+      e.outcome === "auto-enrolled" &&
+      (e.detail as { workflowId?: string; entryState?: string } | null)?.workflowId === "task" &&
+      (e.detail as { workflowId?: string; entryState?: string } | null)?.entryState === "doing",
+    )).toBe(true);
     eventStore.close();
   });
 });

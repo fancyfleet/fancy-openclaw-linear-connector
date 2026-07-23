@@ -1754,6 +1754,7 @@ if (isEntryPoint) {
     operationalEventStore,
     wakeFn: reconciliationWakeFn,
     dispatchLeaseStore,
+    enrolledTicketsStore,
   });
 
   // INF-168: stale-plain-delegate sweep — detect and re-dispatch plain
@@ -1932,6 +1933,7 @@ if (isEntryPoint) {
         since: body?.since,
         until: body?.until,
         dispatchLeaseStore,
+        enrolledTicketsStore,
       });
       res.json({ success: true, ...result });
     } catch (err) {

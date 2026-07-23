@@ -25,11 +25,13 @@ import {
   fetchIssueContext,
   applyBootstrapToIssue,
 } from "./workflow-bootstrap.js";
+import { autoEnrollPlainDelegation } from "./workflow-gate.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
 import { OperationalEventStore, type OperationalEventStore as OperationalEventStoreType } from "./store/operational-event-store.js";
 import type { SessionTracker } from "./bag/session-tracker.js";
 import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
+import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 
 const log = componentLogger(
   createLogger(process.env.LOG_LEVEL ?? "info"),
@@ -64,6 +66,8 @@ export interface DelegationReconciliationOptions {
   now?: () => Date;
   /** AI-2350: durable dispatch lease store — prevent re-dispatches. */
   dispatchLeaseStore?: DispatchLeaseStore;
+  /** INF-334: mirror enrollment for plain delegated tickets promoted to wf:task. */
+  enrolledTicketsStore?: EnrolledTicketsStore;
 }
 
 export interface DelegationReconciliationResult {
@@ -83,6 +87,7 @@ interface GovernedTicket {
   delegateId: string | null;
   delegateName: string | null;
   teamId: string;
+  plainDelegation?: boolean;
 }
 
 type LinearIssueNode = {
@@ -198,6 +203,7 @@ async function queryGovernedTickets(
     delegateId: n.delegate?.id ?? null,
     delegateName: n.delegate?.name ?? null,
     teamId: n.team.id,
+    plainDelegation: false,
   }));
 }
 
@@ -270,6 +276,7 @@ async function queryAdhocDelegatedTickets(
     delegateId: n.delegate?.id ?? null,
     delegateName: n.delegate?.name ?? null,
     teamId: n.team.id,
+    plainDelegation: true,
   }));
 }
 
@@ -605,6 +612,58 @@ export async function runDelegationReconciliationSweep(
 
     // ── AC1: Enrolled ticket with delegate but no dispatch record ───────
     if (ticket.delegateId && ticket.delegateName) {
+      const isPlainDelegation = ticket.plainDelegation || !hasWfLabel(ticket.labels);
+      if (isPlainDelegation) {
+        try {
+          const enrollResult = await autoEnrollPlainDelegation(
+            ticket.id,
+            authToken,
+            (info) => {
+              operationalEventStore.append({
+                outcome: "auto-enrolled",
+                agent: info.delegateAgentName ?? ticket.delegateName,
+                key: `linear-${ticket.identifier}`,
+                detail: {
+                  mode: "plain-delegation-reconciliation",
+                  ticket: ticket.identifier,
+                  workflowId: info.workflowId,
+                  entryState: info.entryState,
+                  delegate: info.delegateAgentName ?? ticket.delegateName,
+                },
+              });
+            },
+            opts.enrolledTicketsStore,
+            ticket.delegateName,
+          );
+          if (enrollResult.enrolled) {
+            log.info(
+              `delegation-reconciliation: auto-enrolled plain delegated ticket ` +
+              `${ticket.identifier} → wf:${enrollResult.workflowId ?? "task"} state:${enrollResult.entryState ?? "doing"}`,
+            );
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          result.errors.push(`plain delegation enrollment failed for ${ticket.identifier}: ${msg}`);
+          operationalEventStore.append({
+            outcome: "delegation-reconciliation-failed",
+            agent: ticket.delegateName,
+            key: `linear-${ticket.identifier}`,
+            errorSummary: msg,
+            detail: {
+              mode: "plain-delegation-enrollment-failure",
+              ticket: ticket.identifier,
+            },
+          });
+          alertBus.notify({
+            severity: "warning",
+            source: "delegation-reconciled",
+            title: `Delegation reconciliation enrollment failed for ${ticket.identifier}`,
+            detail: { error: msg },
+            ticket: ticket.identifier,
+          });
+        }
+      }
+
       // Check idempotency (AC4): has this delegate been dispatched since
       // they were set? Use the real delegate-set timestamp from Linear
       // history, NOT ticket.updatedAt (which changes on any mutation).
@@ -762,6 +821,7 @@ export function registerDelegationReconciliationCron(opts: {
   sessionTracker?: SessionTracker;
   fetchFn?: typeof fetch;
   dispatchLeaseStore?: DispatchLeaseStore;
+  enrolledTicketsStore?: EnrolledTicketsStore;
 }): NodeJS.Timeout {
   const intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
   registerCron(
@@ -783,6 +843,7 @@ export function registerDelegationReconciliationCron(opts: {
       sessionTracker: opts.sessionTracker,
       fetchFn: opts.fetchFn,
       dispatchLeaseStore: opts.dispatchLeaseStore,
+      enrolledTicketsStore: opts.enrolledTicketsStore,
     }).catch((err) => {
       log.error(
         `delegation-reconciliation: unexpected sweep failure: ${err instanceof Error ? err.message : String(err)}`,

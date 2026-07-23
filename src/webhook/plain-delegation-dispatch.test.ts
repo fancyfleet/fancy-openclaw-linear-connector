@@ -19,6 +19,8 @@ type HookDelivery = {
   message: string;
 };
 
+let currentLinearDelegateId: string | null = null;
+
 function sign(body: string): string {
   return crypto.createHmac("sha256", SECRET).update(Buffer.from(body)).digest("hex");
 }
@@ -52,6 +54,8 @@ function createTestApp(onDispatched?: (agentId: string, ticketId: string) => voi
 }
 
 async function postWebhook(app: express.Express, payload: Record<string, unknown>): Promise<void> {
+  const data = payload.data as { delegate?: { id?: string } | null } | undefined;
+  currentLinearDelegateId = data?.delegate?.id ?? null;
   const body = JSON.stringify(payload);
   await request(app)
     .post("/")
@@ -92,11 +96,14 @@ describe("INF-334 plain delegation webhook dispatch", () => {
   let originalEnv: NodeJS.ProcessEnv;
   let originalFetch: typeof globalThis.fetch;
   let deliveries: HookDelivery[];
+  let labelUpdates: string[][];
 
   beforeEach(() => {
     originalEnv = process.env;
     originalFetch = globalThis.fetch;
     deliveries = [];
+    labelUpdates = [];
+    currentLinearDelegateId = null;
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-334-plain-dispatch-"));
     const agentsFile = path.join(dir, "agents.json");
     fs.writeFileSync(
@@ -125,12 +132,82 @@ describe("INF-334 plain delegation webhook dispatch", () => {
       ...originalEnv,
       AGENTS_FILE: agentsFile,
       LINEAR_WEBHOOK_SECRET: SECRET,
+      LINEAR_API_KEY: "linear-test-token",
       REQUIRE_GATEWAY_DELIVERY: "false",
     };
     reloadAgents();
     globalThis.fetch = async (url, init) => {
       if (String(url) !== HOOKS_URL) {
-        throw new Error(`unexpected fetch in plain-delegation webhook test: ${String(url)}`);
+        if (String(url) !== "https://api.linear.app/graphql") {
+          throw new Error(`unexpected fetch in plain-delegation webhook test: ${String(url)}`);
+        }
+        const body = init?.body ? JSON.parse(String(init.body)) as {
+          query?: string;
+          variables?: Record<string, unknown>;
+        } : {};
+        const query = body.query ?? "";
+
+        if (query.includes("IssueWithLabels")) {
+          return new Response(JSON.stringify({
+            data: {
+              issue: {
+                id: "issue-dsn-334",
+                identifier: "DSN-334",
+                team: { id: "team-dsn" },
+                labels: { nodes: [] },
+              },
+            },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (query.includes("TeamLabels")) {
+          return new Response(JSON.stringify({
+            data: {
+              team: {
+                labels: {
+                  nodes: [
+                    { id: "label-wf-task", name: "wf:task", team: { id: "team-dsn" } },
+                    { id: "label-state-doing", name: "state:doing", team: { id: "team-dsn" } },
+                  ],
+                },
+              },
+            },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (query.includes("issueUpdate")) {
+          labelUpdates.push((body.variables?.labelIds as string[] | undefined) ?? []);
+          return new Response(JSON.stringify({ data: { issueUpdate: { success: true } } }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (query.includes("IssueRouting")) {
+          const delegateName = currentLinearDelegateId === SAGE_LINEAR_ID ? "Sage" : "Igor";
+          return new Response(JSON.stringify({
+            data: {
+              issue: {
+                id: "issue-dsn-334",
+                identifier: "DSN-334",
+                delegate: currentLinearDelegateId
+                  ? { id: currentLinearDelegateId, name: delegateName, app: true }
+                  : null,
+                assignee: null,
+                state: { name: "To Do", type: "unstarted" },
+                trashed: false,
+                archivedAt: null,
+                relations: { nodes: [] },
+              },
+            },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (query.includes("IssueLabels")) {
+          return new Response(JSON.stringify({
+            data: { issue: { labels: { nodes: [] } } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        return new Response(JSON.stringify({ data: {} }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
       }
       const body = init?.body ? JSON.parse(String(init.body)) as Partial<HookDelivery> : {};
       if (body.message) {
@@ -166,6 +243,8 @@ describe("INF-334 plain delegation webhook dispatch", () => {
     expect(deliveries[0].message).not.toContain("This is a [");
     expect(deliveries[0].message).not.toContain("Your legal action(s)");
     expect(deliveries[0].message).not.toContain("state: **");
+    await waitFor(() => labelUpdates.length === 1);
+    expect(labelUpdates).toEqual([["label-wf-task", "label-state-doing"]]);
   });
 
   test("AC4: delegate clear is quiet, and re-delegation dispatches the new delegate", async () => {
