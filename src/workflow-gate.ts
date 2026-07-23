@@ -2785,13 +2785,15 @@ export async function checkWorkflowRules(
       "set-state",
       "complete",
       "cancel",
+      "close-adhoc",
     ];
     if (!safeOnUnarmed.includes(intent)) {
       log.warn(`workflow-gate: rejecting '${intent}' on unarmed ticket ${issueId} — no \`wf:*\` label`);
       return (
         `[Proxy] '${intent}' is only valid on workflow tickets ` +
         `(ticket ${issueId} has no \`wf:*\` label). ` +
-        `Use \`linear complete ${issueId}\` to close this ad-hoc ticket, ` +
+        `Use \`linear close-adhoc ${issueId}\` to close it (requires --comment for audit trail), ` +
+        `\`linear complete ${issueId}\` to close without audit comment, ` +
         `\`linear cancel ${issueId}\` to cancel it, ` +
         `or \`linear begin-work ${issueId}\` to enroll it in a workflow.`
       );
