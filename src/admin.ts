@@ -913,6 +913,7 @@ export function createAdminRouter(deps: AdminDeps): Router {
     // not just raw event summaries.
     const DISPATCH_STATUS: Record<string, string> = {
       delivered: "delivered",
+      "delivery-pending-ack": "pending-ack",
       "delivery-failed": "failed",
       "delivery-unconfirmed": "retrying",
       "dispatch-undeliverable": "undeliverable",
