@@ -40,6 +40,9 @@ import { notify } from "../alerts/alert-bus.js";
 import { loadKnownHumans } from "../known-humans.js";
 import { emitStreamTopic } from "../admin-stream.js";
 import { DelegatePingPongDetector } from "../delegate-ping-pong-detector.js";
+import { resolveBodiesForRole } from "../escalation-gate.js";
+import { getImplementer } from "../implementer-store.js";
+import { maybeDispatchMergeGateOutcome, type MergeGateWakeTarget } from "../merge-gate-dispatch.js";
 import type { DispatchRecordStore } from "../liveness-channel/dispatch-record-store.js";
 import type { GatewayDispatchAck } from "../liveness-channel/gateway-ack-types.js";
 
@@ -625,6 +628,104 @@ export function createWebhookRouter(
       }
 
       await enrichCommentEventForRouting(event);
+
+      // ── INF-400: Merge-gate outcome dispatch ────────────────────────────
+      // Hanzo's merge gate posts an outcome COMMENT ("Merge gate held/passed/
+      // failed") on a PR-stage ticket. A comment never changes state/delegate,
+      // and only a state/delegate change drives next-role dispatch — so the
+      // standard path routes this back to the delegate (Hanzo, the author) where
+      // comment-fed suppression eats it, stranding the ticket until a manual
+      // stall sweep (INF-358/INF-342 each sat ~7h). Parse the outcome and wake
+      // the correct next role directly, ahead of the normal router.
+      if (event.type === "Comment") {
+        try {
+          const cData = event.data as Record<string, unknown> | undefined;
+          const issueUuid = (cData?.issueId as string) ?? "";
+          const issueIdentifier =
+            (cData?.issueIdentifier as string) ??
+            (issueIdentifierFromEvent(event) ?? issueUuid);
+          // After enrichment, data.delegate carries the ticket's current
+          // delegate — the merge/deploy owner who must take the forward step.
+          const delId = (cData?.delegate as { id?: string } | undefined)?.id;
+          const currentDelegateAgent = delId ? buildAgentMap()[delId] ?? null : null;
+          const wakeSessionKey = normalizeSessionKey(issueIdentifier);
+
+          const gateResult = await maybeDispatchMergeGateOutcome(
+            event,
+            { issueUuid, issueIdentifier, currentDelegateAgent },
+            {
+              resolveBodiesForRole,
+              getImplementer,
+              isMergeGateAuthor: async (actorId) => {
+                if (!actorId) return false;
+                const name = buildAgentMap()[actorId];
+                if (!name) return false;
+                const deployment = await resolveBodiesForRole("deployment");
+                return deployment.includes(name);
+              },
+              deliverWake: async (target: MergeGateWakeTarget) => {
+                const wakeRoute: RouteResult = {
+                  agentId: target.agentId,
+                  sessionKey: wakeSessionKey,
+                  priority: 0,
+                  routingReason: "merge-gate",
+                  event,
+                };
+                const agentCfg = getAgent(target.agentId);
+                const wakeDeliveryConfig: DeliveryConfig = {
+                  nodeBin: process.execPath,
+                  hooksUrl: agentCfg?.hooksUrl ?? process.env.OPENCLAW_HOOKS_URL,
+                  hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
+                  hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
+                  hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+                  gatewayUrl: agentCfg?.gatewayUrl,
+                  gatewayToken: agentCfg?.gatewayToken,
+                };
+                if (throttle) {
+                  await throttle.wait(wakeRoute.agentId);
+                  throttle.record(wakeRoute.agentId);
+                }
+                const wakeResult = await deliverWithSlot(wakeRoute, wakeDeliveryConfig, throttle, dispatchLeaseStore);
+                if (onDispatched) onDispatched(target.agentId, wakeSessionKey);
+                return { delivered: true };
+              },
+            },
+          );
+
+          if (gateResult) {
+            appendOperationalEvent(operationalEventStore, {
+              outcome: (gateResult.delivered ? "merge-gate-dispatched" : "merge-gate-unresolved") as never,
+              type: event.type,
+              agent: gateResult.targetAgent ?? undefined,
+              key: wakeSessionKey,
+              sessionKey: wakeSessionKey,
+              deliveryMode: "merge-gate",
+              plane: "connector",
+              detail: {
+                outcome: gateResult.outcome,
+                role: gateResult.targetRole,
+                prNumber: gateResult.prNumber,
+                reason: gateResult.reason,
+              },
+            });
+            if (!gateResult.delivered && !gateResult.targetAgent) {
+              notify({
+                severity: "warning",
+                source: "dispatch",
+                title: `Merge-gate '${gateResult.outcome}' on ${issueIdentifier} — no ${gateResult.targetRole} body resolved`,
+                detail: `Gate outcome recognized but no target agent could be resolved; ticket may stall.`,
+                ticket: issueIdentifier,
+              });
+            }
+            // Handled — do not also run the normal router (which would route the
+            // comment back to the author and get comment-fed-suppressed).
+            return;
+          }
+        } catch (err) {
+          log.warn(`merge-gate dispatch hook failed (fail-open): ${errorSummary(err)}`);
+        }
+      }
+
       const routes = routeEventAll(event);
       if (routes.length === 0) {
         log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);
