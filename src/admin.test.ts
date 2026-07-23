@@ -5,6 +5,7 @@ import path from "node:path";
 import http from "node:http";
 import { createApp } from "./index.js";
 import { reloadAgents } from "./agents.js";
+import { processWatchdogOutput, _resetConfigSanityAlertForTests, type WatchdogFinding } from "./config-sanity-alert.js";
 
 function tempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "admin-test-"));
@@ -175,6 +176,27 @@ describe("admin console", () => {
     const res = await adminGet(appState.app, "/admin/api/alerts?limit=5");
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body.alerts)).toBe(true);
+  });
+
+  test("config-sanity endpoint returns the full finding list, not just a count (INF-458 item 1)", async () => {
+    _resetConfigSanityAlertForTests();
+    const findings: WatchdogFinding[] = [
+      { check: "config-json", severity: "critical", message: "Host openclaw.json won't parse" },
+      // A category-A finding that never hits AlertBus — should still be visible here.
+      { check: "gen-token", severity: "info", message: "permission denied reading /proc/123/environ" },
+    ];
+    processWatchdogOutput({ ok: false, findings });
+
+    const res = await adminGet(appState.app, "/admin/api/config-sanity");
+    expect(res.status).toBe(200);
+    expect(res.body.liveness.lastFindingCount).toBe(2);
+    expect(Array.isArray(res.body.findings)).toBe(true);
+    expect(res.body.findings).toHaveLength(2);
+    expect(res.body.findings.map((f: WatchdogFinding) => f.check)).toEqual(
+      expect.arrayContaining(["config-json", "gen-token"])
+    );
+
+    _resetConfigSanityAlertForTests();
   });
 
   test("workflows endpoint returns full definitions", async () => {

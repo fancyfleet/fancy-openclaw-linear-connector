@@ -10,18 +10,33 @@
  *    `git-remote-liveness:critical:AI-2189` — the root-cause ticket, not the
  *    per-repo finding set — so an unchanged root cause does not page repeatedly.
  *  - All other findings use `{check}:{severity}` as their dedup key.
+ *  - INF-458 item 4: a finding whose content hash is unchanged from the
+ *    previous cycle for the same dedup key always folds into the existing
+ *    burst, so the 30-min cron cadence outrunning the 15-min critical
+ *    suppression window no longer spawns a fresh alert row every cycle. A
+ *    genuine content change still starts a fresh, visible burst.
+ *
+ * Category A suppression (INF-458 item 2, from INF-454 triage): checks that
+ * are benign noise or check-authoring bugs rather than real signal —
+ * `retrieval-canary` info findings and `gen-token` never reach the alert
+ * bus; `heartbeat-model-override` is downgraded to info; `stale-sessions`
+ * uses a weekly-digest suppression window instead of the 30-min cadence.
  *
  * Liveness: exported `getConfigSanityAlertLiveness()` returns the last-read
- * timestamp and finding count, surfaced at /health.configSanityAlert.
+ * timestamp, finding count, and a top-10 findings summary, surfaced at
+ * /health.configSanityAlert. `getConfigSanityFindings()` returns the full
+ * current finding list (including category-A-suppressed ones) for the
+ * `/admin/api/config-sanity` findings-detail route (INF-458 item 1).
  *
  * Design: docs/alert-bus.md, lifecycle-os/infra/config-sanity-watchdog.md
  * (Alert routing §).
  */
 
 import { componentLogger, createLogger } from "./logger.js";
-import { notify } from "./alerts/alert-bus.js";
+import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "config-sanity-alert");
 
@@ -42,8 +57,33 @@ export const WATCHDOG_JSON_PATH = process.env.CONFIG_SANITY_WATCHDOG_PATH ?? DEF
 /** Dedup key for `git-remote-liveness` critical findings (all PUSH-DEAD → AI-2189). */
 const GIT_REMOTE_LIVENESS_DEDUP_KEY = "git-remote-liveness:critical:AI-2189";
 
+/**
+ * AI-2335: secrets in history are persistent and tracked.
+ * Deduping them together prevents noise when the blob list shifts.
+ */
+const PUSHED_HISTORY_SECRET_DEDUP_KEY = "pushed-history-secret:critical:AI-2335";
+
+/** Dedup key for transcript secrets. */
+const AGENT_TRANSCRIPT_SECRET_DEDUP_KEY = "agent-transcript-secret:critical";
+
 /** Default sweep cadence: 30 minutes (matches the watchdog's own cadence). */
 const DEFAULT_INTERVAL_MS = 30 * 60_000;
+
+/**
+ * INF-458 item 4: the severity-based suppression window (15m critical / 1h
+ * warning / 6h info) is narrower than the 30-min cron cadence, so an
+ * unchanged finding used to escape the window and spawn a fresh alert row
+ * every cycle. When a finding's content hash is identical to the previous
+ * cycle's for the same dedup key, we pass this effectively-unbounded window
+ * so the occurrence always folds into the existing burst. A content change
+ * resets the effective window to the normal severity default (or a
+ * check-specific override below), so a genuinely new finding still starts
+ * a fresh, visible burst.
+ */
+const CONTENT_UNCHANGED_SUPPRESS_WINDOW_MS = Number.MAX_SAFE_INTEGER;
+
+/** INF-458 item 2: stale-sessions housekeeping moves to a weekly digest cadence. */
+const STALE_SESSIONS_SUPPRESS_WINDOW_MS = 7 * 24 * 60 * 60_000;
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -84,6 +124,8 @@ export interface ConfigSanityAlertLiveness {
   lastFindingCount: number | null;
   /** ISO timestamp of the last alert fired, or null. */
   lastAlertAt: string | null;
+  /** Top findings for visibility (limit 10). */
+  topFindings?: { check: string; severity: string; message: string }[];
 }
 
 // ── Singleton state ─────────────────────────────────────────────────────
@@ -92,6 +134,10 @@ let scheduled = false;
 let lastReadAt: string | null = null;
 let lastFindingCount: number | null = null;
 let lastAlertAt: string | null = null;
+let lastFindings: WatchdogFinding[] = [];
+
+/** INF-458 item 4: previous cycle's content hash per dedup key. */
+let lastContentHashByDedupKey = new Map<string, string>();
 
 // ── Dedup key computation ───────────────────────────────────────────────
 
@@ -109,7 +155,34 @@ export function dedupKeyForFinding(finding: WatchdogFinding): string {
   if (finding.check === "git-remote-liveness" && finding.severity === "critical") {
     return GIT_REMOTE_LIVENESS_DEDUP_KEY;
   }
+  if (finding.check === "pushed-history-secret") {
+    return PUSHED_HISTORY_SECRET_DEDUP_KEY;
+  }
+  if (finding.check === "agent-transcript-secret") {
+    return AGENT_TRANSCRIPT_SECRET_DEDUP_KEY;
+  }
+
+  // AI-2617: git-remote-https-host alerts are actionable per-repo.
+  if (finding.check === "git-remote-https-host" && finding.detail?.repo) {
+    return `git-remote-https-host:${finding.severity}:${finding.detail.repo}`;
+  }
+
   return `${finding.check}:${finding.severity}`;
+}
+
+/**
+ * INF-458 item 4: stable content hash for a finding, used to detect whether
+ * a dedup key's occurrence is a genuine repeat (same content) or a change
+ * (different message/detail) across cron cycles.
+ */
+export function contentHashForFinding(finding: WatchdogFinding): string {
+  const stable = JSON.stringify({
+    check: finding.check,
+    severity: finding.severity,
+    message: finding.message,
+    detail: finding.detail ?? null,
+  });
+  return createHash("sha256").update(stable).digest("hex");
 }
 
 // ── JSON reader ─────────────────────────────────────────────────────────
@@ -157,12 +230,57 @@ export function processWatchdogOutput(output: WatchdogOutput, now = new Date()):
   const nowIso = now.toISOString();
   lastReadAt = nowIso;
   lastFindingCount = findings.length;
+  lastFindings = findings;
 
   for (const finding of findings) {
     const dedupKey = dedupKeyForFinding(finding);
-    const severity = finding.severity === "critical" || finding.severity === "warning"
+    let severity: AlertSeverity = finding.severity === "critical" || finding.severity === "warning"
       ? finding.severity
       : "info";
+
+    // INF-458 item 2 / category A — benign, check-authoring-bug, or noisy
+    // findings that shouldn't page at all or shouldn't page at full severity.
+    // AI-2189/2335/2617-style dedup keys above are for findings that ARE
+    // real and just need folding; these are suppressed/downgraded instead.
+
+    // retrieval-canary's own sample title says "not a miss" — a
+    // check-authoring bug, not a benign finding worth suppressing after
+    // the fact. Don't call notify() at all.
+    if (finding.check === "retrieval-canary" && severity === "info") {
+      continue;
+    }
+    // gen-token: cross-container ptrace restriction artifact, not a signal.
+    // Log-only, never hits the alert bus.
+    if (finding.check === "gen-token") {
+      log.info(`config-sanity: gen-token finding suppressed (log-only, expected ptrace restriction): ${finding.message}`);
+      continue;
+    }
+    // heartbeat-model-override: agents intentionally on non-default
+    // heartbeat models is expected, not a misconfig. Downgrade to info.
+    if (finding.check === "heartbeat-model-override") {
+      severity = "info";
+    }
+
+    // INF-458 item 4 — content-hash dedup. Compute this cycle's content hash
+    // and compare against the previous cycle's hash for the same dedup key.
+    // Unchanged content always folds into the existing burst (regardless of
+    // how much cron-cadence time has elapsed); changed content falls back to
+    // the normal severity-based window and can start a fresh, visible burst.
+    const contentHash = contentHashForFinding(finding);
+    const contentUnchanged = lastContentHashByDedupKey.get(dedupKey) === contentHash;
+    lastContentHashByDedupKey.set(dedupKey, contentHash);
+
+    let suppressWindowMs: number | undefined;
+    if (finding.check === "git-remote-liveness" && severity === "critical") {
+      // git-remote-liveness critical uses a 6h suppression window (AI-2620)
+      // so the 30-min cron cadence doesn't create fresh pushes every cycle.
+      suppressWindowMs = 6 * 60 * 60_000;
+    } else if (finding.check === "stale-sessions") {
+      // Routine housekeeping — weekly digest instead of a 30-min alert.
+      suppressWindowMs = STALE_SESSIONS_SUPPRESS_WINDOW_MS;
+    } else if (contentUnchanged) {
+      suppressWindowMs = CONTENT_UNCHANGED_SUPPRESS_WINDOW_MS;
+    }
 
     notify({
       severity,
@@ -171,17 +289,21 @@ export function processWatchdogOutput(output: WatchdogOutput, now = new Date()):
       detail: finding.detail ?? undefined,
       ticket: finding.ticket ?? undefined,
       dedupKey,
-      // git-remote-liveness critical uses a 6h suppression window (AI-2620)
-      // so the 30-min cron cadence doesn't create fresh pushes every cycle.
-      suppressWindowMs: finding.check === "git-remote-liveness" && severity === "critical"
-        ? 6 * 60 * 60_000
-        : undefined,
+      suppressWindowMs,
     });
 
     if (severity === "critical" || severity === "warning") {
       lastAlertAt = nowIso;
     }
   }
+}
+
+/**
+ * Full current finding list (not just the top-10 liveness summary),
+ * for the /admin/api/config-sanity findings-detail route (INF-458 item 1).
+ */
+export function getConfigSanityFindings(): WatchdogFinding[] {
+  return lastFindings;
 }
 
 /**
@@ -205,6 +327,11 @@ export function getConfigSanityAlertLiveness(): ConfigSanityAlertLiveness {
     lastReadAt,
     lastFindingCount,
     lastAlertAt,
+    topFindings: lastFindings.slice(0, 10).map(f => ({
+      check: f.check,
+      severity: f.severity,
+      message: f.message,
+    })),
   };
 }
 
@@ -215,6 +342,8 @@ export function _resetConfigSanityAlertForTests(): void {
   lastReadAt = null;
   lastFindingCount = null;
   lastAlertAt = null;
+  lastFindings = [];
+  lastContentHashByDedupKey = new Map();
 }
 
 // ── Cron registration ───────────────────────────────────────────────────

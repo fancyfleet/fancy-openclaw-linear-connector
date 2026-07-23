@@ -33,6 +33,7 @@ import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 import { runDelegationReconciliationSweep } from "./delegation-reconciliation-sweep.js";
 import { getAlertBus } from "./alerts/alert-bus.js";
 import type { AlertSeverity } from "./alerts/alert-store.js";
+import { getConfigSanityFindings, getConfigSanityAlertLiveness } from "./config-sanity-alert.js";
 import {
   mintSessionToken,
   verifySessionToken,
@@ -601,6 +602,16 @@ export function createAdminRouter(deps: AdminDeps): Router {
         since: typeof req.query.since === "string" ? req.query.since : undefined,
         limit: Number.isFinite(limitRaw ?? NaN) ? limitRaw : undefined,
       }),
+    });
+  });
+  // INF-458 item 1: dedicated findings-detail route so /health.configSanityAlert
+  // stops being count-only. Returns the full current finding list (including
+  // findings that were suppressed from AlertBus, e.g. category-A noise) —
+  // not just the top-10 summary or what happened to fire an alert row.
+  router.get("/api/config-sanity", (req: Request, res: Response) => {
+    res.json({
+      liveness: getConfigSanityAlertLiveness(),
+      findings: getConfigSanityFindings(),
     });
   });
   // Dead-letter view: dispatch/routing failures from alerts.db (AI-1772).
