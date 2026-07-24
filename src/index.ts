@@ -68,6 +68,7 @@ import { evaluateCronStartupReadiness, parseCronStartupGraceMs } from "./cron/st
 import { getRescueSweepState } from "./rescue-sweep-state.js";
 import { getDetectorState } from "./done-ticket-detector-state.js";
 import { registerFirstActionWatchdogCron } from "./first-action-watchdog.js";
+import { readLastDeliveryDiagnostic } from "./delivery/read-delivery-diagnostic.js";
 import { getFirstActionWatchdogState } from "./first-action-watchdog-state.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
 import { getCapabilityPolicy } from "./escalation-gate.js";
@@ -1911,6 +1912,7 @@ if (isEntryPoint) {
       }
       return "live";
     },
+    getDeliveryDiagnostic: async (ticket) => readLastDeliveryDiagnostic(operationalEventStore, ticket),
     // Rung 2: alert the ops channel with ticket/state/delegate for the on-call.
     notify: (alert) =>
       notify({

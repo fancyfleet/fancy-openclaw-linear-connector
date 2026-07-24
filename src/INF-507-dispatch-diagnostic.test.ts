@@ -27,6 +27,7 @@ import {
 } from "./delivery/delivery-diagnostic.js";
 import { deliverWithAck } from "./delivery/deliver-with-ack.js";
 import type { DeliveryResult } from "./delivery/deliver.js";
+import { readLastDeliveryDiagnostic } from "./delivery/read-delivery-diagnostic.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
 import { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
 
@@ -176,6 +177,31 @@ describe("INF-507 persistence: diagnostic lands on the operational event (AC2)",
     expect(terminal!.errorSummary).toContain("context-overflow");
     const tdetail = terminal!.detail as { diagnostic?: DeliveryDiagnostic };
     expect(tdetail.diagnostic?.resolvedModel).toBe("ollama/gemma4:31b");
+  });
+
+  it("reads the newest persisted diagnostic by ticket id for the production watchdog wire-up", () => {
+    const older = classifyDeliveryFailure({
+      hookError: true,
+      hookErrorSummary: "gateway API responded with 503: upstream provider unavailable",
+    });
+    const newest = classifyDeliveryFailure({ hookError: true, hookErrorSummary: INF506_OVERFLOW });
+
+    store.append({
+      outcome: "delivery-failed",
+      key: "linear-INF-504",
+      detail: { diagnostic: older },
+      occurredAt: new Date(T0).toISOString(),
+    });
+    store.append({
+      outcome: "dispatch-undeliverable",
+      key: "linear-INF-504",
+      detail: { diagnostic: newest },
+      occurredAt: new Date(T0 + 1).toISOString(),
+    });
+
+    const diagnostic = readLastDeliveryDiagnostic(store, "INF-504");
+    expect(diagnostic?.errorClass).toBe("context-overflow");
+    expect(diagnostic?.resolvedModel).toBe("ollama/gemma4:31b");
   });
 });
 
