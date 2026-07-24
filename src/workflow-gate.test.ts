@@ -1211,6 +1211,41 @@ describe("applyStateTransition — normal state advance", () => {
     expect(vars.labelIds).not.toContain("state-lbl");
   });
 
+  it("INF-522: 'force-deploy' advances state:merge → state:deploy (B2 alias mirrors B1)", async () => {
+    // Regression guard: B1 (checkWorkflowRules) aliases force-deploy → continue and
+    // skips the evidence gate, but B2 previously matched on the raw intent and hit
+    // the no-transition fail-open, so the native state write was skipped and the
+    // ticket never advanced. force-deploy must apply the same merge → deploy edge
+    // that `continue` does. Load the canonical dev-impl def so the merge state
+    // carries its real continue→deploy transition.
+    process.env.WORKFLOW_DEFS_DIR = path.resolve(process.cwd(), "src/__fixtures__");
+    resetWorkflowCache();
+    try {
+      const { fetch: mock, calls } = makeTransitionFetch({
+        issueLabels: [
+          { id: "wf-lbl", name: "wf:dev-impl" },
+          { id: "state-lbl", name: "state:merge" },
+          { id: "other-lbl", name: "priority:high" },
+        ],
+        teamLabels: [
+          { id: "deploy-lbl", name: "state:deploy" },
+        ],
+      });
+      globalThis.fetch = mock;
+      const result = await applyStateTransition("force-deploy", "issue-uuid", "Bearer tok");
+
+      const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+      expect(updateCall).toBeDefined();
+      const vars = updateCall!.body.variables as { labelIds: string[] };
+      expect(vars.labelIds).toContain("deploy-lbl");
+      expect(vars.labelIds).not.toContain("state-lbl");
+      expect(result.to).toBe("deploy");
+    } finally {
+      delete process.env.WORKFLOW_DEFS_DIR;
+      resetWorkflowCache();
+    }
+  });
+
   it("creates the target state label when it does not exist in the team", async () => {
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
@@ -2278,6 +2313,18 @@ describe("checkWorkflowRules — INF-112: non-Linear-generated branch (metadata-
     globalThis.fetch = makeInf112Mock(false, "deploy");
     const result = await checkWorkflowRules("force-deploy", "issue-uuid", "Bearer tok", "hanzo");
     expect(result).toBeNull();
+  });
+
+  it("force-deploy from merge state still requires the resolved deploy capability", async () => {
+    globalThis.fetch = makeInf112Mock(false, "merge");
+    const result = await checkWorkflowRules("force-deploy", "issue-uuid", "Bearer tok", "charles");
+    expect(result).toContain("requires the 'deploy:execute' capability");
+  });
+
+  it("force-deploy from deploy state still requires the resolved infra capability", async () => {
+    globalThis.fetch = makeInf112Mock(false, "deploy");
+    const result = await checkWorkflowRules("force-deploy", "issue-uuid", "Bearer tok", "charles");
+    expect(result).toContain("requires the 'infra:ssh' capability");
   });
 
   // ── Path 4: GH_TOKEN set but GitHub confirms NOT merged → blocked ──
