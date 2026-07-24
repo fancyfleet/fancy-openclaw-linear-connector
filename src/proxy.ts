@@ -1485,7 +1485,6 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           transitionResult.code !== "ad-hoc" &&
           transitionResult.code !== "no-issue-id";
 
-        // INF-489 EXPERIMENT (not for merge as-is — see investigation notes):
         // codes that represent a definitive, config/policy-level rejection decided
         // on the FIRST mutation of a command, as opposed to write-verification
         // uncertainty (context-fetch-failed, atomic-mutation-failed,
