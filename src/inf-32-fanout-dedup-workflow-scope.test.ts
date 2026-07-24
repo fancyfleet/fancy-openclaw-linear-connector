@@ -554,11 +554,11 @@ describe("INF-32 AC4 — regression: second fanout on one parent mints its child
     // INF-27 AC2 mint guard: wf:* labels are pre-resolved via TeamLabels lookup
     // and cached. issueLabelCreate is NOT called for them — the cached label ID
     // is passed directly in issueCreate's labelIds. Only non-wf labels like
-    // state:intake are still created via issueLabelCreate.
+    // state:todo are still created via issueLabelCreate.
     const labelCalls = fetchCalls.filter((c) => String(c.body.query ?? "").includes("issueLabelCreate"));
     const labelNames = labelCalls.map((c) => (c.body.variables as Record<string, unknown>).name);
-    // state:intake is still created via findOrCreateLabel (not a wf:* label).
-    expect(labelNames).toContain("state:intake");
+    // INF-441: children mint to To Do — state:todo is created via findOrCreateLabel (not a wf:* label).
+    expect(labelNames).toContain("state:todo");
     // wf:* labels are NOT created inline — they're pre-resolved by the mint guard.
     expect(labelNames).not.toContain(WF_B);
     expect(labelNames).not.toContain(WF_A);

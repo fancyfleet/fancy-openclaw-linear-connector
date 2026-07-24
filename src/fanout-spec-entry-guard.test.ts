@@ -336,7 +336,8 @@ describe("AC1: Spawner guard against spec-hash titles", () => {
         return new Response(
           JSON.stringify({ data: { team: { labels: { nodes: [
             { id: "lbl-wf-dev-impl", name: "wf:dev-impl" },
-            { id: "lbl-state-intake", name: "state:intake" },
+            // INF-441: children mint to To Do, so executeFanout resolves state:todo.
+            { id: "lbl-state-todo", name: "state:todo" },
           ] } } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
