@@ -1,4 +1,4 @@
-# dev-sprint — Sprint Execution Workflow (v9)
+# dev-sprint — Sprint Execution Workflow (v11)
 # owner: steward (Astrid), engine (spawn-arms, spawn-impl)
 # last-updated: 2026-07-22
 # status: v8 deployed to production (INF-359 sprint coherence)
@@ -27,6 +27,14 @@
 #   `requires_children_terminal`) plus a steward attestation comment. It reaches
 #   `done` (satisfies_parent_barrier), unlike cancel/abandon. Reachable via
 #   `linear transition <id> converge` — no dedicated CLI verb needed (INF-204).
+# v11 (2026-07-24): extended the INF-504 `converge` → done edge to also originate
+#   from `spawn-impl` (INF-528). INF-504 covered ac-definition + managing-impl but
+#   left a residual hole: a sprint wedged at `spawn-impl` with children already
+#   spawned + terminal had no path to `converge`. From `spawn-impl` the only moves
+#   were `spawn` (dedups to a no-op once children exist, v7 — never advances) and
+#   break-glass `escape` (loops to intake, re-spawning arms), so `converge → done`
+#   was never reachable. Same children-terminal + attestation gate. Live victim:
+#   LSO-1 (impl children LSO-5/6/7 all Done, wedged at spawn-impl for 2 days).
 #
 # Registered-def copy for CI conformance validation (INF-42). The canonical
 # source is the vault markdown spec at:
@@ -42,7 +50,7 @@
 #   → 5. ac-definition → 6. spawn-impl → 7. managing-impl → 8. validation → done
 
 id: dev-sprint
-version: 10
+version: 11
 archetype: orchestrator
 entry_state: intake
 
@@ -176,6 +184,19 @@ states:
       - command: spawn
         to: managing-impl
         generic: continue
+      # INF-528: governed completion when the impl children were already spawned
+      # and shipped out-of-band, leaving the sprint wedged here. From spawn-impl
+      # the only other move is `spawn` — which dedups to a no-op once children
+      # exist (v7) and never advances — so `converge → done` was unreachable
+      # (INF-504 covered ac-definition + managing-impl but not spawn-impl). Same
+      # gate as the other converge edges: all children terminal (acceptance walk
+      # satisfied) + a steward attestation comment. Fire with
+      # `linear transition <id> converge`. Live victim: LSO-1 (children LSO-5/6/7
+      # all Done, wedged at spawn-impl for 2 days).
+      - command: converge
+        to: done
+        requires_children_terminal: true
+        requires_comment: true
 
   - id: managing-impl
     owner_role: steward
