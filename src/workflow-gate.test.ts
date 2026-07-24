@@ -2209,6 +2209,107 @@ describe("checkWorkflowRules — INF-112: non-Linear-generated branch (metadata-
     expect(result).toBeNull();
   });
 
+  it("allows 'continue' from deploy state when only a recent Linear comment names the LifeOS PR (INF-522)", async () => {
+    globalThis.fetch = async (url: URL | string, init?: RequestInit) => {
+      const urlStr = typeof url === "string" ? url : url.href;
+      const bodyText = typeof init?.body === "string" ? init.body : "";
+
+      if (urlStr.includes("api.github.com/repos/fancyfleet/life-os/pulls?")) {
+        return new Response(
+          JSON.stringify([
+            {
+              html_url: "https://github.com/fancyfleet/life-os/pull/70",
+              title: "Resident Status",
+              head: { ref: "feature/LIF-207-resident-status" },
+              merged_at: "2026-07-24T19:05:53Z",
+              state: "closed",
+            },
+          ]),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (urlStr.includes("api.github.com/repos/") && urlStr.includes("/pulls?")) {
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      if (urlStr.includes("api.github.com/repos/fancyfleet/life-os/pulls/70")) {
+        return new Response(
+          JSON.stringify({ merged: true, merged_at: "2026-07-24T19:05:53Z", merge_commit_sha: "cf3d94aa051e29bcd13d9e50fc5b8e3cc59d8f1b" }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (bodyText.includes("TeamStates")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              team: {
+                states: {
+                  nodes: [
+                    { id: "state-todo-uuid", name: "Todo", type: "unstarted" },
+                    { id: "state-thinking-uuid", name: "Thinking", type: "started" },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (bodyText.includes("IssueBranchAndPR")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                description: null,
+                comments: {
+                  nodes: [
+                    {
+                      body: "Merged fancyfleet/life-os PR #70: https://github.com/fancyfleet/life-os/pull/70",
+                    },
+                  ],
+                },
+                attachments: { nodes: [] },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (bodyText.includes("IssueContext") || bodyText.includes("delegate")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                id: "internal-uuid",
+                identifier: "LIF-207",
+                labels: {
+                  nodes: [
+                    { name: "wf:dev-impl" },
+                    { name: "state:deploy" },
+                  ],
+                },
+                delegate: null,
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      throw new Error(`unexpected fetch call: ${urlStr} ${bodyText.slice(0, 80)}`);
+    };
+
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).toBeNull();
+  });
+
   // ── Path 3: Force-deploy bypasses evidence gate entirely ──
 
   it("force-deploy from merge state bypasses evidence gate entirely (INF-112 force-deploy)", async () => {
@@ -8758,4 +8859,3 @@ describe("checkWorkflowRules — sprint-spawner cycle-roll guard (INF-148)", () 
     }
   });
 });
-
