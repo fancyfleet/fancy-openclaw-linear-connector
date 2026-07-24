@@ -22,6 +22,7 @@ import {
   DelegateChainTracker,
   DelegatePingPongDetector,
   fireEscalation,
+  shouldCheckDelegatePingPong,
   type DelegatePingPongConfig,
   type DelegateAssignment,
   type CycleDetectionResult,
@@ -50,6 +51,31 @@ function makeAssignment(
     timestampMs,
   };
 }
+
+describe("shouldCheckDelegatePingPong", () => {
+  test("checks delegate-only updates", () => {
+    expect(shouldCheckDelegatePingPong({ delegateId: "old-user" })).toBe(true);
+    expect(shouldCheckDelegatePingPong({ delegate: { id: "old-user" } })).toBe(true);
+  });
+
+  test("skips workflow transitions that change delegate and state together", () => {
+    expect(shouldCheckDelegatePingPong({ delegateId: "old-user", stateId: "old-state" })).toBe(false);
+    expect(shouldCheckDelegatePingPong({ delegate: { id: "old-user" }, state: { name: "Review" } })).toBe(false);
+  });
+
+  test("ignores updates without delegate changes", () => {
+    expect(shouldCheckDelegatePingPong({ stateId: "old-state" })).toBe(false);
+    expect(shouldCheckDelegatePingPong(undefined)).toBe(false);
+  });
+});
+
+describe("Linear escalation mutation", () => {
+  test("uses Linear's String issueId type for commentCreate", () => {
+    const source = fs.readFileSync(path.join(process.cwd(), "src/delegate-ping-pong-detector.ts"), "utf8");
+    expect(source).toContain("mutation($issueId: String!, $body: String!)");
+    expect(source).not.toContain("mutation($issueId: ID!, $body: String!)");
+  });
+});
 
 // ── Tests: DelegateChainTracker ──────────────────────────────────────────────
 
