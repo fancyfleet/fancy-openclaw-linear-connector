@@ -221,11 +221,15 @@ describe("INF-35 AC1: checkWorkflowRules rejects transition verbs on unarmed tic
     expect(result).toContain("no `wf:*` label");
   });
 
-  it("rejects 'refuse-work' on a ticket with no wf:* label (AC1)", async () => {
+  // INF-226: refuse-work is a delegate-routing verb that must work on unarmed
+  // tickets — a delegate handed an ad-hoc ticket needs to be able to refuse it
+  // back. It was added to `safeOnUnarmed` (workflow-gate.ts) and is therefore
+  // pass-through here, not a gated def transition. (Was previously asserted as
+  // rejected; that assertion went stale when INF-226 (#403) landed.)
+  it("allows 'refuse-work' on a ticket with no wf:* label (delegate-routing verb — AC3)", async () => {
     globalThis.fetch = makeNoWfLabelsFetch();
     const result = await checkWorkflowRules("refuse-work", "INF-35", "Bearer tok", "igor");
-    expect(result).not.toBeNull();
-    expect(result).toContain("no `wf:*` label");
+    expect(result).toBeNull();
   });
 
   it("allows 'handoff-work' on a ticket with no wf:* label (delegate-routing verb — AC3)", async () => {
