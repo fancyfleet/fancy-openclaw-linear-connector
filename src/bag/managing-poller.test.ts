@@ -8,6 +8,7 @@ import { OperationalEventStore } from "../store/operational-event-store.js";
 import { ManagingPoller, isDue, parseManagingInterval, type LinearManagingIssue } from "./managing-poller.js";
 import type { ManagingWakeTicket } from "./managing-wake.js";
 import { surfaceStalledChildren } from "../barrier.js";
+import { DispatchAckTracker } from "./dispatch-ack-tracker.js";
 
 interface AgentLike {
   name: string;
@@ -19,17 +20,21 @@ interface AgentLike {
 function makeStores(): {
   store: ManagingStateStore;
   ops: OperationalEventStore;
+  ackTracker: DispatchAckTracker;
   cleanup: () => void;
 } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "managing-poller-"));
   const store = new ManagingStateStore(path.join(dir, "managing.db"));
   const ops = new OperationalEventStore(path.join(dir, "ops.db"));
+  const ackTracker = new DispatchAckTracker(path.join(dir, "acks.db"));
   return {
     store,
     ops,
+    ackTracker,
     cleanup: () => {
       store.close();
       ops.close();
+      ackTracker.close();
       fs.rmSync(dir, { recursive: true, force: true });
     },
   };
@@ -113,6 +118,7 @@ describe("ManagingPoller.runCycle", () => {
       {
         store: stores.store,
         operationalEventStore: stores.ops,
+        ackTracker: stores.ackTracker,
         resolveDeliveryConfig: () => ({ nodeBin: "node" }),
         listAgents: () => agents as never,
         fetchManagingTickets: async () => issues,
@@ -135,6 +141,9 @@ describe("ManagingPoller.runCycle", () => {
     expect((sendWake as jest.Mock).mock.calls[0][1]).toHaveLength(2);
     expect(stores.store.getLastDispatched("charles", "AI-1")).toBe(100_000);
     expect(stores.store.getLastDispatched("charles", "AI-2")).toBe(100_000);
+
+    // INF-519: each dispatched ticket has a pending ack record
+    expect(stores.ackTracker.getPendingTimedOut(0)).toHaveLength(2);
   });
 
   it("does not wake when interval has not elapsed", async () => {
@@ -153,6 +162,7 @@ describe("ManagingPoller.runCycle", () => {
       {
         store: stores.store,
         operationalEventStore: stores.ops,
+        ackTracker: stores.ackTracker,
         resolveDeliveryConfig: () => ({ nodeBin: "node" }),
         listAgents: () => agents as never,
         fetchManagingTickets: async () => issues,
@@ -185,6 +195,7 @@ describe("ManagingPoller.runCycle", () => {
       {
         store: stores.store,
         operationalEventStore: stores.ops,
+        ackTracker: stores.ackTracker,
         resolveDeliveryConfig: () => ({ nodeBin: "node" }),
         listAgents: () => agents as never,
         fetchManagingTickets: async () => issues,
@@ -219,6 +230,7 @@ describe("ManagingPoller.runCycle", () => {
       {
         store: stores.store,
         operationalEventStore: stores.ops,
+        ackTracker: stores.ackTracker,
         resolveDeliveryConfig: () => ({ nodeBin: "node" }),
         listAgents: () => agents as never,
         fetchManagingTickets: async () => issues,
@@ -251,6 +263,7 @@ describe("ManagingPoller.runCycle", () => {
       {
         store: stores.store,
         operationalEventStore: stores.ops,
+        ackTracker: stores.ackTracker,
         resolveDeliveryConfig: () => ({ nodeBin: "node" }),
         listAgents: () => agents as never,
         fetchManagingTickets: fetchTickets as never,
@@ -294,6 +307,7 @@ describe("ManagingPoller.runCycle", () => {
       {
         store: stores.store,
         operationalEventStore: stores.ops,
+        ackTracker: stores.ackTracker,
         resolveDeliveryConfig,
         listAgents: () => agents as never,
         fetchManagingTickets: async (agent: AgentLike) =>
@@ -358,6 +372,7 @@ describe("ManagingPoller.runCycle", () => {
       {
         store: stores.store,
         operationalEventStore: stores.ops,
+        ackTracker: stores.ackTracker,
         resolveDeliveryConfig: () => ({ nodeBin: "node" }),
         listAgents: () => agents as never,
         fetchManagingTickets: async () => issues,
@@ -372,5 +387,77 @@ describe("ManagingPoller.runCycle", () => {
     expect(result.ticketsDispatched).toBe(1);
     expect(result.errors).toBe(0);
     expect(sendWake).toHaveBeenCalledTimes(1);
+  });
+
+  it("INF-519: records dispatched tickets in ack tracker", async () => {
+    const agents: AgentLike[] = [
+      { name: "mckell", linearUserId: "u1", openclawAgent: "mckell" },
+    ];
+    const issues: LinearManagingIssue[] = [
+      { identifier: "BBS-1", title: "SEO ticket", description: null, labels: [], stateName: "managing" },
+    ];
+    const sendWake = jest.fn(async () => undefined) as unknown as (
+      agentId: string,
+      tickets: ManagingWakeTicket[],
+      config: unknown,
+    ) => Promise<void>;
+    const poller = new ManagingPoller(
+      {
+        store: stores.store,
+        operationalEventStore: stores.ops,
+        ackTracker: stores.ackTracker,
+        resolveDeliveryConfig: () => ({ nodeBin: "node" }),
+        listAgents: () => agents as never,
+        fetchManagingTickets: async () => issues,
+        sendWake: sendWake as never,
+        now: () => 100_000,
+      },
+      { cycleMs: 60_000, defaultIntervalMs: 30 * 60 * 1000 },
+    );
+
+    await poller.runCycle();
+
+    // The ack tracker should have a pending entry for this dispatch
+    const pending = stores.ackTracker.getPendingTimedOut(0);
+    expect(pending).toHaveLength(1);
+    expect(pending[0].agentId).toBe("mckell");
+    expect(pending[0].ticketId).toBe("linear-BBS-1");
+    expect(pending[0].ackStatus).toBe("pending");
+    expect(pending[0].attemptCount).toBe(1);
+  });
+
+  it("INF-519: does not record ack entries when no tickets are dispatched", async () => {
+    const agents: AgentLike[] = [
+      { name: "charles", linearUserId: "u1", openclawAgent: "charles" },
+    ];
+    const issues: LinearManagingIssue[] = [
+      { identifier: "AI-1", title: "T1", description: null, labels: [], stateName: "" },
+    ];
+    const sendWake = jest.fn(async () => undefined) as unknown as (
+      agentId: string,
+      tickets: ManagingWakeTicket[],
+      config: unknown,
+    ) => Promise<void>;
+    const intervalMs = 30 * 60 * 1000;
+    // Ticket was dispatched recently — not due yet
+    stores.store.recordDispatch("charles", "AI-1", 100_000);
+    const poller = new ManagingPoller(
+      {
+        store: stores.store,
+        operationalEventStore: stores.ops,
+        ackTracker: stores.ackTracker,
+        resolveDeliveryConfig: () => ({ nodeBin: "node" }),
+        listAgents: () => agents as never,
+        fetchManagingTickets: async () => issues,
+        sendWake: sendWake as never,
+        now: () => 101_000, // only 1s later — well within interval
+      },
+      { cycleMs: 60_000, defaultIntervalMs: intervalMs },
+    );
+
+    await poller.runCycle();
+    expect(sendWake).not.toHaveBeenCalled();
+    // No ack entries recorded since no dispatch happened
+    expect(stores.ackTracker.getPendingTimedOut(0)).toHaveLength(0);
   });
 });

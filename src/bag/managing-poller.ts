@@ -28,6 +28,7 @@ import type { DeliveryConfig } from "../delivery/index.js";
 import { sendManagingWakeSignal, type ManagingWakeTicket } from "./managing-wake.js";
 import { surfaceStalledChildren, evaluateBarrier, attemptBarrierTransition, isManagedBarrierFromLabels } from "../barrier.js";
 import { notify } from "../alerts/alert-bus.js";
+import type { DispatchAckTracker } from "./dispatch-ack-tracker.js";
 
 const log = componentLogger(createLogger(), "managing-poller");
 
@@ -59,6 +60,14 @@ export interface ManagingPollerConfig {
 export interface ManagingPollerDeps {
   store: ManagingStateStore;
   operationalEventStore: OperationalEventStore;
+  /**
+   * Ack tracker for dispatch acknowledgment. The managing-poller dispatches
+   * wake signals that must be monitored: if the delegate never starts (never
+   * ack's), the DispatchWatchdog will re-signal and eventually escalate.
+   * Without recording dispatches here, a managing-wake that goes un-acked
+   * by the delegate is invisible to the escalation path (INF-519).
+   */
+  ackTracker: DispatchAckTracker;
   /**
    * Resolves the delivery config for a given agent. This is called per-agent
    * inside the poll loop so that containerized agents (with their own
@@ -249,6 +258,7 @@ export class ManagingPoller {
     this.deps = {
       store: deps.store,
       operationalEventStore: deps.operationalEventStore,
+      ackTracker: deps.ackTracker,
       resolveDeliveryConfig: deps.resolveDeliveryConfig,
       listAgents: deps.listAgents ?? (() => getAgents().filter(isAgentLocal).filter(isPolledForLinear)),
       fetchManagingTickets: deps.fetchManagingTickets ?? fetchManagingTicketsForAgent,
@@ -297,7 +307,7 @@ export class ManagingPoller {
    * and operator visibility.
    */
   async runCycle(): Promise<PollerCycleResult> {
-    const { store, operationalEventStore, resolveDeliveryConfig, listAgents, fetchManagingTickets, sendWake, now } = this.deps;
+    const { store, operationalEventStore, ackTracker, resolveDeliveryConfig, listAgents, fetchManagingTickets, sendWake, now } = this.deps;
     const agents = listAgents();
     const result: PollerCycleResult = {
       agentsChecked: 0,
@@ -425,6 +435,11 @@ export class ManagingPoller {
         const stamp = now();
         for (const t of dueTickets) {
           store.recordDispatch(agent.name, t.identifier, stamp);
+          // INF-519: record dispatch in ack tracker so the DispatchWatchdog
+          // can detect when the delegate never starts work (never ack's).
+          // Without this, a managing-wake that lands but is never picked up
+          // by the delegate is invisible to the escalation path.
+          ackTracker.recordDispatch(openclawAgent, t.identifier);
         }
         operationalEventStore.append({
           outcome: "delivered",
