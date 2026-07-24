@@ -31,6 +31,7 @@
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules, bodyHasCapability } from "./escalation-gate.js";
+import { checkLeakedCredentialGate } from "./leaked-credential-gate.js";
 import { checkStaleSnapshotForTerminal } from "./proxy-cas-check.js";
 import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, setStateAtomic, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
 import { buildTransitionAuditRecord, emitTransitionAuditRecord, verifyPostTransition, type GateResult, type TransitionAuditRecord } from "./transition-audit.js";
@@ -923,6 +924,28 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         log.warn(`enforcement-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${p2rejection}`);
         res.status(200).json({ errors: [{ message: p2rejection }] });
         return;
+      }
+
+      // INF-529: leaked-credential rotation gate. Standalone (not inside the
+      // workflow gate) because the origin failure was a plain, non-workflow
+      // ticket — this keys on the `sec:leaked-credential` label alone and blocks
+      // any close (semantic verb or raw stateId → completed/canceled) that lacks
+      // a rotation-confirmation artifact. Break-glass bypasses; see module doc.
+      {
+        const targetStateId = issueUpdateInput(body)?.stateId;
+        const rotationRejection = await checkLeakedCredentialGate(
+          effectiveIntent,
+          issueId,
+          authorization,
+          typeof targetStateId === "string" ? targetStateId : null,
+          breakGlassOverride,
+        );
+        if (rotationRejection) {
+          log.warn(`leaked-credential-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${rotationRejection}`);
+          deps?.operationalEventStore?.append({ outcome: "leaked-credential-close-blocked" as never, agent: agentId, key: issueId ?? undefined });
+          res.status(200).json({ errors: [{ message: rotationRejection }] });
+          return;
+        }
       }
 
       // G-13a: emit audit event for authorized break-glass use.
