@@ -617,6 +617,19 @@ function makeFanoutIntegrationFetch(opts: {
         },
       });
     }
+    // INF-470/AI-1992: the fan-out spec is fetched via IssueWithComments
+    // (fetchFanoutSpecDescription) — the description carries the findings spec
+    // and comments are scanned for a signed brief. Mirror the parent description
+    // so the spec parses the same way it did off IssueTeamParent pre-INF-470.
+    if (query.includes("IssueWithComments")) {
+      return json({
+        issue: {
+          id: "parent-internal-id",
+          description: opts.parentDescription,
+          comments: { nodes: [] },
+        },
+      });
+    }
     if (query.includes("TeamLabels")) {
       const commonLabels = [
         { id: "lbl-wf-dev-impl", name: "wf:dev-impl" },
