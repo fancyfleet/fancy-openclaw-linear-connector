@@ -57,9 +57,11 @@ import { validateDefStateRemovals } from "./def-state-migration.js";
 import { readDefStateSnapshot, writeDefStateSnapshot } from "./store/def-state-snapshot-store.js";
 import { recordImplementer, getImplementer, removeImplementer } from "./implementer-store.js";
 import { recordAppliedState, clearAppliedState, getAppliedState } from "./store/applied-state-store.js";
+import { probeDeployOutcome } from "./deploy-probe.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import { reposWithoutCiAutoDeploy, githubRepoFromUrl } from "./deploy-policy.js";
 import { notify } from "./alerts/alert-bus.js";
+import { markDispatchIntegrityGateActive } from "./dispatch-integrity-state.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 
 /**
@@ -141,6 +143,8 @@ export interface WorkflowTransition {
   capture_ac?: boolean;
   /** Phase 6.5 / H-7 (AI-1482): if true, requires human sign-off when stakes >= threshold. */
   requires_human_signoff_above_stakes?: boolean;
+  /** AI-2515: if true, this transition requires a deploy-outcome probe. */
+  requires_deploy_probe?: boolean;
   /** If true, a comment must accompany this transition. Surfaced in delivery messages and enforced by the CLI. */
   requires_comment?: boolean;
   /** Generic transition role: 'continue' maps to `linear continue-workflow`, 'revision' maps to `linear request-revision`. */
@@ -518,6 +522,11 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
     }
     await writeDefStateSnapshot(nextSnapshot);
   }
+
+  // AI-2515: mark the deploy-outcome gate active at the substrate wiring point
+  // (the workflow-gate module load/init). /health.dispatchIntegrity projects this
+  // as proof the gate is live on the production transition path.
+  markDispatchIntegrityGateActive("deployOutcomeVerification", "Automated live-service probe (workflow-gate → probeDeployOutcome)");
 
   _registryCache = registry;
   return registry;
@@ -4203,6 +4212,10 @@ export interface ApplyStateTransitionOptions {
   enrolledTicketsStore?: EnrolledTicketsStore;
   /** AI-1762: operational-event sink for transition-write-failed events. */
   operationalEventStore?: OperationalEventStore;
+  /** AI-2515: deployment health/version URL for automated outcome verification. */
+  deployProbeUrl?: string | null;
+  /** AI-2515: expected artifact symbol (commit/version) for outcome verification. */
+  expectedArtifactSymbol?: string | null;
 
   /**
    * AI-1977: Pre-computed delegateId to use instead of resolving via role/prior-implementer.
@@ -5100,6 +5113,48 @@ export async function applyStateTransition(
   const priorImplementerAtFeedback = matchedTransition?.feedback?.required
     ? await getImplementer(issueId).catch(() => null)
     : null;
+
+  // ── AI-2515: Automated deploy-outcome gate ──────────────────────────
+  // If the transition requires a deploy probe, verify the running service
+  // reflects the change BEFORE applying the state mutation.
+  // Fail-closed: mismatch/timeout/unreachable blocks the transition.
+  if (matchedTransition?.requires_deploy_probe && intent !== breakGlassCommand) {
+    const probeUrl = options?.deployProbeUrl;
+    const expected = options?.expectedArtifactSymbol;
+    if (!probeUrl || !expected) {
+      log.warn(`workflow-gate: deploy gate REFUSED for ${issueId}: requires_deploy_probe but probeUrl or expectedArtifactSymbol is missing`);
+      const internalId = issue.internalId;
+      const msg = `⛔️ **Transition refused — deploy-probe configuration required.**\n\n` +
+        `This transition requires automated verification of the deployed outcome, but the probe URL or expected artifact symbol is missing. ` +
+        `Supply these via \`--probe-url\` and \`--expected-artifact\` flags (or X-Openclaw-Deploy-Probe-Url and X-Openclaw-Expected-Artifact-Symbol headers).`;
+      await postComment(internalId, msg, authToken);
+      return { status: "failed", code: "deploy-probe-config-missing", detail: "requires_deploy_probe but config missing", from: currentStateName, to: toStateName };
+    }
+
+    log.info(`workflow-gate: AI-2515: probing deploy outcome for ${issueId} at ${probeUrl} (expected: ${expected})`);
+    const probe = await probeDeployOutcome({ url: probeUrl, expected, timeoutMs: 30_000 });
+    if (!probe.success) {
+      log.warn(`workflow-gate: AI-2515: deploy probe FAILED for ${issueId}: ${probe.reason} — ${probe.detail}`);
+      const internalId = issue.internalId;
+      const msg = `⛔️ **Deploy verification failed — transition not applied.**\n\n` +
+        `The automated probe of the running service at ${probeUrl} failed:\n\n` +
+        `> **Reason**: ${probe.reason}\n` +
+        `> **Detail**: ${probe.detail}\n\n` +
+        `The change appears merged but the running service is still stale. Verify the deployment and retry when production reflects the change.`;
+      await postComment(internalId, msg, authToken);
+      // INF-452 AC2: Fail loud to deploy owner — also emit a notification.
+      notify({
+        severity: "warning",
+        source: "deploy-probe",
+        title: `deploy verification failed on ${issueId}`,
+        detail: probe.detail,
+        ticket: issueId,
+        dedupKey: `deploy-probe-failed|${issueId}|${toStateName}`,
+      });
+      return { status: "blocked", code: "deploy-probe-failed", detail: probe.detail, from: currentStateName, to: toStateName };
+    }
+    log.info(`workflow-gate: AI-2515: deploy probe PASSED for ${issueId}: ${probe.detail}`);
+  }
 
   // Step 1: Resolve label IDs for the state swap.
   const newLabelId = await findOrCreateLabel(

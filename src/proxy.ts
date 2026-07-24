@@ -573,6 +573,8 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
   const target = (req.headers["x-openclaw-linear-target"] as string | undefined) ?? null;
   const feedbackCategoryHeader = (req.headers["x-openclaw-feedback-category"] as string | undefined) ?? null;
   const artifactRefHeader = (req.headers["x-openclaw-artifact-ref"] as string | undefined) ?? null;
+  const deployProbeUrlHeader = (req.headers["x-openclaw-deploy-probe-url"] as string | undefined) ?? null;
+  const expectedArtifactSymbolHeader = (req.headers["x-openclaw-expected-artifact-symbol"] as string | undefined) ?? null;
   const codeArtifactHeader = (req.headers["x-openclaw-code-artifact"] as string | undefined) ?? null;
   const substitutionReasonHeader = (req.headers["x-openclaw-substitution-reason"] as string | undefined) ?? null;
   const cliVersion = (req.headers["x-openclaw-linear-cli-version"] as string | undefined) ?? null;
@@ -1369,6 +1371,8 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             enrolledTicketsStore: deps?.enrolledTicketsStore,
             operationalEventStore: deps?.operationalEventStore,
             delegateOverride,
+            deployProbeUrl: deployProbeUrlHeader,
+            expectedArtifactSymbol: expectedArtifactSymbolHeader,
           });
 
           // ── AI-2554: Structured transition audit record ──────────────
