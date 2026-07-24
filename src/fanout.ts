@@ -131,13 +131,6 @@ export interface ExistingChild {
    * the legacy read path.
    */
   childWorkflow?: string;
-  /**
-   * INF-469: the child's title, as minted. Used by the duplicate-title guard
-   * (same-parent, same-child-workflow collision check) — see the mint loop in
-   * {@link executeFanout}. Optional: children fetched before this field existed
-   * carry no title, and the guard fail-opens on a missing value.
-   */
-  title?: string;
 }
 
 /**
