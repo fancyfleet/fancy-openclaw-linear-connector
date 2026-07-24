@@ -2392,8 +2392,18 @@ export function shouldTriggerFanout(
   const breakGlass = def.break_glass?.command ?? "escape";
   if (intent === breakGlass) return null;
   // The intent must be a real forward transition command declared on this state.
-  const isForwardCommand = (state.transitions ?? []).some((t) => t.command === intent);
-  if (!isForwardCommand) return null;
+  const transition = (state.transitions ?? []).find((t) => t.command === intent);
+  if (!transition) return null;
+  // INF-528: a `requires_children_terminal` transition is a governed *convergence*
+  // edge — it fires only when the children already exist and are all terminal, the
+  // logical inverse of a spawn (which *creates* children). Such an edge must never
+  // trip the pre-transition fan-out spawn-spec gate. Without this guard, `converge`
+  // out of a fanout state (dev-sprint `spawn-impl`) resolves command-legality, then
+  // the AI-1992 gate intercepts it with `fanout-spec-invalid` ("no 'findings'
+  // entries") *before* its own children-terminal gate can run — re-wedging the very
+  // already-spawned sprint (LSO-1) this edge exists to close. Route it past the
+  // spawn gate to its declared gates.
+  if (transition.requires_children_terminal) return null;
   return state.fanout;
 }
 
