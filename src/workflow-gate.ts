@@ -4649,7 +4649,15 @@ export async function applyStateTransition(
       return { status: "failed", code: "no-state-label", detail: `workflow ticket ${issueId} has no state:* label` };
     }
     const stateNode = def.states.find((s) => s.id === currentStateName);
-    matchedTransition = stateNode?.transitions?.find((t) => t.command === intent);
+    // INF-522: `force-deploy` is an alias for `continue` in merge/deploy states —
+    // mirror the same resolution B1 (checkWorkflowRules, §3202) applies. B1 accepts
+    // force-deploy (aliasing to the `continue` transition and skipping the evidence
+    // gate), but B2 matched on the raw intent, so a `force-deploy` that passed B1 hit
+    // the `no-transition` fail-open here and the native state write was silently
+    // skipped — the ticket never advanced. Alias here so the merge→deploy / deploy→
+    // ac-validate edge actually applies.
+    const b2ResolvedIntent = intent === "force-deploy" ? "continue" : intent;
+    matchedTransition = stateNode?.transitions?.find((t) => t.command === b2ResolvedIntent);
     if (!matchedTransition) {
       // Should not happen — B1 already validated the command — but fail-open.
       log.warn(
