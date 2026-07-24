@@ -234,6 +234,7 @@ states:
       - command: continue
         to: ac-validate
         requires_capability: infra:ssh
+        requires_deploy_probe: true
         requires_human_signoff_above_stakes: true
         assign: { mode: auto }     # ac-validate steward is singleton (Astrid) — auto-assign
         generic: continue
@@ -273,6 +274,7 @@ states:
     transitions:
       - command: validated
         to: done
+        requires_deploy_probe: true
         # terminal → no assignment
         generic: continue
       - command: ac-fail
@@ -312,4 +314,3 @@ states:
     kind: terminal
     native_state: done           # targetState: "done" → Done
     satisfies_parent_barrier: true   # uniform terminal contract (design.md §5.4)
-
