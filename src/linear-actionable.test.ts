@@ -382,6 +382,30 @@ describe("isLinearIssueActionable", () => {
     ).resolves.toBe(true);
   });
 
+  it("INF-498: does not hold INF-196 or LIF-45 on the INF-476 manual dispatch hold (hold lifted)", async () => {
+    for (const identifier of ["INF-196", "LIF-45"]) {
+      global.fetch = okFetch({
+        id: `issue-${identifier}`, identifier,
+        delegate: { id: IGOR_LINEAR_USER_ID, name: "Igor (Back End Dev)", app: true },
+        assignee: null,
+        state: { name: "To Do", type: "unstarted" },
+        relations: { nodes: [] },
+      }) as unknown as typeof fetch;
+
+      await expect(
+        isLinearIssueStillRoutedToAgent(`linear-${identifier}`, "igor", "delegate"),
+      ).resolves.toBe(true);
+
+      global.fetch = okFetch({
+        id: `issue-${identifier}`, identifier,
+        state: { name: "To Do", type: "unstarted" },
+        relations: { nodes: [] },
+      }) as unknown as typeof fetch;
+
+      await expect(isLinearIssueActionable(identifier, "igor")).resolves.toBe(true);
+    }
+  });
+
   describe("isHumanLinearUser", () => {
     const roster = new Set([IGOR_LINEAR_USER_ID]);
 
