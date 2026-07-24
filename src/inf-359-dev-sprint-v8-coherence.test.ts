@@ -164,3 +164,37 @@ describe("INF-359 E2E: sprint spine cannot close without v8 coherence gates", ()
     expect(validationApprove.requires_demonstration_walk).toBe(true);
   });
 });
+
+
+describe("INF-453: dev-sprint redundant arm phase can terminate without break-glass", () => {
+  it.each(["spawn-arms", "managing-arms"])("%s exposes cancel and abandon transitions to cancelled", (stateId) => {
+    const def = loadDevSprint();
+
+    for (const command of ["cancel", "abandon"]) {
+      const tx = transition(def, stateId, command);
+      expect(tx.to).toBe("cancelled");
+      expect(tx.generic).toBe("cancel");
+    }
+  });
+
+  it("cancelled is a terminal state that satisfies parent barriers", () => {
+    const def = loadDevSprint();
+    const cancelled = state(def, "cancelled");
+
+    expect(cancelled.kind).toBe("terminal");
+    expect(cancelled.barrier).toBe(true);
+    expect(cancelled.native_state).toBe("done");
+  });
+
+  it("empty spawn-arms specs are refused before child creation", () => {
+    const def = loadDevSprint();
+    const spawnArms = state(def, "spawn-arms");
+
+    const rejected = validateFanoutSpec("No structured arm list here.", spawnArms.fanout as FanoutConfig);
+
+    expect(rejected.ok).toBe(false);
+    if (!rejected.ok) {
+      expect(rejected.reason).toMatch(/structured|at least one|parseable/i);
+    }
+  });
+});

@@ -1,4 +1,4 @@
-# dev-sprint — Sprint Execution Workflow (v8)
+# dev-sprint — Sprint Execution Workflow (v9)
 # owner: steward (Astrid), engine (spawn-arms, spawn-impl)
 # last-updated: 2026-07-22
 # status: v8 deployed to production (INF-359 sprint coherence)
@@ -15,6 +15,9 @@
 #   capability statements; implementation fanout requires classification and
 #   adds per-capability integration-verify children; validation approval
 #   requires passed demonstration-walk evidence.
+# v9 (2026-07-23): added steward-accessible cancel/abandon transitions from
+#   spawn-arms and managing-arms to the cancelled terminal state, so redundant
+#   or out-of-band delivered sprints do not require host break-glass (INF-453).
 #
 # Registered-def copy for CI conformance validation (INF-42). The canonical
 # source is the vault markdown spec at:
@@ -30,7 +33,7 @@
 #   → 5. ac-definition → 6. spawn-impl → 7. managing-impl → 8. validation → done
 
 id: dev-sprint
-version: 8
+version: 9
 archetype: orchestrator
 entry_state: intake
 
@@ -94,6 +97,9 @@ states:
       - command: cancel
         to: cancelled
         generic: cancel
+      - command: abandon
+        to: cancelled
+        generic: cancel
 
   - id: managing-arms
     owner_role: steward
@@ -106,6 +112,9 @@ states:
       - command: continue
         to: ac-definition
         generic: continue
+      - command: cancel
+        to: cancelled
+        generic: cancel
       - command: abandon
         to: cancelled
         generic: cancel
@@ -215,6 +224,7 @@ states:
   # escape to cancelled state. Not a normal forward path.
   - id: cancelled
     kind: terminal
+    barrier: true
     native_state: done
     description: >
       Sprint terminated without completing all arms. Used via break-glass
