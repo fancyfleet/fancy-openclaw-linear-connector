@@ -1,0 +1,68 @@
+id: synthetic-parent
+version: 1
+archetype: engine-primitive-matrix
+entry_state: registered
+
+x_engine_primitives:
+  - workflow-registration
+  - governed-transitions
+  - guards
+  - fan-out
+  - barrier-join
+  - terminal-reachability
+  - dispatch-wake
+  - idempotency-mutex
+  - parenting-reparenting
+  - role-delegate-resolution
+  - escape-break-glass
+
+break_glass:
+  command: abort-path
+  to: escaped
+  owner_role: synthetic-steward
+
+states:
+  - id: registered
+    owner_role: synthetic-steward
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: admit
+        to: guarded
+        requires_capability: synthetic:admit
+
+  - id: guarded
+    owner_role: synthetic-reviewer
+    kind: normal
+    native_state: thinking
+    noActivityTimeout: 900
+    deliverLastComment: true
+    resources:
+      - path: docs/synthetic-engine-primitive.md
+        label: synthetic fixture note
+    fanout:
+      spec_source: synthetic entries
+      child_workflow: wf:synthetic-child
+      initial_delegate: alpha-worker
+      block_siblings: true
+    transitions:
+      - command: fan-out
+        to: joining
+
+  - id: joining
+    owner_role: synthetic-steward
+    kind: normal
+    native_state: managing
+    barrier: true
+    transitions:
+      - command: join
+        to: complete
+
+  - id: complete
+    kind: terminal
+    native_state: done
+
+  - id: escaped
+    owner_role: synthetic-steward
+    kind: terminal
+    native_state: invalid

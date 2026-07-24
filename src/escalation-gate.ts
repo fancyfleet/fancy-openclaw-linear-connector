@@ -265,6 +265,16 @@ export async function resolveBodiesForRole(roleId: string): Promise<string[]> {
 }
 
 /**
+ * Returns true when the role is explicitly declared in the capability policy.
+ * This lets workflow runtime distinguish a real |C|=0 role from older/minimal
+ * test policies that do not model every workflow role.
+ */
+export async function isRoleDeclared(roleId: string): Promise<boolean> {
+  const policy = await loadPolicy();
+  return (policy.roles ?? []).some((role) => role.id === roleId);
+}
+
+/**
  * Returns body IDs whose container grants the specified capability.
  * Used by the workflow gate to identify designated approvers for signoff gates
  * (INF-197) and provide actionable error messages naming the approver.
