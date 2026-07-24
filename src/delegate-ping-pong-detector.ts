@@ -101,6 +101,14 @@ export interface PingPongHandlingResult {
   suppressDispatch: boolean;
 }
 
+export function shouldCheckDelegatePingPong(updatedFrom?: Record<string, unknown>): boolean {
+  if (!updatedFrom || (!("delegateId" in updatedFrom) && !("delegate" in updatedFrom))) {
+    return false;
+  }
+
+  return !("stateId" in updatedFrom) && !("state" in updatedFrom);
+}
+
 // ── DelegateChainTracker ─────────────────────────────────────────────────────
 
 /**
@@ -289,7 +297,7 @@ async function postComment(
   authHeader: string,
 ): Promise<boolean> {
   const mutation = `
-    mutation($issueId: ID!, $body: String!) {
+    mutation($issueId: String!, $body: String!) {
       commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
     }
   `;

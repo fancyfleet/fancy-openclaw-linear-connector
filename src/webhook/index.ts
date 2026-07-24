@@ -40,7 +40,7 @@ import { maybeBootstrapWorkflow } from "../workflow-bootstrap.js";
 import { notify } from "../alerts/alert-bus.js";
 import { loadKnownHumans } from "../known-humans.js";
 import { emitStreamTopic } from "../admin-stream.js";
-import { DelegatePingPongDetector } from "../delegate-ping-pong-detector.js";
+import { DelegatePingPongDetector, shouldCheckDelegatePingPong } from "../delegate-ping-pong-detector.js";
 import type { DispatchRecordStore } from "../liveness-channel/dispatch-record-store.js";
 import type { GatewayDispatchAck } from "../liveness-channel/gateway-ack-types.js";
 
@@ -78,7 +78,7 @@ async function checkDelegatePingPong(
 ): Promise<boolean> {
   if (event.type !== "Issue" || event.action !== "update") return false;
   const updatedFrom = (event as { updatedFrom?: Record<string, unknown> }).updatedFrom;
-  if (!updatedFrom || (!("delegateId" in updatedFrom) && !("delegate" in updatedFrom))) return false;
+  if (!shouldCheckDelegatePingPong(updatedFrom)) return false;
 
   const data = (event as { data?: Record<string, unknown> }).data;
   const delegate = data?.delegate as { id?: string; name?: string } | null | undefined;
