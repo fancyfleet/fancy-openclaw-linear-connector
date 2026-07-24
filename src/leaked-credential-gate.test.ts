@@ -135,10 +135,38 @@ describe("checkLeakedCredentialGate — label scoping", () => {
 describe("checkLeakedCredentialGate — enforcement", () => {
   it("BLOCKS a semantic close of a labelled ticket with no artifact", async () => {
     installMockFetch({ labels: [SEC_LEAKED_CREDENTIAL_LABEL], comments: ["closing, dup"] });
-    const result = await checkLeakedCredentialGate("refuse-work", ID, AUTH, null, false);
+    const result = await checkLeakedCredentialGate("complete-work", ID, AUTH, null, false);
     expect(result).not.toBeNull();
     expect(result).toContain("blocked");
     expect(result).toContain(SEC_LEAKED_CREDENTIAL_LABEL);
+  });
+
+  it("BLOCKS every resolving verb on a labelled ticket with no artifact", async () => {
+    for (const verb of ["complete-work", "complete", "cancel", "invalidate"]) {
+      installMockFetch({ labels: [SEC_LEAKED_CREDENTIAL_LABEL], comments: ["no artifact here"] });
+      const result = await checkLeakedCredentialGate(verb, ID, AUTH, null, false);
+      // verb under test: `verb`
+      expect(result).not.toBeNull();
+      expect(result).toContain("blocked");
+    }
+  });
+
+  it("ALLOWS refuse-work (decline-and-reroute) on a labelled ticket with no artifact", async () => {
+    // refuse-work sets status to Todo and re-delegates — it is NOT a terminal
+    // close. Gating it would strand a mis-delegated security ticket behind its
+    // own protection. The gate must let the routing path through.
+    installMockFetch({ labels: [SEC_LEAKED_CREDENTIAL_LABEL], comments: ["wrong owner"] });
+    const result = await checkLeakedCredentialGate("refuse-work", ID, AUTH, null, false);
+    expect(result).toBeNull();
+  });
+
+  it("STILL BLOCKS a refuse-work that carries a completed/canceled stateId", async () => {
+    // Belt-and-suspenders: if a refuse ever forwarded a genuine closing stateId,
+    // the authoritative stateId type check catches it regardless of verb name.
+    installMockFetch({ labels: [SEC_LEAKED_CREDENTIAL_LABEL], comments: [], stateType: "canceled" });
+    const result = await checkLeakedCredentialGate("refuse-work", ID, AUTH, "state-uuid", false);
+    expect(result).not.toBeNull();
+    expect(result).toContain("blocked");
   });
 
   it("ALLOWS a close of a labelled ticket once a rotation artifact is present", async () => {
@@ -187,10 +215,12 @@ describe("checkLeakedCredentialGate — enforcement", () => {
 
 describe("CLOSE_INTENTS", () => {
   it("covers the resolving verbs", () => {
-    for (const v of ["complete-work", "complete", "refuse-work", "cancel", "abandon"]) {
+    for (const v of ["complete-work", "complete", "cancel", "abandon", "invalidate"]) {
       expect(CLOSE_INTENTS.has(v)).toBe(true);
     }
     expect(CLOSE_INTENTS.has("note")).toBe(false);
     expect(CLOSE_INTENTS.has("handoff-work")).toBe(false);
+    // refuse-work is decline-and-reroute (→ Todo), not a terminal close.
+    expect(CLOSE_INTENTS.has("refuse-work")).toBe(false);
   });
 });

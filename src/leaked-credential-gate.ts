@@ -38,11 +38,17 @@ const LINEAR_API_URL = "https://api.linear.app/graphql";
  * the authoritative catch-all (it sees the true destination regardless of verb
  * naming); this set is the cheap pre-filter and the fallback when a semantic
  * close carries no explicit `stateId` in the forwarded mutation.
+ *
+ * `refuse-work` is deliberately NOT here: it is decline-and-reroute (sets status
+ * to Todo and re-delegates), not a terminal resolution. Gating it would strand a
+ * mis-delegated `sec:leaked-credential` ticket behind its own protection — the
+ * mandate is "cannot CLOSE without rotation", not "cannot reroute before
+ * rotation." A refuse that genuinely resolves would still carry a
+ * completed/canceled `stateId` and be caught by the `stateId` type check.
  */
 export const CLOSE_INTENTS = new Set<string>([
   "complete-work",
   "complete",
-  "refuse-work",
   "cancel",
   "abandon",
   "invalidate",

@@ -28,11 +28,18 @@ keys on the `sec:leaked-credential` label alone and fires regardless of workflow
 
 It blocks a close when all of:
 - the mutation is a close — a resolving verb (`complete-work`, `complete`,
-  `refuse-work`, `cancel`, `abandon`, `invalidate`) **or** a raw `stateId` whose
+  `cancel`, `abandon`, `invalidate`) **or** a raw `stateId` whose
   Linear `WorkflowState.type` is `completed`/`canceled` (covers Done, Canceled,
   Invalid), and
 - the ticket carries `sec:leaked-credential`, and
 - no rotation-confirmation artifact is present.
+
+`refuse-work` is deliberately **not** a gated verb. It is decline-and-reroute
+(sets status to Todo and re-delegates), not a terminal resolution — the mandate
+is "cannot **close** without rotation," not "cannot reroute before rotation."
+Gating it would strand a mis-delegated `sec:leaked-credential` ticket behind its
+own protection. A refuse that somehow forwarded a genuine `completed`/`canceled`
+`stateId` is still caught by the authoritative `stateId` type check.
 
 Break-glass (steward) bypasses — a genuine non-rotation close is a human decision.
 
