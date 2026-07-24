@@ -21,6 +21,16 @@
  *  - AC5: the runtime gate FAILS CLOSED when the child set is unreadable.
  *  - AC6: the runtime gate ALLOWS converge from spawn-impl when every child is
  *         terminal.
+ *  - AC7 (revision, Astrid request-changes 2026-07-24): the pre-transition
+ *         fan-out spawn-spec gate must NOT intercept `converge`. `spawn-impl`
+ *         declares a `fanout` block, and the deployed v11 tripped the AI-1992
+ *         gate (`fanout-spec-invalid`, "no 'findings' entries") on `converge`
+ *         before its children-terminal gate could run — because
+ *         `shouldTriggerFanout` fired for ANY forward command on a fanout state.
+ *         A `requires_children_terminal` edge is a convergence, not a spawn, and
+ *         must resolve to its own gate. This is the runtime gate-ordering case
+ *         the AC1–AC6 suite missed: those exercise def-shape + the children gate
+ *         via checkWorkflowRules, but never the apply-path spawn-spec preflight.
  */
 
 import fs from "node:fs";
@@ -28,6 +38,7 @@ import os from "node:os";
 import path from "node:path";
 import { load as yamlLoad } from "js-yaml";
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "@jest/globals";
+import { shouldTriggerFanout } from "./fanout.js";
 import { checkWorkflowRules, resetWorkflowCache } from "./workflow-gate.js";
 import type { WorkflowDef, WorkflowState, WorkflowTransition } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
@@ -248,5 +259,32 @@ describe("INF-528 AC3–AC6: converge-from-spawn-impl children-terminal runtime 
       ]),
     );
     expect(result).toBeNull();
+  });
+});
+
+// ── AC7: gate ordering — converge must not trip the fan-out spawn-spec gate ──
+//
+// The bug Astrid's live repro surfaced (deployed v11): `spawn-impl` carries a
+// `fanout` block, so the pre-transition AI-1992 spawn-spec gate in the apply
+// path fired on `converge` (via `shouldTriggerFanout`) and refused with
+// `fanout-spec-invalid` before the children-terminal gate ran. `converge` is a
+// convergence edge (`requires_children_terminal`), the logical inverse of a
+// spawn — it consumes already-terminal children rather than creating any — so it
+// must be routed past the spawn-spec preflight. `shouldTriggerFanout` is the
+// exact resolver that decides fan-out vs. not, so asserting on it reproduces the
+// gate-ordering defect deterministically without a live proxy.
+describe("INF-528 AC7: converge resolves to its children-terminal gate, NOT the fan-out spawn-spec gate", () => {
+  it("shouldTriggerFanout returns null for converge from spawn-impl (children-terminal edge is not a spawn)", () => {
+    const def = loadDevSprint();
+    // Sanity: the fixture is the real fanout state under test.
+    expect(state(def, "spawn-impl").fanout).toBeDefined();
+    // The regression: on deployed v11 this returned the fanout config, which is
+    // what fired `fanout-spec-invalid` on LSO-1's converge.
+    expect(shouldTriggerFanout(def, "spawn-impl", "converge")).toBeNull();
+  });
+
+  it("still fans out on the spawn edge from spawn-impl (fix is additive, not a blanket disable)", () => {
+    const def = loadDevSprint();
+    expect(shouldTriggerFanout(def, "spawn-impl", "spawn")).not.toBeNull();
   });
 });
