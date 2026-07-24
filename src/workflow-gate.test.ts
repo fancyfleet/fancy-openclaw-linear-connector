@@ -62,6 +62,7 @@ capabilities:
   - id: human:escalate
   - id: workflow:break-glass
   - id: workflow:steward
+  - id: workflow:force-deploy
   - id: deploy:execute
   - id: infra:ssh
 
@@ -69,9 +70,9 @@ containers:
   - id: dev
     grants: [linear:transition]
   - id: deployment
-    grants: [linear:transition, deploy:execute, infra:ssh]
+    grants: [linear:transition, deploy:execute, infra:ssh, workflow:force-deploy]
   - id: steward
-    grants: [linear:transition, human:escalate, workflow:break-glass, workflow:steward]
+    grants: [linear:transition, human:escalate, workflow:break-glass, workflow:steward, workflow:force-deploy]
   - id: code-review
     grants: [linear:transition]
 
@@ -2358,6 +2359,24 @@ describe("checkWorkflowRules — INF-112: non-Linear-generated branch (metadata-
     globalThis.fetch = makeInf112Mock(false, "deploy");
     const result = await checkWorkflowRules("force-deploy", "issue-uuid", "Bearer tok", "hanzo");
     expect(result).toBeNull();
+  });
+
+  it("INF-527: force-deploy is allowed for the recovery steward (holds workflow:force-deploy)", async () => {
+    // astrid's steward container grants workflow:force-deploy in TEST_POLICY_YAML,
+    // mirroring the live policy (steward is a co-holder, not just Hanzo).
+    globalThis.fetch = makeInf112Mock(false, "merge");
+    const result = await checkWorkflowRules("force-deploy", "issue-uuid", "Bearer tok", "astrid");
+    expect(result).toBeNull();
+  });
+
+  it("INF-527: force-deploy is BLOCKED for a known caller lacking workflow:force-deploy", async () => {
+    // charles (code-review container) is a known body but holds neither the merge
+    // grant nor break-glass — the break-glass-class bypass must reject him before
+    // the evidence gate is skipped.
+    globalThis.fetch = makeInf112Mock(false, "merge");
+    const result = await checkWorkflowRules("force-deploy", "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("does not hold 'workflow:force-deploy'");
   });
 
   // ── Path 4: GH_TOKEN set but GitHub confirms NOT merged → blocked ──
