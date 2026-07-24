@@ -1485,11 +1485,52 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           transitionResult.code !== "ad-hoc" &&
           transitionResult.code !== "no-issue-id";
 
+        // INF-489 EXPERIMENT (not for merge as-is — see investigation notes):
+        // codes that represent a definitive, config/policy-level rejection decided
+        // on the FIRST mutation of a command, as opposed to write-verification
+        // uncertainty (context-fetch-failed, atomic-mutation-failed,
+        // transition-write-unverified — all provably noisy against static test
+        // mocks and, per AI-1762, tolerated in production too) or a benign
+        // trailing-mutation no-op within the same logical command
+        // (no-transition, terminal-reentry-guard — AI-1860/AI-2472/AI-2035
+        // rely on these stayng silent).
+        const HARD_FAIL_CODES = new Set([
+          "delegate-unresolved",
+          "native-state-unresolved",
+          "native-state-missing",
+          "artifact-gate",
+          "parent-ac-gate",
+          "parent-ac-gate-error",
+          "release-gate",
+          "label-resolve-failed",
+          "target-unresolved",
+          "no-state-label",
+          "registry-load-failed",
+        ]);
+
         if (workflowReminder || attachTransition) {
           try {
             const parsedResponse = JSON.parse(responseText);
             if (attachTransition) parsedResponse._workflowTransition = transitionResult;
             if (workflowReminder) parsedResponse._workflowReminder = workflowReminder;
+            if (
+              transitionResult &&
+              (transitionResult.status === "blocked" || transitionResult.status === "failed") &&
+              transitionResult.code &&
+              HARD_FAIL_CODES.has(transitionResult.code)
+            ) {
+              const failMsg =
+                `[Workflow] '${effectiveIntent}' did not apply to ${issueId ?? "(unknown)"}: ${transitionResult.code}` +
+                (transitionResult.detail ? ` — ${transitionResult.detail}` : "");
+              const existingErrors = Array.isArray(parsedResponse.errors) ? parsedResponse.errors : [];
+              parsedResponse.errors = [
+                ...existingErrors,
+                {
+                  message: failMsg,
+                  extensions: { code: `WORKFLOW_TRANSITION_${transitionResult.status.toUpperCase()}` },
+                },
+              ];
+            }
             res.status(upstreamRes.status).set("Content-Type", "application/json").send(JSON.stringify(parsedResponse));
             return;
           } catch {
