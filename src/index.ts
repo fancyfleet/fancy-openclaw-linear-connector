@@ -43,6 +43,7 @@ import { registerStallSweepCron } from "./cron/stall-sweep-cron.js";
 import { getStallDetectionState, DEFAULT_STALL_CONFIG } from "./stall-detection-state.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
 import { registerDoneDetectorCron } from "./cron/done-ticket-detector-cron.js";
+import { registerLeakedCredentialSweepCron } from "./cron/leaked-credential-sweep-cron.js";
 import { registerMergedEvidenceReconcilerCron } from "./cron/merged-evidence-reconciler-cron.js";
 import { registerBootstrapReconciliationCron } from "./bootstrap-reconciliation-sweep.js";
 import { registerDelegationReconciliationCron, runDelegationReconciliationSweep } from "./delegation-reconciliation-sweep.js";
@@ -2163,6 +2164,11 @@ if (isEntryPoint) {
     graceHours: parseInt(process.env.DONE_DETECTOR_GRACE_HOURS ?? "4", 10),
     pollIntervalMs: parseInt(process.env.DONE_DETECTOR_POLL_INTERVAL_MS ?? String(60 * 60 * 1000), 10),
   });
+
+  // INF-529: leaked-credential reopen sweep (Layer 2). Reopens sec:leaked-credential
+  // tickets a human closed in the UI (bypassing the proxy gate) without a rotation
+  // artifact. Disabled unless LEAKED_CRED_SWEEP_ENABLED=1; the proxy gate is always on.
+  registerLeakedCredentialSweepCron();
 
   // INF-122: periodic anti-entropy reconciliation (G-7/G-17).
   // AC1 — native state desync heal; AC2 — missed barrier webhook auto-advance.
