@@ -49,6 +49,30 @@ export const ACCEPTED_WAIVER_KEYS: readonly string[] = [
   "fanout-before-barrier",
 ];
 
+const FROZEN_ENGINE_PRIMITIVES = [
+  "workflow-registration",
+  "governed-transitions",
+  "guards",
+  "fan-out",
+  "barrier-join",
+  "terminal-reachability",
+  "dispatch-wake",
+  "idempotency-mutex",
+  "parenting-reparenting",
+  "role-delegate-resolution",
+  "escape-break-glass",
+] as const;
+
+interface CapabilityPolicyBody {
+  id: string;
+  fills_roles?: string[];
+}
+
+interface CapabilityPolicy {
+  bodies?: CapabilityPolicyBody[];
+  roles?: Array<{ id: string }>;
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 /** Build index of state by id for quick lookup. */
@@ -112,6 +136,30 @@ function getRegisteredDefIdsSync(): Set<string> | undefined {
   const cache = getCachedRegistrySync();
   if (cache === null || cache === undefined) return undefined;
   return new Set(cache.keys());
+}
+
+function loadCapabilityPolicySync(): CapabilityPolicy | null {
+  const policyPath = process.env.CAPABILITY_POLICY_PATH;
+  if (!policyPath) return null;
+
+  try {
+    const raw = fs.readFileSync(policyPath, "utf8");
+    const parsed = yamlLoad(raw) as CapabilityPolicy;
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function bodiesForRole(policy: CapabilityPolicy | null, roleId: string): string[] | undefined {
+  if (!policy) return undefined;
+  return (policy.bodies ?? [])
+    .filter((body) => Array.isArray(body.fills_roles) && body.fills_roles.includes(roleId))
+    .map((body) => body.id);
+}
+
+function roleIsDeclared(policy: CapabilityPolicy, roleId: string): boolean {
+  return (policy.roles ?? []).some((role) => role.id === roleId);
 }
 
 // ── Invariant checks ──────────────────────────────────────────────────────
@@ -256,6 +304,85 @@ function checkChildWorkflowSync(
   }
 }
 
+function checkEnginePrimitiveMatrix(
+  def: WorkflowDef,
+  errors: ConformanceError[],
+): void {
+  const rawPrimitives = (def as unknown as Record<string, unknown>).x_engine_primitives;
+  if (def.archetype !== "engine-primitive-matrix" && rawPrimitives === undefined) return;
+
+  if (!Array.isArray(rawPrimitives)) {
+    errors.push({
+      invariant: "engine-primitive-matrix",
+      message: `Workflow '${def.id}' must declare x_engine_primitives with the frozen primitive matrix.`,
+    });
+    return;
+  }
+
+  const primitives = rawPrimitives.filter((value): value is string => typeof value === "string");
+  const frozenPrimitiveSet = new Set<string>(FROZEN_ENGINE_PRIMITIVES);
+  const missing = FROZEN_ENGINE_PRIMITIVES.filter((primitive) => !primitives.includes(primitive));
+  const unknown = primitives.filter((primitive) => !frozenPrimitiveSet.has(primitive));
+  if (missing.length > 0 || unknown.length > 0 || primitives.length !== rawPrimitives.length) {
+    errors.push({
+      invariant: "engine-primitive-matrix",
+      message:
+        `Workflow '${def.id}' must declare exactly the frozen engine primitive matrix. ` +
+        `Missing: ${missing.length ? missing.join(", ") : "none"}. ` +
+        `Unknown/non-string: ${unknown.length ? unknown.join(", ") : "none"}.`,
+    });
+  }
+}
+
+function checkDelegateResolution(
+  def: WorkflowDef,
+  errors: ConformanceError[],
+): void {
+  const policy = loadCapabilityPolicySync();
+  if (!policy) return;
+
+  const incoming = new Map<string, NonNullable<WorkflowState["transitions"]>>();
+  for (const state of def.states) {
+    for (const transition of state.transitions ?? []) {
+      const list = incoming.get(transition.to) ?? [];
+      list.push(transition);
+      incoming.set(transition.to, list);
+    }
+  }
+
+  for (const state of def.states) {
+    if (!state.owner_role || state.kind === "terminal") continue;
+
+    const candidates = bodiesForRole(policy, state.owner_role) ?? [];
+    if (candidates.length === 0) {
+      if (!roleIsDeclared(policy, state.owner_role)) continue;
+      errors.push({
+        invariant: "delegate-resolution",
+        message: `State '${state.id}' owner_role '${state.owner_role}' resolves to no bodies.`,
+        state: state.id,
+      });
+      continue;
+    }
+
+    if (candidates.length > 1) {
+      const entries = incoming.get(state.id) ?? [];
+      for (const transition of entries) {
+        const selectionCriteria = transition.assign?.selection_criteria;
+        if (transition.assign?.mode !== "required" || typeof selectionCriteria !== "string" || selectionCriteria.trim() === "") {
+          errors.push({
+            invariant: "delegate-resolution",
+            message:
+              `State '${state.id}' owner_role '${state.owner_role}' resolves to multiple bodies ` +
+              `(${candidates.join(", ")}); incoming transition '${transition.command}' must require an explicit delegate ` +
+              `and declare selection criteria.`,
+            state: state.id,
+          });
+        }
+      }
+    }
+  }
+}
+
 // ── Public API ─────────────────────────────────────────────────────────────
 
 /**
@@ -277,6 +404,8 @@ export function validateWorkflowDef(def: WorkflowDef, _file?: string): Conforman
   // Structural invariants
   checkBarrierInvariant(def, errors);
   checkFanoutBeforeBarrier(def, errors);
+  checkEnginePrimitiveMatrix(def, errors);
+  checkDelegateResolution(def, errors);
 
   // Child_workflow sync check (wf: prefix + cached registry)
   checkChildWorkflowSync(def, errors);

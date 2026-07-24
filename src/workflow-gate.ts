@@ -39,7 +39,7 @@ import path from "node:path";
 import yaml from "js-yaml";
 import { componentLogger, createLogger, type Logger } from "./logger.js";
 import { defaultWorkflowDefPath } from "./instance-config.js";
-import { bodyHasCapability, resolveBodiesForRole, resolveBodiesWithCapability, isBodyKnown } from "./escalation-gate.js";
+import { bodyHasCapability, resolveBodiesForRole, resolveBodiesWithCapability, isBodyKnown, isRoleDeclared } from "./escalation-gate.js";
 import { probeDeployOutcome } from "./deploy-probe.js";
 import { isTerminalIssueState } from "./linear-actionable.js";
 import type { ObservationStore } from "./store/observation-store.js";
@@ -136,6 +136,7 @@ export interface WorkflowTransition {
     mode?: 'required' | 'auto' | 'none';
     constraint?: string;
     default?: string;
+    selection_criteria?: string;
   };
   /** Phase 6.5 / H-7 (AI-1482): if true, capture verbatim AC from issue description at accept time. */
   capture_ac?: boolean;
@@ -4413,7 +4414,7 @@ async function fetchFanoutSpecDescription(issueId: string, authToken: string, sp
  */
 async function postComment(internalIssueId: string, body: string, authToken: string): Promise<void> {
   const mutation = `
-    mutation($issueId: ID!, $body: String!) {
+    mutation CommentCreate($issueId: ID!, $body: String!) {
       commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
     }
   `;
@@ -5248,6 +5249,29 @@ export async function applyStateTransition(
       // "overridable with --target" true, and makes zero-body roles drivable.
       const explicitTarget = options?.cliTarget;
       if (explicitTarget) {
+        const enforcesSelectionCriteria =
+          typeof matchedTransition?.assign?.selection_criteria === "string" &&
+          matchedTransition.assign.selection_criteria.trim().length > 0;
+        if (enforcesSelectionCriteria) {
+          const legalTargets = await resolveBodiesForRole(destOwnerRole!);
+          const roleDeclared = legalTargets.length > 0 || await isRoleDeclared(destOwnerRole!);
+          if ((legalTargets.length > 1 || legalTargets.length === 0 && roleDeclared) && !legalTargets.includes(explicitTarget)) {
+            log.error(
+              `workflow-gate: B2 apply: FAIL-CLOSED — CLI target '${explicitTarget}' is not a valid body for role '${destOwnerRole}' on ${issueId}. Transition aborted.`,
+            );
+            return await failDelegateUnresolved({
+              issueId: issue.internalId,
+              authToken,
+              detail: `CLI target '${explicitTarget}' is not a valid body for role '${destOwnerRole}'`,
+              remedy:
+                `'${intent}' routes to role '${destOwnerRole}', but '${explicitTarget}' is not one of the ` +
+                `registered bodies for that role. Re-run with \`--target <body>\`, naming one of: ` +
+                `${legalTargets.length > 0 ? legalTargets.join(", ") : "(none registered)"}.`,
+              from: currentStateName,
+              to: toStateName,
+            });
+          }
+        }
         const targetAgent = getAgent(explicitTarget);
         if (targetAgent?.linearUserId) {
           resolvedDelegateId = targetAgent.linearUserId;
@@ -5336,25 +5360,24 @@ export async function applyStateTransition(
               from: currentStateName,
               to: toStateName,
             });
+          } else if (intent === 'approve' || intent === 'reject' || await isRoleDeclared(destOwnerRole!)) {
+            log.error(
+              `workflow-gate: B2 apply: FAIL-CLOSED — no bodies found for role '${destOwnerRole}' on '${intent}'. Transition aborted per delegate-resolution contract.`,
+            );
+            return await failDelegateUnresolved({
+              issueId: issue.internalId,
+              authToken,
+              detail: `no bodies found for role '${destOwnerRole}'`,
+              remedy:
+                `'${intent}' routes to role '${destOwnerRole}', but no body is registered as filling that role, ` +
+                `so there is nobody to delegate to. Add a body with '${destOwnerRole}' in its \`fills_roles\` in ` +
+                `capability-policy.yaml, or route this transition to a state with a resolvable owner role.`,
+              from: currentStateName,
+              to: toStateName,
+            });
           } else {
-            if (intent === 'approve' || intent === 'reject') {
-              log.error(
-                `workflow-gate: B2 apply: FAIL-CLOSED — no bodies found for role '${destOwnerRole}' on '${intent}'. Transition aborted per AI-1493.`,
-              );
-              return await failDelegateUnresolved({
-                issueId: issue.internalId,
-                authToken,
-                detail: `no bodies found for role '${destOwnerRole}'`,
-                remedy:
-                  `'${intent}' routes to role '${destOwnerRole}', but no body is registered as filling that role, ` +
-                  `so there is nobody to delegate to. Add a body with '${destOwnerRole}' in its \`fills_roles\` in ` +
-                  `capability-policy.yaml, or re-run with \`--target <body>\` to route this transition explicitly.`,
-                from: currentStateName,
-                to: toStateName,
-              });
-            }
             log.warn(
-              `workflow-gate: B2 apply: no bodies found for role '${destOwnerRole}' on '${intent}' — skipping auto-delegate`,
+              `workflow-gate: B2 apply: no declared role or bodies found for '${destOwnerRole}' on '${intent}' — preserving legacy no-delegate transition`,
             );
           }
         } catch (err) {
