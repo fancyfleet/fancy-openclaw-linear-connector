@@ -3248,8 +3248,7 @@ export async function checkWorkflowRules(
 
   const transitions = stateNode.transitions ?? [];
   // INF-112: `force-deploy` is an alias for `continue` in merge/deploy states.
-  // It maps to the same transition but skips the evidence gate. Capability
-  // checks still run against the resolved transition below.
+  // It maps to the same transition but skips the evidence gate.
   const resolvedIntent = (intent === 'force-deploy') ? 'continue' : intent;
   const match = transitions.find((t) => t.command === resolvedIntent);
 
@@ -3282,7 +3281,16 @@ export async function checkWorkflowRules(
 
   // Capability gate — e.g. deploy:execute is Hanzo-only (§16.2).
   // Unknown callers (humans on the sign-off path) bypass capability checks.
-  if (match.requires_capability && isCallerKnown) {
+  //
+  // INF-527: `force-deploy` is a break-glass alias for `continue`, so `match` here
+  // is the underlying continue transition — carrying its ordinary requirement
+  // (deploy:execute in merge, infra:ssh in deploy). A break-glass escape hatch must
+  // not inherit that: infra:ssh would let an unrelated body force a deploy-state
+  // advance, and deploy:execute excludes the recovery steward. force-deploy is
+  // instead gated by the dedicated `workflow:force-deploy` capability in the
+  // evidence-skip block below (merge role-holder Hanzo + steward Astrid). Exempt it
+  // here so the two gates don't conflict.
+  if (match.requires_capability && isCallerKnown && intent !== 'force-deploy') {
     const allowed = await bodyHasCapability(bodyId, match.requires_capability);
     if (!allowed) {
       const legalMoves = [...transitions.map((t) => t.command), breakGlassCommand].join(", ");
@@ -3505,6 +3513,28 @@ export async function checkWorkflowRules(
   if (isMergeDeployContinue) {
     // force-deploy: log and skip evidence gate entirely
     if (intent === 'force-deploy') {
+      // INF-527: force-deploy is a break-glass-class bypass — it skips the PR
+      // evidence gate entirely, so it must be capability-gated like the other
+      // break-glass intents (migrate-state, rewind), not left open to any
+      // ticket-holder. Restricted to the dedicated `workflow:force-deploy`
+      // capability, granted in capability-policy.yaml to the merge role-holder
+      // (Hanzo, `deployment` container) and the recovery steward (Astrid,
+      // `workflow` container). isCallerKnown guards the human sign-off path
+      // (unknown callers are already handled upstream at ~L2916).
+      if (isCallerKnown) {
+        const forceDeployAllowed = await bodyHasCapability(bodyId, 'workflow:force-deploy');
+        if (!forceDeployAllowed) {
+          log.warn(`workflow-gate: force-deploy blocked agent=${bodyId} ticket=${issueId} — lacks workflow:force-deploy`);
+          const holders = await resolveBodiesWithCapability('workflow:force-deploy');
+          return (
+            `[Proxy] 'force-deploy' blocked: caller '${bodyId}' does not hold 'workflow:force-deploy'. ` +
+            `This break-glass bypass of the PR evidence gate is restricted to the merge role-holder and the workflow steward` +
+            (holders.length ? ` (${holders.join(', ')})` : '') +
+            `. If a merge is verified but the evidence gate cannot see it, ask one of them to fire force-deploy, or escalate to the steward.`
+          );
+        }
+        log.info(`workflow-gate: force-deploy authorized agent=${bodyId} ticket=${issueId} (holds workflow:force-deploy)`);
+      }
       log.warn(`workflow-gate: done gate: ${issueId} — force-deploy used, skipping evidence check`);
       notify({
         severity: "info",

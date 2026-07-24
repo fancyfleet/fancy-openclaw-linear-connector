@@ -61,6 +61,7 @@ capabilities:
   - id: linear:transition
   - id: human:escalate
   - id: workflow:break-glass
+  - id: workflow:force-deploy
   - id: deploy:execute
   - id: infra:ssh
 
@@ -68,9 +69,9 @@ containers:
   - id: dev
     grants: [linear:transition]
   - id: deployment
-    grants: [linear:transition, deploy:execute, infra:ssh]
+    grants: [linear:transition, deploy:execute, infra:ssh, workflow:force-deploy]
   - id: steward
-    grants: [linear:transition, human:escalate, workflow:break-glass]
+    grants: [linear:transition, human:escalate, workflow:break-glass, workflow:force-deploy]
   - id: code-review
     grants: [linear:transition]
 
@@ -2315,16 +2316,34 @@ describe("checkWorkflowRules — INF-112: non-Linear-generated branch (metadata-
     expect(result).toBeNull();
   });
 
-  it("force-deploy from merge state still requires the resolved deploy capability", async () => {
+  it("INF-527: force-deploy is allowed for the recovery steward (holds workflow:force-deploy)", async () => {
+    // astrid's steward container grants workflow:force-deploy in TEST_POLICY_YAML,
+    // mirroring the live policy (steward is a co-holder, not just Hanzo).
     globalThis.fetch = makeInf112Mock(false, "merge");
-    const result = await checkWorkflowRules("force-deploy", "issue-uuid", "Bearer tok", "charles");
-    expect(result).toContain("requires the 'deploy:execute' capability");
+    const result = await checkWorkflowRules("force-deploy", "issue-uuid", "Bearer tok", "astrid");
+    expect(result).toBeNull();
   });
 
-  it("force-deploy from deploy state still requires the resolved infra capability", async () => {
-    globalThis.fetch = makeInf112Mock(false, "deploy");
+  it("INF-527: force-deploy is BLOCKED for a known caller lacking workflow:force-deploy", async () => {
+    // charles (dev container) is a known body but holds neither the force-deploy
+    // grant nor break-glass — the break-glass-class bypass must reject him before
+    // the evidence gate is skipped. Under the old inherit approach he'd have been
+    // blocked on the resolved deploy:execute; now he's blocked on the dedicated
+    // workflow:force-deploy gate instead.
+    globalThis.fetch = makeInf112Mock(false, "merge");
     const result = await checkWorkflowRules("force-deploy", "issue-uuid", "Bearer tok", "charles");
-    expect(result).toContain("requires the 'infra:ssh' capability");
+    expect(result).not.toBeNull();
+    expect(result).toContain("does not hold 'workflow:force-deploy'");
+  });
+
+  it("INF-527: force-deploy from deploy state is gated on workflow:force-deploy, not the inherited infra:ssh", async () => {
+    // Regression guard for the reconcile: from deploy state the resolved edge
+    // carries infra:ssh, which the deployment role-holder (hanzo) does NOT hold —
+    // the inherit approach would have blocked hanzo here. force-deploy must instead
+    // resolve on workflow:force-deploy, which hanzo holds → allowed.
+    globalThis.fetch = makeInf112Mock(false, "deploy");
+    const result = await checkWorkflowRules("force-deploy", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).toBeNull();
   });
 
   // ── Path 4: GH_TOKEN set but GitHub confirms NOT merged → blocked ──
