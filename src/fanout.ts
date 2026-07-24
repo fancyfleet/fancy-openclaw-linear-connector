@@ -53,6 +53,19 @@ const SPEC_ENTRY_MARKER_RE = /<!--\s*ai-1994:spec-entry-id:\s*(\S+?)\s*-->/;
 const CHILD_WORKFLOW_MARKER_PREFIX = "<!-- inf-32:child-workflow: ";
 const CHILD_WORKFLOW_MARKER_RE = /<!--\s*inf-32:child-workflow:\s*(\S+?)\s*-->/;
 
+interface DevSprintTitleParts {
+  icon: string;
+}
+
+function parseDevSprintTitle(title: string): DevSprintTitleParts | null {
+  const trimmed = title.trim();
+  const icon = trimmed.split(/\s+/, 1)[0] ?? "";
+  if (!icon || /^[A-Za-z0-9]/.test(icon)) return null;
+  if (!/\bCycle\s+\d+\b/i.test(trimmed)) return null;
+  if (!/\s[—–-]\s+\S/.test(trimmed)) return null;
+  return { icon };
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────
 
 /** A single finding to fan out into its own child issue. */
@@ -111,6 +124,13 @@ export interface ExistingChild {
    * the legacy read path.
    */
   childWorkflow?: string;
+  /**
+   * INF-469: the child's title, as minted. Used by the duplicate-title guard
+   * (same-parent, same-child-workflow collision check) — see the mint loop in
+   * {@link executeFanout}. Optional: children fetched before this field existed
+   * carry no title, and the guard fail-opens on a missing value.
+   */
+  title?: string;
 }
 
 /**
@@ -1564,6 +1584,72 @@ export async function executeFanout(
 
     // AI-2199: per-entry child workflow override. Falls back to config default.
     const findingWorkflow = finding.child_workflow ?? childWorkflowLabel;
+
+    if (findingWorkflow === "wf:dev-sprint") {
+      const titleParts = parseDevSprintTitle(childTitle);
+      if (!titleParts) {
+        result.errors.push({
+          findingIndex: i,
+          message:
+            `Refusing to spawn: sprint title "${childTitle}" must include a unique leading icon, ` +
+            `cycle number, and theme in the format "<icon> <Project> Cycle <N> — <Theme>".`,
+        });
+        log.warn(`fanout: REFUSED — invalid sprint title shape for finding ${i + 1}/${toSpawn.length}: "${childTitle}"`);
+        continue;
+      }
+    }
+
+    // INF-469: duplicate-title guard for wf:dev-sprint children. INF-439/INF-468
+    // both minted as "🔒 Connector 2026-07-23 Sprint" — identical title, indistinguishable
+    // on Matt's active-sprint dashboard. The sprint title is entirely steward-authored
+    // free text (extractSpecFindings takes the `## sprint` bullet verbatim — there is no
+    // engine-side title template to "fix" beyond this). Refuse rather than silently mint
+    // a second identically-titled sprint (this codebase's established pattern — see the
+    // dangling `-->` guard above): a collision means the steward re-wrote the same
+    // "<emoji> <Project> <date> Sprint" bullet across a rework loop / incident-recovery
+    // re-entry without differentiating it. Scoped to same-parent history (existingChildren
+    // spans this spawner's full lifetime, including prior loop cycles) and to the same
+    // child_workflow, so an unrelated sibling fan-out can't false-positive the guard.
+    const normalizedTitle = childTitle.trim().toLowerCase();
+    const duplicateSibling = existingChildren.find(
+      (c) => c.childWorkflow === findingWorkflow && c.title?.trim().toLowerCase() === normalizedTitle,
+    );
+    if (findingWorkflow === "wf:dev-sprint" && duplicateSibling) {
+      result.errors.push({
+        findingIndex: i,
+        message:
+          `Refusing to spawn: title "${childTitle}" duplicates existing sibling ${duplicateSibling.identifier} ` +
+          `under this parent. Sprint titles must be unique for dashboard clarity — include a cycle number and ` +
+          `distinguish the theme, e.g. "<icon> <Project> Cycle <N> — <Theme>".`,
+      });
+      log.warn(
+        `fanout: REFUSED — duplicate sprint title for finding ${i + 1}/${toSpawn.length}: "${childTitle}" ` +
+        `(matches existing sibling ${duplicateSibling.identifier})`,
+      );
+      continue;
+    }
+
+    if (findingWorkflow === "wf:dev-sprint") {
+      const titleParts = parseDevSprintTitle(childTitle);
+      const sameIconSibling = existingChildren.find((c) => {
+        if (c.childWorkflow !== findingWorkflow || !c.title) return false;
+        return parseDevSprintTitle(c.title)?.icon === titleParts?.icon;
+      });
+      if (titleParts && sameIconSibling) {
+        result.errors.push({
+          findingIndex: i,
+          message:
+            `Refusing to spawn: sprint title "${childTitle}" reuses icon "${titleParts.icon}" from existing sibling ` +
+            `${sameIconSibling.identifier}. Sprint titles need a per-cycle unique icon for dashboard clarity.`,
+        });
+        log.warn(
+          `fanout: REFUSED — duplicate sprint icon for finding ${i + 1}/${toSpawn.length}: "${titleParts.icon}" ` +
+          `(matches existing sibling ${sameIconSibling.identifier})`,
+        );
+        continue;
+      }
+    }
+
     const wfLabelId = workflowLabelIds.get(findingWorkflow);
     if (!wfLabelId) {
       result.errors.push({
@@ -1795,7 +1881,7 @@ async function fetchExistingSpawnChildren(
   const query = `
     query FanoutChildren($id: String!) {
       issue(id: $id) {
-        children { nodes { identifier description state { name } labels { nodes { name } } } }
+        children { nodes { identifier title description state { name } labels { nodes { name } } } }
       }
     }
   `;
@@ -1811,6 +1897,7 @@ async function fetchExistingSpawnChildren(
           children?: {
             nodes?: Array<{
               identifier: string;
+              title?: string | null;
               description?: string | null;
               state?: { name?: string } | null;
               labels?: { nodes?: Array<{ name?: string }> } | null;
@@ -1837,6 +1924,7 @@ async function fetchExistingSpawnChildren(
           specEntryId: m[1],
           state: n.state?.name,
           childWorkflow: wfMarker ? wfMarker[1] : wfLabel,
+          title: n.title ?? undefined,
         });
       }
     }
