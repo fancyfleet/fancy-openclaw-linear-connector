@@ -239,6 +239,13 @@ export function checkCaps(
 export interface FindingInput {
   title: string;
   description?: string;
+  /**
+   * AI-2199: per-entry child workflow override. When set, this finding's
+   * children are labeled with this workflow id instead of the fanout config's
+   * `child_workflow` default. Passed from Fanout.Finding so the preview
+   * shows the resolved workflow.
+   */
+  child_workflow?: string;
 }
 
 /**
@@ -273,7 +280,7 @@ export async function generateSpawnPreview(
     index: i,
     title: f.title,
     description: f.description,
-    workflow: "dev-impl",
+    workflow: f.child_workflow ?? "dev-impl",
     // Seed AC: derive from the finding title + description
     seedAc: f.description
       ? `${f.title}: ${f.description}`

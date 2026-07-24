@@ -1200,7 +1200,12 @@ export function createAdminRouter(deps: AdminDeps): Router {
         }
       : undefined;
 
-    const result = await setStateAtomic(ticketId, targetState, delegate, authToken, { sendWakeUp, operationalEventStore: deps.operationalEventStore, force });
+    const result = await setStateAtomic(ticketId, targetState, delegate, authToken, {
+      sendWakeUp,
+      operationalEventStore: deps.operationalEventStore,
+      enrolledTicketsStore: deps.enrolledTicketsStore,
+      force,
+    });
     if (!result.ok) {
       res.status(422).json(result);
       return;

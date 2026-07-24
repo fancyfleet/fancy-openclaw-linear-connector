@@ -23,6 +23,7 @@ import { resetWorkflowCache } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { reloadAgents } from "./agents.js";
 import { createApp } from "./index.js";
+import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -107,6 +108,37 @@ const MOCK_TEAM_STATES = [
   { id: "state-done-uuid", name: "Done", type: "completed" },
   { id: "state-invalid-uuid", name: "Invalid", type: "canceled" },
 ];
+
+function fakeMirror(initial: { state: string; delegate: string | null }) {
+  const row = {
+    ticket_id: "AI-9999",
+    workflow: "dev-impl",
+    state: initial.state,
+    delegate: initial.delegate,
+    designated_approver: null,
+    entered_state_at: "2026-07-24T00:00:00.000000Z",
+    enrolled_at: "2026-07-24T00:00:00.000000Z",
+    last_event_kind: "enroll",
+    last_event_at: "2026-07-24T00:00:00.000000Z",
+    terminal: 0,
+  };
+  return {
+    store: {
+      getByTicketId: jest.fn(() => row),
+      recordTransition: jest.fn((input: { toState: string; delegate: string | null; eventKind: string }) => {
+        row.state = input.toState;
+        row.delegate = input.delegate;
+        row.last_event_kind = input.eventKind;
+        row.terminal = 0;
+      }),
+      markTerminal: jest.fn((_ticketId: string, eventKind: string) => {
+        row.last_event_kind = eventKind;
+        row.terminal = 1;
+      }),
+    } as unknown as EnrolledTicketsStore,
+    row,
+  };
+}
 
 function makeSetStateFetch(opts: MockOptions): typeof globalThis.fetch {
   const {
@@ -465,6 +497,75 @@ describe("setStateAtomic (AI-1546)", () => {
     const result = await setStateAtomic("AI-9999", "intake", undefined, "Bearer test-token", { sendWakeUp });
     expect(result.ok).toBe(true);
     expect(result.redispatched).toBeUndefined();
+  });
+
+  it("INF-466: records successful non-terminal admin set-state in the enrolled-ticket mirror", async () => {
+    globalThis.fetch = makeSetStateFetch({
+      fromLabels: ["wf:dev-impl", "state:implementation"],
+      updateSuccess: true,
+      consistencyLabels: ["wf:dev-impl", "state:intake"],
+    });
+
+    const mirror = fakeMirror({ state: "implementation", delegate: "igor" });
+
+    const result = await setStateAtomic("AI-9999", "intake", undefined, "Bearer test-token", {
+      enrolledTicketsStore: mirror.store,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(mirror.row.state).toBe("intake");
+    expect(mirror.row.delegate).toBe("igor");
+    expect(mirror.row.last_event_kind).toBe("set-state");
+    expect(mirror.row.terminal).toBe(0);
+    expect(mirror.store.recordTransition).toHaveBeenCalledWith({
+      ticketId: "AI-9999",
+      toState: "intake",
+      delegate: "igor",
+      eventKind: "set-state",
+    });
+  });
+
+  it("INF-466: marks the mirror terminal after successful terminal admin set-state", async () => {
+    globalThis.fetch = makeSetStateFetch({
+      fromLabels: ["wf:dev-impl", "state:implementation"],
+      updateSuccess: true,
+      consistencyLabels: ["wf:dev-impl", "state:done"],
+    });
+
+    const mirror = fakeMirror({ state: "implementation", delegate: "igor" });
+
+    const result = await setStateAtomic("AI-9999", "done", undefined, "Bearer test-token", {
+      enrolledTicketsStore: mirror.store,
+      force: true,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(mirror.row.last_event_kind).toBe("set-state");
+    expect(mirror.row.terminal).toBe(1);
+    expect(mirror.store.markTerminal).toHaveBeenCalledWith("AI-9999", "set-state");
+    expect(mirror.store.recordTransition).not.toHaveBeenCalled();
+  });
+
+  it("INF-466: does not update the mirror when admin set-state fails verification", async () => {
+    globalThis.fetch = makeSetStateFetch({
+      fromLabels: ["wf:dev-impl", "state:implementation"],
+      updateSuccess: true,
+      consistencyLabels: ["wf:dev-impl", "state:implementation"],
+    });
+
+    const mirror = fakeMirror({ state: "implementation", delegate: "igor" });
+
+    const result = await setStateAtomic("AI-9999", "done", undefined, "Bearer test-token", {
+      enrolledTicketsStore: mirror.store,
+      force: true,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(mirror.row.state).toBe("implementation");
+    expect(mirror.row.last_event_kind).toBe("enroll");
+    expect(mirror.row.terminal).toBe(0);
+    expect(mirror.store.recordTransition).not.toHaveBeenCalled();
+    expect(mirror.store.markTerminal).not.toHaveBeenCalled();
   });
 });
 
