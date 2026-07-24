@@ -2917,11 +2917,11 @@ export async function checkWorkflowRules(
   // Gated on proceed/start-cycle from evaluating state.
   if (workflowId === "sprint-spawner" && (intent === "proceed" || intent === "start-cycle") && !breakGlassOverride) {
     if (!labels.includes("harness-green")) {
-       log.warn(`workflow-gate: INF-474 Readiness Guard — blocking '${intent}' on ${issueId} (wf:sprint-spawner) because harness-green label is missing`);
-       return (
-         `[Proxy] '${intent}' blocked: the sprint-spawner is frozen until the integration-test harness is green. ` +
-         `Apply the 'harness-green' label to the spawner once the E2E harness (INF-474) is operational.`
-       );
+      log.warn(`workflow-gate: INF-474 Readiness Guard — blocking '${intent}' on ${issueId} (wf:sprint-spawner) because harness-green label is missing`);
+      return (
+        `[Proxy] '${intent}' blocked: the sprint-spawner is frozen until the integration-test harness is green. ` +
+        `Apply the 'harness-green' label to the spawner once the E2E harness (INF-474) is operational.`
+      );
     }
   }
 
@@ -5505,7 +5505,7 @@ export async function applyStateTransition(
         // executeFanout already posts specific comments for refused/spawn_if_waived,
         // but the generic "attempted N, minted 0" or "empty spec" path needs a summary.
         if (fanoutResult.attempted > 0 || (fanoutResult.refused && fanoutResult.errors.length > 0)) {
-           await postComment(issue.internalId, `❌ **Fan-out Failed**: No children were created.\n\n**Reason**: ${errorDetail || "Unknown error during fan-out execution."}`, authToken);
+          await postComment(issue.internalId, `❌ **Fan-out Failed**: No children were created.\n\n**Reason**: ${errorDetail || "Unknown error during fan-out execution."}`, authToken);
         }
       }
       // Post a summary comment on the parent ticket with the fan-out result.
