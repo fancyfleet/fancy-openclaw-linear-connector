@@ -12,6 +12,9 @@ import { resetPolicyCache } from "../escalation-gate.js";
 const CANONICAL_TASK_FIXTURE = path.resolve(process.cwd(), "src/__fixtures__/canonical-task.yaml");
 
 const TASK_POLICY_YAML = `
+containers:
+  - id: default
+    secretsPath: /dev/null
 capabilities:
   - id: linear:transition
 roles:
@@ -24,9 +27,24 @@ roles:
 bodies:
   - id: ai
     fills_roles: [requester]
+    container: default
   - id: astrid
     fills_roles: [department-head]
+    container: default
 `;
+
+const AGENTS_JSON = [
+  {
+    id: "ai",
+    name: "Ai",
+    linearUserId: "ai-user-id"
+  },
+  {
+    id: "astrid",
+    name: "Astrid",
+    linearUserId: "astrid-user-id"
+  }
+];
 
 const TOK = "Bearer test-token";
 const ISSUE = "INF-489-REPRO";
@@ -99,12 +117,16 @@ describe("INF-489 Repro: same-column transition no-op", () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf489-repro-"));
     const policyFile = path.join(tmpDir, "capability-policy.yaml");
     fs.writeFileSync(policyFile, TASK_POLICY_YAML, "utf8");
+    const agentsFile = path.join(tmpDir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify(AGENTS_JSON), "utf8");
     process.env.CAPABILITY_POLICY_PATH = policyFile;
+    process.env.AGENTS_JSON_PATH = agentsFile;
     process.env.WORKFLOW_DEF_PATH = CANONICAL_TASK_FIXTURE;
   });
 
   afterAll(() => {
     delete process.env.WORKFLOW_DEF_PATH;
+    delete process.env.AGENTS_JSON_PATH;
     delete process.env.CAPABILITY_POLICY_PATH;
   });
 
