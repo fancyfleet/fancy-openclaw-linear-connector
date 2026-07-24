@@ -628,6 +628,167 @@ describe("AC3: enrolled ticket (state:* present) never touched; no double-bootst
   });
 });
 
+// ── INF-497: terminal workflow label + active native state → reconciled ──────
+
+describe("INF-497: Pass 3 reconciles terminal-label / active-native-state mismatch", () => {
+  const ISSUE_ID_MISMATCH = "issue-uuid-inf496-shape";
+  const DONE_STATE_ID = "team-done-state-uuid";
+
+  /**
+   * Fetch mock for the INF-496 shape: a `wf:task` + `state:done` ticket whose
+   * native Linear state is still `To Do` (type unstarted) with a null delegate.
+   * `nativeType` lets a test override the native state type to exercise the
+   * skip guards (already-completed / canceled).
+   */
+  function makeMismatchFetch(opts: {
+    mutationCalls: string[];
+    nativeType?: string;
+    nativeName?: string;
+    completedStates?: Array<{ id: string; name: string; type: string; position: number }>;
+    mutationSuccess?: boolean;
+  }): typeof fetch {
+    const {
+      mutationCalls,
+      nativeType = "unstarted",
+      nativeName = "To Do",
+      completedStates = [{ id: DONE_STATE_ID, name: "Done", type: "completed", position: 3 }],
+      mutationSuccess = true,
+    } = opts;
+
+    return async (_url, init) => {
+      const body = typeof init?.body === "string" ? init.body : "";
+
+      // Native state + delegate lookup (queryEnrolledTicketState)
+      if (body.includes("IssueContextSweep")) {
+        return new Response(
+          JSON.stringify({
+            data: { issue: { id: ISSUE_ID_MISMATCH, state: { id: "todo-state-uuid", name: nativeName, type: nativeType }, delegate: null } },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Team completed-state resolution (queryTeamCompletedStateId)
+      if (body.includes("TeamCompletedState")) {
+        return new Response(
+          JSON.stringify({ data: { team: { states: { nodes: completedStates } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Reconcile mutation
+      if (body.includes("issueUpdate") || body.includes("IssueUpdate")) {
+        mutationCalls.push(body);
+        return new Response(
+          JSON.stringify({ data: { issueUpdate: { success: mutationSuccess } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Candidate sweep query
+      if (body.includes("BootstrapReconciliation") || body.includes("wf:")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issues: {
+                nodes: [
+                  {
+                    id: ISSUE_ID_MISMATCH,
+                    identifier: "INF-496",
+                    updatedAt: OLD_TIMESTAMP,
+                    labels: { nodes: [{ id: "label-wf-task", name: "wf:task" }, { id: "label-state-done", name: "state:done" }] },
+                    delegate: null,
+                    team: { id: TEAM_ID },
+                    title: "Ticket INF-496",
+                  },
+                ],
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      return new Response(JSON.stringify({ data: {} }), { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+  }
+
+  it("pushes native state to the team completed state, clears delegate, and leaves labels untouched", async () => {
+    const mutationCalls: string[] = [];
+    const { bus, alerts } = makeTestAlertBus();
+    globalThis.fetch = makeMismatchFetch({ mutationCalls });
+
+    const result = await runBootstrapReconciliationSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: WORKFLOW_REGISTRY as never,
+      alertBus: bus,
+    });
+
+    expect(result.healed).toBe(1);
+    expect(result.errors).toHaveLength(0);
+
+    // Exactly one reconcile mutation, targeting the completed state + clearing delegate.
+    expect(mutationCalls).toHaveLength(1);
+    const mutation = mutationCalls[0];
+    expect(mutation).toContain(DONE_STATE_ID);
+    expect(mutation).toContain("delegateId");
+    // Must NOT touch labels — the workflow record is already terminal and correct.
+    expect(mutation).not.toContain("labelIds");
+
+    // Audited via the alert bus, not a ticket comment.
+    const reconcileAlerts = alerts.filter((a) => a.title.includes("reconciled terminal-label"));
+    expect(reconcileAlerts).toHaveLength(1);
+    expect(reconcileAlerts[0].ticket).toBe("INF-496");
+  });
+
+  it("does NOT force-complete a ticket whose native state is already canceled", async () => {
+    const mutationCalls: string[] = [];
+    const { bus } = makeTestAlertBus();
+    globalThis.fetch = makeMismatchFetch({ mutationCalls, nativeType: "canceled", nativeName: "Canceled" });
+
+    const result = await runBootstrapReconciliationSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: WORKFLOW_REGISTRY as never,
+      alertBus: bus,
+    });
+
+    expect(result.healed).toBe(0);
+    expect(mutationCalls).toHaveLength(0);
+  });
+
+  it("does nothing when the native state is already completed (Pass 2's domain)", async () => {
+    const mutationCalls: string[] = [];
+    const { bus } = makeTestAlertBus();
+    // native already completed + no merged PR → Pass 2 skips, Pass 3 skips.
+    globalThis.fetch = makeMismatchFetch({ mutationCalls, nativeType: "completed", nativeName: "Done" });
+
+    const result = await runBootstrapReconciliationSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: WORKFLOW_REGISTRY as never,
+      alertBus: bus,
+    });
+
+    expect(result.healed).toBe(0);
+    expect(mutationCalls).toHaveLength(0);
+  });
+
+  it("records an error and does not heal when the team has no completed state", async () => {
+    const mutationCalls: string[] = [];
+    const { bus } = makeTestAlertBus();
+    globalThis.fetch = makeMismatchFetch({ mutationCalls, completedStates: [] });
+
+    const result = await runBootstrapReconciliationSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: WORKFLOW_REGISTRY as never,
+      alertBus: bus,
+    });
+
+    expect(result.healed).toBe(0);
+    expect(mutationCalls).toHaveLength(0);
+    expect(result.errors.some((e) => e.includes("no completed state"))).toBe(true);
+  });
+});
+
 // ── AC4: Linear API failure → alert emitted, no crash ────────────────────
 
 describe("AC4: Linear API error → alert rather than crash", () => {

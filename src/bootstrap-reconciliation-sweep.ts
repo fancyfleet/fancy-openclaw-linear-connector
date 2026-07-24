@@ -18,6 +18,12 @@
  *   - Heal (Pass 2 — enrolled, AI-2016 AC3): for tickets WITH state:* labels that
  *     are native-Done with merged PRs, strip wf:* and state:* labels and clear
  *     delegate so the workflow record closes.
+ *   - Heal (Pass 3 — enrolled, INF-497): the mirror of Pass 2. For tickets whose
+ *     workflow label is terminal-done (`state:done`) but whose native Linear state
+ *     is still active (the INF-496 shape — `wf:task` + `state:done` + native `To Do`
+ *     + null delegate), push the native state to the team's completed state and
+ *     clear the delegate. Labels are left untouched (the workflow record is already
+ *     terminal and correct) and no ticket comment is posted.
  *   - Alert: each heal emits a warning via the alert bus (`bootstrap-reconciled`).
  *   - Race-safe: the idempotency re-fetch inside the heal path prevents
  *     double-bootstrap when a late webhook lands between query and heal.
@@ -237,6 +243,92 @@ async function closeEnrolledTicket(
         query: mutation,
         variables: { issueId, labelIds: keepIds },
       }),
+    });
+    type MResp = { data?: { issueUpdate?: { success: boolean } } };
+    const data = (await res.json()) as MResp;
+    return data.data?.issueUpdate?.success ?? false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve the team's completed Linear state id (INF-497).
+ *
+ * The `done` terminal workflow state projects to `native_state: done` — the
+ * team's completed-type Linear state. When a ticket carries the terminal
+ * `state:done` label but its native state was never advanced (a dropped
+ * state-projection webhook), Pass 3 pushes the native state here. Prefers a
+ * completed state literally named "Done"; otherwise the lowest-position
+ * completed state (Linear teams virtually always have exactly one).
+ *
+ * Inlined query (injected fetchFn) so tests can intercept it, matching the
+ * other sweep helpers.
+ */
+async function queryTeamCompletedStateId(
+  teamId: string,
+  authToken: string,
+  fetchFn: typeof fetch,
+): Promise<string | null> {
+  const query = `
+    query TeamCompletedState($id: String!) {
+      team(id: $id) {
+        states { nodes { id name type position } }
+      }
+    }
+  `;
+  try {
+    const res = await fetchFn(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: teamId } }),
+    });
+    type Resp = {
+      data?: {
+        team?: {
+          states: { nodes: Array<{ id: string; name: string; type: string; position: number }> };
+        } | null;
+      };
+    };
+    const data = (await res.json()) as Resp;
+    const nodes = data.data?.team?.states?.nodes ?? [];
+    const completed = nodes.filter((s) => s.type === "completed");
+    if (completed.length === 0) return null;
+    const named = completed.find((s) => s.name.trim().toLowerCase() === "done");
+    if (named) return named.id;
+    completed.sort((a, b) => a.position - b.position);
+    return completed[0].id;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reconcile an enrolled ticket whose workflow label is terminal-done but whose
+ * native Linear state is still active (INF-497 / the INF-496 shape).
+ *
+ * Sets native stateId → the team's completed state and clears the delegate — a
+ * terminal ticket owns no agent. Does NOT touch the `state:*` / `wf:*` labels
+ * (the workflow record is already terminal and correct) and posts no comment.
+ */
+async function reconcileTerminalNativeState(
+  issueId: string,
+  completedStateId: string,
+  authToken: string,
+  fetchFn: typeof fetch,
+): Promise<boolean> {
+  const mutation = `
+    mutation ReconcileTerminalNativeState($issueId: String!, $stateId: String!) {
+      issueUpdate(id: $issueId, input: { stateId: $stateId, delegateId: null }) {
+        success
+      }
+    }
+  `;
+  try {
+    const res = await fetchFn(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: mutation, variables: { issueId, stateId: completedStateId } }),
     });
     type MResp = { data?: { issueUpdate?: { success: boolean } } };
     const data = (await res.json()) as MResp;
@@ -491,6 +583,76 @@ export async function runBootstrapReconciliationSweep(
         severity: "warning",
         source: "bootstrap-reconciled",
         title: `Bootstrap reconciliation enrolled-ticket error for ${ticket.identifier}`,
+        detail: { error: msg },
+        ticket: ticket.identifier,
+      });
+    }
+  }
+
+  // ── Pass 3: Terminal workflow label but active native state (INF-497) ────────
+  // The mirror image of Pass 2. Pass 2 closes tickets that are native-Done but
+  // still carry live workflow labels. Pass 3 handles the inverse: the workflow
+  // record already reached terminal `done` (label `state:done`) but the native
+  // Linear state was never advanced off an active column — the INF-496 shape
+  // (`wf:task` + `state:done` + native `To Do` + null delegate). The null-delegate
+  // stall sweep then re-flags it forever as an active, ownerless ticket the
+  // workflow engine itself considers terminal, with no legal agent verb to repair
+  // it (`complete` is rejected from state `done`; `escape` would re-open it).
+  //
+  // Gate: reconcile ONLY when the terminal `state:done` label is present. This
+  // moves native state strictly toward completion — it never re-opens a ticket,
+  // never changes the workflow label, and posts no ticket comment (audit is the
+  // alert-bus record below).
+  for (const ticket of candidates) {
+    const hasTerminalDoneLabel = ticket.labels.some((l) => l.name === "state:done");
+    if (!hasTerminalDoneLabel) continue;
+
+    try {
+      const stateData = await queryEnrolledTicketState(ticket.id, authToken, fetchFn);
+      if (!stateData || !stateData.state) continue;
+      // Already terminal (completed/canceled) → nothing to reconcile. A native-Done
+      // ticket with live labels is Pass 2's job; a canceled ticket must not be
+      // force-completed.
+      if (stateData.state.type === "completed" || stateData.state.type === "canceled") continue;
+
+      const completedStateId = await queryTeamCompletedStateId(ticket.teamId, authToken, fetchFn);
+      if (!completedStateId) {
+        result.errors.push(`no completed state resolved for team of ${ticket.identifier}`);
+        log.warn(`bootstrap-reconciliation: could not resolve completed state for ${ticket.identifier}`);
+        continue;
+      }
+
+      const reconciled = await reconcileTerminalNativeState(ticket.id, completedStateId, authToken, fetchFn);
+      if (reconciled) {
+        result.healed++;
+        log.info(
+          `bootstrap-reconciliation: reconciled terminal-label ticket ${ticket.identifier}` +
+          ` (native ${stateData.state.name} → completed; label state:done unchanged)`,
+        );
+        alertBus.notify({
+          severity: "warning",
+          source: "bootstrap-reconciled",
+          title: `Bootstrap reconciliation reconciled terminal-label ticket ${ticket.identifier}`,
+          detail: {
+            ticket: ticket.identifier,
+            issueId: ticket.id,
+            fromNativeState: stateData.state.name,
+            toStateId: completedStateId,
+          },
+          ticket: ticket.identifier,
+        });
+      } else {
+        result.errors.push(`terminal-state reconcile mutation failed for ${ticket.identifier}`);
+        log.warn(`bootstrap-reconciliation: terminal-state reconcile returned false for ${ticket.identifier}`);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      result.errors.push(`terminal-state reconcile failed for ${ticket.identifier}: ${msg}`);
+      log.error(`bootstrap-reconciliation: terminal-state reconcile error for ${ticket.identifier}: ${msg}`);
+      alertBus.notify({
+        severity: "warning",
+        source: "bootstrap-reconciled",
+        title: `Bootstrap reconciliation terminal-state error for ${ticket.identifier}`,
         detail: { error: msg },
         ticket: ticket.identifier,
       });
