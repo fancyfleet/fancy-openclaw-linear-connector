@@ -8,6 +8,10 @@ import { resolveCanonicalIdentifierFromEvent } from "../canonical-identifier.js"
 import { normalizeSessionKey } from "../session-key.js";
 import type { DispatchLeaseStore } from "../store/dispatch-lease-store.js";
 import type { DispatchInFlightStore } from "../store/dispatch-inflight-store.js";
+import {
+  classifyDeliveryFailure,
+  type DeliveryDiagnostic,
+} from "./delivery-diagnostic.js";
 
 const log = componentLogger(createLogger(), "delivery");
 
@@ -86,6 +90,10 @@ export interface DeliveryResult {
   canonVersion?: string | null;
   /** The connection was established and the request was accepted; the turn is queued. Not a failure. */
   pendingAck?: boolean;
+  /** INF-507: structured classification of a failed dispatch — names the resolved
+   *  model and distinguishes a non-cascading prompt/context-overflow from a
+   *  provider error, timeout, or unreachable host. Set only on failure. */
+  diagnostic?: DeliveryDiagnostic;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -100,17 +108,22 @@ function classifyFetchError(err: unknown): DeliveryResult {
     ? String((err as { name?: unknown }).name)
     : undefined;
   if (name === "AbortError") {
+    // Connect-established abort — queued, not a failure. No failure diagnostic.
     return {
       dispatched: false,
       pendingAck: true,
       hookErrorSummary: summary,
     };
   }
-  return {
+  const base: DeliveryResult = {
     dispatched: false,
     hookError: true,
     hookErrorSummary: summary,
   };
+  // INF-507: a thrown non-ok carries the gateway error body in its message
+  // (e.g. "gateway API responded with 500: <body>") — classify it so a
+  // context-overflow surfaces its model + budgets instead of an opaque string.
+  return { ...base, diagnostic: classifyDeliveryFailure(base) };
 }
 
 /**
@@ -313,16 +326,19 @@ async function deliverViaHooks(
       const errorSummary = typeof json.error === "string" ? json.error
         : typeof json.summary === "string" ? json.summary
         : JSON.stringify(json).slice(0, 200);
-      log.error(
-        `Gateway returned hook error for ${agentName} [${sessionId}]: ${errorSummary}`,
-      );
-      return {
+      const failed: DeliveryResult = {
         dispatched: false,
         runId,
         rawResponse: json,
         hookError: true,
         hookErrorSummary: errorSummary,
       };
+      const diagnostic = classifyDeliveryFailure(failed);
+      log.error(
+        `Gateway returned hook error for ${agentName} [${sessionId}]: ${errorSummary} ` +
+          `[${diagnostic.errorClass}${diagnostic.resolvedModel ? ` model=${diagnostic.resolvedModel}` : ""}]`,
+      );
+      return { ...failed, diagnostic };
     }
 
     log.info(
@@ -412,7 +428,29 @@ async function deliverViaGatewayApi(
 
     if (!response.ok) {
       const errBody = await response.text().catch(() => "no body");
-      throw new Error(`gateway API responded with ${response.status}: ${errBody}`);
+      // INF-507: the /v1 path is AWAITED, so a turn that dies on a prompt/context
+      // overflow surfaces here synchronously (unlike the fire-and-forget hooks
+      // path). Parse the OpenAI-style error body so the diagnostic gets the
+      // structured model/budget fields, not just a scraped string.
+      let parsed: Record<string, unknown> | undefined;
+      try {
+        parsed = JSON.parse(errBody) as Record<string, unknown>;
+      } catch {
+        parsed = undefined;
+      }
+      const summary = `gateway API responded with ${response.status}: ${errBody}`;
+      const failed: DeliveryResult = {
+        dispatched: false,
+        rawResponse: parsed,
+        hookError: true,
+        hookErrorSummary: summary,
+      };
+      const diagnostic = classifyDeliveryFailure(failed);
+      log.error(
+        `Gateway API error for ${agentName} [${routedSessionKey}]: ${response.status} ` +
+          `[${diagnostic.errorClass}${diagnostic.resolvedModel ? ` model=${diagnostic.resolvedModel}` : ""}]`,
+      );
+      return { ...failed, diagnostic };
     }
 
     const json = (await response.json()) as Record<string, unknown>;

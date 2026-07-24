@@ -40,6 +40,7 @@ import {
 } from "./first-action-watchdog-state.js";
 import type { DispatchIdempotencyStore } from "./store/dispatch-idempotency-store.js";
 import { StallReasonCode, type StallReason } from "./wake-observability/index.js";
+import { isContextOverflow, type DeliveryDiagnostic } from "./delivery/delivery-diagnostic.js";
 
 const CRON_NAME = "first-action-watchdog";
 const MINUTE = 60_000;
@@ -108,6 +109,11 @@ export interface UnreachableAlert {
    *  alert copy, NOT history.length (history also logs the exhaustion entry). */
   rungsFired: number;
   history: LadderHistoryEntry[];
+  /** INF-507: structured per-container failure diagnostic for the last dispatch
+   *  attempt, when the connector captured one — names the resolved model and the
+   *  error class (e.g. a non-cascading context-overflow-on-primary), so an
+   *  on-call human sees the root cause instead of a bare "unreachable." */
+  diagnostic?: DeliveryDiagnostic;
   [key: string]: unknown;
 }
 
@@ -152,6 +158,15 @@ export interface FirstActionWatchdogOptions {
    *  invoked for breached tickets, so the Linear read cost stays proportional
    *  to actual stalls. */
   crossCheck?: (ticket: WatchdogTicket) => Promise<CrossCheckVerdict>;
+  /** INF-507 — on breach, fetch the structured diagnostic for the ticket's most
+   *  recent failed dispatch attempt (from the operational event store). Wired in
+   *  index.ts to read the last `delivery-failed` / `dispatch-undeliverable`
+   *  event's `detail.diagnostic`. Only invoked for breached tickets. When it
+   *  returns a non-cascading context-overflow, the ladder skips the futile
+   *  re-dispatch (re-waking the same tiny-context primary just overflows again —
+   *  the INF-506 auto-redispatch-produces-no-activity signature) and escalates
+   *  straight to a loud, model-named unreachable verdict. */
+  getDeliveryDiagnostic?: (ticket: string) => Promise<DeliveryDiagnostic | null>;
   /** Present only so the sweep can assert it NEVER auto-transitions. */
   transition?: (payload: unknown) => Promise<void>;
   cadenceMs?: number;
@@ -483,7 +498,61 @@ export async function runFirstActionWatchdogSweep(
           continue;
         }
 
-        if (priorRungs >= maxRungs) {
+        // INF-507 — pull the structured diagnostic for this ticket's most recent
+        // failed dispatch. When present it turns a blank "unreachable" into a
+        // model-named, error-classed verdict; a non-cascading context-overflow
+        // also short-circuits the futile re-dispatch below.
+        let diagnostic: DeliveryDiagnostic | null = null;
+        if (opts.getDeliveryDiagnostic) {
+          try {
+            diagnostic = await opts.getDeliveryDiagnostic(t.ticket);
+          } catch {
+            diagnostic = null; // fail open — a missing diagnostic never blocks the ladder
+          }
+        }
+        // Build a loud, self-describing unreachable title. A context-overflow
+        // names the resolved model + budgets and is explicitly NOT a generic
+        // unreachable (AC1/AC3); anything else keeps the original wording.
+        const unreachableTitle = diagnostic && diagnostic.errorClass !== "unknown"
+          ? `Delegate ${t.delegate} unreachable on ${t.ticket} (${t.state}) — [${diagnostic.errorClass}] ${diagnostic.summary}`
+          : `Delegate ${t.delegate} unreachable on ${t.ticket} (${t.state})`;
+
+        // INF-507 fast path — a context-overflow on the primary is non-cascading:
+        // re-dispatching just re-injects the same oversized bootstrap into the
+        // same tiny-context primary and dies identically (this is the INF-506
+        // "auto-redispatch also produces no activity" signature). Skip the ladder
+        // and escalate straight to a loud, model-named unreachable verdict.
+        if (isContextOverflow(diagnostic) && !unreachable) {
+          unreachable = true;
+          history.push({
+            rung: "unreachable",
+            at: new Date(now).toISOString(),
+            detail: `context-overflow-on-primary${diagnostic?.resolvedModel ? ` model=${diagnostic.resolvedModel}` : ""}`,
+          });
+          result.unreachable += 1;
+          rungsFired = maxRungs; // mark exhausted — no rung-1 redispatch will help
+
+          opts.notify?.({
+            severity: "critical",
+            source: "first-action-watchdog",
+            title: unreachableTitle,
+            ticket: t.ticket,
+            state: t.state,
+            delegate: t.delegate,
+            rungsFired: priorRungs,
+            history: history.map((h) => ({ ...h })),
+            diagnostic: diagnostic ?? undefined,
+          });
+
+          if (opts.escalateUnreachable) {
+            await opts.escalateUnreachable({
+              ticket: t.ticket,
+              state: t.state,
+              agent: t.delegate,
+              history: history.map((h) => ({ ...h })),
+            });
+          }
+        } else if (priorRungs >= maxRungs) {
           // Rung 2 — ladder exhausted: mark unreachable + alert ops, carrying
           // ticket / state / delegate / history for the on-call human.
           unreachable = true;
@@ -493,12 +562,13 @@ export async function runFirstActionWatchdogSweep(
           opts.notify?.({
             severity: "critical",
             source: "first-action-watchdog",
-            title: `Delegate ${t.delegate} unreachable on ${t.ticket} (${t.state})`,
+            title: unreachableTitle,
             ticket: t.ticket,
             state: t.state,
             delegate: t.delegate,
             rungsFired: priorRungs,
             history: history.map((h) => ({ ...h })),
+            ...(diagnostic ? { diagnostic } : {}),
           });
 
           if (opts.escalateUnreachable) {

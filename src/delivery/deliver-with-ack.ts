@@ -75,6 +75,19 @@ function failureOutcome(result: DeliveryResult): "delivery-failed" | "delivery-u
   return result.hookError || result.hookErrorSummary ? "delivery-failed" : "delivery-unconfirmed";
 }
 
+/**
+ * INF-507: the error string persisted on a failed attempt. When the failure was
+ * classified (e.g. a context overflow that names the resolved model + budgets),
+ * prefer that structured one-liner over the opaque raw summary so the dispatch
+ * outcome is self-describing without a gateway-log dig.
+ */
+function failureSummary(result: DeliveryResult): string | null {
+  if (result.diagnostic && result.diagnostic.errorClass !== "unknown") {
+    return `[${result.diagnostic.errorClass}] ${result.diagnostic.summary}`;
+  }
+  return result.hookErrorSummary ?? null;
+}
+
 export async function deliverWithAck(params: DeliverWithAckParams): Promise<DeliverWithAckOutcome> {
   const {
     agentId,
@@ -107,6 +120,10 @@ export async function deliverWithAck(params: DeliverWithAckParams): Promise<Deli
   };
 
   let attempt = 0;
+  // INF-507: remember the most recent classified failure so the terminal
+  // `dispatch-undeliverable` record can name the root cause (e.g. a
+  // context-overflow-on-primary) instead of a generic "undeliverable."
+  let lastDiagnostic: DeliveryResult["diagnostic"] | undefined;
   while (attempt < totalAttempts) {
     attempt += 1;
     const result = await deliver({ attempt, dispatchId });
@@ -144,7 +161,11 @@ export async function deliverWithAck(params: DeliverWithAckParams): Promise<Deli
       return { status: "delivered-pending-ack", attempts: attempt, dispatchId };
     }
 
+    if (result.diagnostic) lastDiagnostic = result.diagnostic;
+
     // AC2: log every failed/unconfirmed attempt to the operational event store.
+    // INF-507: carry the structured diagnostic on `detail` so the failure is
+    // queryable via the admin dispatch timeline — no gateway-log dig required.
     eventStore.append({
       outcome: failureOutcome(result),
       agent: agentId,
@@ -153,8 +174,10 @@ export async function deliverWithAck(params: DeliverWithAckParams): Promise<Deli
       workflowState: workflowState ?? null,
       attemptCount: attempt,
       wakeId: dispatchId,
-      errorSummary: result.hookErrorSummary ?? null,
-      detail: baseDetail,
+      errorSummary: failureSummary(result),
+      detail: result.diagnostic
+        ? { ...baseDetail, diagnostic: result.diagnostic }
+        : baseDetail,
     });
 
     // Bounded retry with backoff — only wait when another attempt follows.
@@ -170,6 +193,9 @@ export async function deliverWithAck(params: DeliverWithAckParams): Promise<Deli
 
   // AC3: every attempt failed — emit a loud, first-class undeliverable warning
   // naming ticket, state, delegate, and gateway. Not a silent log line.
+  const undeliverableCause = lastDiagnostic
+    ? ` — cause: [${lastDiagnostic.errorClass}] ${lastDiagnostic.summary}`
+    : "";
   eventStore.append({
     outcome: "dispatch-undeliverable",
     agent: agentId,
@@ -178,8 +204,8 @@ export async function deliverWithAck(params: DeliverWithAckParams): Promise<Deli
     workflowState: workflowState ?? null,
     attemptCount: totalAttempts,
     wakeId: dispatchId,
-    errorSummary: `dispatch-undeliverable after ${totalAttempts} attempt(s): ${displayTicket} (${workflowState ?? "?"}) → ${agentId} @ ${gateway ?? "?"}`,
-    detail: baseDetail,
+    errorSummary: `dispatch-undeliverable after ${totalAttempts} attempt(s): ${displayTicket} (${workflowState ?? "?"}) → ${agentId} @ ${gateway ?? "?"}${undeliverableCause}`,
+    detail: lastDiagnostic ? { ...baseDetail, diagnostic: lastDiagnostic } : baseDetail,
   });
 
   return { status: "undeliverable", attempts: totalAttempts, dispatchId };
