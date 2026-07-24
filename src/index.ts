@@ -69,6 +69,7 @@ import { getRescueSweepState } from "./rescue-sweep-state.js";
 import { getDetectorState } from "./done-ticket-detector-state.js";
 import { registerFirstActionWatchdogCron } from "./first-action-watchdog.js";
 import { getFirstActionWatchdogState } from "./first-action-watchdog-state.js";
+import { StallReasonCode, type StallReason, type WakeFailureDiagnostic } from "./wake-observability/index.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
 import { getCapabilityPolicy } from "./escalation-gate.js";
 import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
@@ -1838,6 +1839,34 @@ if (isEntryPoint) {
               .filter((ms) => Number.isFinite(ms));
             if (actionTimes.length > 0) firstOwnerActionAtMs = Math.min(...actionTimes);
           }
+
+          // INF-508 — attach a WAKE_TURN_FAILED stall reason when this dispatch's
+          // hook turn errored before any activity. Only when there is no first
+          // owner action (a turn that produced work is not a silent failure) and
+          // the failure post-dates entry into the current state (a diagnostic from
+          // a prior dispatch must not shadow a fresh wake). The watchdog then
+          // surfaces the resolved model / error class / gateway instead of a
+          // generic "unreachable", and skips the pointless re-wake.
+          let stallReason: StallReason | undefined;
+          if (delegate && firstOwnerActionAtMs === null) {
+            const failures = operationalEventStore.query({
+              key: `linear-${row.ticket_id}`,
+              outcome: "wake-turn-failed",
+              since: row.entered_state_at,
+              limit: 20,
+            });
+            const latest = failures[0]; // query returns newest-first (occurred_at DESC)
+            const diagnostic = (latest?.detail as { diagnostic?: WakeFailureDiagnostic } | undefined)?.diagnostic;
+            if (latest && diagnostic) {
+              stallReason = {
+                reason: StallReasonCode.WAKE_TURN_FAILED,
+                detail: diagnostic.summary ?? latest.errorSummary ?? "wake turn failed",
+                resolvedAt: Date.parse(latest.occurredAt) || Date.now(),
+                diagnostic,
+              };
+            }
+          }
+
           return {
             ticket: row.ticket_id,
             workflow: row.workflow,
@@ -1848,6 +1877,7 @@ if (isEntryPoint) {
             dispatchDeliveredAtMs: Number.isFinite(deliveredMs) ? deliveredMs : Date.now(),
             dispatchUpdatedAt: row.entered_state_at,
             firstOwnerActionAtMs,
+            stallReason,
           };
         });
     },
@@ -1912,14 +1942,24 @@ if (isEntryPoint) {
       return "live";
     },
     // Rung 2: alert the ops channel with ticket/state/delegate for the on-call.
-    notify: (alert) =>
+    // INF-508 — a WAKE_TURN_FAILED breach carries a structured diagnostic; put
+    // the resolved model / error class / gateway / fallback-skipped into the
+    // alert body so the on-call sees WHY the wake failed, not just "unreachable".
+    notify: (alert) => {
+      const diag = (alert as { diagnostic?: WakeFailureDiagnostic | null }).diagnostic;
+      const detail = diag
+        ? `${alert.ticket} (${alert.state}) — ${alert.delegate} wake turn failed: ${diag.failureClass} on ${diag.resolvedProvider ? `${diag.resolvedProvider}/${diag.resolvedModel}` : diag.resolvedModel ?? "unknown-model"}` +
+          `${diag.gateway ? ` @${diag.gateway}` : ""}${diag.fallbackSkipped ? " (fallback skipped — a re-wake will not help; fix the model config)" : ""}` +
+          `${diag.promptTokens != null && diag.promptBudget != null ? ` [prompt ${diag.promptTokens} tok > budget ${diag.promptBudget} tok]` : ""}`
+        : `${alert.ticket} (${alert.state}) — delegate ${alert.delegate} unreachable after ${alert.rungsFired} rung(s)`;
       notify({
-        severity: "warning",
+        severity: diag ? "critical" : "warning",
         source: "first-action-watchdog",
         title: alert.title,
-        detail: `${alert.ticket} (${alert.state}) — delegate ${alert.delegate} unreachable after ${alert.rungsFired} rung(s)`,
+        detail,
         dedupKey: `first-action-watchdog|${alert.ticket}|${alert.state}`,
-      }),
+      });
+    },
     // Rung 3: re-route to the fallback body by waking it directly. The delegate
     // reassignment itself is left to the steward — the ladder never mutates
     // workflow state — but the fallback body is surfaced immediately.

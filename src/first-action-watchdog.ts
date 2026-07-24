@@ -535,7 +535,52 @@ export async function runFirstActionWatchdogSweep(
           // Reason-code-aware escalation: some stall reasons should skip rung-1
           // redispatch (re-waking a dead session is pointless) and go directly
           // to the appropriate higher rung.
-          if (stallReason === StallReasonCode.SESSION_DEAD) {
+          if (stallReason === StallReasonCode.WAKE_TURN_FAILED) {
+            // INF-508 — the wake WAS delivered and the gateway accepted it, but
+            // the hook turn errored before any activity (context overflow, auth,
+            // tool). Re-dispatching is pointless: a genuine fresh wake lands on
+            // the SAME oversized-prompt / broken-model config and re-errors
+            // identically. Skip rung-1 redispatch → go straight to a
+            // diagnostic-rich unreachable that names the resolved model, the
+            // error class, the gateway, and whether the fallback was skipped —
+            // so the on-call sees the real cause, not a generic "unreachable".
+            const diag = t.stallReason?.diagnostic;
+            unreachable = true;
+            history.push({
+              rung: "unreachable",
+              at: new Date(now).toISOString(),
+              detail: diag ? `wake-turn-failed: ${diag.failureClass} on ${diag.resolvedModel ?? "unknown"}` : "wake-turn-failed",
+            });
+            result.unreachable += 1;
+
+            opts.notify?.({
+              severity: "critical",
+              source: "first-action-watchdog",
+              title: diag
+                ? `Delegate ${t.delegate} wake failed on ${t.ticket} (${t.state}): ${diag.failureClass} on ${diag.resolvedProvider ? `${diag.resolvedProvider}/${diag.resolvedModel}` : diag.resolvedModel ?? "unknown-model"}${diag.fallbackSkipped ? " (fallback skipped)" : ""}`
+                : `Delegate ${t.delegate} wake-turn failed on ${t.ticket} (${t.state})`,
+              ticket: t.ticket,
+              state: t.state,
+              delegate: t.delegate,
+              rungsFired: priorRungs,
+              history: history.map((h) => ({ ...h })),
+              reason: StallReasonCode.WAKE_TURN_FAILED,
+              diagnostic: diag ?? null,
+            });
+
+            if (opts.escalateUnreachable) {
+              await opts.escalateUnreachable({
+                ticket: t.ticket,
+                state: t.state,
+                agent: t.delegate,
+                history: history.map((h) => ({ ...h })),
+              });
+            }
+
+            // Ladder exhausted — a re-wake cannot fix a prompt/model/tool config
+            // error; it needs an operator to fix the gateway config.
+            rungsFired = maxRungs;
+          } else if (stallReason === StallReasonCode.SESSION_DEAD) {
             // SESSION_DEAD: skip redispatch → go directly to unreachable (rung 2).
             unreachable = true;
             history.push({ rung: "unreachable", at: new Date(now).toISOString() });
