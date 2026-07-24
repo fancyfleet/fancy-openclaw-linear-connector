@@ -27,7 +27,7 @@
 
 import { componentLogger, createLogger } from "./logger.js";
 import { findLabel, findOrCreateLabel } from "./linear-helpers.js";
-import { generateSpawnPreview, checkCaps, formatPreviewComment, formatCapRefusalComment, parseSpawnCaps, type SpawnPreview, type CapCheckResult, type SpawnCaps } from "./spawn-preview.js";
+import { generateSpawnPreview, checkCaps, formatPreviewComment, formatCapRefusalComment, parseSpawnCaps, type SpawnPreview, type CapCheckResult, type SpawnCaps, type FindingInput } from "./spawn-preview.js";
 import type { FanoutConfig, SpawnIfConfig, WorkflowDef } from "./workflow-gate.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "fanout");
@@ -102,6 +102,13 @@ export interface ExistingChild {
   specEntryId: string;
   /** Current workflow state (any state suppresses re-spawn — informational). */
   state?: string;
+  /**
+   * INF-469: the child's title, as minted. Used by the duplicate-title guard
+   * (same-parent, same-child-workflow collision check) — see the mint loop in
+   * {@link executeFanout}. Optional: children fetched before this field existed
+   * carry no title, and the guard fail-opens on a missing value.
+   */
+  title?: string;
   /**
    * INF-32: the `wf:*` workflow that minted this child. Spec-entry ids are
    * content-addressed, so two fan-outs on one parent sharing a `spec_source`
@@ -1396,10 +1403,24 @@ export async function executeFanout(
   if (toSpawn.length === 0) {
     // AC3: unchanged spec re-entry (or every entry already has a child) spawns
     // nothing. This is a legitimate no-op, not a refusal.
+    // INF-453: if every entry is already spawned, the loop is satisfied.
     log.info(
       `fanout: incremental dedup — nothing new to spawn for ${parentIssueId} ` +
       `(${findings.length} spec entr${findings.length === 1 ? "y" : "ies"}, all already spawned)`,
     );
+    return result;
+  }
+
+  // INF-453: Guard against zero arms/spec in dev-sprint.
+  // If we reach this point and findings.length is 0, it means there is no spec
+  // and no existing children. For dev-sprint, this is a stall.
+  if (findings.length === 0 && config.child_workflow?.includes("sprint-arm")) {
+    const errorMsg = "Refusing to spawn: No arms found in the ## Structured section. A dev-sprint requires at least one arm to proceed. If arms were delivered out-of-band, use the 'cancel' or 'abandon' commands to terminate this sprint.";
+    result.errors.push({
+      findingIndex: -1,
+      message: errorMsg,
+    });
+    log.warn(`fanout: ${errorMsg}`);
     return result;
   }
 
@@ -1451,10 +1472,16 @@ export async function executeFanout(
   if (!options?.skipPreview) {
     const caps = options?.caps ?? parseSpawnCaps();
 
+    const previewFindings: FindingInput[] = toSpawn.map((f) => ({
+      title: f.title,
+      description: f.description,
+      child_workflow: f.child_workflow ?? childWorkflowLabel,
+    }));
+
     const previewResult = await generateSpawnPreview(
       parentIssueId,
       authToken,
-      toSpawn.map((f) => ({ title: f.title, description: f.description })),
+      previewFindings,
       caps,
     );
 
@@ -1795,7 +1822,7 @@ async function fetchExistingSpawnChildren(
   const query = `
     query FanoutChildren($id: String!) {
       issue(id: $id) {
-        children { nodes { identifier description state { name } labels { nodes { name } } } }
+        children { nodes { identifier title description state { name } labels { nodes { name } } } }
       }
     }
   `;
@@ -1811,6 +1838,7 @@ async function fetchExistingSpawnChildren(
           children?: {
             nodes?: Array<{
               identifier: string;
+              title?: string | null;
               description?: string | null;
               state?: { name?: string } | null;
               labels?: { nodes?: Array<{ name?: string }> } | null;
@@ -1837,6 +1865,7 @@ async function fetchExistingSpawnChildren(
           specEntryId: m[1],
           state: n.state?.name,
           childWorkflow: wfMarker ? wfMarker[1] : wfLabel,
+          title: n.title ?? undefined,
         });
       }
     }

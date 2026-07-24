@@ -4245,14 +4245,30 @@ export interface TransitionApplyResult {
 
 /**
  * AI-1992: Fetch just the parent issue description for the pre-transition
- * fan-out spec gate. Query name includes `IssueTeamParent` so it shares the
- * fanout module's fetch shape. Returns null on any failure (caller treats a
- * null/empty description as an unvalidatable spec → refuse).
+ /**
+ * AI-1992: Fetch the ticket description to extract the fan-out spec.
+ * Query name includes `IssueTeamParent` so it shares the fanout module's fetch
+ * shape. Returns null on any failure (caller treats a null/empty description as
+ * an unvalidatable spec → refuse).
+ *
+ * INF-470: Scans recent comments for a signed brief when the description spec
+ * is missing or empty. The signed brief is identified by a "## sprint" or
+ * "## structured" header in a comment from a designated approver (or the
+ * steward).
  */
-async function fetchFanoutSpecDescription(issueId: string, authToken: string): Promise<string | null> {
+async function fetchFanoutSpecDescription(issueId: string, authToken: string, specSource?: string): Promise<string | null> {
   const query = `
-    query IssueTeamParent($id: String!) {
-      issue(id: $id) { id description }
+    query IssueWithComments($id: String!) {
+      issue(id: $id) {
+        id
+        description
+        comments(last: 10) {
+          nodes {
+            body
+            user { name }
+          }
+        }
+      }
     }
   `;
   try {
@@ -4261,10 +4277,42 @@ async function fetchFanoutSpecDescription(issueId: string, authToken: string): P
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({ query, variables: { id: issueId } }),
     });
-    const data = (await res.json()) as { data?: { issue?: { description?: string | null } | null } };
-    return data.data?.issue?.description ?? null;
+    type CommentNode = { body: string; user?: { name: string } | null };
+    type Resp = { data?: { issue?: { id: string; description?: string | null; comments?: { nodes: CommentNode[] } } | null } };
+    const data = (await res.json()) as Resp;
+    const issue = data.data?.issue;
+    if (!issue) return null;
+
+    const desc = issue.description ?? "";
+    // If we have a specSource, check if the description already has it.
+    if (specSource) {
+      const findings = extractSpecFindings(desc, specSource);
+      if (findings.length > 0) {
+        // INF-470: Ensure we don't mint from a stale spec entry.
+        // A section-level content-hash marker (INF-131) in the description
+        // means this section has already fanned out. If the steward is
+        // providing a NEW brief in a comment, the comment should win.
+        const storedHash = /<!--\s*inf-131:spec-hash:(\S+)\s*for\s*(\S+)\s*-->/.exec(desc);
+        if (!storedHash) return desc;
+        log.info(`workflow-gate: INF-470: description spec for '${specSource}' has an INF-131 hash; checking comments for a fresh update`);
+      }
+
+      // Scan comments for a brief that isn't already fanned out or is newer.
+      const comments = issue.comments?.nodes ?? [];
+      // Search from newest to oldest.
+      for (let i = comments.length - 1; i >= 0; i--) {
+        const body = comments[i].body;
+        const findings = extractSpecFindings(body, specSource);
+        if (findings.length > 0) {
+          log.info(`workflow-gate: INF-470: found '${specSource}' spec in comment by ${comments[i].user?.name ?? "unknown"} for ${issueId}`);
+          return body;
+        }
+      }
+    }
+
+    return desc || null;
   } catch (err) {
-    log.warn(`workflow-gate: AI-1992: failed to fetch description for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
+    log.warn(`workflow-gate: AI-1992: failed to fetch description/comments for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
     return null;
   }
 }
@@ -4619,7 +4667,7 @@ export async function applyStateTransition(
     : shouldTriggerFanout(def, currentStateName ?? "", intent);
   if (fanoutConfig) {
     specDescriptionLoop: for (let attempt = 0; attempt < 2; attempt++) {
-      const specDescription = await fetchFanoutSpecDescription(issueId, authToken);
+      const specDescription = await fetchFanoutSpecDescription(issueId, authToken, fanoutConfig.spec_source);
       // AI-2199: load registry to validate per-entry child workflow ids.
       // Fail-open: if registry load fails, skip per-entry validation (backward compat).
       let registeredWorkflows: Set<string> | undefined;
@@ -4750,7 +4798,7 @@ export async function applyStateTransition(
     const destState = def.states.find((s) => s.id === toStateName);
     if (destState?.fanout?.spec_source) {
       const specSource = destState.fanout.spec_source;
-      const specDescription = await fetchFanoutSpecDescription(issueId, authToken);
+      const specDescription = await fetchFanoutSpecDescription(issueId, authToken, specSource);
       const findings = extractSpecFindings(specDescription, specSource);
       if (findings.length === 0) {
         const msg =
@@ -5670,7 +5718,7 @@ async function postFanoutSummaryComment(
 ): Promise<void> {
   const childLinks = result.childIdentifiers.map((id) => `- ${id}`).join("\n");
   const body =
-    `[Fan-out] Spawned ${result.created} child issue(s):\n${childLinks}` +
+    `✅ [Fan-out] Spawned ${result.created} child issue(s):\n${childLinks}` +
     (result.errors.length > 0
       ? `\n\n⚠️ ${result.errors.length} error(s): ${result.errors.map((e) => e.message).join("; ")}`
       : "");
@@ -6467,6 +6515,8 @@ export interface SetStateAtomicOptions {
   sendWakeUp?: (agentId: string, ticketId: string) => Promise<void>;
   /** AI-1762: operational-event sink for transition-write-failed events. */
   operationalEventStore?: OperationalEventStore;
+  /** INF-466: keep the enrolled-ticket mirror aligned with admin set-state repairs. */
+  enrolledTicketsStore?: EnrolledTicketsStore;
   /**
    * AI-1954 AC3: allow forcing terminal set-state from an active (non-terminal)
    * workflow state. Without this flag such transitions are refused with an
@@ -6607,6 +6657,26 @@ export async function setStateAtomic(
     (resolvedDelegateId != null ? ` delegate=${resolvedDelegateId}` : resolvedDelegateId === null ? ` delegate=cleared` : ``) +
     (resolvedNativeStateId ? ` native=${resolvedNativeStateId}` : ``),
   );
+
+  const mirror = options?.enrolledTicketsStore;
+  if (mirror && def) {
+    const targetNode = def.states.find((s) => s.id === targetState);
+    if (targetNode?.kind === "terminal") {
+      mirror.markTerminal(issue.identifier ?? ticketIdentifier, "set-state");
+    } else {
+      const allAgents = getAgents();
+      const delegateAgent =
+        resolvedDelegateId === undefined
+          ? mirror.getByTicketId(issue.identifier ?? ticketIdentifier)?.delegate ?? null
+          : allAgents.find((a) => a.linearUserId === resolvedDelegateId)?.name ?? null;
+      mirror.recordTransition({
+        ticketId: issue.identifier ?? ticketIdentifier,
+        toState: targetState,
+        delegate: delegateAgent,
+        eventKind: "set-state",
+      });
+    }
+  }
 
   // Step 9: Re-dispatch to the new state's owner (AI-1607).
   // Fail-open: errors are logged but never block the set-state result.

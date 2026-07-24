@@ -91,6 +91,9 @@ states:
       - command: spawn
         to: managing-arms
         generic: continue
+      - command: cancel
+        to: cancelled
+        generic: cancel
 
   - id: managing-arms
     owner_role: steward
@@ -103,6 +106,9 @@ states:
       - command: continue
         to: ac-definition
         generic: continue
+      - command: abandon
+        to: cancelled
+        generic: cancel
 
   - id: ac-definition
     owner_role: steward
