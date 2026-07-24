@@ -1872,6 +1872,11 @@ async function fetchBranchAndPRStatus(
     query IssueBranchAndPR($id: String!) {
       issue(id: $id) {
         description
+        comments(first: 25) {
+          nodes {
+            body
+          }
+        }
         attachments {
           nodes {
             url
@@ -1894,7 +1899,7 @@ async function fetchBranchAndPRStatus(
       metadata?: Record<string, unknown> | null;
     };
     type PRResp = {
-      data?: { issue?: { description?: string | null; attachments?: { nodes: AttachmentNode[] } } };
+      data?: { issue?: { description?: string | null; comments?: { nodes: Array<{ body?: string | null }> }; attachments?: { nodes: AttachmentNode[] } } };
       errors?: Array<{ message?: string; extensions?: { code?: string } }>;
     };
     const data = (await res.json()) as PRResp;
@@ -1957,7 +1962,26 @@ async function fetchBranchAndPRStatus(
       }
     }
 
-    const allPrUrls = [...attachmentPrUrls, ...descPrUrls];
+    // INF-522: also scan recent Linear comments for PR URLs. Review/merge agents
+    // routinely post the GitHub PR URL there, and that evidence survives when
+    // Linear's generated branch name does not match the actual PR branch.
+    const commentPrUrls: string[] = [];
+    const comments = issue.comments?.nodes ?? [];
+    if (!hasPR && descPrUrls.length === 0 && comments.length > 0) {
+      const commentPrPattern = /https?:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/gi;
+      for (const comment of comments) {
+        const body = comment.body ?? "";
+        let match: RegExpExecArray | null;
+        while ((match = commentPrPattern.exec(body)) !== null) {
+          commentPrUrls.push(match[0]);
+        }
+      }
+      if (commentPrUrls.length > 0) {
+        log.info(`workflow-gate: found ${commentPrUrls.length} PR URL(s) in issue comments for ${issueId} (INF-522 comment fallback)`);
+      }
+    }
+
+    const allPrUrls = [...attachmentPrUrls, ...descPrUrls, ...commentPrUrls];
 
     // INF-132: If no PR is confirmed merged by Linear metadata, verify via
     // GitHub API. Linear's GitHub integration syncs PR data asynchronously, so
@@ -2003,8 +2027,8 @@ async function fetchBranchAndPRStatus(
       // INF-144: also true when GitHub search found PRs by ticket reference.
       // prMetadataAvailable: true when any PR attachment has explicit status/state metadata.
       // False for externally-created branches (INF-112 metadata-gap case).
-      hasBranch: hasPR || descPrUrls.length > 0 || searchedPrUrls.length > 0,
-      hasPR: hasPR || descPrUrls.length > 0 || searchedPrUrls.length > 0,
+      hasBranch: hasPR || descPrUrls.length > 0 || commentPrUrls.length > 0 || searchedPrUrls.length > 0,
+      hasPR: hasPR || descPrUrls.length > 0 || commentPrUrls.length > 0 || searchedPrUrls.length > 0,
       hasMergedPR,
       prMetadataAvailable,
       prUrls: allPrUrls,
@@ -2033,6 +2057,7 @@ const KNOWN_SCAN_REPOS: Array<{ owner: string; repo: string }> = [
   { owner: "fancymatt", repo: "fancy-openclaw-workflow-skill" },
   { owner: "fancyfleet", repo: "fancy-openclaw-linear-connector" },
   { owner: "fancyfleet", repo: "gen" },
+  { owner: "fancyfleet", repo: "life-os" },
 ];
 
 /**
@@ -4970,6 +4995,12 @@ export async function applyStateTransition(
       // INF-96: no evidence → hard block (was AI-1497 fail-open).
       log.warn(`workflow-gate: B2 apply: done gate blocked for ${issueId} — no branch/PR evidence`);
       return { status: "blocked", code: "release-gate", detail: "no branch/PR evidence", from: currentStateName, to: toStateName };
+    } else if (branchStatus.hasPR && !branchStatus.hasMergedPR && !branchStatus.prMetadataAvailable && !(process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN)) {
+      // INF-522 parity with checkWorkflowRules: comment/description PR URLs are
+      // valid release evidence even when no GitHub token is configured to verify
+      // private repos directly. The merge state already proves Hanzo's merge gate
+      // ran; this check is defense-in-depth against zero-evidence releases.
+      log.warn(`workflow-gate: B2 apply: done gate accepted PR URL evidence for ${issueId} without GH_TOKEN (INF-522 comment/description fallback)`);
     } else {
       // Has some evidence but not merged → block.
       const missing: string[] = [];
