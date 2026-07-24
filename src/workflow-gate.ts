@@ -47,7 +47,7 @@ import { recordObservation } from "./store/observation-write-path.js";
 import { getAgent, getAgents } from "./agents.js";
 import { executeFanout, shouldTriggerFanout, validateFanoutSpec, extractSpecFindings, autoDeriveArmFindings, deriveSpecFromPriorChildren, deriveStructuredFromChildren, upsertDerivedSpecSection, updateIssueDescription, type Finding } from "./fanout.js";
 import { recordFanoutOutcome } from "./fanout-outcome-store.js";
-import { onChildTerminal, onManagingEntry, isTerminalState } from "./barrier.js";
+import { onChildTerminal, onManagingEntry, isTerminalState, evaluateBarrier } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
 import { fetchLastCommentByUser } from "./linear-helpers.js";
 import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store.js";
@@ -145,6 +145,12 @@ export interface WorkflowTransition {
   requires_deploy_probe?: boolean;
   /** If true, a comment must accompany this transition. Surfaced in delivery messages and enforced by the CLI. */
   requires_comment?: boolean;
+  /** INF-504: if true, this transition is only legal when every child of the
+   *  ticket is in a terminal workflow state AND at least one child exists
+   *  (non-vacuous). Encodes "the acceptance walk is already satisfied" for the
+   *  dev-sprint `converge` → done edge: a governed completion move that cannot
+   *  fire while any tracked work is still in flight. Read-failure fails closed. */
+  requires_children_terminal?: boolean;
   /** Generic transition role: 'continue' maps to `linear continue-workflow`, 'revision' maps to `linear request-revision`. */
   generic?: 'continue' | 'revision';
 }
@@ -3325,6 +3331,42 @@ export async function checkWorkflowRules(
       return (
         `[Proxy] '${intent}' requires passed demonstration-walk evidence in the ticket description. ` +
         `Add a '## Demonstration Walk' section showing the walk passed, then retry.`
+      );
+    }
+  }
+
+  // INF-504: children-terminal gate for the dev-sprint `converge` → done edge.
+  // A governed completion move that is only legal when the acceptance walk is
+  // already satisfied — every child terminal, and at least one child exists so
+  // an empty sprint cannot silently converge. This is what makes `converge` a
+  // real terminal edge (unlike cancel/abandon → cancelled): it proves the
+  // tracked work shipped rather than asserting it. Break-glass bypasses (a
+  // steward may force it). Read-failure fails closed — an unreadable child set
+  // is NOT "no children" (INF-34), so we hold rather than complete on a guess.
+  if (match.requires_children_terminal && !breakGlassOverride) {
+    const barrier = await evaluateBarrier(issueId, authToken);
+    if (barrier.readFailed) {
+      log.warn(`workflow-gate: children-terminal gate: ${intent} on ${issueId} — child set unreadable, failing closed`);
+      return (
+        `[Proxy] '${intent}' blocked: unable to read the ticket's children to confirm the acceptance walk is complete. ` +
+        `Retry once Linear is readable, or use break-glass if a steward intentionally needs to override.`
+      );
+    }
+    if (barrier.totalChildren === 0) {
+      log.warn(`workflow-gate: children-terminal gate: ${intent} on ${issueId} — zero children, refusing vacuous convergence`);
+      return (
+        `[Proxy] '${intent}' blocked: this ticket has no children, so there is no completed work to converge on. ` +
+        `A terminal completion edge requires at least one delivered child. Use a normal forward transition, or cancel if the sprint is being abandoned.`
+      );
+    }
+    if (!barrier.allTerminal) {
+      const inFlight = barrier.totalChildren - barrier.terminalCount;
+      log.warn(`workflow-gate: children-terminal gate: ${intent} on ${issueId} — ${inFlight}/${barrier.totalChildren} children not terminal (orphaned=${barrier.orphanedCount})`);
+      return (
+        `[Proxy] '${intent}' blocked: ${barrier.terminalCount}/${barrier.totalChildren} children are terminal ` +
+        `(${inFlight} still in flight, ${barrier.orphanedCount} orphaned). ` +
+        `The acceptance walk is not yet satisfied — '${intent}' completes the sprint only when every child is Done. ` +
+        `Finish or resolve the outstanding children first.`
       );
     }
   }
