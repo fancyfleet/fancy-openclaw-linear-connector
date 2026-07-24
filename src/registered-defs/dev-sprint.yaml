@@ -18,6 +18,15 @@
 # v9 (2026-07-23): added steward-accessible cancel/abandon transitions from
 #   spawn-arms and managing-arms to the cancelled terminal state, so redundant
 #   or out-of-band delivered sprints do not require host break-glass (INF-453).
+# v10 (2026-07-24): added a GOVERNED completion edge `converge` → done from
+#   ac-definition and managing-impl (INF-504). INF-453's cancel/abandon route to
+#   `cancelled`, which is a did-not-complete terminal and does NOT satisfy the
+#   parent barrier — wrong for a sprint whose implementation actually shipped
+#   out-of-band (INF-479). `converge` is the missing DONE edge: it requires the
+#   acceptance walk to already be satisfied (all children terminal, non-vacuous,
+#   `requires_children_terminal`) plus a steward attestation comment. It reaches
+#   `done` (satisfies_parent_barrier), unlike cancel/abandon. Reachable via
+#   `linear transition <id> converge` — no dedicated CLI verb needed (INF-204).
 #
 # Registered-def copy for CI conformance validation (INF-42). The canonical
 # source is the vault markdown spec at:
@@ -33,7 +42,7 @@
 #   → 5. ac-definition → 6. spawn-impl → 7. managing-impl → 8. validation → done
 
 id: dev-sprint
-version: 9
+version: 10
 archetype: orchestrator
 entry_state: intake
 
@@ -131,6 +140,16 @@ states:
       - command: continue
         to: spawn-impl
         generic: continue
+      # INF-504: governed completion when implementation shipped out-of-band.
+      # `continue` here mints a redundant impl arm (INF-271 debt); `converge`
+      # is the terminal edge for a sprint whose tracked work is already Done.
+      # Gated on all children terminal (acceptance walk satisfied) + a steward
+      # attestation comment. Steward-only via delegate-gating. Fire with
+      # `linear transition <id> converge`.
+      - command: converge
+        to: done
+        requires_children_terminal: true
+        requires_comment: true
 
   - id: spawn-impl
     owner_role: engine
@@ -170,6 +189,13 @@ states:
       - command: continue
         to: validation
         generic: continue
+      # INF-504: governed completion when validation happened out-of-band and
+      # the normal continue→validation walk is redundant. Same gate as the
+      # ac-definition edge: all children terminal + steward attestation comment.
+      - command: converge
+        to: done
+        requires_children_terminal: true
+        requires_comment: true
 
   - id: validation
     owner_role: steward
