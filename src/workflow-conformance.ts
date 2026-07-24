@@ -83,6 +83,17 @@ function hasFanout(state: WorkflowState): boolean {
   return state.fanout !== undefined && state.fanout !== null;
 }
 
+/** Terminal cancellation is a governed exit, not a fanout barrier edge. */
+function isTerminalCancelTransition(
+  transition: { command?: string; generic?: string; to?: string },
+  targetState?: WorkflowState,
+): boolean {
+  const command = transition.command?.toLowerCase();
+  const generic = transition.generic?.toLowerCase();
+  const targetKind = (targetState as unknown as Record<string, unknown> | undefined)?.kind;
+  return targetKind === "terminal" && (generic === "cancel" || command === "cancel" || command === "abandon");
+}
+
 /**
  * Get the set of registered def IDs from the gateway's cached registry.
  * Returns undefined if the registry hasn't been loaded yet this process lifetime.
@@ -107,18 +118,19 @@ function checkBarrierInvariant(
 
   // Build a set of target states that are reached from a fanout state
   const targetsFromFanout = new Set<string>();
+  const stateIndex = indexStates(def.states);
 
   for (const state of def.states) {
     if (!state.transitions || !hasFanout(state)) continue;
     for (const t of state.transitions) {
-      if (t.to) {
-        targetsFromFanout.add(t.to);
-      }
+      if (!t.to) continue;
+      const targetState = stateIndex.get(t.to);
+      if (isTerminalCancelTransition(t, targetState)) continue;
+      targetsFromFanout.add(t.to);
     }
   }
 
   // Any state that is a target from a fanout state must declare barrier: true
-  const stateIndex = indexStates(def.states);
   for (const targetId of targetsFromFanout) {
     const targetState = stateIndex.get(targetId);
     if (!targetState) continue; // skip unresolvable targets
@@ -147,6 +159,7 @@ function checkFanoutBeforeBarrier(
   const barrierStateIds = new Set(
     def.states.filter((s) => isBarrier(s)).map((s) => s.id),
   );
+  const stateIndex = indexStates(def.states);
 
   if (barrierStateIds.size === 0) return;
 
@@ -156,6 +169,7 @@ function checkFanoutBeforeBarrier(
     for (const t of state.transitions) {
       if (!t.to) continue;
       if (barrierStateIds.has(t.to)) {
+        if (isTerminalCancelTransition(t, stateIndex.get(t.to))) continue;
         if (!hasFanout(state)) {
           errors.push({
             invariant: "fanout-before-barrier",
