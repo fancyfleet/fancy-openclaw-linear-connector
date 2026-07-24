@@ -84,6 +84,8 @@ export interface Finding {
    * Parsed from the `[wf:sprint-arm-ux → signe]` marker (the part after →).
    */
   delegate?: string;
+  /** INF-530: natural dev-sprint arm types that are invalid in spawn-arms. */
+  unsupportedArmType?: string;
   /** INF-359: classification of this implementation entry. */
   classification?: string;
   /** INF-359: capability this entry traces to, when classification requires one. */
@@ -243,6 +245,35 @@ function withFindingMetadata(finding: Finding): Finding {
   };
 }
 
+function applyDevSprintArmInference(finding: Finding): Finding {
+  if (finding.child_workflow) return finding;
+  const title = finding.title.trim();
+  const lower = title.toLowerCase();
+  const inferred =
+    /^(scope|scoping)\s+arm\b/.test(lower) ? { child_workflow: "wf:sprint-arm-scope", delegate: "astrid" } :
+    /^spike\s+arm\b/.test(lower) ? { child_workflow: "wf:sprint-arm-spike", delegate: "igor" } :
+    /^(ux|user experience)\s+arm\b/.test(lower) ? { child_workflow: "wf:sprint-arm-ux", delegate: "signe" } :
+    /^design\s+arm\b/.test(lower) ? { child_workflow: "wf:sprint-arm-design", delegate: "laren" } :
+    undefined;
+  if (inferred) return { ...finding, ...inferred };
+  if (/^(impl|implementation)\s+arm\b/.test(lower)) {
+    return { ...finding, unsupportedArmType: "implementation" };
+  }
+  return finding;
+}
+
+function cleanSpawnChildDescription(description: string | null | undefined, parentIssueId?: string): string | undefined {
+  let clean = description ?? "";
+  clean = clean.replace(SPEC_ENTRY_MARKER_RE, "");
+  clean = clean.replace(CHILD_WORKFLOW_MARKER_RE, "");
+  const parentLine = parentIssueId
+    ? new RegExp(`^Parent:\\s*${parentIssueId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\n?`, "i")
+    : /^Parent:\s*.+\n?/i;
+  clean = clean.replace(parentLine, "");
+  clean = clean.trim();
+  return clean || undefined;
+}
+
 // ── Finding extraction ────────────────────────────────────────────────────
 
 /**
@@ -380,7 +411,7 @@ export function extractSpecFindings(
     const lineRegex = /[-*]\s+\*\*(.+?)\*\*(?:[:\s-]+(.*))?|[-*]\s+(.+?)(?:\n|$)|\d+\.\s+(.+?)(?:\n|$)/g;
     let match: RegExpExecArray | null;
     while ((match = lineRegex.exec(sectionBody)) !== null) {
-      let title = (match[1] ?? match[3] ?? match[4] ?? "").trim();
+      let title = (match[1] ?? match[3] ?? match[4] ?? "").trim().replace(/:\s*$/, "");
       const desc = (match[2] ?? "").trim();
       if (title) {
         // AI-2199: check for per-entry child workflow marker
@@ -428,7 +459,7 @@ export function extractSpecFindings(
 
   // AI-1994: every extracted entry carries a stable, engine-derived id so the
   // fan-out can dedup against already-spawned children on re-entry.
-  return withStableIds(findings.map(withFindingMetadata));
+  return withStableIds(findings.map(applyDevSprintArmInference).map(withFindingMetadata));
 }
 
 // ── INF-123: Auto-derive Findings from completed arm children ──────────────
@@ -774,6 +805,16 @@ export function validateFanoutSpec(
       reason:
         `fan-out spec is empty or unparseable: no '${config.spec_source}' entries found in the ticket description. ` +
         `Add a '## ${config.spec_source}' section with at least one bullet (e.g. "- **Title**: detail") and retry the spawn.`,
+    };
+  }
+  const unsupportedArm = findings.find((f) => f.unsupportedArmType);
+  if (unsupportedArm) {
+    return {
+      ok: false,
+      reason:
+        `fan-out spec entry "${unsupportedArm.title}" is an implementation arm seed, but '${config.spec_source}' ` +
+        `spawn-arms only supports shaping arms (scope, spike, ux, design). Move implementation work to spawn-impl ` +
+        `after AC definition.`,
     };
   }
   if (config.classification_required) {
@@ -1344,6 +1385,17 @@ export async function executeFanout(
     });
     return result;
   }
+  const unsupportedArm = findings.find((f) => f.unsupportedArmType);
+  if (unsupportedArm) {
+    result.refused = true;
+    result.errors.push({
+      findingIndex: findings.indexOf(unsupportedArm),
+      message:
+        `Refusing fan-out: "${unsupportedArm.title}" is an implementation arm seed, but '${config.spec_source}' ` +
+        `spawn-arms only supports shaping arms (scope, spike, ux, design). Move implementation work to spawn-impl.`,
+    });
+    return result;
+  }
 
   // ── AI-1994: incremental re-spawn dedup ────────────────────────────
   // The rework loop re-enters this fan-out state. Partition the spec against
@@ -1606,16 +1658,11 @@ export async function executeFanout(
       log.warn(`fanout: per-entry delegate '${finding.delegate}' for finding "${childTitle}" did not resolve — spawning undelegated`);
     }
 
-    // Build child description: parent reference + a machine-readable spec-entry
-    // marker (AI-1994) so a later re-entry can match this child back to its spec
-    // entry and skip re-spawning it. The marker is an HTML comment — invisible
-    // in Linear's rendered markdown.
+    // Keep child descriptions user-facing. Older children may carry HTML
+    // comment markers; new children dedup by deriving the same spec-entry id
+    // from title + clean description on readback.
     const childDescription = [
       `Parent: ${parentIssueId}`,
-      finding.id ? `${SPEC_ENTRY_MARKER_PREFIX}${finding.id} -->` : "",
-      // INF-32: record the minting workflow so a later fan-out sharing this
-      // spec_source can tell this child apart from one of its own.
-      finding.id ? `${CHILD_WORKFLOW_MARKER_PREFIX}${findingWorkflow} -->` : "",
       finding.description ? `\n${finding.description}` : "",
     ].filter(Boolean).join("\n");
 
@@ -1774,10 +1821,10 @@ async function postPreviewComment(
 
 /**
  * AI-1994: read back the parent's already-spawned children so a re-entry of the
- * fan-out state can dedup against them. Only children carrying the spec-entry
- * marker (i.e. minted by a prior fan-out of this spec) are returned; pre-marker
- * or hand-created children have no marker and are ignored — they neither
- * suppress a spawn nor surface as unmatched.
+ * fan-out state can dedup against them. Marker-era children carry an explicit
+ * spec-entry id; clean INF-530 children derive the same id from child title plus
+ * the user-facing description after stripping the parent line and any legacy
+ * markers.
  *
  * INF-32: each child's minting workflow is resolved so dedup can scope to it —
  * from the `inf-32:child-workflow` marker when present, else from the child's own
@@ -1795,7 +1842,7 @@ async function fetchExistingSpawnChildren(
   const query = `
     query FanoutChildren($id: String!) {
       issue(id: $id) {
-        children { nodes { identifier description state { name } labels { nodes { name } } } }
+        children { nodes { identifier title description state { name } labels { nodes { name } } } }
       }
     }
   `;
@@ -1811,6 +1858,7 @@ async function fetchExistingSpawnChildren(
           children?: {
             nodes?: Array<{
               identifier: string;
+              title?: string | null;
               description?: string | null;
               state?: { name?: string } | null;
               labels?: { nodes?: Array<{ name?: string }> } | null;
@@ -1824,21 +1872,20 @@ async function fetchExistingSpawnChildren(
     const children: ExistingChild[] = [];
     for (const n of nodes) {
       const m = SPEC_ENTRY_MARKER_RE.exec(n.description ?? "");
-      if (m) {
-        // INF-32: marker first (authoritative — written at mint time), then the
-        // child's live wf:* label. Neither ⇒ a pre-INF-32 child; leave undefined
-        // rather than guessing, and let dedupeSpawnSpec report the fallback.
-        const wfMarker = CHILD_WORKFLOW_MARKER_RE.exec(n.description ?? "");
-        const wfLabel = (n.labels?.nodes ?? [])
-          .map((l) => l.name)
-          .find((name): name is string => typeof name === "string" && /^wf:.+/.test(name));
-        children.push({
-          identifier: n.identifier,
-          specEntryId: m[1],
-          state: n.state?.name,
-          childWorkflow: wfMarker ? wfMarker[1] : wfLabel,
-        });
-      }
+      const wfMarker = CHILD_WORKFLOW_MARKER_RE.exec(n.description ?? "");
+      const wfLabel = (n.labels?.nodes ?? [])
+        .map((l) => l.name)
+        .find((name): name is string => typeof name === "string" && /^wf:.+/.test(name));
+      const hasParentRef = /^Parent:\s*.+/i.test(n.description ?? "");
+      const cleanDescription = cleanSpawnChildDescription(n.description);
+      const specEntryId = m?.[1] ?? (hasParentRef && n.title ? deriveFindingId(n.title, cleanDescription) : undefined);
+      if (!specEntryId || !wfLabel) continue;
+      children.push({
+        identifier: n.identifier,
+        specEntryId,
+        state: n.state?.name,
+        childWorkflow: wfMarker ? wfMarker[1] : wfLabel,
+      });
     }
     return children;
   } catch (err) {
