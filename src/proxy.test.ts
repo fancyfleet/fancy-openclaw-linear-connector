@@ -12,7 +12,7 @@ import fs from "node:fs";
 import { createApp } from "./index.js";
 import { reloadAgents } from "./agents.js";
 import { resetPolicyCache } from "./escalation-gate.js";
-import { resetWorkflowCache } from "./workflow-gate.js";
+import { resetNativeStateCache, resetWorkflowCache } from "./workflow-gate.js";
 import { resetConfigHealth } from "./config-health.js";
 
 const TEST_POLICY_YAML = `
@@ -115,6 +115,35 @@ states:
     transitions: []
 `;
 
+const TEST_SPRINT_SPAWNER_WORKFLOW_YAML = `
+id: sprint-spawner
+version: 1
+archetype: sprint
+entry_state: planning
+break_glass:
+  command: escape
+states:
+  - id: planning
+    owner_role: steward
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: plan
+        to: managing
+  - id: managing
+    owner_role: steward
+    kind: normal
+    native_state: doing
+    transitions:
+      - command: complete
+        to: releasing
+  - id: releasing
+    owner_role: steward
+    kind: normal
+    native_state: doing
+    transitions: []
+`;
+
 // Minimal agents.json so createApp() doesn't complain.
 function writeAgents(dir: string): string {
   const file = path.join(dir, "agents.json");
@@ -132,9 +161,9 @@ function writePolicyFile(dir: string, content = TEST_POLICY_YAML): string {
   return file;
 }
 
-function writeWorkflowFile(dir: string): string {
+function writeWorkflowFile(dir: string, content = TEST_WORKFLOW_YAML): string {
   const file = path.join(dir, "dev-impl.yaml");
-  fs.writeFileSync(file, TEST_WORKFLOW_YAML, "utf8");
+  fs.writeFileSync(file, content, "utf8");
   process.env.WORKFLOW_DEF_PATH = file;
   return file;
 }
@@ -1361,6 +1390,7 @@ describe("proxy — Layer 2 raw mutation interception (AI-1387)", () => {
     writeWorkflowFile(dir);
     resetPolicyCache();
     resetWorkflowCache();
+    resetNativeStateCache();
     reloadAgents();
     appState = createApp({
       bagDbPath: path.join(dir, "bag.db"),
@@ -1419,6 +1449,116 @@ describe("proxy — Layer 2 raw mutation interception (AI-1387)", () => {
     expect(res.body.errors[0].message).toContain("[Proxy]");
     expect(res.body.errors[0].message).toContain("Direct status");
     expect(res.body.errors[0].message).toContain("blocked on this workflow ticket");
+  });
+
+  it("allows a steward to repair stale native state when state:managing already matches the workflow label", async () => {
+    writeWorkflowFile(dir, TEST_SPRINT_SPAWNER_WORKFLOW_YAML);
+    resetWorkflowCache();
+    resetNativeStateCache();
+    const calls: Array<{ query: string; variables?: Record<string, unknown> }> = [];
+    globalThis.fetch = async (url: unknown, init?: RequestInit) => {
+      if (typeof url !== "string" || !url.includes("api.linear.app")) {
+        return originalFetch(url as URL | RequestInfo, init);
+      }
+      const parsed = JSON.parse(String(init?.body ?? "{}")) as { query?: string; variables?: Record<string, unknown> };
+      calls.push({ query: parsed.query ?? "", variables: parsed.variables });
+      if (parsed.query?.includes("IssueContext") || parsed.query?.includes("IssueLabels")) {
+        return new Response(JSON.stringify({
+          data: { issue: { identifier: "LIF-45", labels: { nodes: [{ name: "wf:sprint-spawner" }, { name: "state:managing" }] }, delegate: { id: "astrid-user" } } },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (parsed.query?.includes("IssueWithLabels")) {
+        return new Response(JSON.stringify({
+          data: {
+            issue: {
+              id: "issue-uuid",
+              identifier: "LIF-45",
+              team: { id: "lif-team" },
+              labels: { nodes: [{ id: "wf-label", name: "wf:sprint-spawner" }, { id: "state-label", name: "state:managing" }] },
+            },
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (parsed.query?.includes("TeamStates")) {
+        return new Response(JSON.stringify({
+          data: { team: { states: { nodes: [{ id: "state-thinking-uuid", name: "Thinking", type: "started" }, { id: "state-doing-uuid", name: "Doing", type: "started" }] } } },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ data: { issueUpdate: { success: true } } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "astrid")
+      .send({
+        query: "mutation Repair($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+        variables: { id: "issue-uuid", input: { stateId: "state-doing-uuid" } },
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+    expect(res.body.data.issueUpdate.success).toBe(true);
+    expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(false);
+    expect(calls.filter((c) => c.query.includes("issueUpdate")).length).toBe(1);
+  });
+
+  it("rejects native-state repair when the requested stateId is not the mirror of state:managing", async () => {
+    writeWorkflowFile(dir, TEST_SPRINT_SPAWNER_WORKFLOW_YAML);
+    resetWorkflowCache();
+    resetNativeStateCache();
+    const calls: Array<{ query: string; variables?: Record<string, unknown> }> = [];
+    globalThis.fetch = async (url: unknown, init?: RequestInit) => {
+      if (typeof url !== "string" || !url.includes("api.linear.app")) {
+        return originalFetch(url as URL | RequestInfo, init);
+      }
+      const parsed = JSON.parse(String(init?.body ?? "{}")) as { query?: string; variables?: Record<string, unknown> };
+      calls.push({ query: parsed.query ?? "", variables: parsed.variables });
+      if (parsed.query?.includes("IssueContext") || parsed.query?.includes("IssueLabels")) {
+        return new Response(JSON.stringify({
+          data: { issue: { identifier: "LIF-45", labels: { nodes: [{ name: "wf:sprint-spawner" }, { name: "state:managing" }] }, delegate: { id: "astrid-user" } } },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (parsed.query?.includes("IssueWithLabels")) {
+        return new Response(JSON.stringify({
+          data: {
+            issue: {
+              id: "issue-uuid",
+              identifier: "LIF-45",
+              team: { id: "lif-team" },
+              labels: { nodes: [{ id: "wf-label", name: "wf:sprint-spawner" }, { id: "state-label", name: "state:managing" }] },
+            },
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (parsed.query?.includes("TeamStates")) {
+        return new Response(JSON.stringify({
+          data: { team: { states: { nodes: [{ id: "state-thinking-uuid", name: "Thinking", type: "started" }, { id: "state-doing-uuid", name: "Doing", type: "started" }] } } },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ data: { issueUpdate: { success: true } } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "astrid")
+      .send({
+        query: "mutation Repair($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+        variables: { id: "issue-uuid", input: { stateId: "state-thinking-uuid" } },
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("repair-native-state rejected");
+    expect(res.body.errors[0].message).toContain("does not match");
+    expect(calls.filter((c) => c.query.includes("issueUpdate")).length).toBe(0);
   });
 
   it("blocks a raw assigneeId mutation on a workflow ticket without intent header", async () => {

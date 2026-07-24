@@ -4125,6 +4125,20 @@ export async function checkRawMutationInterception(
     );
   }
 
+  if (hasStateChange && !hasAssigneeChange && !hasLabelChange && !hasDelegateChange) {
+    let canAttemptRepair = false;
+    try {
+      canAttemptRepair = !!bodyId && await bodyHasCapability(bodyId, "workflow:break-glass");
+    } catch {
+      canAttemptRepair = false;
+    }
+    if (canAttemptRepair) {
+      const repair = await validateNativeStateRepair(body, issueId, authToken, bodyId);
+      if (repair.ok) return null;
+      return repair.message;
+    }
+  }
+
   // Build per-command help strings with assignment info.
   const helpLines = await Promise.all(
     (stateNode.transitions ?? []).map(async (t) => {
@@ -4149,6 +4163,116 @@ export async function checkRawMutationInterception(
     `(state: **${currentState}**). Use workflow commands instead:\n\n` +
     helpLines.join("\n")
   );
+}
+
+export async function validateNativeStateRepair(
+  body: { query?: string; variables?: Record<string, unknown>; operationName?: string } | null,
+  issueId: string | null,
+  authToken: string,
+  bodyId?: string,
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  if (!body || !body.query?.includes("issueUpdate")) {
+    return { ok: false, message: "[Proxy] repair-native-state rejected: request is not an issueUpdate mutation." };
+  }
+  if (!issueId) {
+    return { ok: false, message: "[Proxy] repair-native-state rejected: ticket id could not be resolved from this request." };
+  }
+  if (!bodyId) {
+    return { ok: false, message: "[Proxy] repair-native-state rejected: caller is unknown. Required capability: workflow:break-glass." };
+  }
+
+  let authorized = false;
+  try {
+    authorized = await bodyHasCapability(bodyId, "workflow:break-glass");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { ok: false, message: `[Proxy] repair-native-state rejected: capability check failed (${msg}). Required capability: workflow:break-glass.` };
+  }
+  if (!authorized) {
+    return { ok: false, message: `[Proxy] repair-native-state rejected: caller '${bodyId}' does not hold workflow:break-glass.` };
+  }
+
+  const q = body.query ?? "";
+  const vars = body.variables ?? {};
+  const queryHasField = (field: string) => new RegExp(`\\b${field}\\b`).test(q);
+  const varsHaveKey = (obj: unknown, key: string): boolean => {
+    if (!obj || typeof obj !== "object") return false;
+    if (Array.isArray(obj)) return obj.some((v) => varsHaveKey(v, key));
+    const rec = obj as Record<string, unknown>;
+    if (key in rec) return true;
+    return Object.values(rec).some((v) => varsHaveKey(v, key));
+  };
+  const fieldValue = (obj: unknown, key: string): unknown => {
+    if (!obj || typeof obj !== "object") return undefined;
+    if (Array.isArray(obj)) {
+      for (const item of obj) {
+        const found = fieldValue(item, key);
+        if (found !== undefined) return found;
+      }
+      return undefined;
+    }
+    const rec = obj as Record<string, unknown>;
+    if (key in rec) return rec[key];
+    for (const value of Object.values(rec)) {
+      const found = fieldValue(value, key);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  };
+  const touches = (field: string) => queryHasField(field) || varsHaveKey(vars, field);
+  const forbidden = ["assigneeId", "delegateId", "labelIds", "addedLabelIds", "removedLabelIds"].filter(touches);
+  if (forbidden.length > 0) {
+    return {
+      ok: false,
+      message: `[Proxy] repair-native-state rejected: repair may only write stateId; found ${forbidden.join(", ")}.`,
+    };
+  }
+  const requestedStateId = fieldValue(vars, "stateId");
+  if (typeof requestedStateId !== "string" || requestedStateId.length === 0) {
+    return { ok: false, message: "[Proxy] repair-native-state rejected: request must include a non-empty stateId." };
+  }
+
+  const { labels } = await fetchTicketContext(issueId, authToken);
+  const workflowId = getWorkflowId(labels);
+  if (!workflowId) {
+    return { ok: false, message: `[Proxy] repair-native-state rejected: ${issueId} is not a workflow ticket.` };
+  }
+  const def = await loadWorkflowDefById(workflowId);
+  if (!def) {
+    return { ok: false, message: `[Proxy] repair-native-state rejected: workflow '${workflowId}' is not registered.` };
+  }
+  const currentState = getCurrentState(labels, def);
+  if (!currentState) {
+    return { ok: false, message: `[Proxy] repair-native-state rejected: ${issueId} has no resolvable state:* label.` };
+  }
+  const stateNode = def.states.find((s) => s.id === currentState);
+  if (!stateNode?.native_state) {
+    return { ok: false, message: `[Proxy] repair-native-state rejected: state '${currentState}' has no native_state mapping.` };
+  }
+  const issue = await fetchIssueWithLabels(issueId, authToken);
+  if (!issue) {
+    return { ok: false, message: `[Proxy] repair-native-state rejected: could not fetch ${issueId}'s team for native state resolution.` };
+  }
+  const expectedStateId = await resolveNativeStateId(issue.teamId, stateNode.native_state, authToken);
+  if (!expectedStateId) {
+    return {
+      ok: false,
+      message: `[Proxy] repair-native-state rejected: could not resolve native_state '${stateNode.native_state}' for state '${currentState}'.`,
+    };
+  }
+  if (requestedStateId !== expectedStateId) {
+    return (
+      {
+        ok: false,
+        message:
+          `[Proxy] repair-native-state rejected: requested stateId does not match the native_state mirror ` +
+          `for state:${currentState} (${stateNode.native_state}).`,
+      }
+    );
+  }
+
+  log.warn(`workflow-gate: repair-native-state ALLOW agent=${bodyId} ticket=${issueId} state=${currentState} native_state=${stateNode.native_state}`);
+  return { ok: true };
 }
 
 // ── Layer 1: Proactive legal-verb re-injection at completion (AI-1387) ────

@@ -33,7 +33,7 @@ import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules, bodyHasCapability } from "./escalation-gate.js";
 import { checkLeakedCredentialGate } from "./leaked-credential-gate.js";
 import { checkStaleSnapshotForTerminal } from "./proxy-cas-check.js";
-import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, setStateAtomic, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
+import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, setStateAtomic, validateNativeStateRepair, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
 import { buildTransitionAuditRecord, emitTransitionAuditRecord, verifyPostTransition, type GateResult, type TransitionAuditRecord } from "./transition-audit.js";
 import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import type { ObservationStore } from "./store/observation-store.js";
@@ -732,6 +732,48 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         }
         effectiveIntent = metaResult.resolved;
         log.info(`meta-intent-resolved agent=${agentId} ${intent}→${effectiveIntent}${ticketCtx}`);
+      }
+
+      if (effectiveIntent === "repair-native-state") {
+        const repair = await validateNativeStateRepair(body, issueId, authorization, agentId);
+        if (!repair.ok) {
+          log.warn(`repair-native-state-block agent=${agentId}${ticketCtx}: ${repair.message}`);
+          res.status(200).json({ errors: [{ message: repair.message }] });
+          return;
+        }
+
+        await resolveMutationIssueIds(body, authorization);
+
+        let repairRes: globalThis.Response;
+        try {
+          repairRes = await fetch(LINEAR_API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: authorization },
+            body: JSON.stringify(body),
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.error(`repair-native-state upstream request failed: ${msg}`);
+          res.status(200).json({ errors: [{ message: `Linear API unreachable: ${msg}. No state was changed.`, extensions: { code: "UPSTREAM_TIMEOUT" } }] });
+          return;
+        }
+
+        deps?.operationalEventStore?.append({ outcome: "native-state-repaired" as never, type: "native-state-repair", agent: agentId, key: issueId ?? undefined });
+        deps?.mutationAuditStore?.append({
+          source: "proxy",
+          ticket: extractIssueIdentifier(body) ?? issueId ?? "",
+          ticketUuid: issueId ?? undefined,
+          changeType: "state",
+          field: "intent:repair-native-state",
+          agent: agentId,
+          intent: effectiveIntent,
+          opName,
+          sessionKey: sessionKeyHeader,
+        });
+
+        const repairText = await repairRes.text();
+        res.status(repairRes.status).set("Content-Type", "application/json").send(repairText);
+        return;
       }
 
       // AI-1914 AC2: `migrate-state` — sanctioned, non-lossy steward migration of a
