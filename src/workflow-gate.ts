@@ -1223,7 +1223,15 @@ async function fetchNativeState(
 async function fetchIssueWithLabels(
   issueId: string,
   authToken: string,
-): Promise<{ internalId: string; identifier: string; teamId: string; labels: LabelNode[] } | null> {
+): Promise<{
+  internalId: string;
+  identifier: string;
+  teamId: string;
+  labels: LabelNode[];
+  delegateId: string | null;
+  assigneeId: string | null;
+  nativeStateId: string | null;
+} | null> {
   const query = `
     query IssueWithLabels($id: String!) {
       issue(id: $id) {
@@ -1231,6 +1239,9 @@ async function fetchIssueWithLabels(
         identifier
         team { id }
         labels { nodes { id name } }
+        delegate { id }
+        assignee { id }
+        state { id }
       }
     }
   `;
@@ -1247,13 +1258,24 @@ async function fetchIssueWithLabels(
           identifier: string;
           team: { id: string };
           labels: { nodes: LabelNode[] };
+          delegate?: { id: string } | null;
+          assignee?: { id: string } | null;
+          state?: { id: string } | null;
         };
       };
     };
     const data = (await res.json()) as Resp;
     const issue = data.data?.issue;
     if (!issue) return null;
-    return { internalId: issue.id, identifier: issue.identifier, teamId: issue.team.id, labels: issue.labels.nodes };
+    return {
+      internalId: issue.id,
+      identifier: issue.identifier,
+      teamId: issue.team.id,
+      labels: issue.labels.nodes,
+      delegateId: issue.delegate?.id ?? null,
+      assigneeId: issue.assignee?.id ?? null,
+      nativeStateId: issue.state?.id ?? null,
+    };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log.warn(`workflow-gate: issue fetch failed for ${issueId}: ${msg}`);
@@ -2683,6 +2705,32 @@ export async function resolveMetaIntent(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return { error: `[Proxy] '${intent}' blocked: workflow registry unavailable (${msg}).` };
+  }
+
+  // INF-562 / AC2: an approval-gate state must never be advanced by reusing a
+  // continue-workflow snapshot captured at an EARLIER state. When a ticket has
+  // live-advanced into an approval_gate (e.g. review→sign-off) but the meta-intent
+  // was snapshotted at the prior state, the prior stage's approval intent must NOT
+  // satisfy the gate — it rests for a fresh, deliberate act by its own owner role.
+  // (Live: INF-552 — continue-workflow ran review→sign-off→done in one invocation,
+  // the review-stage approval double-counting as sign-off.)
+  if (
+    intent === "continue-workflow" &&
+    typeof snapshotState === "string" &&
+    snapshotState.length > 0
+  ) {
+    const liveState = getCurrentState(labels, def);
+    if (liveState && liveState !== snapshotState) {
+      const liveNode = def.states.find((s) => s.id === liveState);
+      if (liveNode?.kind === "approval_gate") {
+        return {
+          error:
+            `[Proxy] '${intent}' blocked: the '${liveState}' approval gate requires a fresh, ` +
+            `explicit sign-off act by its owner role (${liveNode.owner_role ?? "owner"}); a ` +
+            `prior-state ('${snapshotState}') continue snapshot cannot satisfy it.`,
+        };
+      }
+    }
   }
 
   const currentState =
@@ -5563,6 +5611,16 @@ export async function applyStateTransition(
     resolvedDelegateId,
     resolvedNativeStateId,
     toStateName,
+    issue.identifier,
+    currentStateName
+      ? {
+          labelIds: issue.labels.map((l) => l.id),
+          stateName: currentStateName,
+          delegateId: issue.delegateId,
+          assigneeId: issue.assigneeId,
+          nativeStateId: issue.nativeStateId,
+        }
+      : undefined,
   );
   const applied = writeOutcome.ok;
 
@@ -5976,6 +6034,7 @@ async function issueUpdateAtomic(
   authToken: string,
   delegateId?: string | null,
   nativeStateId?: string | null,
+  assigneeId?: string | null,
 ): Promise<boolean> {
   // Build the mutation input: include delegateId when explicitly set (string or null to clear).
   // undefined means "don't touch delegate". null means "clear delegate".
@@ -6009,7 +6068,7 @@ async function issueUpdateAtomic(
   const variables: Record<string, unknown> = { issueId: internalId, labelIds };
   if (hasDelegate) {
     variables.delegateId = delegateId;
-    variables.assigneeId = null;
+    variables.assigneeId = assigneeId ?? null;
   }
   if (hasStateId) variables.stateId = nativeStateId;
   try {
@@ -6062,10 +6121,10 @@ export function _setTransitionWritePolicyForTests(policy?: Partial<TransitionWri
  */
 async function verifyTransitionWritePersisted(
   internalId: string,
-  expected: { stateName: string; delegateId?: string | null; nativeStateId?: string | null },
+  expected: { stateName: string; delegateId?: string | null; assigneeId?: string | null; nativeStateId?: string | null },
   authToken: string,
 ): Promise<string[] | null> {
-  const query = `query VerifyTransitionWrite($id: String!) { issue(id: $id) { labels { nodes { name } } delegate { id } state { id } } }`;
+  const query = `query VerifyTransitionWrite($id: String!) { issue(id: $id) { labels { nodes { name } } delegate { id } assignee { id } state { id } } }`;
   try {
     const res = await fetch(LINEAR_API_URL, {
       method: "POST",
@@ -6077,6 +6136,7 @@ async function verifyTransitionWritePersisted(
         issue?: {
           labels?: { nodes: Array<{ name: string }> };
           delegate?: { id: string } | null;
+          assignee?: { id: string } | null;
           state?: { id: string } | null;
         };
       };
@@ -6095,6 +6155,12 @@ async function verifyTransitionWritePersisted(
       const got = issue.delegate?.id ?? null;
       if (got !== expected.delegateId) {
         divergent.push(`delegate expected '${expected.delegateId ?? "null"}' got '${got ?? "null"}'`);
+      }
+    }
+    if (expected.assigneeId !== undefined) {
+      const got = issue.assignee?.id ?? null;
+      if (got !== expected.assigneeId) {
+        divergent.push(`assignee expected '${expected.assigneeId ?? "null"}' got '${got ?? "null"}'`);
       }
     }
     if (expected.nativeStateId !== undefined && expected.nativeStateId !== null) {
@@ -6141,6 +6207,14 @@ async function issueUpdateAtomicVerified(
   delegateId: string | null | undefined,
   nativeStateId: string | null | undefined,
   expectedStateName: string,
+  issueIdentifier?: string | null,
+  rollbackSnapshot?: {
+    labelIds: string[];
+    stateName: string;
+    delegateId: string | null;
+    assigneeId: string | null;
+    nativeStateId: string | null;
+  },
 ): Promise<VerifiedWriteOutcome> {
   const { maxAttempts, retryDelayMs } = transitionWritePolicy;
   let failureKind: "mutation" | "verification" = "mutation";
@@ -6157,9 +6231,23 @@ async function issueUpdateAtomicVerified(
       log.warn(`workflow-gate: AI-1762: atomic mutation attempt ${attempt}/${maxAttempts} failed for ${internalId}${attempt < maxAttempts ? " — retrying" : ""}`);
       continue;
     }
+
+    if (issueIdentifier) {
+      // INF-424: record applied state immediately after a successful mutation
+      // but BEFORE verification. This ensures that any re-entrant reads
+      // (e.g. from child-creation webhooks during a fan-out) see the
+      // destination state even if verification has not yet completed.
+      recordAppliedState(issueIdentifier, expectedStateName);
+    }
+
     const verification = await verifyTransitionWritePersisted(
       internalId,
-      { stateName: expectedStateName, delegateId, nativeStateId },
+      {
+        stateName: expectedStateName,
+        delegateId,
+        assigneeId: delegateId !== undefined ? null : undefined,
+        nativeStateId,
+      },
       authToken,
     );
     if (verification === null) {
@@ -6172,6 +6260,81 @@ async function issueUpdateAtomicVerified(
     failureKind = "verification";
     divergent = verification;
     log.warn(`workflow-gate: AI-1762: write attempt ${attempt}/${maxAttempts} for ${internalId} reported success but did NOT fully persist — ${verification.join("; ")}${attempt < maxAttempts ? " — retrying" : ""}`);
+  }
+
+  // INF-424: a state-label read can stay lagged behind a genuinely-applied mutation
+  // (Linear's read replica catching up — the exact race that desynced INF-196's label).
+  // The applied-state-store already recorded the destination state right after the
+  // mutation succeeded (above), and every consumer of transition state (barrier
+  // checks, outbound delivery, fan-out) is required to prefer that authoritative
+  // record over a live label read. So when retries exhaust with ONLY the label
+  // still divergent — no delegate or native-state facet dropped — accept the write
+  // instead of failing the whole transition (and blocking its fan-out) on a read lag
+  // we already have a fix for. A dropped delegate/native-state facet (the AI-1759
+  // bug class) still fails loudly; that risk is unrelated to label read lag.
+  if (
+    failureKind === "verification" &&
+    divergent.length > 0 &&
+    divergent.every((d) => d.startsWith("state-label"))
+  ) {
+    log.warn(
+      `workflow-gate: AI-1762/INF-424: state-label verification stayed lagged after ${maxAttempts} attempt(s) for ${internalId} — ` +
+      `accepting on applied-state-store authority (mutation succeeded, no delegate/native-state divergence): ${divergent.join("; ")}`,
+    );
+    return { ok: true, attempts: maxAttempts, failureKind: "none", divergent, unverified: true };
+  }
+
+  // INF-562 / AC1: the transition did NOT fully apply (a delegate/native-state
+  // facet was dropped — the AI-1759 class). The applied-state record written
+  // speculatively above (INF-424, before verification) would otherwise leave the
+  // authoritative cache advanced to the destination while the ticket never truly
+  // reached it — the exact half-applied state that let INF-552 slip past sign-off.
+  // Roll the speculative record back so a failed transition is all-or-nothing.
+  if (issueIdentifier) {
+    clearAppliedState(issueIdentifier);
+  }
+
+  if (failureKind === "verification" && rollbackSnapshot) {
+    const rollbackApplied = await issueUpdateAtomic(
+      internalId,
+      rollbackSnapshot.labelIds,
+      authToken,
+      rollbackSnapshot.delegateId,
+      rollbackSnapshot.nativeStateId,
+      rollbackSnapshot.assigneeId,
+    );
+    if (rollbackApplied) {
+      const rollbackVerification = await verifyTransitionWritePersisted(
+        internalId,
+        {
+          stateName: rollbackSnapshot.stateName,
+          delegateId: rollbackSnapshot.delegateId,
+          assigneeId: rollbackSnapshot.assigneeId,
+          nativeStateId: rollbackSnapshot.nativeStateId,
+        },
+        authToken,
+      );
+      if (rollbackVerification === null) {
+        log.warn(
+          `workflow-gate: INF-562: rollback write for ${internalId} reported success but could not be read back — accepting unverified rollback`,
+        );
+      } else if (rollbackVerification.length === 0) {
+        log.warn(
+          `workflow-gate: INF-562: rolled back partial transition write for ${internalId} to state:${rollbackSnapshot.stateName}`,
+        );
+      } else {
+        divergent = [
+          ...divergent,
+          `rollback failed verification: ${rollbackVerification.join("; ")}`,
+        ];
+        log.error(
+          `workflow-gate: INF-562: rollback write for ${internalId} did NOT fully persist — ${rollbackVerification.join("; ")}`,
+        );
+      }
+    } else {
+      divergent = [...divergent, "rollback mutation failed"];
+      log.error(`workflow-gate: INF-562: rollback mutation failed for ${internalId}`);
+    }
   }
 
   return { ok: false, attempts: maxAttempts, failureKind, divergent, unverified: false };
