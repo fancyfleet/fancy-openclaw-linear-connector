@@ -36,6 +36,7 @@ import {
   applyBootstrapToIssue,
 } from "./workflow-bootstrap.js";
 import { loadWorkflowRegistry, type WorkflowDef } from "./workflow-gate.js";
+import { isTerminalIssueState } from "./linear-actionable.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { registerCron, markCronRun, formatIntervalMs } from "./cron/registry.js";
 import { buildAgentMap } from "./agents.js";
@@ -97,6 +98,8 @@ type ReconciliationCandidate = {
   labels: Array<{ id: string; name: string }>;
   delegateId: string | null;
   teamId: string;
+  /** INF-608: native Linear state, for the native-terminality guard (symmetric to INF-584). */
+  nativeState?: { name?: string; type?: string } | null;
 };
 
 function workflowDefForLabel(registry: Map<string, WorkflowDef> | undefined, workflowLabel: string): WorkflowDef | undefined {
@@ -411,6 +414,7 @@ async function queryUnenrolledTickets(
           labels { nodes { id name } }
           delegate { id }
           team { id }
+          state { name type }
           title
         }
       }
@@ -433,6 +437,7 @@ async function queryUnenrolledTickets(
           labels: { nodes: Array<{ id: string; name: string }> };
           delegate: { id: string } | null;
           team: { id: string };
+          state: { name: string; type: string } | null;
         }>;
       };
     };
@@ -447,6 +452,7 @@ async function queryUnenrolledTickets(
     labels: n.labels.nodes,
     delegateId: n.delegate?.id ?? null,
     teamId: n.team.id,
+    nativeState: n.state ?? null,
   }));
 }
 
@@ -499,6 +505,19 @@ export async function runBootstrapReconciliationSweep(
 
   // ── Pass 1: Unenrolled tickets ────────────────────────────────────────────
   for (const ticket of candidates) {
+    // INF-608: native Linear terminality wins over stale workflow labels. A
+    // native-Done/Canceled ticket carrying a wf:* label but missing its state:*
+    // label must NOT be re-enrolled (Done→Doing) — that is the DSN-5 loop.
+    // Symmetric to INF-584's guard on the delegation sweep.
+    if (isTerminalIssueState(ticket.nativeState)) {
+      log.info(
+        `bootstrap-reconciliation: skipping ${ticket.identifier} (Pass 1) — Linear entity is natively terminal ` +
+        `(state.type='${ticket.nativeState?.type ?? "null"}', name='${ticket.nativeState?.name ?? "null"}'); ` +
+        `no re-enrollment on a retired issue`,
+      );
+      continue;
+    }
+
     // Filter: must have a wf:* label but NO state:* label
     const hasStateLabel = ticket.labels.some((l) => l.name.startsWith("state:"));
     if (hasStateLabel) continue; // already enrolled — handled in Pass 2
@@ -581,6 +600,11 @@ export async function runBootstrapReconciliationSweep(
 
   // ── Pass 2: Enrolled actionable tickets missing dispatch records (INF-570) ──
   for (const ticket of candidates) {
+    // INF-608: a natively-terminal issue draws zero wakes from the bootstrap
+    // sweep — an actionable-looking state:* label on a Done/Canceled ticket is
+    // stale and must not re-dispatch its owner. Symmetric to INF-584.
+    if (isTerminalIssueState(ticket.nativeState)) continue;
+
     const workflowLabel = ticket.labels.find((l) => l.name.startsWith("wf:"))?.name;
     const stateLabel = ticket.labels.find((l) => l.name.startsWith("state:"))?.name;
     if (!workflowLabel || !stateLabel || !ticket.delegateId) continue;
