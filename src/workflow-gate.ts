@@ -2614,6 +2614,32 @@ export async function resolveMetaIntent(
     return { error: `[Proxy] '${intent}' blocked: workflow registry unavailable (${msg}).` };
   }
 
+  // INF-562 / AC2: an approval-gate state must never be advanced by reusing a
+  // continue-workflow snapshot captured at an EARLIER state. When a ticket has
+  // live-advanced into an approval_gate (e.g. review→sign-off) but the meta-intent
+  // was snapshotted at the prior state, the prior stage's approval intent must NOT
+  // satisfy the gate — it rests for a fresh, deliberate act by its own owner role.
+  // (Live: INF-552 — continue-workflow ran review→sign-off→done in one invocation,
+  // the review-stage approval double-counting as sign-off.)
+  if (
+    intent === "continue-workflow" &&
+    typeof snapshotState === "string" &&
+    snapshotState.length > 0
+  ) {
+    const liveState = getCurrentState(labels, def);
+    if (liveState && liveState !== snapshotState) {
+      const liveNode = def.states.find((s) => s.id === liveState);
+      if (liveNode?.kind === "approval_gate") {
+        return {
+          error:
+            `[Proxy] '${intent}' blocked: the '${liveState}' approval gate requires a fresh, ` +
+            `explicit sign-off act by its owner role (${liveNode.owner_role ?? "owner"}); a ` +
+            `prior-state ('${snapshotState}') continue snapshot cannot satisfy it.`,
+        };
+      }
+    }
+  }
+
   const currentState =
     typeof snapshotState === "string" && snapshotState.length > 0
       ? snapshotState
@@ -6166,6 +6192,16 @@ async function issueUpdateAtomicVerified(
       `accepting on applied-state-store authority (mutation succeeded, no delegate/native-state divergence): ${divergent.join("; ")}`,
     );
     return { ok: true, attempts: maxAttempts, failureKind: "none", divergent, unverified: true };
+  }
+
+  // INF-562 / AC1: the transition did NOT fully apply (a delegate/native-state
+  // facet was dropped — the AI-1759 class). The applied-state record written
+  // speculatively above (INF-424, before verification) would otherwise leave the
+  // authoritative cache advanced to the destination while the ticket never truly
+  // reached it — the exact half-applied state that let INF-552 slip past sign-off.
+  // Roll the speculative record back so a failed transition is all-or-nothing.
+  if (issueIdentifier) {
+    clearAppliedState(issueIdentifier);
   }
 
   return { ok: false, attempts: maxAttempts, failureKind, divergent, unverified: false };
