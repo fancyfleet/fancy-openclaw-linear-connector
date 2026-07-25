@@ -39,8 +39,10 @@ import path from "node:path";
 import { describe, it, expect, jest, beforeAll, afterAll, beforeEach, afterEach } from "@jest/globals";
 import {
   runDelegationReconciliationSweep,
+  registerDelegationReconciliationCron,
   type DelegationReconciliationOptions,
 } from "./delegation-reconciliation-sweep.js";
+import { resetCronRegistryForTest } from "./cron/registry.js";
 import {
   setStateAtomic,
   checkWorkflowRules,
@@ -519,5 +521,118 @@ describe("INF-560 D — applyStateTransition: `complete` terminal-sync preserves
     expect(result.code).toBe("native-state-not-terminal");
     expect(captured.stateId).toBeUndefined();
     expect(markTerminal).not.toHaveBeenCalled();
+  });
+});
+
+// ── Part E: production-entry-point liveness (AC R1, AI-1808) ──────────────────
+//
+// AC of record (Astrid, INF-560 intake): a module-level unit test of the heal
+// function alone does NOT satisfy Residual 1. The Canceled path must be invoked
+// through the sweep BOOTED FROM THE PRODUCTION ENTRY POINT
+// (registerDelegationReconciliationCron), exercising the REAL setStateAtomic —
+// the cron passes NO setStateFn, so a wiring defect (e.g. an override that never
+// reaches the primitive) would be dead code in prod with green unit tests. This
+// test boots the cron, fires one interval, and asserts the live issueUpdate the
+// real setStateAtomic emitted carried the CANCELED native stateId (flavor
+// preserved) with the delegate cleared.
+
+describe("INF-560 E — booted-cron liveness: Canceled path heals via real setStateAtomic", () => {
+  let original: typeof globalThis.fetch;
+  beforeEach(() => { resetWorkflowCache(); resetPolicyCache(); resetConfigHealth(); resetCronRegistryForTest(); original = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = original; jest.useRealTimers(); });
+
+  it("boots registerDelegationReconciliationCron; one pass writes the Canceled stateId, clears delegate (native NOT flipped to Done)", async () => {
+    const IDENT = "LSO-canceled-e";
+    // Merged mock: answers the sweep's governed-ticket query AND every
+    // setStateAtomic sub-query, capturing the atomic mutation.
+    const captured: { stateId?: string | null; delegateId?: unknown } = {};
+    const mock = (async (_url: unknown, init?: RequestInit) => {
+      const body = typeof init?.body === "string" ? init.body : "";
+      const json = (o: unknown) => new Response(JSON.stringify(o), { status: 200, headers: { "Content-Type": "application/json" } });
+
+      if (body.includes("AdhocDelegationReconciliation")) {
+        return json({ data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } });
+      }
+      if (body.includes("DelegationReconciliation")) {
+        return json({ data: { issues: { nodes: [{
+          id: "issue-internal-uuid",
+          identifier: IDENT,
+          updatedAt: "2020-01-01T00:00:00.000Z", // safely older than the grace window
+          title: `Ticket ${IDENT}`,
+          state: { type: "canceled" },
+          labels: { nodes: [
+            { id: "lbl-wf-dev-impl", name: "wf:dev-impl" },
+            { id: "lbl-state-implementation", name: "state:implementation" },
+          ] },
+          delegate: { id: "astrid-linear-uuid", name: "astrid" },
+          team: { id: TEAM_ID },
+        }], pageInfo: { hasNextPage: false, endCursor: null } } } });
+      }
+      if (body.includes("TeamStates")) return json({ data: { team: { states: { nodes: TEAM_STATES } } } });
+      if (body.includes("TeamLabels")) return json({ data: { team: { labels: { nodes: TEAM_LABELS } } } });
+      if (body.includes("IssueWithLabels")) {
+        return json({ data: { issue: {
+          id: "issue-internal-uuid",
+          identifier: IDENT,
+          team: { id: TEAM_ID },
+          labels: { nodes: [
+            { id: "lbl-wf-dev-impl", name: "wf:dev-impl" },
+            { id: "lbl-state-implementation", name: "state:implementation" },
+          ] },
+        } } });
+      }
+      if (body.includes("VerifyTransitionWrite")) {
+        return json({ data: { issue: {
+          labels: { nodes: [{ name: "state:done" }] },
+          delegate: captured.delegateId != null ? { id: captured.delegateId } : null,
+          state: { id: captured.stateId ?? null },
+        } } });
+      }
+      if (body.includes("ApplyAtomicTransition")) {
+        const vars = (JSON.parse(body).variables ?? {}) as Record<string, unknown>;
+        captured.stateId = (vars.stateId as string | null) ?? null;
+        captured.delegateId = vars.delegateId;
+        return json({ data: { issueUpdate: { success: true } } });
+      }
+      return json({ data: {} });
+    }) as unknown as typeof globalThis.fetch;
+    globalThis.fetch = mock;
+
+    const markTerminal = jest.fn();
+    const enrolledTicketsStore = {
+      getByTicketId: (id: string) => ({ ticket_id: id, terminal: 0 }),
+      markTerminal,
+      recordTransition: jest.fn(),
+    } as any;
+
+    // Real timers + a short interval, then wait for the fire-and-forget async
+    // sweep (multiple awaited fetches + verified write) to settle — the pattern
+    // the sweep's own integration tests use (ai-2534). Fake timers can't reliably
+    // drain the sweep's promise chain.
+    const timer = registerDelegationReconciliationCron({
+      authToken: AUTH,
+      intervalMs: 20,
+      operationalEventStore: new OperationalEventStore(":memory:"),
+      alertBus: { notify: jest.fn() } as any,
+      wakeFn: jest.fn(async () => {}),
+      enrolledTicketsStore,
+      // NOTE: deliberately NO setStateFn — the production entry point does not
+      // pass one, so the real setStateAtomic runs. This is the AI-1808 guard.
+    });
+    // Poll until the atomic mutation fires (or time out), then stop the cron.
+    const deadline = Date.now() + 3_000;
+    while (captured.stateId === undefined && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    clearInterval(timer);
+
+    // The REAL setStateAtomic emitted the atomic mutation with the Canceled
+    // native stateId — the override reached the primitive through the booted
+    // cron. Native state is Canceled, not resurrected to Done.
+    expect(captured.stateId).toBe(CANCELED_UUID);
+    expect(captured.stateId).not.toBe(DONE_UUID);
+    // Delegate cleared and enrolled mirror marked terminal — facets healed.
+    expect(captured.delegateId).toBeNull();
+    expect(markTerminal).toHaveBeenCalledWith(IDENT, "out-of-band-terminal");
   });
 });
