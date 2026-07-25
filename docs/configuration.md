@@ -93,6 +93,33 @@ Open a user's profile in Linear → the URL contains their UUID:
 5. Copy the **signing secret** — set it as `LINEAR_WEBHOOK_SECRET` env var
 6. Click **Create webhook**
 
+## Linear Webhook Secret Drift
+
+The connector supports multiple Linear webhook signing secrets because each
+org-level or team-level Linear webhook may have a different secret. Keep every
+current team webhook secret in `LINEAR_WEBHOOK_SECRETS` or in the admin webhook
+registry.
+
+When a signed webhook fails HMAC validation, the connector still rejects it with
+401 and never trusts it for dispatch. For diagnostics only, it best-effort
+parses the rejected raw body and records `webhookId`, `teamKey`, `type`, and
+`action` on the `signature-rejected` operational event. Repeated identified
+rejects for the same team/webhook raise a `webhook-secret-drift` warning alert
+naming the drifting team and webhook.
+
+To repair drift without restarting the connector, add or rotate the team's
+secret through `/admin/api/webhooks` (or the management console page backed by
+that API). The registry updates the env file and `process.env`; webhook
+requests call `parseWebhookSecrets()` per request, so the next delivery uses the
+new secret set immediately.
+
+Extra or stale loaded secrets do not cause 401s. `verifyLinearSignatureMulti()`
+accepts the request if any loaded secret matches the HMAC. A signature reject
+therefore means the matching current Linear secret is missing or rotated, not
+that a different loaded secret is "bad". Do not delete unknown registry rows as
+cleanup unless you have confirmed the owning Linear webhook is gone; removing a
+still-active team's secret can re-break that team.
+
 ### Which Events to Subscribe To
 
 | Event | Recommended | Why |

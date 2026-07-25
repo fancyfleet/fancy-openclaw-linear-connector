@@ -43,12 +43,20 @@ import { emitStreamTopic } from "../admin-stream.js";
 import { DelegatePingPongDetector, shouldCheckDelegatePingPong } from "../delegate-ping-pong-detector.js";
 import type { DispatchRecordStore } from "../liveness-channel/dispatch-record-store.js";
 import type { GatewayDispatchAck } from "../liveness-channel/gateway-ack-types.js";
+import { extractRejectedWebhookDiagnostic, WebhookSecretDriftTracker } from "./drift.js";
 
 const log = componentLogger(createLogger(), "webhook");
 
 export type { LinearEvent } from "./schema.js";
 export { verifyLinearSignature } from "./signature.js";
 export { normalizeLinearEvent } from "./normalize.js";
+
+function signatureRejectedDetail(rawBody: Buffer | undefined, secretCount: number): Record<string, unknown> {
+  return {
+    ...extractRejectedWebhookDiagnostic(rawBody),
+    loadedHmacCount: secretCount,
+  };
+}
 
 /**
  * Creates the Express router for the Linear webhook endpoint.
@@ -275,6 +283,7 @@ export function createWebhookRouter(
 ): Router {
   const router = Router();
   const delegatePingPongDetector = new DelegatePingPongDetector(undefined, undefined, operationalEventStore);
+  const webhookSecretDriftTracker = new WebhookSecretDriftTracker();
 
   // AI-2091 §2/§9 (G2): the delivery-time fetchability gate is wired into the
   // PRIMARY dispatch path (dispatchRoute → checkLinearIssueRouting →
@@ -319,7 +328,11 @@ export function createWebhookRouter(
       if (secrets.length > 0) {
         const signature = req.headers["x-linear-signature"] ?? req.headers["linear-signature"];
         if (!signature || typeof signature !== "string") {
-          appendOperationalEvent(operationalEventStore, { outcome: "signature-rejected", errorSummary: "Missing signature header" });
+          appendOperationalEvent(operationalEventStore, {
+            outcome: "signature-rejected",
+            errorSummary: "Missing signature header",
+            detail: signatureRejectedDetail(rawBody, secrets.length),
+          });
           res.status(400).json({
             error: "Missing signature header",
           });
@@ -335,7 +348,15 @@ export function createWebhookRouter(
         const signatureValid = matchedSecret !== null;
       log.info(`Signature validation result: ${signatureValid ? "valid" : "invalid"}`);
         if (!signatureValid) {
-          appendOperationalEvent(operationalEventStore, { outcome: "signature-rejected", errorSummary: "Invalid signature" });
+          const diagnostic = extractRejectedWebhookDiagnostic(rawBody);
+          appendOperationalEvent(operationalEventStore, {
+            outcome: "signature-rejected",
+            type: diagnostic.type,
+            key: diagnostic.teamKey && diagnostic.webhookId ? `${diagnostic.teamKey}:${diagnostic.webhookId}` : diagnostic.webhookId ?? diagnostic.teamKey,
+            errorSummary: "Invalid signature",
+            detail: { ...diagnostic, loadedHmacCount: secrets.length },
+          });
+          webhookSecretDriftTracker.record({ diagnostic, secretCount: secrets.length });
           res.status(401).json({ error: "Invalid signature" });
           return;
         }
