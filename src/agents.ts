@@ -581,6 +581,25 @@ export function getLinearUserIdForAgent(openclawAgentId: string): string | undef
   return _agents.find((a) => (a.openclawAgent ?? a.name) === openclawAgentId)?.linearUserId;
 }
 
+/**
+ * Resolve the OpenClaw agent id for a Linear user id — the inverse of
+ * `getLinearUserIdForAgent`, and the value delivery/gateway keys on (what
+ * `getOpenclawAgentName` would yield for that agent).
+ *
+ * Delegation-reconciliation carries the Linear delegate's user id but wakes
+ * through the OpenClaw agent id. The delegate's Linear *display name* (e.g.
+ * `Felix (Unity Dev)`) is NOT a routable id: `getOpenclawAgentName` matches on
+ * `a.name` (the lowercase id, e.g. `felix`), so passing the display name misses
+ * and returns it unchanged, routing `model: openclaw/Felix (Unity Dev)` which
+ * the gateway cannot resolve. Resolve by the stable user id instead. Returns
+ * undefined for an unrecognized user id. (INF-589)
+ */
+export function getAgentIdForLinearUserId(linearUserId: string): string | undefined {
+  if (!linearUserId) return undefined;
+  const agent = _agents.find((a) => a.linearUserId === linearUserId);
+  return agent ? (agent.openclawAgent ?? agent.name) : undefined;
+}
+
 /** Update tokens for an agent and persist to disk */
 export interface TokenStatus {
   agentId: string;
