@@ -216,12 +216,24 @@ function matchSessionInIndex(
     const raw = fs.readFileSync(indexPath, "utf8");
     const index = JSON.parse(raw) as Record<string, Record<string, unknown>>;
 
-    const toEntry = (val: Record<string, unknown>): SessionIndexEntry => ({
-      sessionId: String(val.sessionId ?? ""),
-      sessionFile: String(val.sessionFile ?? path.join(sessionsDir, `${val.sessionId}.jsonl`)),
-      sessionStartedAt: typeof val.sessionStartedAt === "number" ? val.sessionStartedAt : undefined,
-      status: typeof val.status === "string" ? val.status : undefined,
-    });
+    const toEntry = (val: Record<string, unknown>): SessionIndexEntry => {
+      const sessionId = String(val.sessionId ?? "");
+      // Reconstruct the transcript path from the HOST-resolved sessionsDir, not
+      // the index's stored `sessionFile`: a containerized agent records its own
+      // container-internal path (e.g. /home/node/.openclaw/…) which does not
+      // exist on the connector host. Since we found the index at sessionsDir,
+      // <sessionsDir>/<sessionId>.jsonl is always the correct host path (and is
+      // identical to the stored value for bare-metal agents). (INF-664)
+      const sessionFile = sessionId
+        ? path.join(sessionsDir, `${sessionId}.jsonl`)
+        : String(val.sessionFile ?? "");
+      return {
+        sessionId,
+        sessionFile,
+        sessionStartedAt: typeof val.sessionStartedAt === "number" ? val.sessionStartedAt : undefined,
+        status: typeof val.status === "string" ? val.status : undefined,
+      };
+    };
 
     // Try exact match: agent:<agentId>:<sessionKey>
     const openclawKey = `agent:${openclawAgentName}:${sessionKey}`;

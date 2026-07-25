@@ -220,7 +220,10 @@ describe("buildSnapshot — containerized agent transcript (INF-664)", () => {
       JSON.stringify({
         [`agent:${agentId}:${sessionKey}`]: {
           sessionId: "live-container-999",
-          sessionFile: transcript,
+          // Container-internal path as OpenClaw records it inside the container —
+          // does NOT exist on the connector host. Forensics must ignore it and
+          // reconstruct <sessionsDir>/<sessionId>.jsonl instead (INF-664).
+          sessionFile: "/home/node/.openclaw/agents/astrid/sessions/live-container-999.jsonl",
           sessionStartedAt: 2000,
           status: "done",
         },
@@ -234,6 +237,10 @@ describe("buildSnapshot — containerized agent transcript (INF-664)", () => {
       { agentId, sessionKey, startedAt: Date.now() - 30 * 60 * 1000, timeoutMs: 25 * 60 * 1000, pendingTickets: [] },
       { openclawHome: home },
     );
+    // Reconstructed host path under the container config dir — NOT the stored
+    // /home/node/... container-internal path.
+    expect(snapshot.metadata.sessionFile).toContain(path.join("containers", "workflow", "config"));
+    expect(snapshot.metadata.sessionFile).not.toContain("/home/node/");
     expect(snapshot.metadata.sessionFile).toContain("live-container-999.jsonl");
     expect(snapshot.toolCallSummary.totalCalls).toBe(1);
     expect(snapshot.classification).not.toBe("C4");
