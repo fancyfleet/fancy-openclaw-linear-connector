@@ -1,4 +1,7 @@
 import crypto from "crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import request from "supertest";
 import { createApp } from "../index.js";
 
@@ -35,16 +38,24 @@ describe("POST /", () => {
   let app: ReturnType<typeof createApp>["app"];
 
   let savedWebhookSecrets: string | undefined;
+  // INF-617: the verify path now stamps webhook last-seen metadata via the
+  // registry sidecar (beside WEBHOOK_ENV_FILE). Isolate it to a temp dir so the
+  // test never writes .webhooks-metadata.json into the repo root.
+  let envDir: string;
 
   beforeEach(() => {
     savedWebhookSecrets = process.env.LINEAR_WEBHOOK_SECRETS;
     delete process.env.LINEAR_WEBHOOK_SECRETS;
     process.env.LINEAR_WEBHOOK_SECRET = SECRET;
+    envDir = fs.mkdtempSync(path.join(os.tmpdir(), "endpoint-env-"));
+    process.env.WEBHOOK_ENV_FILE = path.join(envDir, ".env");
     ({ app } = createApp());
   });
 
   afterEach(() => {
     delete process.env.LINEAR_WEBHOOK_SECRET;
+    delete process.env.WEBHOOK_ENV_FILE;
+    fs.rmSync(envDir, { recursive: true, force: true });
     if (savedWebhookSecrets !== undefined) {
       process.env.LINEAR_WEBHOOK_SECRETS = savedWebhookSecrets;
     }

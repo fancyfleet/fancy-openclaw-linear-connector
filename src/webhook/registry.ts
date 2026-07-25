@@ -185,6 +185,41 @@ export function addWebhook(input: {
   };
 }
 
+/**
+ * INF-617 — record that a webhook signed by `secret` was just received, so the
+ * admin table's "Last seen" column reflects real traffic instead of "never".
+ *
+ * The verification path (verifyLinearSignatureMulti) only ever returned a
+ * boolean, so nothing attributed a delivery to a specific secret; last-seen was
+ * written once at add-time (as null) and never touched again. This closes that
+ * gap.
+ *
+ * If the secret has no metadata entry yet — e.g. it was seeded directly into
+ * LINEAR_WEBHOOK_SECRETS / the legacy LINEAR_WEBHOOK_SECRET rather than through
+ * the admin form — an entry is created so last-seen still populates (url/team
+ * stay blank until an operator fills them in, which is honest: we genuinely
+ * don't know them for an env-seeded secret).
+ *
+ * Best-effort: a metadata read/write failure must never break inbound webhook
+ * processing, so all IO is swallowed.
+ */
+export function recordWebhookSeen(secret: string, when: string = new Date().toISOString()): void {
+  try {
+    const envFile = envFilePath();
+    const id = webhookId(secret);
+    const meta = readMeta(envFile);
+    const existing = meta[id];
+    meta[id] = {
+      url: existing?.url ?? "",
+      teamLabel: existing?.teamLabel ?? "",
+      lastSeen: when,
+    };
+    writeMeta(envFile, meta);
+  } catch {
+    // Telemetry only — never let a metadata write failure reject a valid webhook.
+  }
+}
+
 /** AC3 — remove the secret from the env file + runtime and drop its metadata. */
 export function removeWebhook(id: string): { ok: boolean; status: number } {
   const envFile = envFilePath();

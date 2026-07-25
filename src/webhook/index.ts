@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import { Router, Request, Response } from "express";
-import { verifyLinearSignatureMulti, parseWebhookSecrets } from "./signature.js";
+import { matchLinearSignature, parseWebhookSecrets } from "./signature.js";
+import { recordWebhookSeen } from "./registry.js";
 import { normalizeLinearEvent } from "./normalize.js";
 import type { LinearEvent } from "./schema.js";
 import { EventStore } from "../store/event-store.js";
@@ -330,13 +331,17 @@ export function createWebhookRouter(
           return;
         }
 
-        const signatureValid = verifyLinearSignatureMulti(rawBody, signature as string, secrets);
+        const matchedSecret = matchLinearSignature(rawBody, signature as string, secrets);
+        const signatureValid = matchedSecret !== null;
       log.info(`Signature validation result: ${signatureValid ? "valid" : "invalid"}`);
         if (!signatureValid) {
           appendOperationalEvent(operationalEventStore, { outcome: "signature-rejected", errorSummary: "Invalid signature" });
           res.status(401).json({ error: "Invalid signature" });
           return;
         }
+        // INF-617 — attribute the delivery to its registered webhook so the
+        // admin table's "Last seen" reflects real traffic. Best-effort.
+        recordWebhookSeen(matchedSecret);
       } else {
         log.warn("No LINEAR_WEBHOOK_SECRETS or LINEAR_WEBHOOK_SECRET set — skipping signature validation");
       }

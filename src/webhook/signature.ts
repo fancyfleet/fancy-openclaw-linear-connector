@@ -54,6 +54,33 @@ export function verifyLinearSignatureMulti(
 }
 
 /**
+ * Like {@link verifyLinearSignatureMulti}, but returns the secret that matched
+ * (or `null` if none did) so the caller can attribute the delivery to a
+ * specific registered webhook — e.g. to stamp its last-seen metadata.
+ *
+ * Comparison is still constant-time per secret. The identity of the matched
+ * secret is used only server-side (never returned to the HTTP caller), so this
+ * does not weaken the "don't leak which secret matched" property of the
+ * request/response surface.
+ */
+export function matchLinearSignature(
+  rawBody: Buffer,
+  signature: string,
+  secrets: string[]
+): string | null {
+  if (!signature || secrets.length === 0) {
+    return null;
+  }
+
+  for (const secret of secrets) {
+    if (verifyLinearSignature(rawBody, signature, secret)) {
+      return secret;
+    }
+  }
+  return null;
+}
+
+/**
  * Parses the webhook secrets from environment variables.
  *
  * Supports two formats:

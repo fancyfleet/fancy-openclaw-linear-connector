@@ -1,5 +1,5 @@
 import crypto from "crypto";
-import { verifyLinearSignature, verifyLinearSignatureMulti, parseWebhookSecrets } from "./signature.js";
+import { verifyLinearSignature, verifyLinearSignatureMulti, matchLinearSignature, parseWebhookSecrets } from "./signature.js";
 
 const SECRET = "test-webhook-secret-abc123";
 const PRIVATE_SECRET = "private-team-secret-xyz789";
@@ -83,6 +83,43 @@ describe("verifyLinearSignatureMulti", () => {
     const secrets = ["s1", "s2", "s3", "s4", "s5"];
     const sig = makeSignature(body, "s4");
     expect(verifyLinearSignatureMulti(rawBody, sig, secrets)).toBe(true);
+  });
+});
+
+describe("matchLinearSignature (INF-617 — attribute delivery to a secret)", () => {
+  const body = JSON.stringify({ type: "Issue", action: "create" });
+  const rawBody = Buffer.from(body);
+
+  it("returns the matching secret when the first secret matches", () => {
+    const sig = makeSignature(body, SECRET);
+    expect(matchLinearSignature(rawBody, sig, [SECRET, PRIVATE_SECRET])).toBe(SECRET);
+  });
+
+  it("returns the matching secret when a later secret matches", () => {
+    const sig = makeSignature(body, PRIVATE_SECRET);
+    expect(matchLinearSignature(rawBody, sig, [SECRET, PRIVATE_SECRET])).toBe(PRIVATE_SECRET);
+  });
+
+  it("returns null when no secret matches", () => {
+    const sig = makeSignature(body, "wrong-secret");
+    expect(matchLinearSignature(rawBody, sig, [SECRET, PRIVATE_SECRET])).toBeNull();
+  });
+
+  it("returns null for an empty secrets array", () => {
+    const sig = makeSignature(body, SECRET);
+    expect(matchLinearSignature(rawBody, sig, [])).toBeNull();
+  });
+
+  it("returns null for an empty signature", () => {
+    expect(matchLinearSignature(rawBody, "", [SECRET, PRIVATE_SECRET])).toBeNull();
+  });
+
+  it("agrees with verifyLinearSignatureMulti on the match/no-match verdict", () => {
+    const sig = makeSignature(body, PRIVATE_SECRET);
+    const secrets = [SECRET, PRIVATE_SECRET];
+    expect(matchLinearSignature(rawBody, sig, secrets) !== null).toBe(
+      verifyLinearSignatureMulti(rawBody, sig, secrets),
+    );
   });
 });
 
