@@ -39,6 +39,17 @@ export interface RoleGuardResult {
   /** All legal body IDs for the state's owner_role when blocked. */
   legalBodies?: string[];
   /**
+   * INF-576: the owner role required by the blocking state. Surfaced as a
+   * structured field (not just embedded in `reason`) so the ping-pong
+   * escalation can name the unroutable role without regex-parsing the reason.
+   */
+  ownerRole?: string;
+  /**
+   * INF-576: the workflow id the blocking state belongs to. Paired with
+   * `ownerRole`/`legalBodies` to make a role-guard block legible downstream.
+   */
+  workflowId?: string;
+  /**
    * AI-2044: true when the dispatch was blocked but the ticket's current
    * delegate fills the owner_role (or could not be verified), so the guard
    * left delegate/assignee untouched and posted nothing.
@@ -188,6 +199,8 @@ export async function checkRoleGuardEnforced(
     blocked: true,
     reason,
     legalBodies,
+    ownerRole,
+    workflowId,
   };
 
   // Surface the correction target so the caller can update the delegate.

@@ -1145,6 +1145,15 @@ export function createWebhookRouter(
               deliveryMode: "role-guard-blocked",
               attemptCount: 1,
               errorSummary: `routing-guard blocked: ${guardResult.reason ?? "role mismatch"}`,
+              // INF-576: carry the structured role-block descriptor so the
+              // ping-pong escalation can name the unroutable role instead of
+              // silently locking to steward (delegate-ping-pong-detector.ts).
+              detail: {
+                ownerRole: guardResult.ownerRole ?? null,
+                workflowId: guardResult.workflowId ?? null,
+                legalBodies: guardResult.legalBodies ?? [],
+                blockedTarget: route.agentId,
+              },
             });
             // No delivery was sent — roll back the dedup priming so the genuine
             // dispatch to the agent that legitimately becomes the delegate is not

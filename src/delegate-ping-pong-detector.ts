@@ -30,6 +30,7 @@
 import { createLogger, componentLogger } from "./logger.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import { getAccessToken, getLinearUserIdForAgent } from "./agents.js";
+import { tryNormalizeSessionKey } from "./session-key.js";
 
 const log = componentLogger(createLogger(), "delegate-ping-pong-detector");
 
@@ -88,6 +89,25 @@ export interface EscalationResult {
   bounceCount: number;
   /** The cycling delegate(s). */
   cyclingDelegates: string[];
+  /**
+   * INF-576: set when the churn was driven by role-guard rejections against a
+   * role no body can fill in the ticket's workflow, so the escalation named the
+   * structural condition instead of the generic ping-pong text.
+   */
+  structuralUnroutable?: boolean;
+}
+
+/**
+ * INF-576: descriptor of a role-guard block that makes a governed ticket
+ * structurally unroutable — the churn is not a genuine two-agent bounce but a
+ * required role that no legal body can fill in this workflow. Carried on the
+ * `role-guard-blocked` operational event and consumed by the escalation so the
+ * steward lock states the real condition instead of a silent dead-end.
+ */
+export interface StructuralUnroutable {
+  ownerRole: string | null;
+  workflowId: string | null;
+  legalBodies: string[];
 }
 
 export interface PingPongHandlingResult {
@@ -209,6 +229,7 @@ export async function fireEscalation(
   cyclingDelegates: string[],
   bounceCount: number,
   authToken?: string,
+  structuralUnroutable?: StructuralUnroutable | null,
 ): Promise<EscalationResult> {
   const token =
     authToken ??
@@ -224,6 +245,7 @@ export async function fireEscalation(
       escalatedTo: "ai",
       bounceCount,
       cyclingDelegates,
+      structuralUnroutable: Boolean(structuralUnroutable),
     };
   }
 
@@ -237,14 +259,21 @@ export async function fireEscalation(
       escalatedTo: "ai",
       bounceCount,
       cyclingDelegates,
+      structuralUnroutable: Boolean(structuralUnroutable),
     };
   }
 
   const delegates = cyclingDelegates.join(", ");
-  const body =
-    `[Connector] Delegate ping-pong cycle detected on ${ticketId}: ` +
-    `${delegates} reached ${bounceCount} assignment(s) within the configured window. ` +
-    "Suppressing this dispatch and escalating to steward (Ai).";
+  // INF-576: when the churn was driven by role-guard rejections against a role
+  // no body can fill in this workflow, the ticket is structurally unroutable —
+  // locking to steward is a dead-end because the steward also has no verb to
+  // reach the required role. Say so, and tell the reader how to dispose of it,
+  // instead of the generic ping-pong text. Still lock to steward as the fallback.
+  const body = structuralUnroutable
+    ? buildStructuralUnroutableComment(ticketId, structuralUnroutable)
+    : `[Connector] Delegate ping-pong cycle detected on ${ticketId}: ` +
+      `${delegates} reached ${bounceCount} assignment(s) within the configured window. ` +
+      "Suppressing this dispatch and escalating to steward (Ai).";
   const commentPosted = await postComment(issueId, body, authHeader);
 
   const stewardUserId = getLinearUserIdForAgent("ai");
@@ -259,7 +288,8 @@ export async function fireEscalation(
   const fired = commentPosted && delegateChanged;
   log.warn(
     `PING_PONG_CYCLE_DETECTED: issue=${ticketId} delegates=${delegates} ` +
-    `bounceCount=${bounceCount} escalatedTo=ai fired=${fired}`,
+    `bounceCount=${bounceCount} escalatedTo=ai fired=${fired}` +
+    (structuralUnroutable ? ` structuralUnroutable=true role=${structuralUnroutable.ownerRole ?? "?"} wf=${structuralUnroutable.workflowId ?? "?"}` : ""),
   );
 
   return {
@@ -268,7 +298,31 @@ export async function fireEscalation(
     escalatedTo: "ai",
     bounceCount,
     cyclingDelegates,
+    structuralUnroutable: Boolean(structuralUnroutable),
   };
+}
+
+/**
+ * INF-576: diagnostic escalation comment for a structurally-unroutable ticket.
+ * Names the required role, the workflow, and the (empty or role-mismatched)
+ * legal-body set, then tells the steward how to dispose of it — because locking
+ * to steward alone is a dead-end when no legal target for the role exists.
+ */
+function buildStructuralUnroutableComment(
+  ticketId: string,
+  s: StructuralUnroutable,
+): string {
+  const role = s.ownerRole ?? "(unknown role)";
+  const wf = s.workflowId ? `wf:${s.workflowId}` : "this workflow";
+  const legal = s.legalBodies.length > 0 ? s.legalBodies.join(", ") : "none";
+  return (
+    `[Connector] No legal target for required role '${role}' in ${wf} on ${ticketId} — ` +
+    `objective unroutable through this workflow. ` +
+    `Repeated role-guard rejections (legal target(s) for '${role}': ${legal}) tripped the ` +
+    `delegate ping-pong threshold; the intended body fills none of the workflow's routable roles. ` +
+    `Locking to steward (Ai) as a fallback, but the steward has no verb to reach '${role}' either — ` +
+    `dispose of this manually: \`demote\` it to ad-hoc (un-gated routing) or re-file it under a workflow whose roles include '${role}'.`
+  );
 }
 
 async function resolveIssueId(
@@ -390,10 +444,18 @@ export class DelegatePingPongDetector {
     let suppressDispatch = false;
 
     if (detection.hasCycle) {
+      // INF-576: distinguish a genuine two-agent bounce from a structural
+      // routing impossibility. If the churn was driven by role-guard rejections
+      // against a role no legal body fills in this workflow, the steward lock is
+      // a dead-end — surface the real condition in the escalation comment.
+      const structuralUnroutable = this.findRecentStructuralUnroutable(ticketId, now);
+
       escalation = await fireEscalation(
         ticketId,
         detection.cyclingDelegates,
         Object.values(detection.bounceCounts).reduce((a, b) => Math.max(a, b), 0),
+        undefined,
+        structuralUnroutable,
       );
 
       suppressDispatch = true;
@@ -414,6 +476,7 @@ export class DelegatePingPongDetector {
               bounceCounts: detection.bounceCounts,
               maxAllowed: detection.maxAllowed,
               escalationFired: escalation.fired,
+              structuralUnroutable: structuralUnroutable ?? undefined,
             },
           });
         } catch (err) {
@@ -432,5 +495,62 @@ export class DelegatePingPongDetector {
       escalation,
       suppressDispatch,
     };
+  }
+
+  /**
+   * INF-576: look for a recent `role-guard-blocked` operational event on this
+   * ticket within the ping-pong window. Its presence means the delegate churn
+   * was manufactured by role-guard rejections (a role no body fills in this
+   * workflow), not a genuine agent bounce — so the escalation should name the
+   * structural condition. Returns the most recent block's descriptor, or null
+   * when there is no store, no matching event, or the detail lacks the fields.
+   *
+   * The webhook keys the role-guard event with `normalizeSessionKey(identifier)`
+   * (e.g. `linear-INF-573`), while the detector receives the raw identifier —
+   * so we probe both key forms.
+   */
+  private findRecentStructuralUnroutable(
+    ticketId: string,
+    now?: number,
+  ): StructuralUnroutable | null {
+    if (!this.operationalEventStore) return null;
+
+    const nowMs = now ?? Date.now();
+    const since = new Date(nowMs - this.config.windowMs).toISOString();
+
+    const candidateKeys = new Set<string>([ticketId]);
+    const normalized = tryNormalizeSessionKey(ticketId);
+    if (normalized) candidateKeys.add(normalized);
+
+    try {
+      for (const key of candidateKeys) {
+        const events = this.operationalEventStore.query({
+          key,
+          outcome: "delivery-failed",
+          since,
+          limit: 100,
+        });
+        // Query returns newest-first; take the most recent role-guard block.
+        const block = events.find((e) => e.deliveryMode === "role-guard-blocked");
+        if (!block) continue;
+        const detail = block.detail as
+          | { ownerRole?: string | null; workflowId?: string | null; legalBodies?: string[] }
+          | null
+          | undefined;
+        if (!detail) continue;
+        return {
+          ownerRole: detail.ownerRole ?? null,
+          workflowId: detail.workflowId ?? null,
+          legalBodies: Array.isArray(detail.legalBodies) ? detail.legalBodies : [],
+        };
+      }
+    } catch (err) {
+      log.warn(
+        `ping-pong: role-guard-block lookup failed for ${ticketId} (fail-open, generic escalation): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    return null;
   }
 }
