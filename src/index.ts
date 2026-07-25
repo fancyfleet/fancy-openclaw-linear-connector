@@ -313,6 +313,37 @@ export function createApp(options?: CreateAppOptions) {
         log.info(`proxy-auto-ack agent=${agentId} ticket=${ticketId}`);
       }
     },
+    fanoutWakeFn: async (agentName, ticketIdentifier) => {
+      const sessionKey = normalizeSessionKey(ticketIdentifier);
+      if (sessionTracker.isActiveForTicket(agentName, sessionKey)) {
+        log.info(`fanout dispatch skipped for ${agentName} [${sessionKey}]: session already active`);
+        return;
+      }
+      const agentCfg = getAgent(agentName);
+      const authToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+      const deliveryConfig: DeliveryConfig = {
+        nodeBin: process.execPath,
+        hooksUrl: agentCfg?.hooksUrl ?? process.env.OPENCLAW_HOOKS_URL,
+        hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
+        hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
+        hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+        gatewayUrl: agentCfg?.gatewayUrl,
+        gatewayToken: agentCfg?.gatewayToken,
+      };
+      const actionText = `You were delegated ${ticketIdentifier}`;
+      const message = (await buildWorkflowAwareDeliveryMessage(ticketIdentifier, authToken, actionText)) ?? actionText;
+      await reconciliationWakeWithLeaseCheck({
+        agentId: agentName,
+        ticketId: ticketIdentifier,
+        leaseStore: dispatchLeaseStore,
+        leaseTtlMs: 30_000,
+        deliveryConfig,
+        sendWake: async (agId, _tId, msg, cfg) => {
+          return await deliverMessageToAgent(agId, sessionKey, msg, cfg);
+        },
+      });
+    },
+    getDispatchAckTracker: () => ackTracker,
   }));
 
   // Upload proxy — AI-1767. Agents can't fetch uploads.linear.app directly
@@ -1742,6 +1773,7 @@ if (isEntryPoint) {
   registerBootstrapReconciliationCron({
     authToken: reconciliationAuthToken,
     wakeFn: reconciliationWakeFn,
+    dispatchAckTracker: ackTracker,
   });
 
   // AI-1807: delegation reconciliation sweep — detect and heal stranded

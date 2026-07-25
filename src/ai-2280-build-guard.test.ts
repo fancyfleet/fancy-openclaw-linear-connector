@@ -45,7 +45,7 @@ function invokeGuard(guardScript: string, cwd: string, env: Record<string, strin
     const result = execFileSync(
       process.execPath,
       [guardScript],
-      { cwd, env: { ...process.env, ...env }, timeout: 10_000, encoding: "utf8" },
+      { cwd, env: { ...process.env, CONNECTOR_RUNTIME_TREE: cwd, ...env }, timeout: 10_000, encoding: "utf8" },
     );
     return { status: 0, stderr: result.stderr ?? "" };
   } catch (err: unknown) {
@@ -86,10 +86,7 @@ describe("build guard — guard-runtime-build.mjs", () => {
     writeFileSync(join(worktree, "dist", "index.js"), "// worktree build");
     try {
       const guardScript = join(repo.root, "scripts", "guard-runtime-build.mjs");
-      // cwd=worktree, so cwdReal resolves to worktree; runtimeDist = worktree/dist
-      // projectRoot from scriptDir = repo.root; outDir = repo.root/dist
-      // outDirReal (repo.root/dist) ≠ runtimeDistReal (worktree/dist) → allow
-      const result = invokeGuard(guardScript, worktree);
+      const result = invokeGuard(guardScript, repo.root, { CONNECTOR_RUNTIME_TREE: worktree });
       expect(result.status).toBe(0);
     } finally {
       repo.cleanup();

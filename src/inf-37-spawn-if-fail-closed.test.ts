@@ -417,6 +417,18 @@ function makeIntegrationFetch(opts: {
     // The spawn_if predicate's read — the seam under test.
     if (query.includes("ParentChildrenLabels")) return opts.childrenQuery();
 
+    if (query.includes("IssueWithComments")) {
+      return json({
+        data: {
+          issue: {
+            id: "parent-internal-id",
+            description: "## Findings\n- **Item One**: Desc one\n- **Item Two**: Desc two\n",
+            comments: { nodes: [] },
+          },
+        },
+      });
+    }
+
     if (query.includes("IssueWithLabels")) {
       return json({ data: { issue: { id: "parent-internal-id", team: { id: "team-uuid" }, labels: { nodes: parentLabels() } } } });
     }

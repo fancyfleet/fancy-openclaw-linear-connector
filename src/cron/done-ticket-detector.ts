@@ -360,6 +360,13 @@ async function runScanIteration(): Promise<void> {
   }
 }
 
+export async function _runDoneTicketDetectorIterationForTest(): Promise<void> {
+  if (process.env.NODE_ENV !== "test") {
+    throw new Error("_runDoneTicketDetectorIterationForTest is test-only");
+  }
+  await runScanIteration();
+}
+
 /**
  * Register the Done-ticket detector as an in-process recurring job.
  * Interval is controlled by DONE_DETECTOR_INTERVAL env var (default: 1h).
@@ -376,12 +383,12 @@ export function registerDoneTicketDetectorCron(): void {
   const firstRunTimer = setTimeout(() => {
     void runScanIteration();
   }, 0);
-  firstRunTimer.unref();
+  if (process.env.NODE_ENV !== "test") firstRunTimer.unref();
 
   const timer = setInterval(() => {
     void runScanIteration();
   }, intervalMs);
-  timer.unref();
+  if (process.env.NODE_ENV !== "test") timer.unref();
 
   log.info(
     `[done-ticket-detector] Scheduled every ${intervalMs}ms (DONE_DETECTOR_INTERVAL=${process.env.DONE_DETECTOR_INTERVAL ?? "1h"})` +

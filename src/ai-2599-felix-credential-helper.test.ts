@@ -15,6 +15,7 @@ const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '..');
 const VALIDATOR = path.join(REPO_ROOT, 'scripts', 'validate-credential-helper.sh');
 const FELIX_HELPER = '!/home/node/.openclaw/workspace/felix/.secrets/gh-app-helper-venv.sh';
+const describeInFelixContainer = process.env['AGENT_ID'] === 'felix' ? describe : describe.skip;
 
 const run = (command: string, args: string[], env = process.env) =>
   cp.spawnSync(command, args, {
@@ -24,7 +25,7 @@ const run = (command: string, args: string[], env = process.env) =>
     timeout: 70_000,
   });
 
-describe('AI-2599: Felix Developer App git credential helper', () => {
+describeInFelixContainer('AI-2599: Felix Developer App git credential helper', () => {
   test('AC: Felix global git config uses the Developer App helper and HTTP path scoping', () => {
     const helper = run('git', ['config', '--global', 'credential.helper']);
     const useHttpPath = run('git', ['config', '--global', 'credential.useHttpPath']);

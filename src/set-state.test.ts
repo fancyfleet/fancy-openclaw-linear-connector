@@ -496,7 +496,8 @@ describe("setStateAtomic (AI-1546)", () => {
 
     const result = await setStateAtomic("AI-9999", "intake", undefined, "Bearer test-token", { sendWakeUp });
     expect(result.ok).toBe(true);
-    expect(result.redispatched).toBeUndefined();
+    expect(result.redispatched).toBe("ai");
+    expect(result.dispatchFailure?.reasonCode).toBe("session-never-spawned");
   });
 
   it("INF-466: records successful non-terminal admin set-state in the enrolled-ticket mirror", async () => {

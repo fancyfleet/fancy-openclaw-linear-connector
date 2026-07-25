@@ -15,6 +15,8 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { createApp } from "./index.js";
+import { reloadAgents } from "./agents.js";
+import { _resetSingletonGuard as resetManagingPollerSingletonGuard } from "./bag/managing-poller.js";
 
 // ── Test helpers ────────────────────────────────────────────────────────────
 
@@ -111,6 +113,7 @@ describe("Dead-letter queue — webhook integration [FAILING]", () => {
     process.env.OPENCLAW_HOOKS_TOKEN = "test-hooks-token";
     // Disable liveness check for test
     process.env.NODE_ENV = "test";
+    reloadAgents();
 
     const created = createApp();
     app = created.app;
@@ -123,6 +126,7 @@ describe("Dead-letter queue — webhook integration [FAILING]", () => {
     delete process.env.OPENCLAW_HOOKS_URL;
     delete process.env.OPENCLAW_HOOKS_TOKEN;
     delete process.env.NODE_ENV;
+    reloadAgents();
     // Close stores
     if (operationalEventStore && "close" in operationalEventStore) {
       (operationalEventStore as { close: () => void }).close();
@@ -238,22 +242,31 @@ describe("Dead-letter queue — webhook integration [FAILING]", () => {
 // ── Background-wiring integration test (AC5) ──────────────────────────────
 
 describe("Dead-letter queue — background wiring (AC5) [FAILING]", () => {
+  beforeEach(() => {
+    resetManagingPollerSingletonGuard();
+  });
+
   it("AC5: dead-letter queue store is instantiated and registered at production entry point", () => {
     // This test verifies the DLQ is wired into the app at startup.
     // It FAILS because createApp() does not yet instantiate or return a
     // DeadLetterQueueStore.
 
-    const { deadLetterQueue } = createApp();
+    const dir = tempDbDir();
+    const { deadLetterQueue } = createApp({ deadLetterQueueDbPath: path.join(dir, "dead-letter.db") });
     expect(deadLetterQueue).toBeDefined();
 
     // The store should be open and queryable
     expect(typeof (deadLetterQueue as { count: () => number }).count).toBe("function");
+    deadLetterQueue.close();
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 
   test("AC5: dead-letter queue store is accessible from app and operational", () => {
     // Verify the store is properly initialized: zero entries at start,
     // accepts appends, and can be queried.
-    const { deadLetterQueue } = createApp();
+    resetManagingPollerSingletonGuard();
+    const dir = tempDbDir();
+    const { deadLetterQueue } = createApp({ deadLetterQueueDbPath: path.join(dir, "dead-letter.db") });
 
     expect(deadLetterQueue.count()).toBe(0);
 
@@ -267,5 +280,7 @@ describe("Dead-letter queue — background wiring (AC5) [FAILING]", () => {
     const entries = deadLetterQueue.query({ ticketId: "AC5-TEST" });
     expect(entries).toHaveLength(1);
     expect(entries[0].intendedAgent).toBe("test-agent");
+    deadLetterQueue.close();
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });
