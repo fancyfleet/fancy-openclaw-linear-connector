@@ -26,6 +26,46 @@ const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "work
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 
+/**
+ * INF-552: sentinel label for the CLI authoring path.
+ *
+ * `linear create --workflow <id>` cannot attach a `wf:<id>` label directly: an
+ * agent OAuth actor token cannot create IssueLabels, so an unregistered (or
+ * simply not-yet-provisioned) `wf:<id>` fails opaquely at the CLI with a 400 and
+ * the id never reaches the engine's registry validation. Instead the CLI
+ * attaches this single, pre-provisioned, taxonomy-free sentinel and carries the
+ * verbatim requested id in a description marker (below). The engine — the sole
+ * registry holder — resolves the real id here, then swaps the sentinel for the
+ * concrete `wf:<id>` label (registered) or loudly rejects it (unregistered).
+ *
+ * The sentinel encodes no workflow taxonomy — it means only "a workflow was
+ * requested and is pending engine resolution" — so keeping it out of the CLI's
+ * knowledge and pre-provisioning it once is not the label-existence-as-registry
+ * anti-pattern that a per-workflow `wf:<id>` allowlist would be.
+ */
+export const WF_PENDING_LABEL = "wf:pending";
+
+/**
+ * INF-552: structured marker the CLI writes into a ticket's description to carry
+ * the verbatim requested workflow id to the engine alongside the `wf:pending`
+ * sentinel. An HTML comment so it is invisible in rendered Markdown. The id is
+ * matched verbatim (no case-folding) — the engine matches it against the
+ * registry exactly, mirroring the CLI's verbatim-preservation contract.
+ */
+const WORKFLOW_REQUEST_MARKER_RE = /<!--\s*openclaw:workflow-request\s+id="([^"]*)"\s*-->/;
+
+/**
+ * Extract the requested workflow id from a `wf:pending` ticket's description.
+ * Returns the trimmed id, or null when no marker is present or the id is empty.
+ */
+export function parseWorkflowRequestMarker(description: string | undefined | null): string | null {
+  if (!description) return null;
+  const m = description.match(WORKFLOW_REQUEST_MARKER_RE);
+  if (!m) return null;
+  const id = m[1].trim();
+  return id.length > 0 ? id : null;
+}
+
 // ── Public result type ────────────────────────────────────────────────────────
 
 export interface BootstrapResult {
@@ -70,6 +110,11 @@ export interface IssueContext {
    * when the creator could not be resolved from the API.
    */
   creatorId?: string;
+  /**
+   * INF-552: issue description — carries the `wf:pending` authoring marker that
+   * names the requested workflow id. Absent when not fetched (older callers).
+   */
+  description?: string | null;
 }
 
 /** Re-export so callers (sweep) can import from a single module. */
@@ -92,6 +137,7 @@ export async function fetchIssueContext(issueId: string, authToken: string): Pro
         labels { nodes { id name } }
         delegate { id }
         creator { id }
+        description
       }
     }
   `;
@@ -111,6 +157,7 @@ export async function fetchIssueContext(issueId: string, authToken: string): Pro
           labels: { nodes: Array<{ id: string; name: string }> };
           delegate: { id: string } | null;
           creator: { id: string } | null;
+          description: string | null;
         } | null;
       };
     };
@@ -124,6 +171,7 @@ export async function fetchIssueContext(issueId: string, authToken: string): Pro
       title: issue.title,
       labels: issue.labels.nodes,
       creatorId: issue.creator?.id,
+      description: issue.description,
     };
   } catch {
     return null;
@@ -318,7 +366,35 @@ export async function applyBootstrapToIssue(
   const wfLabelNode = issue.labels.find((n) => n.name.startsWith("wf:"));
   if (!wfLabelNode) return null;
 
-  const workflowId = wfLabelNode.name.slice("wf:".length);
+  // INF-552: two authoring shapes converge here.
+  //   1. A concrete `wf:<id>` label (dev-sprint fanout children, Linear UI) —
+  //      the id is the label suffix, as before.
+  //   2. The `wf:pending` CLI sentinel — the concrete id lives in a description
+  //      marker because the CLI cannot create a `wf:<id>` label. Resolve it and
+  //      remember the sentinel's label id so we can swap it for the real one on
+  //      enrollment. A `wf:pending` with no readable marker is a malformed
+  //      authoring attempt: reject it loudly (never silently strand).
+  let workflowId: string;
+  let pendingSentinelLabelId: string | undefined;
+  if (wfLabelNode.name === WF_PENDING_LABEL) {
+    pendingSentinelLabelId = wfLabelNode.id;
+    const requested = parseWorkflowRequestMarker(issue.description);
+    if (!requested) {
+      log.warn(
+        `workflow-bootstrap: ${issue.identifier ?? issue.id} carries ${WF_PENDING_LABEL} but no readable ` +
+          `workflow-request marker — rejecting as a malformed authoring attempt`,
+      );
+      return rejectUnregisteredWorkflow(
+        issue,
+        "pending",
+        authToken,
+        `workflow authoring failed — the ${WF_PENDING_LABEL} sentinel is present but no workflow-request marker was found in the description`,
+      );
+    }
+    workflowId = requested;
+  } else {
+    workflowId = wfLabelNode.name.slice("wf:".length);
+  }
 
   let registry: Map<string, WorkflowDef>;
   if (workflowRegistryOverride) {
@@ -397,8 +473,22 @@ export async function applyBootstrapToIssue(
     return null;
   }
 
+  // INF-552: for the `wf:pending` sentinel authoring path, swap the sentinel for
+  // the concrete `wf:<id>` label. The engine CAN create labels (unlike the CLI's
+  // agent OAuth token), so this is where the real `wf:<id>` first materializes —
+  // find-or-create so a registered workflow enrolls even on a team that has
+  // never used it. Drop the sentinel's id so the ticket is left cleanly managed.
   const currentLabelIds = issue.labels.map((l) => l.id);
-  const newLabelIds = Array.from(new Set([...currentLabelIds, stateLabelId]));
+  let baseLabelIds = currentLabelIds;
+  if (pendingSentinelLabelId) {
+    const wfLabelId = await findOrCreateLabel(issue.teamId, `wf:${workflowId}`, authToken);
+    if (!wfLabelId) {
+      log.warn(`workflow-bootstrap: could not resolve label 'wf:${workflowId}' — aborting bootstrap`);
+      return null;
+    }
+    baseLabelIds = currentLabelIds.filter((id) => id !== pendingSentinelLabelId).concat(wfLabelId);
+  }
+  const newLabelIds = Array.from(new Set([...baseLabelIds, stateLabelId]));
   const success = await issueUpdateAtomic(issue.id, newLabelIds, authToken, delegateLinearUserId);
 
   if (!success) {
@@ -453,8 +543,14 @@ async function rejectUnregisteredWorkflow(
   issue: IssueContext,
   workflowId: string,
   authToken: string,
+  /**
+   * INF-552: optional reason override for the sentinel authoring path, where a
+   * `wf:pending` ticket carries no readable marker — "unknown workflow" would be
+   * misleading there. Defaults to the registry-miss phrasing.
+   */
+  reasonOverride?: string,
 ): Promise<BootstrapResult> {
-  const reason = `unknown workflow '${workflowId}' — not registered`;
+  const reason = reasonOverride ?? `unknown workflow '${workflowId}' — not registered`;
 
   // Drop every wf:* and state:* label — the authoring attempt leaves no managed
   // limbo behind; what remains is a plain, ad-hoc ticket.
