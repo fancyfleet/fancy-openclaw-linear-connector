@@ -35,6 +35,7 @@ import {
   resetNativeStateCache,
   enrollIfMissing,
   loadWorkflowDef,
+  autoEnrollPlainDelegation,
 } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { reloadAgents } from "./agents.js";
@@ -975,6 +976,8 @@ type FetchCall = {
 };
 
 /** Build a fetch mock that handles the three B2 API calls and records all calls. */
+let makeTransitionFetchCallCount = 0;
+
 function makeTransitionFetch(opts: {
   issueLabels: Array<{ id: string; name: string }>;
   teamId?: string;
@@ -1008,14 +1011,22 @@ function makeTransitionFetch(opts: {
     calls.push({ url, body: parsed });
 
     const query = parsed.query ?? "";
+    const vars = parsed.variables ?? {};
+    const requestIssueId = (typeof vars.id === "string" ? vars.id : "internal-uuid") as string;
 
     if (query.includes("IssueWithLabels")) {
       if (opts.issueError) throw new Error("simulated fetch error");
+      // Preserve the original 'id: internal-uuid' for backward compat with existing
+      // tests that expect it as the ApplyAtomicTransition issueId. Use a unique
+      // identifier per call so the applied-state store does not contaminate across
+      // tests that share the same issueId string.
+      const callNum = ++makeTransitionFetchCallCount;
       return new Response(
         JSON.stringify({
           data: {
             issue: {
               id: "internal-uuid",
+              identifier: requestIssueId + "-" + callNum,
               team: { id: teamId },
               labels: { nodes: opts.issueLabels },
             },
@@ -8956,5 +8967,102 @@ describe("checkWorkflowRules — sprint-spawner cycle-roll guard (INF-148)", () 
       const result = await checkWorkflowRules("escape", "issue-uuid", "Bearer tok", "astrid");
       expect(result).toBeNull(); // state: ${state}
     }
+  });
+});
+
+describe("autoEnrollPlainDelegation — INF-594 PR guard", () => {
+  let originalFetch: typeof globalThis.fetch;
+  let mockTeamLabels: Array<{ id: string; name: string }>;
+  const issueId = "linear-issue-uuid";
+  const authToken = "Bearer test-token";
+
+  beforeAll(() => {
+    mockTeamLabels = [
+      { id: "lbl-wf-task", name: "wf:task" },
+      { id: "lbl-state-doing", name: "state:doing" },
+    ];
+  });
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("AC1: refuses enrollment into wf:task when issue has PR evidence", async () => {
+    const { fetch } = makeTransitionFetch({
+      issueLabels: [], // no existing wf:* label
+      teamLabels: mockTeamLabels,
+      branchStatus: { hasPR: true, hasMergedPR: false },
+    });
+    globalThis.fetch = fetch;
+
+    // Mock out label create too
+    const result = await autoEnrollPlainDelegation(issueId, authToken);
+
+    expect(result.enrolled).toBe(false);
+    // No workflowId should be reported — we didn't enroll
+    expect(result.workflowId).toBeUndefined();
+  });
+
+  it("AC2: allows enrollment into wf:task when issue has no PR evidence", async () => {
+    const { fetch } = makeTransitionFetch({
+      issueLabels: [],
+      teamLabels: mockTeamLabels,
+      branchStatus: { hasPR: false, hasMergedPR: false },
+    });
+    globalThis.fetch = fetch;
+
+    const result = await autoEnrollPlainDelegation(issueId, authToken);
+
+    // Should enroll successfully since no PR evidence
+    expect(result.enrolled).toBe(true);
+    expect(result.workflowId).toBe("task");
+    expect(result.entryState).toBe("doing");
+  });
+
+  it("AC3: refuses enrollment when issue has a merged PR", async () => {
+    const { fetch } = makeTransitionFetch({
+      issueLabels: [],
+      teamLabels: mockTeamLabels,
+      branchStatus: { hasPR: true, hasMergedPR: true },
+    });
+    globalThis.fetch = fetch;
+
+    const result = await autoEnrollPlainDelegation(issueId, authToken);
+
+    expect(result.enrolled).toBe(false);
+  });
+
+  it("AC4: still enrolls when fetchBranchAndPRStatus fails (fail-open regression)", async () => {
+    const { fetch } = makeTransitionFetch({
+      issueLabels: [],
+      teamLabels: mockTeamLabels,
+      branchStatus: null, // simulate fetch error
+    });
+    globalThis.fetch = fetch;
+
+    const result = await autoEnrollPlainDelegation(issueId, authToken);
+
+    // null from fetchBranchAndPRStatus = fail-open, proceed with enrollment
+    expect(result.enrolled).toBe(true);
+    expect(result.workflowId).toBe("task");
+  });
+
+  it("AC5: skips PR check when ticket already has a wf:* label", async () => {
+    const { fetch } = makeTransitionFetch({
+      issueLabels: [
+        { id: "lbl-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "lbl-state-doing", name: "state:doing" },
+      ],
+    });
+    globalThis.fetch = fetch;
+
+    const result = await autoEnrollPlainDelegation(issueId, authToken);
+
+    // Already has wf:* — returns enrolled:false without hitting PR check
+    expect(result.enrolled).toBe(false);
   });
 });

@@ -6890,6 +6890,21 @@ export async function autoEnrollPlainDelegation(
     return { enrolled: false };
   }
 
+  // INF-594: Refuse to enroll code-fix tickets into wf:task. A ticket with
+  // PR/branch evidence is a code change, not a non-code deliverable — it
+  // belongs in dev-impl, not task. Skipping enrollment prevents the dead-end
+  // class (INF-585) where a connector code fix hits wf:task and has no path
+  // to merge or deploy.
+  const prStatus = await fetchBranchAndPRStatus(issueId, authToken, issue.identifier);
+  if (prStatus && (prStatus.hasPR || prStatus.hasMergedPR)) {
+    log.warn(
+      `workflow-gate: autoEnrollPlainDelegation: refusing to enroll ${issue.identifier} ` +
+      `into wf:task because it has PR/branch evidence (hasPR=${prStatus.hasPR}, ` +
+      `hasMergedPR=${prStatus.hasMergedPR}) — code-fix tickets should route through dev-impl`,
+    );
+    return { enrolled: false };
+  }
+
   // INF-334: A re-delegation timestamp can bypass a stale demoted tombstone.
   if (enrolledTicketsStore?.wasDemoted(issue.identifier, delegateSetTimestamp ?? undefined)) {
     autoEnrollLiveness = {
