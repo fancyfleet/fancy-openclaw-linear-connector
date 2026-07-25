@@ -789,6 +789,226 @@ describe("INF-497: Pass 3 reconciles terminal-label / active-native-state mismat
   });
 });
 
+// ── INF-588: Pass 3 close of a natively-terminal ENROLLED ticket ──────────────
+//
+// The mirror-image gap Astrid gated on. Pass 3's `closeEnrolledTicket` strips
+// the stale wf:*/state:* facets off a ticket a human dragged to a native
+// terminal state (canceled/duplicate) while it still carries a non-terminal
+// state:* label + delegate. But Linear RETIRES such an entity and refuses every
+// mutation ("Entity is retired: issue ↳ Could not modify retired issue"). INF-588
+// teaches `closeEnrolledTicket` to return a three-way outcome so Pass 3 can:
+//   - "retired": recognize the refusal as terminal-acknowledged — no error, no
+//                alert, no retry (the facets are un-healable via API and inert).
+//   - "failed":  keep surfacing a genuine (non-retired) mutation failure as a
+//                retryable error, so an over-broad /retired/ match cannot silently
+//                swallow it.
+describe("INF-588: Pass 3 close of a natively-terminal enrolled ticket", () => {
+  const STATE_IMPL_LABEL_ID = "label-state-implementation";
+
+  /**
+   * Fetch mock for an ENROLLED ticket (wf:dev-impl + state:implementation +
+   * delegate) whose native Linear state is terminal (canceled/duplicate). Only
+   * Pass 3 acts on it: Pass 1 skips (has state:*), Pass 2 skips (no wakeFn),
+   * Pass 4 skips (no state:done). `closeMutationResponse` is what the
+   * CloseEnrolledTicket mutation returns, letting a test drive the retired vs.
+   * failed outcome.
+   */
+  function makeEnrolledTerminalFetch(opts: {
+    closeMutationResponse: unknown;
+    closeMutationCalls: string[];
+    nativeType?: string;
+    nativeName?: string;
+  }): typeof fetch {
+    const {
+      closeMutationResponse,
+      closeMutationCalls,
+      nativeType = "canceled",
+      nativeName = "Invalid",
+    } = opts;
+
+    const json = (payload: unknown) =>
+      new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+
+    return async (_url, init) => {
+      const body = typeof init?.body === "string" ? init.body : "";
+
+      // Native state + delegate lookup (queryEnrolledTicketState)
+      if (body.includes("IssueContextSweep")) {
+        return json({
+          data: {
+            issue: {
+              id: ISSUE_ID_ENROLLED,
+              state: { id: "native-terminal-state-uuid", name: nativeName, type: nativeType },
+              delegate: { id: DELEGATE_LINEAR_ID },
+            },
+          },
+        });
+      }
+
+      // Label re-fetch for the facet strip (closeEnrolledTicket)
+      if (body.includes("IssueWithLabelsForClose")) {
+        return json({
+          data: {
+            issue: {
+              id: ISSUE_ID_ENROLLED,
+              identifier: "AI-2628",
+              team: { id: TEAM_ID },
+              labels: {
+                nodes: [
+                  { id: WF_LABEL_ID, name: WF_LABEL_NAME },
+                  { id: STATE_IMPL_LABEL_ID, name: "state:implementation" },
+                ],
+              },
+            },
+          },
+        });
+      }
+
+      // The facet-strip mutation — the point of the test. Matched by its named
+      // operation so it never collides with the candidate query.
+      if (body.includes("CloseEnrolledTicket")) {
+        closeMutationCalls.push(body);
+        return json(closeMutationResponse);
+      }
+
+      // Candidate sweep query
+      if (body.includes("BootstrapReconciliation")) {
+        return json({
+          data: {
+            issues: {
+              nodes: [
+                {
+                  id: ISSUE_ID_ENROLLED,
+                  identifier: "AI-2628",
+                  updatedAt: OLD_TIMESTAMP,
+                  labels: {
+                    nodes: [
+                      { id: WF_LABEL_ID, name: WF_LABEL_NAME },
+                      { id: STATE_IMPL_LABEL_ID, name: "state:implementation" },
+                    ],
+                  },
+                  delegate: { id: DELEGATE_LINEAR_ID },
+                  team: { id: TEAM_ID },
+                  title: "Ticket AI-2628",
+                  state: { name: nativeName, type: nativeType },
+                },
+              ],
+            },
+          },
+        });
+      }
+
+      return json({ data: {} });
+    };
+  }
+
+  /** The documented Linear refusal on a retired entity (from the ticket logs). */
+  const RETIRED_REFUSAL = {
+    data: { issueUpdate: null },
+    errors: [{ message: "Entity is retired: issue\nCould not modify retired issue." }],
+  };
+
+  it("treats the retired-entity refusal as terminal-acknowledged — no error, no alert, no heal", async () => {
+    const closeMutationCalls: string[] = [];
+    const { bus, alerts } = makeTestAlertBus();
+    globalThis.fetch = makeEnrolledTerminalFetch({
+      closeMutationResponse: RETIRED_REFUSAL,
+      closeMutationCalls,
+      nativeType: "canceled",
+      nativeName: "Invalid",
+    });
+
+    const result = await runBootstrapReconciliationSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: WORKFLOW_REGISTRY as never,
+      alertBus: bus,
+    });
+
+    // The strip mutation WAS attempted (Pass 3 reached closeEnrolledTicket)...
+    expect(closeMutationCalls).toHaveLength(1);
+    // ...but the retired refusal is acknowledged, not treated as a failure:
+    expect(result.healed).toBe(0);
+    expect(result.errors).toHaveLength(0);
+    // No alert of any kind — re-reporting an un-healable ticket every cadence is
+    // exactly the noise INF-588 removes.
+    expect(alerts).toHaveLength(0);
+  });
+
+  it("acknowledges a native DUPLICATE retirement the same way", async () => {
+    const closeMutationCalls: string[] = [];
+    const { bus, alerts } = makeTestAlertBus();
+    globalThis.fetch = makeEnrolledTerminalFetch({
+      closeMutationResponse: RETIRED_REFUSAL,
+      closeMutationCalls,
+      nativeType: "duplicate",
+      nativeName: "Duplicate",
+    });
+
+    const result = await runBootstrapReconciliationSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: WORKFLOW_REGISTRY as never,
+      alertBus: bus,
+    });
+
+    expect(closeMutationCalls).toHaveLength(1);
+    expect(result.healed).toBe(0);
+    expect(result.errors).toHaveLength(0);
+    expect(alerts).toHaveLength(0);
+  });
+
+  it("does NOT swallow an unrelated (non-retired) mutation failure — surfaces it as a retryable error", async () => {
+    const closeMutationCalls: string[] = [];
+    const { bus } = makeTestAlertBus();
+    // A generic failure whose message does NOT match /retired/. If the guard's
+    // regex were over-broad this would be silently swallowed as "retired" — the
+    // precise failure class Astrid gated on. It must remain a surfaced error.
+    globalThis.fetch = makeEnrolledTerminalFetch({
+      closeMutationResponse: {
+        data: { issueUpdate: null },
+        errors: [{ message: "Rate limited: too many requests, please retry" }],
+      },
+      closeMutationCalls,
+      nativeType: "canceled",
+      nativeName: "Invalid",
+    });
+
+    const result = await runBootstrapReconciliationSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: WORKFLOW_REGISTRY as never,
+      alertBus: bus,
+    });
+
+    expect(closeMutationCalls).toHaveLength(1);
+    expect(result.healed).toBe(0);
+    // The failure is surfaced (retryable next cadence), not acknowledged away.
+    expect(result.errors.some((e) => e.includes("close enrolled mutation failed") && e.includes("AI-2628"))).toBe(true);
+  });
+
+  it("also treats a plain success:false (no error payload) as a retryable failure, not retired", async () => {
+    const closeMutationCalls: string[] = [];
+    const { bus } = makeTestAlertBus();
+    globalThis.fetch = makeEnrolledTerminalFetch({
+      closeMutationResponse: { data: { issueUpdate: { success: false } } },
+      closeMutationCalls,
+      nativeType: "canceled",
+      nativeName: "Invalid",
+    });
+
+    const result = await runBootstrapReconciliationSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: WORKFLOW_REGISTRY as never,
+      alertBus: bus,
+    });
+
+    expect(closeMutationCalls).toHaveLength(1);
+    expect(result.healed).toBe(0);
+    expect(result.errors.some((e) => e.includes("close enrolled mutation failed"))).toBe(true);
+  });
+});
+
 // ── AC4: Linear API failure → alert emitted, no crash ────────────────────
 
 describe("AC4: Linear API error → alert rather than crash", () => {

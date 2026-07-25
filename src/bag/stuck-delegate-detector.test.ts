@@ -1198,6 +1198,19 @@ describe("defaultFetchStuckCandidates — retired-entity guard (INF-572)", () =>
     expect(completed).toHaveLength(0);
   });
 
+  // INF-588: the widened TERMINAL_NATIVE_STATE_TYPES set — a ticket dragged to
+  // Duplicate, or one whose native type carries the British `cancelled` spelling,
+  // is just as retired as a `canceled` one and must not surface as stuck.
+  it("excludes a natively-duplicate (retired) issue whose state:* label is still non-terminal", async () => {
+    const candidates = await defaultFetchStuckCandidates(agent, deps(issueNode("duplicate", "Duplicate")));
+    expect(candidates).toHaveLength(0);
+  });
+
+  it("excludes a natively-cancelled issue (British `cancelled` spelling)", async () => {
+    const candidates = await defaultFetchStuckCandidates(agent, deps(issueNode("cancelled", "Cancelled")));
+    expect(candidates).toHaveLength(0);
+  });
+
   it("still surfaces a live (non-terminal native state) issue in the same stuck shape as a candidate", async () => {
     const candidates = await defaultFetchStuckCandidates(agent, deps(issueNode("started", "In Progress")));
     expect(candidates).toHaveLength(1);
@@ -1207,5 +1220,88 @@ describe("defaultFetchStuckCandidates — retired-entity guard (INF-572)", () =>
     // proving the guard excludes on native terminality alone, not by breaking the shape.
     expect(candidates[0].delegateComments).toHaveLength(1);
     expect(candidates[0].transitionsAfterEntry).toHaveLength(0);
+  });
+});
+
+// ── INF-588: the widened native-terminal set also feeds the N→1 child barrier ─
+//
+// `isChildTerminal` reuses TERMINAL_NATIVE_STATE_TYPES to decide whether a child
+// satisfies the parent's barrier. INF-588 widened that set with `duplicate` and
+// the `cancelled` spelling, so a parent whose only open children were dragged to
+// Duplicate/Cancelled must count them terminal (nonTerminalChildCount → 0) — the
+// same fix, exercised on the barrier side rather than the stuck-fetcher guard.
+describe("defaultFetchStuckCandidates — child barrier honors widened terminal set (INF-588)", () => {
+  const DELEGATE_ID = "igor-user-uuid";
+
+  const agent = {
+    name: "igor",
+    linearUserId: DELEGATE_ID,
+  } as unknown as AgentConfig;
+
+  /** A live (non-terminal native) sprint PARENT in the stuck shape, with a
+   *  settable-native-state child so the barrier resolution can be asserted. */
+  function parentWithChild(childNativeType: string, childNativeName: string) {
+    return {
+      identifier: "AI-2700",
+      labels: { nodes: [{ name: "wf:dev-sprint" }, { name: "state:validation" }] },
+      delegate: { id: DELEGATE_ID },
+      updatedAt: "2026-07-24T02:00:00.000Z",
+      // Parent itself is live — it must NOT be excluded by the native-terminal
+      // guard, so the barrier count is what the assertion turns on.
+      state: { name: "In Progress", type: "started" },
+      children: {
+        nodes: [
+          {
+            identifier: "AI-2701",
+            state: { name: childNativeName, type: childNativeType },
+            labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] },
+          },
+        ],
+      },
+      comments: {
+        nodes: [
+          {
+            id: "c1",
+            createdAt: "2026-07-24T01:00:00.000Z",
+            body: "Barrier check.",
+            user: { id: DELEGATE_ID, name: "Igor" },
+          },
+        ],
+      },
+      history: {
+        nodes: [
+          { __typename: "IssueHistory", createdAt: "2026-07-24T00:00:00.000Z", actor: { id: DELEGATE_ID } },
+        ],
+      },
+    };
+  }
+
+  const deps = (node: ReturnType<typeof parentWithChild>) => ({
+    getToken: () => "test-token",
+    fetchImpl: (async () =>
+      ({
+        ok: true,
+        status: 200,
+        json: async () => ({ data: { issues: { nodes: [node] } } }),
+      })) as unknown as typeof fetch,
+  });
+
+  it("counts a native-DUPLICATE child as terminal (barrier not held by it)", async () => {
+    const candidates = await defaultFetchStuckCandidates(agent, deps(parentWithChild("duplicate", "Duplicate")));
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].totalChildren).toBe(1);
+    expect(candidates[0].nonTerminalChildCount).toBe(0);
+  });
+
+  it("counts a native-CANCELLED child (British spelling) as terminal", async () => {
+    const candidates = await defaultFetchStuckCandidates(agent, deps(parentWithChild("cancelled", "Cancelled")));
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].nonTerminalChildCount).toBe(0);
+  });
+
+  it("still counts a live (native-started) child with a non-terminal label as open", async () => {
+    const candidates = await defaultFetchStuckCandidates(agent, deps(parentWithChild("started", "In Progress")));
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].nonTerminalChildCount).toBe(1);
   });
 });
