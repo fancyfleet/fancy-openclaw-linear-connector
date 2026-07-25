@@ -487,11 +487,13 @@ function hasDispatchSinceDelegation(
  *      the native terminal flavor.
  *   2. **Linear facet heal** — strip the stale `state:*` label → terminal and
  *      clear the pinned delegate via the same atomic primitive the governed
- *      terminal uses. Only run when the target terminal state's `native_state`
- *      is IDEMPOTENT with the ticket's current native state, so we never flip an
- *      authoritative native state (e.g. resurrect a Canceled ticket to Done).
- *      The dominant/documented class is native `completed` → target `done`;
- *      canceled/duplicate get the local heal plus an operator alert.
+ *      terminal uses. Runs for every native terminal flavor. The native state is
+ *      never flipped: `completed` set-states to target `done` (native `done`,
+ *      idempotent), while `canceled`/`cancelled`/`duplicate` pass
+ *      `nativeStateOverride: "invalid"` (INF-560) so the write keeps the ticket
+ *      natively Canceled/Invalid while still clearing the label + delegate. Only
+ *      a genuine write failure raises an alert now — the Canceled path self-heals
+ *      instead of deferring to an operator (INF-558 residual 1 closed).
  *
  * Never throws — failures are captured in `result.errors` and surfaced via the
  * alert bus, matching the sweep's fail-open contract.
@@ -525,50 +527,50 @@ async function reconcileOutOfBandTerminal(
     }
   }
 
-  // 2) Linear facet heal — only when native-idempotent (completed → done).
+  // 2) Linear facet heal — strip the stale `state:*` mirror label → terminal and
+  //    clear the pinned delegate via the same atomic primitive the governed
+  //    terminal uses. INF-560: this now runs on the Canceled/duplicate path too.
+  //
+  //    Every governed terminal state maps `native_state: done`, so set-state'ing
+  //    a Canceled zombie to `done` would resurrect its native state Canceled →
+  //    Done. INF-558 therefore only healed the `completed → done` case and left
+  //    Canceled/duplicate with a stale label + pinned delegate (cosmetic board
+  //    drift, no functional loop). INF-560 closes that: for a non-`completed`
+  //    native flavor we pass `nativeStateOverride: "invalid"` so the write keeps
+  //    the ticket natively Canceled/Invalid while still stripping the mirror
+  //    label and clearing the delegate. The mirror label lands on `state:done`
+  //    (the sole sweep-recognized terminal label reachable via a real governed
+  //    state — see TERMINAL_STATE_PREFIXES); the authoritative native state
+  //    stays Canceled, so done-vs-canceled is never lost.
   if (labelActive || delegatePinned) {
-    if (ticket.nativeStateType === "completed") {
-      let res: SetStateAtomicResult;
-      try {
-        res = await setStateFn(ticket.identifier, "done", null, opts.authToken, {
-          force: true,
-          enrolledTicketsStore: mirror,
-          operationalEventStore: opts.operationalEventStore,
-        });
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        res = { ok: false, ticketId: ticket.identifier, from: null, to: "done", error: msg };
-      }
-      if (!res.ok) {
-        result.errors.push(
-          `out-of-band terminal facet-sync failed for ${ticket.identifier}: ${res.error}`,
-        );
-        opts.alertBus.notify({
-          severity: "warning",
-          source: "delegation-reconciled",
-          title: `Out-of-band terminal facet-sync failed for ${ticket.identifier}`,
-          detail: { error: res.error, nativeStateType: ticket.nativeStateType },
-          ticket: ticket.identifier,
-        });
-        return;
-      }
-    } else {
-      // Canceled/duplicate: the enrolled mirror is already healed above, which
-      // stops the redispatch loop. We deliberately do NOT auto-sync the Linear
-      // facets, because every governed terminal state maps `native_state: done`
-      // — a Linear write would resurrect the native state from Canceled to Done.
-      // Surface for operator review instead.
+    // completed → native `done` (no override, idempotent).
+    // canceled/cancelled/duplicate → native `invalid` (Canceled/Invalid), preserved.
+    const nativeOverride =
+      ticket.nativeStateType === "completed" ? undefined : "invalid";
+    let res: SetStateAtomicResult;
+    try {
+      res = await setStateFn(ticket.identifier, "done", null, opts.authToken, {
+        force: true,
+        enrolledTicketsStore: mirror,
+        operationalEventStore: opts.operationalEventStore,
+        nativeStateOverride: nativeOverride,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res = { ok: false, ticketId: ticket.identifier, from: null, to: "done", error: msg };
+    }
+    if (!res.ok) {
+      result.errors.push(
+        `out-of-band terminal facet-sync failed for ${ticket.identifier}: ${res.error}`,
+      );
       opts.alertBus.notify({
         severity: "warning",
         source: "delegation-reconciled",
-        title: `Out-of-band ${ticket.nativeStateType} ticket ${ticket.identifier} — enrolled mirror healed, Linear facets need operator sync`,
-        detail: {
-          nativeStateType: ticket.nativeStateType,
-          labelActive,
-          delegatePinned,
-        },
+        title: `Out-of-band terminal facet-sync failed for ${ticket.identifier}`,
+        detail: { error: res.error, nativeStateType: ticket.nativeStateType },
         ticket: ticket.identifier,
       });
+      return;
     }
   }
 

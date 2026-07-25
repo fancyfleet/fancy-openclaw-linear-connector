@@ -201,7 +201,7 @@ describe("INF-558: out-of-band terminal facet reconciliation", () => {
     expect(result.facetHealed).toBe(0);
   });
 
-  it("AC3: a natively-canceled ticket heals the enrolled mirror + alerts, but does NOT write Linear (no native flip)", async () => {
+  it("AC3 (INF-560): a natively-canceled ticket is facet-synced with native flavor preserved (override 'invalid'), no operator alert", async () => {
     const ticket: MockTicket = {
       id: "issue-canceled",
       identifier: "LSO-7",
@@ -232,12 +232,18 @@ describe("INF-558: out-of-band terminal facet reconciliation", () => {
 
     // Local mirror heal stops the loop for every terminal flavor …
     expect(markTerminal).toHaveBeenCalledWith("LSO-7", "out-of-band-terminal");
-    // … but we deliberately do NOT auto-write Linear (would flip Canceled→Done).
-    expect(setStateFn).not.toHaveBeenCalled();
-    // Operator is alerted that the Linear facets still need a sync.
-    expect(notify).toHaveBeenCalled();
+    // INF-560: the Linear facet heal now runs on the Canceled path too, but with
+    // nativeStateOverride "invalid" so the native state stays Canceled (never
+    // resurrected to Done).
+    expect(setStateFn).toHaveBeenCalledTimes(1);
+    const [id, target, delegate, , options] = setStateFn.mock.calls[0] as any[];
+    expect(id).toBe("LSO-7");
+    expect(target).toBe("done");
+    expect(delegate).toBeNull();
+    expect(options).toMatchObject({ force: true, nativeStateOverride: "invalid" });
+    // No more "operator sync needed" alert — the Canceled path self-heals now.
     const alertTitles = notify.mock.calls.map((c: any[]) => String((c[0] as any).title));
-    expect(alertTitles.some((t) => t.includes("operator sync"))).toBe(true);
+    expect(alertTitles.some((t) => t.includes("operator sync"))).toBe(false);
     expect(wakeFn).not.toHaveBeenCalled();
     expect(result.facetHealed).toBe(1);
   });

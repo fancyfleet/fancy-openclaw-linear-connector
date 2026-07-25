@@ -1176,6 +1176,37 @@ async function fetchTicketContext(issueId: string, authToken: string): Promise<T
 }
 
 /**
+ * INF-560: fetch the native Linear state ({ type, name }) for an issue so the
+ * gate can tell whether the ticket is already natively terminal (Done/Canceled/
+ * Duplicate). Used by the `complete`-clean-exit edge, which is legal from any
+ * workflow state ONLY when the native state is already terminal. Returns null on
+ * any error — the caller treats null as "not verifiably terminal" and falls
+ * through to the normal legality check (fail-safe: never widens legality on a
+ * fetch failure).
+ */
+async function fetchNativeState(
+  issueId: string,
+  authToken: string,
+): Promise<{ type?: string; name?: string } | null> {
+  const query = `query NativeState($id: String!) { issue(id: $id) { state { type name } } }`;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: issueId } }),
+    });
+    const data = (await res.json()) as {
+      data?: { issue?: { state?: { type?: string; name?: string } | null } | null };
+    };
+    return data.data?.issue?.state ?? null;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: native-state fetch failed for ${issueId}: ${msg}`);
+    return null;
+  }
+}
+
+/**
  * Fetch label nodes with IDs plus the team ID for a Linear issue.
  * Used by B2 to build the label set for the atomic state swap mutation.
  * Returns null on any error — caller fails open.
@@ -3229,6 +3260,32 @@ export async function checkWorkflowRules(
   const match = transitions.find((t) => t.command === resolvedIntent);
 
   if (!match) {
+    // INF-560 (Grover ask #3): governed clean-exit edge. When a ticket's native
+    // Linear state is ALREADY terminal (Done/Canceled/Duplicate) but its workflow
+    // facets were never synced — an out-of-band close, the same zombie the OOB
+    // reconcile sweep heals — an agent woken onto it has no clean exit: `complete`
+    // is not a legal transition in its (active) state, leaving only re-activating
+    // edges (`continue`/`escape`, which re-enter the spine) or `needs-human`.
+    // Make `complete` legal from ANY state when native is already terminal, so the
+    // woken delegate can sync facets to terminal and leave. Still delegate-gated
+    // (the delegate-only check above already ran) and bounded to the case where the
+    // native state proves the ticket is closed — it can never reopen or reactivate.
+    // B2 (applyStateTransition) routes this to __terminal_sync__, which preserves
+    // the native flavor (canceled stays canceled) via setStateAtomic's override.
+    if (resolvedIntent === "complete") {
+      const nativeState = await fetchNativeState(issueId, authToken);
+      if (nativeState && isTerminalIssueState(nativeState)) {
+        log.info(
+          `workflow-gate: INF-560 clean-exit — allowing 'complete' from active state '${currentState}' on ${issueId} ` +
+            `(native state type='${nativeState.type ?? "?"}' name='${nativeState.name ?? "?"}' already terminal)`,
+        );
+        return null;
+      }
+      log.info(
+        `workflow-gate: INF-560 — 'complete' from '${currentState}' on ${issueId} not a clean-exit ` +
+          `(native state not terminal: type='${nativeState?.type ?? "?"}'); falling through to normal legality`,
+      );
+    }
     const legalMoves = [...transitions.map((t) => t.command), breakGlassCommand].join(", ");
     // AI-2055: `needs-human` is not a transition in any workflow def, so a governed
     // ticket rejects it here — before the mutation, so nothing is half-applied and no
@@ -4690,13 +4747,28 @@ export async function applyStateTransition(
     const b2ResolvedIntent = intent === "force-deploy" ? "continue" : intent;
     matchedTransition = stateNode?.transitions?.find((t) => t.command === b2ResolvedIntent);
     if (!matchedTransition) {
-      // Should not happen — B1 already validated the command — but fail-open.
-      log.warn(
-        `workflow-gate: B2 apply: no transition for '${intent}' in state '${currentStateName}' on ${issueId} — skipping`,
-      );
-      return { status: "failed", code: "no-transition", detail: `no transition for '${intent}' in state '${currentStateName}'`, from: currentStateName };
+      // INF-560 (Grover ask #3): `complete` clean-exit from a native-terminal
+      // zombie. B1 already allowed `complete` from this active state ONLY when the
+      // native Linear state is terminal; there is no matching `complete` transition
+      // here, so route to the __terminal_sync__ target, which syncs facets to
+      // terminal while preserving the native flavor (canceled stays canceled). We
+      // re-verify native-terminal in the handler (B2 must be self-sufficient — it
+      // can be reached without B1 on some paths) rather than trusting B1's gate.
+      if (intent === "complete") {
+        toStateName = "__terminal_sync__";
+        log.info(
+          `workflow-gate: B2 apply: ${issueId} 'complete' has no transition in active state '${currentStateName}' — routing to __terminal_sync__ (native-terminal clean exit)`,
+        );
+      } else {
+        // Should not happen — B1 already validated the command — but fail-open.
+        log.warn(
+          `workflow-gate: B2 apply: no transition for '${intent}' in state '${currentStateName}' on ${issueId} — skipping`,
+        );
+        return { status: "failed", code: "no-transition", detail: `no transition for '${intent}' in state '${currentStateName}'`, from: currentStateName };
+      }
+    } else {
+      toStateName = matchedTransition.to;
     }
-    toStateName = matchedTransition.to;
   }
 
   // INF-311: clean up artifact binding and implementer record BEFORE the
@@ -4805,6 +4877,70 @@ export async function applyStateTransition(
       `workflow-gate: B2 apply: ${issueId} retired — removed state:* and wf:* labels, cleared delegate`,
     );
     return { status: "applied", code: "retired", from: currentStateName, to: "__retired__" };
+  }
+
+  // ── Special target: __terminal_sync__ (INF-560, Grover ask #3) ──────────
+  // Governed `complete` clean-exit from a native-terminal zombie. Unlike
+  // __retired__ (steward-only, EXITS governance by stripping wf:*/state:*), this
+  // is a delegate-usable GOVERNED complete: it syncs the ticket's facets to its
+  // terminal state (state:done label, delegate cleared, enrolled mirror terminal)
+  // while the ticket stays enrolled — the same facet set the OOB reconcile sweep
+  // produces. Reuses setStateAtomic with INF-560's nativeStateOverride so a
+  // natively-Canceled ticket stays Canceled (override "invalid") rather than being
+  // resurrected to Done, and a natively-completed ticket lands on Done idempotently.
+  if (toStateName === "__terminal_sync__") {
+    // Self-sufficient native-terminal re-verify (B2 must not trust B1's gate).
+    const nativeState = await fetchNativeState(issueId, authToken);
+    if (!nativeState || !isTerminalIssueState(nativeState)) {
+      log.warn(
+        `workflow-gate: B2 apply: __terminal_sync__ blocked — ${issueId} native state is not terminal (type='${nativeState?.type ?? "?"}')`,
+      );
+      return {
+        status: "blocked",
+        code: "native-state-not-terminal",
+        detail:
+          `'complete' clean-exit refused: ${issueId} native Linear state is not terminal. ` +
+          `This edge is only legal when the ticket is already natively terminal (Done/Canceled/Duplicate).`,
+        from: currentStateName,
+        to: "__terminal_sync__",
+      };
+    }
+
+    // Preserve the native flavor: completed/done → idempotent Done (no override);
+    // canceled/cancelled/duplicate → "invalid" keeps it Canceled/Invalid.
+    const nativeType = (nativeState.type ?? "").toLowerCase();
+    const nativeStateOverride =
+      nativeType === "completed" || nativeType === "done" ? undefined : "invalid";
+    let res: SetStateAtomicResult;
+    try {
+      res = await setStateAtomic(issue.identifier ?? issueId, "done", null, authToken, {
+        force: true,
+        enrolledTicketsStore: options?.enrolledTicketsStore,
+        operationalEventStore: options?.operationalEventStore,
+        nativeStateOverride,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res = { ok: false, ticketId: issue.identifier ?? issueId, from: currentStateName, to: "done", error: msg };
+    }
+    if (!res.ok) {
+      log.error(`workflow-gate: B2 apply: __terminal_sync__ facet-sync FAILED for ${issueId}: ${res.error}`);
+      emitTransitionWriteFailure({
+        identifier: issue.identifier ?? issueId,
+        from: currentStateName,
+        to: "done",
+        intent,
+        agent: options?.bodyId ?? null,
+        outcome: { ok: false, attempts: 1, failureKind: "mutation", divergent: [], unverified: false },
+        operationalEventStore: options?.operationalEventStore,
+      });
+      return { status: "failed", code: "atomic-mutation-failed", detail: `__terminal_sync__ facet-sync did not apply: ${res.error}`, from: currentStateName, to: "done" };
+    }
+    log.info(
+      `workflow-gate: B2 apply: ${issueId} terminal-sync complete — facets synced to 'done' ` +
+        `(native flavor '${nativeType}' preserved${nativeStateOverride ? " via override 'invalid'" : ""}), delegate cleared`,
+    );
+    return { status: "applied", code: "terminal-sync", from: currentStateName, to: "done" };
   }
 
   // ── AI-1992: Pre-transition fan-out spec gate (AC5) ──────────────────────
@@ -6703,6 +6839,20 @@ export interface SetStateAtomicOptions {
    * explanatory error.
    */
   force?: boolean;
+  /**
+   * INF-560: override the native Linear state the write projects, instead of
+   * resolving it from the target state's `native_state` field. A semantic state
+   * name (e.g. "invalid"), resolved via the same SEMANTIC_STATE_MAP the def uses.
+   *
+   * Why: every governed dev-sprint terminal maps `native_state: done`, so healing
+   * a natively-**Canceled** zombie's facets by set-state'ing it to a terminal
+   * state (`done`) would resurrect its native state from Canceled to Done. The
+   * out-of-band terminal reconcile passes `nativeStateOverride: "invalid"` so it
+   * can strip the stale `state:*` mirror label and clear the pinned delegate
+   * while keeping the ticket natively Canceled/Invalid — carrying the correct
+   * terminal native flavor (done vs canceled) rather than flipping it.
+   */
+  nativeStateOverride?: string;
 }
 
 /**
@@ -6782,14 +6932,18 @@ export async function setStateAtomic(
   ];
 
   // Step 5: Resolve native Linear state id.
+  // INF-560: an explicit nativeStateOverride wins over the target state's
+  // `native_state` mapping, so a caller can decouple the mirror label (target
+  // state) from the native flavor it projects — used by the out-of-band terminal
+  // reconcile to heal a Canceled zombie's facets without flipping native → Done.
   let resolvedNativeStateId: string | null | undefined = undefined;
-  if (def) {
-    const destNativeState = def.states.find((s) => s.id === targetState)?.native_state;
-    if (destNativeState) {
-      const nativeId = await resolveNativeStateId(issue.teamId, destNativeState, authToken);
-      if (!nativeId) return fail(`could not resolve native stateId for '${destNativeState}' on team ${issue.teamId}`, fromState);
-      resolvedNativeStateId = nativeId;
-    }
+  const destNativeState =
+    options?.nativeStateOverride ??
+    (def ? def.states.find((s) => s.id === targetState)?.native_state : undefined);
+  if (destNativeState) {
+    const nativeId = await resolveNativeStateId(issue.teamId, destNativeState, authToken);
+    if (!nativeId) return fail(`could not resolve native stateId for '${destNativeState}' on team ${issue.teamId}`, fromState);
+    resolvedNativeStateId = nativeId;
   }
 
   // Step 6: Resolve delegate Linear user id.
