@@ -25,7 +25,7 @@ import {
   fetchIssueContext,
   applyBootstrapToIssue,
 } from "./workflow-bootstrap.js";
-import { autoEnrollPlainDelegation } from "./workflow-gate.js";
+import { autoEnrollPlainDelegation, setStateAtomic, type SetStateAtomicResult } from "./workflow-gate.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
 import { OperationalEventStore, type OperationalEventStore as OperationalEventStoreType } from "./store/operational-event-store.js";
@@ -68,6 +68,14 @@ export interface DelegationReconciliationOptions {
   dispatchLeaseStore?: DispatchLeaseStore;
   /** INF-334: mirror enrollment for plain delegated tickets promoted to wf:task. */
   enrolledTicketsStore?: EnrolledTicketsStore;
+  /**
+   * INF-558: atomic facet-sync primitive used to heal out-of-band terminal
+   * tickets (strip the stale `state:*` mirror label → terminal, clear the
+   * pinned delegate). Injected for testability; defaults to the real
+   * `setStateAtomic`. The sweep never dispatches these tickets — it re-aligns
+   * their facets so the whole poller fleet stops seeing them as active.
+   */
+  setStateFn?: typeof setStateAtomic;
 }
 
 export interface DelegationReconciliationResult {
@@ -75,6 +83,12 @@ export interface DelegationReconciliationResult {
   healed: number;
   bootstrapHealed: number;
   skippedIdempotent: number;
+  /**
+   * INF-558: count of natively-terminal tickets whose stale facets (active
+   * `state:*` mirror label, pinned delegate, or non-terminal enrolled row)
+   * were reconciled this sweep.
+   */
+  facetHealed: number;
   errors: string[];
 }
 
@@ -87,6 +101,8 @@ interface GovernedTicket {
   delegateId: string | null;
   delegateName: string | null;
   teamId: string;
+  /** INF-558: native Linear state type (completed/canceled/duplicate/...), or null when unavailable. */
+  nativeStateType: string | null;
   plainDelegation?: boolean;
 }
 
@@ -94,6 +110,7 @@ type LinearIssueNode = {
   id: string;
   identifier: string;
   updatedAt: string;
+  state?: { type: string } | null;
   labels: { nodes: Array<{ id: string; name: string }> };
   delegate: { id: string; name: string } | null;
   team: { id: string };
@@ -121,6 +138,24 @@ function isTerminal(labels: Array<{ name: string }>): boolean {
   return labels.some((l) =>
     TERMINAL_STATE_PREFIXES.some((t) => l.name.startsWith(t)),
   );
+}
+
+/**
+ * INF-558: native Linear state types that mean the issue is closed for good.
+ * Mirrors the on-repo idiom (`linear-actionable.ts`): `completed` is Done,
+ * `canceled`/`cancelled` cover the spelling variants, and `duplicate` is a
+ * first-class terminal type (INF-203). Native state is authoritative for
+ * "this issue is closed" regardless of the `state:*` mirror label.
+ */
+const TERMINAL_NATIVE_STATE_TYPES = new Set([
+  "completed",
+  "canceled",
+  "cancelled",
+  "duplicate",
+]);
+
+function isNativelyTerminal(stateType: string | null | undefined): boolean {
+  return typeof stateType === "string" && TERMINAL_NATIVE_STATE_TYPES.has(stateType.toLowerCase());
 }
 
 function hasStateLabel(labels: Array<{ name: string }>): boolean {
@@ -159,6 +194,7 @@ async function queryGovernedTickets(
             identifier
             updatedAt
             title
+            state { type }
             labels { nodes { id name } }
             delegate { id name }
             team { id }
@@ -204,6 +240,7 @@ async function queryGovernedTickets(
     delegateId: n.delegate?.id ?? null,
     delegateName: n.delegate?.name ?? null,
     teamId: n.team.id,
+    nativeStateType: n.state?.type ?? null,
     plainDelegation: false,
   }));
 }
@@ -232,6 +269,7 @@ async function queryAdhocDelegatedTickets(
             identifier
             updatedAt
             title
+            state { type }
             labels { nodes { id name } }
             delegate { id name }
             team { id }
@@ -296,6 +334,7 @@ async function queryAdhocDelegatedTickets(
     delegateId: n.delegate?.id ?? null,
     delegateName: n.delegate?.name ?? null,
     teamId: n.team.id,
+    nativeStateType: n.state?.type ?? null,
     plainDelegation: true,
   }));
 }
@@ -428,6 +467,131 @@ function hasDispatchSinceDelegation(
   });
 }
 
+// ── INF-558: out-of-band terminal facet reconciliation ──────────────────────
+
+/**
+ * Heal the facets of a natively-terminal ticket whose lifecycle was closed
+ * out-of-band (manual Linear column flip, or any non-governed edge that failed
+ * to sync facets), so the dispatch poller fleet stops treating it as active.
+ *
+ * The governed `complete`/`converge` terminal syncs three facets: the `state:*`
+ * mirror label → terminal, the delegate → null, and the enrolled-tickets mirror
+ * row → terminal. An out-of-band close advances only the native Linear state,
+ * leaving all three stale — and every poller keys off those facets, not the
+ * native state, so the ticket re-dispatches forever (live victim: LSO-1).
+ *
+ * Two heals, ordered by safety:
+ *   1. **Local mirror heal** — always safe (no Linear write, no native-state
+ *      risk). Marks the enrolled-tickets row terminal, which stops every poller
+ *      that keys off that mirror (e.g. the first-action watchdog) regardless of
+ *      the native terminal flavor.
+ *   2. **Linear facet heal** — strip the stale `state:*` label → terminal and
+ *      clear the pinned delegate via the same atomic primitive the governed
+ *      terminal uses. Only run when the target terminal state's `native_state`
+ *      is IDEMPOTENT with the ticket's current native state, so we never flip an
+ *      authoritative native state (e.g. resurrect a Canceled ticket to Done).
+ *      The dominant/documented class is native `completed` → target `done`;
+ *      canceled/duplicate get the local heal plus an operator alert.
+ *
+ * Never throws — failures are captured in `result.errors` and surfaced via the
+ * alert bus, matching the sweep's fail-open contract.
+ */
+async function reconcileOutOfBandTerminal(
+  ticket: GovernedTicket,
+  opts: DelegationReconciliationOptions,
+  result: DelegationReconciliationResult,
+): Promise<void> {
+  const mirror = opts.enrolledTicketsStore;
+  const setStateFn = opts.setStateFn ?? setStateAtomic;
+
+  const labelActive = hasStateLabel(ticket.labels) && !isTerminal(ticket.labels);
+  const delegatePinned = !!ticket.delegateId;
+  const enrolledRow = mirror?.getByTicketId(ticket.identifier) ?? null;
+  const enrolledActive = !!enrolledRow && enrolledRow.terminal !== 1;
+
+  // Already clean — nothing to reconcile. Keeps the heal idempotent across
+  // sweeps so we never re-write a ticket we healed on a prior pass.
+  if (!labelActive && !delegatePinned && !enrolledActive) return;
+
+  // 1) Local mirror heal — unconditional and Linear-write-free.
+  if (mirror && enrolledActive) {
+    try {
+      mirror.markTerminal(ticket.identifier, "out-of-band-terminal");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      result.errors.push(
+        `out-of-band terminal mirror heal failed for ${ticket.identifier}: ${msg}`,
+      );
+    }
+  }
+
+  // 2) Linear facet heal — only when native-idempotent (completed → done).
+  if (labelActive || delegatePinned) {
+    if (ticket.nativeStateType === "completed") {
+      let res: SetStateAtomicResult;
+      try {
+        res = await setStateFn(ticket.identifier, "done", null, opts.authToken, {
+          force: true,
+          enrolledTicketsStore: mirror,
+          operationalEventStore: opts.operationalEventStore,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        res = { ok: false, ticketId: ticket.identifier, from: null, to: "done", error: msg };
+      }
+      if (!res.ok) {
+        result.errors.push(
+          `out-of-band terminal facet-sync failed for ${ticket.identifier}: ${res.error}`,
+        );
+        opts.alertBus.notify({
+          severity: "warning",
+          source: "delegation-reconciled",
+          title: `Out-of-band terminal facet-sync failed for ${ticket.identifier}`,
+          detail: { error: res.error, nativeStateType: ticket.nativeStateType },
+          ticket: ticket.identifier,
+        });
+        return;
+      }
+    } else {
+      // Canceled/duplicate: the enrolled mirror is already healed above, which
+      // stops the redispatch loop. We deliberately do NOT auto-sync the Linear
+      // facets, because every governed terminal state maps `native_state: done`
+      // — a Linear write would resurrect the native state from Canceled to Done.
+      // Surface for operator review instead.
+      opts.alertBus.notify({
+        severity: "warning",
+        source: "delegation-reconciled",
+        title: `Out-of-band ${ticket.nativeStateType} ticket ${ticket.identifier} — enrolled mirror healed, Linear facets need operator sync`,
+        detail: {
+          nativeStateType: ticket.nativeStateType,
+          labelActive,
+          delegatePinned,
+        },
+        ticket: ticket.identifier,
+      });
+    }
+  }
+
+  result.facetHealed += 1;
+  opts.operationalEventStore.append({
+    outcome: "delegation-reconciled",
+    agent: ticket.delegateName,
+    key: `linear-${ticket.identifier}`,
+    detail: {
+      mode: "out-of-band-terminal-facet-sync",
+      ticket: ticket.identifier,
+      nativeStateType: ticket.nativeStateType,
+      labelActive,
+      delegatePinned,
+      enrolledActive,
+    },
+  });
+  log.info(
+    `delegation-reconciliation: out-of-band terminal facet-sync for ${ticket.identifier} ` +
+      `(native=${ticket.nativeStateType}, labelActive=${labelActive}, delegatePinned=${delegatePinned}, enrolledActive=${enrolledActive})`,
+  );
+}
+
 // ── Main sweep ───────────────────────────────────────────────────────────────
 
 /**
@@ -452,6 +616,7 @@ export async function runDelegationReconciliationSweep(
     healed: 0,
     bootstrapHealed: 0,
     skippedIdempotent: 0,
+    facetHealed: 0,
     errors: [],
   };
 
@@ -494,7 +659,23 @@ export async function runDelegationReconciliationSweep(
 
   // ── Process each ticket ───────────────────────────────────────────────
   for (const ticket of filtered) {
-    // Skip terminal tickets
+    // INF-558: out-of-band terminal reconciliation. A ticket that reached a
+    // native terminal state (completed/canceled/duplicate) via a NON-governed
+    // path — a manual Linear column flip, or any future edge that forgets to
+    // sync facets — never ran the governed terminal that syncs the `state:*`
+    // mirror label and clears the delegate. Every dispatch poller keys off the
+    // mirror label + delegate (or the enrolled mirror), NOT the native state,
+    // so such a zombie re-dispatches forever (live victim: LSO-1). Simply
+    // skipping it here would stop THIS sweep from redispatching but leave the
+    // mirror poisoned for every other poller — so we heal the facets the same
+    // way the governed complete/converge terminal does. INF-528 closed the
+    // governed-path hole; this closes the non-governed-terminal hole.
+    if (isNativelyTerminal(ticket.nativeStateType)) {
+      await reconcileOutOfBandTerminal(ticket, opts, result);
+      continue;
+    }
+
+    // Skip label-terminal tickets (lifecycle already finished)
     if (isTerminal(ticket.labels)) continue;
 
     // ── AC2: wf:* but no state:* and no delegate (dropped enrollment) ────
