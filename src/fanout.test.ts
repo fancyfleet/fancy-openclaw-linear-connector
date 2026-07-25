@@ -839,6 +839,9 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     parentDescription?: string;
     /** Parent issue title. */
     parentTitle?: string;
+    /** When false, child issueCreate returns a Linear refusal. */
+    childCreateSucceeds?: boolean;
+    childCreateError?: string;
   }): typeof globalThis.fetch {
     const parentLabels = opts.parentLabels ?? [
       { id: "wf-lbl", name: "wf:ux-audit" },
@@ -847,6 +850,8 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     const teamLabels = opts.teamLabels ?? [];
     const parentTitle = opts.parentTitle ?? "UX Audit";
     const parentDescription = opts.parentDescription ?? "## Findings\n- **Finding A**: Desc A\n- **Finding B**: Desc B\n";
+    const childCreateSucceeds = opts.childCreateSucceeds ?? true;
+    const childCreateError = opts.childCreateError ?? "Title must match <icon> <Project> Cycle <N> - <Theme>";
     let childCount = 0;
 
     return async (url, init) => {
@@ -987,6 +992,15 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
       // Fan-out: create child issue
       if (query.includes("issueCreate")) {
         childCount++;
+        if (!childCreateSucceeds) {
+          return new Response(
+            JSON.stringify({
+              data: { issueCreate: { success: false, issue: null } },
+              errors: [{ message: childCreateError }],
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
         const input = (parsed.variables as Record<string, unknown>).input as Record<string, unknown>;
         return new Response(
           JSON.stringify({
@@ -1037,6 +1051,43 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     expect(commentCall).toBeDefined();
     const commentVars = commentCall!.body.variables as Record<string, unknown>;
     expect(commentVars.issueId).toBe("parent-internal-id");
+  });
+
+  it("INF-624: fails closed when preview succeeds but invalid child title creates zero children", async () => {
+    const validatorReason = "Sprint title must match '<icon> <Project> Cycle <N> - <Theme>'";
+    globalThis.fetch = makeIntegrationFetch({
+      teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-todo", name: "state:todo" },
+      ],
+      parentDescription: "## Findings\n- **LifeOS 2026-07-25 Sprint**: invalid deployed sprint title shape\n",
+      childCreateSucceeds: false,
+      childCreateError: validatorReason,
+    });
+
+    const result = await applyStateTransition("spawn", "AI-1439", "Bearer tok");
+
+    expect(result.status).toBe("failed");
+    expect(result.code).toBe("fanout-create-failed");
+    expect(result.detail).toContain(validatorReason);
+
+    const childCreateCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
+    expect(childCreateCalls).toHaveLength(1);
+
+    const stateUpdateCall = fetchCalls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(stateUpdateCall).toBeUndefined();
+
+    const barrierFetch = fetchCalls.find((c) => (c.body.query ?? "").includes("ParentChildren"));
+    expect(barrierFetch).toBeUndefined();
+
+    const commentBodies = fetchCalls
+      .filter((c) => (c.body.query ?? "").includes("commentCreate"))
+      .map((c) => ((c.body.variables as Record<string, unknown>).body as string | undefined) ?? "");
+    expect(commentBodies.some((body) => body.includes("Spawn Preview"))).toBe(true);
+    const failureComment = commentBodies.find((body) => body.includes("Fan-out failed - transition not applied"));
+    expect(failureComment).toContain("proposed 1 child issue(s), but child creation created 0");
+    expect(failureComment).toContain("parent remains in `spawning`");
+    expect(failureComment).toContain(validatorReason);
   });
 
   it("does NOT trigger fan-out for non-ux-audit workflows", async () => {

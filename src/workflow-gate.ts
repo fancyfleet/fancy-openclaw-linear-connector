@@ -45,7 +45,7 @@ import { isTerminalIssueState } from "./linear-actionable.js";
 import type { ObservationStore } from "./store/observation-store.js";
 import { recordObservation } from "./store/observation-write-path.js";
 import { getAgent, getAgents } from "./agents.js";
-import { executeFanout, shouldTriggerFanout, validateFanoutSpec, extractSpecFindings, autoDeriveArmFindings, deriveSpecFromPriorChildren, deriveStructuredFromChildren, upsertDerivedSpecSection, updateIssueDescription, type Finding } from "./fanout.js";
+import { executeFanout, shouldTriggerFanout, validateFanoutSpec, extractSpecFindings, autoDeriveArmFindings, deriveSpecFromPriorChildren, deriveStructuredFromChildren, upsertDerivedSpecSection, updateIssueDescription, type FanoutResult, type Finding } from "./fanout.js";
 import { recordFanoutOutcome } from "./fanout-outcome-store.js";
 import { onChildTerminal, onManagingEntry, isTerminalState, evaluateBarrier } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
@@ -4537,6 +4537,33 @@ export interface ApplyStateTransitionOptions {
   }) => void | Promise<void>;
 }
 
+function deriveFanoutBarrierOutcome(result: FanoutResult): {
+  outcome: "refused" | "pending-approval" | "waived" | "failed" | "awaiting";
+  childIdentifiers?: string[];
+} {
+  if (result.refused) return { outcome: "refused" };
+  if (result.pendingApproval) return { outcome: "pending-approval" };
+  if (result.spawnIfResult && !result.spawnIfResult.shouldSpawn) {
+    return result.spawnIfResult.outcome === "failed"
+      ? { outcome: "failed" }
+      : { outcome: "waived" };
+  }
+  if (result.created === 0 && result.errors.length > 0) return { outcome: "failed" };
+  if (result.attempted > 0 && result.created === 0) return { outcome: "failed" };
+  if (result.specMatchedChildren.length > 0) {
+    return { outcome: "awaiting", childIdentifiers: result.specMatchedChildren };
+  }
+  if (result.created > 0) {
+    return { outcome: "awaiting", childIdentifiers: result.childIdentifiers };
+  }
+  return { outcome: "waived" };
+}
+
+function formatFanoutFailureDetail(result: FanoutResult): string {
+  const errors = result.errors.map((e) => e.message).filter(Boolean);
+  return errors.length > 0 ? errors.join("; ") : "fan-out created zero children without a refusal reason";
+}
+
 /**
  * AI-1809: machine-readable outcome of applyStateTransition.
  *
@@ -5771,6 +5798,65 @@ export async function applyStateTransition(
     return { status: "failed", code: "native-state-missing", detail: `destination state '${toStateName}' has no native_state field`, from: currentStateName, to: toStateName };
   }
 
+  let preTransitionFanoutResult: FanoutResult | null = null;
+  if (pendingFanout) {
+    try {
+      log.info(`workflow-gate: AI-1992 fan-out preflight: triggering fan-out for ${issueId} before parent advance (${currentStateName} → ${toStateName}, child=${pendingFanout.config.child_workflow})`);
+      const fanoutWorkflowRegistry = new Map<string, WorkflowDef>();
+      preTransitionFanoutResult = await executeFanout(issueId, authToken, pendingFanout.config, {
+        findingsOverride: pendingFanout.findings,
+        // INF-111: resolve each child workflow's true entry_state from its
+        // registered workflow def, instead of the hardcoded "state:intake"
+        // that caused def-skew between mint and validate paths.
+        lookupEntryState: async (wfLabel: string) => {
+          const defId = wfLabel.startsWith("wf:") ? wfLabel.slice(3) : wfLabel;
+          const def = await loadWorkflowDefById(defId);
+          if (def) fanoutWorkflowRegistry.set(defId, def);
+          return def?.entry_state ? `state:${def.entry_state}` : undefined;
+        },
+        // Carried onto the INF-624 preflight so the child wake / dispatch-ack
+        // behavior that lands children as actionable is preserved now that the
+        // fan-out runs before the parent advance and is not re-executed after.
+        workflowRegistry: fanoutWorkflowRegistry,
+        wakeFn: options?.fanoutWakeFn,
+        dispatchAckTracker: options?.getDispatchAckTracker?.(),
+      });
+
+      const outcome = deriveFanoutBarrierOutcome(preTransitionFanoutResult);
+      if (
+        outcome.outcome === "failed" &&
+        preTransitionFanoutResult.attempted > 0 &&
+        preTransitionFanoutResult.created === 0
+      ) {
+        const detail = formatFanoutFailureDetail(preTransitionFanoutResult);
+        log.error(
+          `workflow-gate: INF-624: fan-out failed closed for ${issueId} before parent advance — ` +
+          `${preTransitionFanoutResult.created}/${preTransitionFanoutResult.attempted} children created: ${detail}`,
+        );
+        await postComment(
+          issue.internalId,
+          `[Fan-out failed - transition not applied]\n\n` +
+          `The \`${intent}\` transition out of \`${currentStateName}\` proposed ` +
+          `${preTransitionFanoutResult.attempted} child issue(s), but child creation created 0. ` +
+          `The parent remains in \`${currentStateName}\`; no barrier advance was attempted.\n\n` +
+          `Failure detail: ${detail}`,
+          authToken,
+        );
+        return {
+          status: "failed",
+          code: "fanout-create-failed",
+          detail,
+          from: currentStateName,
+          to: toStateName,
+        };
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`workflow-gate: B-2 fan-out: fan-out execution failed for ${issueId}: ${msg}`);
+      return { status: "failed", code: "fanout-create-failed", detail: msg, from: currentStateName, to: toStateName };
+    }
+  }
+
   // Step 5: Apply the FULL transition atomically (labels + delegate + native state in one
   // mutation), verified read-after-write with bounded internal retry (AI-1762) — Linear can
   // report success while silently dropping facets (live: app-user delegateId, AI-1759).
@@ -5947,11 +6033,9 @@ export async function applyStateTransition(
   }
 
   // ── Phase 5 / B-2 + AI-1992: Fan-out edge (spawning 1→N) ────────────
-  // After a successful state transition out of a state that declares a `fanout`
-  // block, mint N children under the configured child_workflow. The spec was
-  // already validated pre-transition (AC5) and the findings stashed in
-  // `pendingFanout`, so this never re-guesses the spec.
-  // Fail-open: fan-out errors are logged and never block the transition.
+  // The fan-out itself ran before the parent state write so a zero-created
+  // create failure cannot leave the parent in its barrier state. After the
+  // successful parent transition, record and comment on that preflight result.
   // INF-37: set when a spawn_if predicate could not be *evaluated* (as opposed
   // to evaluating false). Zero children then means "we never found out", not
   // "none were needed" — so the barrier below must not read it as vacuous
@@ -5963,25 +6047,12 @@ export async function applyStateTransition(
   // set → all-terminal → advance would re-create LIF-2).
   let fanoutRecordWriteFailed = false;
 
-  if (applied && pendingFanout) {
+  if (applied && preTransitionFanoutResult) {
     try {
-      log.info(`workflow-gate: AI-1992 fan-out: triggering fan-out for ${issueId} (${currentStateName} → ${toStateName}, child=${pendingFanout.config.child_workflow})`);
-      const fanoutWorkflowRegistry = new Map<string, WorkflowDef>();
-      const fanoutResult = await executeFanout(issueId, authToken, pendingFanout.config, {
-        findingsOverride: pendingFanout.findings,
-        // INF-111: resolve each child workflow's true entry_state from its
-        // registered workflow def, instead of the hardcoded "state:intake"
-        // that caused def-skew between mint and validate paths.
-        lookupEntryState: async (wfLabel: string) => {
-          const defId = wfLabel.startsWith("wf:") ? wfLabel.slice(3) : wfLabel;
-          const def = await loadWorkflowDefById(defId);
-          if (def) fanoutWorkflowRegistry.set(defId, def);
-          return def?.entry_state ? `state:${def.entry_state}` : undefined;
-        },
-        workflowRegistry: fanoutWorkflowRegistry,
-        wakeFn: options?.fanoutWakeFn,
-        dispatchAckTracker: options?.getDispatchAckTracker?.(),
-      });
+      // INF-624: the fan-out already ran as a preflight before the parent
+      // advance (see above). Reuse that result here — do NOT re-execute
+      // executeFanout, which would double-mint children.
+      const fanoutResult = preTransitionFanoutResult;
       spawnIfEvaluationFailed = fanoutResult.spawnIfResult?.outcome === "failed";
       if (fanoutResult.created > 0) {
         log.info(
@@ -6001,38 +6072,12 @@ export async function applyStateTransition(
       // to wait on, or whether to block+alarm.
       if (!spawnIfEvaluationFailed) {
         const now = new Date().toISOString();
-        let outcomeType: string;
-        let childIds: string[] | undefined;
-
-        if (fanoutResult.refused) {
-          outcomeType = "refused";
-        } else if (fanoutResult.pendingApproval) {
-          outcomeType = "pending-approval";
-        } else if (fanoutResult.spawnIfResult && !fanoutResult.spawnIfResult.shouldSpawn) {
-          // Verified waive (spawnIfResult.outcome === "waived")
-          outcomeType = "waived";
-        } else if (fanoutResult.created === 0 && fanoutResult.errors.length > 0) {
-          outcomeType = "failed";
-        } else if (fanoutResult.attempted > 0 && fanoutResult.created === 0) {
-          // Attempted N, minted 0 — rare but distinct from waived
-          outcomeType = "failed";
-        } else if (fanoutResult.specMatchedChildren.length > 0) {
-          outcomeType = "awaiting";
-          childIds = fanoutResult.specMatchedChildren;
-        } else if (fanoutResult.created > 0) {
-          // Created children without spec-matched set (fallback — should not happen
-          // with the FanoutResult extension, but be defensive)
-          outcomeType = "awaiting";
-          childIds = fanoutResult.childIdentifiers;
-        } else {
-          // Zero children created, no errors, no refusal — effectively waived
-          outcomeType = "waived";
-        }
+        const outcome = deriveFanoutBarrierOutcome(fanoutResult);
 
         try {
           await recordFanoutOutcome(issueId, {
-            outcome: outcomeType as "refused" | "pending-approval" | "waived" | "failed" | "awaiting",
-            childIdentifiers: childIds,
+            outcome: outcome.outcome,
+            childIdentifiers: outcome.childIdentifiers,
             recordedAt: now,
           });
         } catch (err) {
