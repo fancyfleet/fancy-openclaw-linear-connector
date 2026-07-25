@@ -44,7 +44,7 @@ import { probeDeployOutcome } from "./deploy-probe.js";
 import { isTerminalIssueState } from "./linear-actionable.js";
 import type { ObservationStore } from "./store/observation-store.js";
 import { recordObservation } from "./store/observation-write-path.js";
-import { getAgent, getAgents } from "./agents.js";
+import { getAgent, getAgentByTarget, getAgents } from "./agents.js";
 import { executeFanout, shouldTriggerFanout, validateFanoutSpec, extractSpecFindings, autoDeriveArmFindings, deriveSpecFromPriorChildren, deriveStructuredFromChildren, upsertDerivedSpecSection, updateIssueDescription, type Finding } from "./fanout.js";
 import { recordFanoutOutcome } from "./fanout-outcome-store.js";
 import { onChildTerminal, onManagingEntry, isTerminalState, evaluateBarrier } from "./barrier.js";
@@ -1567,9 +1567,10 @@ export async function resolveTransitionDelegate(
 
   const wantsPriorImplementer = matchedTransition?.assign?.default === 'prior-implementer';
 
-  // (1) Explicit CLI target wins.
+  // (1) Explicit CLI target wins. INF-563: resolve tolerant of case / displayName
+  // so a hand-typed break-glass `--target Igor` matches body id `igor`.
   if (cliTarget) {
-    const targetAgent = getAgent(cliTarget);
+    const targetAgent = getAgentByTarget(cliTarget);
     if (targetAgent?.linearUserId) {
       return targetAgent.linearUserId;
     }
@@ -5342,17 +5343,33 @@ export async function applyStateTransition(
             });
           }
         }
-        const targetAgent = getAgent(explicitTarget);
+        // INF-563: resolve tolerant of case / displayName / openclawAgent, so a
+        // steward's hand-typed break-glass `--target Igor` matches body id `igor`
+        // instead of fail-closing as "unresolved". escape does not run the
+        // target-legality check above (no matched transition / selection_criteria),
+        // so this is the sole guard on the break-glass re-entry target.
+        const targetAgent = getAgentByTarget(explicitTarget);
         if (targetAgent?.linearUserId) {
           resolvedDelegateId = targetAgent.linearUserId;
           log.info(
-            `workflow-gate: B2 apply: ${issueId} ${intent} — explicit target '${explicitTarget}' → delegate=${resolvedDelegateId}`,
+            `workflow-gate: B2 apply: ${issueId} ${intent} — explicit target '${explicitTarget}' → agent '${targetAgent.name}' delegate=${resolvedDelegateId}`,
           );
-        } else {
+        } else if (targetAgent) {
+          // Known body, but no Linear user id — a registry/onboarding gap, not a
+          // typo. Say so distinctly so the operator escalates onboarding rather
+          // than hunting for the "right" spelling of a name that already matched.
           log.error(
-            `workflow-gate: B2 apply: FAIL-CLOSED — CLI target '${explicitTarget}' cannot be resolved to a Linear user ID for ${issueId}. Register the agent in agents.json with a linearUserId. Transition aborted.`,
+            `workflow-gate: B2 apply: FAIL-CLOSED — CLI target '${explicitTarget}' resolved to agent '${targetAgent.name}' but that agent has no linearUserId in agents.json for ${issueId}. Transition aborted.`,
           );
-          return { status: "failed", code: "target-unresolved", detail: `CLI target '${explicitTarget}' has no linearUserId`, from: currentStateName, to: toStateName };
+          return { status: "failed", code: "target-unresolved", detail: `CLI target '${explicitTarget}' resolved to agent '${targetAgent.name}' which has no linearUserId (onboard it to Linear)`, from: currentStateName, to: toStateName };
+        } else {
+          // No body matched at all — list the legal bodies for the destination
+          // role so the operator can re-run with a name that resolves.
+          const legalTargets = await resolveBodiesForRole(destOwnerRole!).catch(() => [] as string[]);
+          log.error(
+            `workflow-gate: B2 apply: FAIL-CLOSED — CLI target '${explicitTarget}' matched no registered body for ${issueId} (role '${destOwnerRole}' bodies: ${legalTargets.length > 0 ? legalTargets.join(", ") : "none"}). Transition aborted.`,
+          );
+          return { status: "failed", code: "target-unresolved", detail: `CLI target '${explicitTarget}' matched no registered body${legalTargets.length > 0 ? `; role '${destOwnerRole}' bodies: ${legalTargets.join(", ")}` : ""}`, from: currentStateName, to: toStateName };
         }
       }
 

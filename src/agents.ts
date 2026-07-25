@@ -484,6 +484,55 @@ export function getAgent(agentName: string): AgentConfig | undefined {
 }
 
 /**
+ * Resolve a caller-supplied `--target`/body string to an agent, tolerant of the
+ * forms an operator actually types — different case, the human `displayName`, or
+ * the `openclawAgent` id — as well as the exact body id.
+ *
+ * INF-563: `getAgent()` is an exact, case-sensitive match on `name`. The
+ * break-glass `escape` path (workflow-gate `applyStateTransition` /
+ * `resolveTransitionDelegate`) feeds a raw `--target` header typed by a steward
+ * during recovery, and `escape` does NOT run the transition's target-legality
+ * validation. So a capitalized or display-name form ("Igor", "Grover", "Ai")
+ * fell straight through to `getAgent`, returned `undefined`, and surfaced as
+ * `target-unresolved — CLI target '<x>' has no linearUserId` even though the
+ * body is registered with a perfectly valid id and linearUserId. The failure
+ * read as "app-user bodies don't resolve CLI-side" when the real cause was that
+ * the resolver only accepted the exact lowercase body id.
+ *
+ * Resolution is most-specific-first and fail-closed on ambiguity:
+ *   1. exact `name`                 (preserves prior precedence exactly)
+ *   2. case-insensitive `name`
+ *   3. case-insensitive `openclawAgent`
+ *   4. case-insensitive `displayName`
+ * The first tier that produces exactly ONE distinct agent wins. A tier that
+ * matches two or more DIFFERENT agents returns `undefined` — the caller then
+ * reports an unresolved target rather than the connector silently guessing which
+ * body to hand a ticket to.
+ */
+export function getAgentByTarget(target: string): AgentConfig | undefined {
+  if (!target) return undefined;
+  // Exact name match keeps historical precedence and short-circuits the common case.
+  const exact = _agents.find((a) => a.name === target);
+  if (exact) return exact;
+
+  const needle = target.trim().toLowerCase();
+  if (!needle) return undefined;
+
+  const tiers: Array<(a: AgentConfig) => boolean> = [
+    (a) => a.name.toLowerCase() === needle,
+    (a) => (a.openclawAgent ?? "").toLowerCase() === needle,
+    (a) => (a.displayName ?? "").toLowerCase() === needle,
+  ];
+  for (const matches of tiers) {
+    const hits = _agents.filter(matches);
+    const distinctNames = new Set(hits.map((a) => a.name));
+    if (distinctNames.size === 1) return hits[0];
+    if (distinctNames.size > 1) return undefined; // ambiguous — fail closed
+  }
+  return undefined;
+}
+
+/**
  * Resolve an agent by its opaque broker proxy token. This is the authenticated
  * identity path: the token can only have come from the agent's own env, so the
  * proxy trusts it over the spoofable X-Openclaw-Agent header. Returns undefined
