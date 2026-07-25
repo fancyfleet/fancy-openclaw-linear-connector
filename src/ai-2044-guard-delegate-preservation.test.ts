@@ -53,6 +53,7 @@ jest.unstable_mockModule("./workflow-gate.js", () => ({
 
 jest.unstable_mockModule("./escalation-gate.js", () => ({
   resolveBodiesForRole: mockResolveBodiesForRole,
+  resolveBodiesWithCapability: jest.fn(async () => [] as string[]),
 }));
 
 jest.unstable_mockModule("./alerts/alert-bus.js", () => ({

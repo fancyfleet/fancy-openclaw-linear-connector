@@ -14,6 +14,7 @@ const mockGetAgents = jest.fn<() => { name: string; linearUserId: string }[]>().
 const mockLoadWorkflowDef = jest.fn<() => Promise<unknown>>();
 const mockLoadWorkflowDefById = jest.fn<() => Promise<unknown>>();
 const mockResolveBodiesForRole = jest.fn<(role: string) => Promise<string[]>>();
+const mockResolveBodiesWithCapability = jest.fn<(cap: string) => Promise<string[]>>().mockResolvedValue([]);
 
 jest.unstable_mockModule("./agents.js", () => ({
   getAccessToken: mockGetAccessToken,
@@ -39,6 +40,7 @@ jest.unstable_mockModule("./workflow-gate.js", () => ({
 
 jest.unstable_mockModule("./escalation-gate.js", () => ({
   resolveBodiesForRole: mockResolveBodiesForRole,
+  resolveBodiesWithCapability: mockResolveBodiesWithCapability,
 }));
 
 // Dynamic import after mocks are registered.
