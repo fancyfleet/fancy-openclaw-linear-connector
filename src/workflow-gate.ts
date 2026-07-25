@@ -5789,6 +5789,18 @@ export async function applyStateTransition(
               from: currentStateName,
               to: toStateName,
             });
+          } else if (await isSyntheticNoBodyRole(destOwnerRole!)) {
+            // INF-673: the destination is an explicitly declared synthetic
+            // no_body (engine/runtime) role — a phase driven by the engine
+            // itself, intentionally not staffed by any policy body. isRoleDeclared()
+            // is true for it, which previously tripped the fail-closed branch below
+            // and wedged every `owner_role: engine` transition (e.g. the sprint
+            // spawner's propose-brief). Fall through to the legacy no-delegate path
+            // so the engine phase advances with no delegate set — correct for a
+            // runtime-owned state. resolvedDelegateId is left undefined below.
+            log.info(
+              `workflow-gate: B2 apply: destination role '${destOwnerRole}' is a synthetic no_body role — proceeding with no delegate (INF-673)`,
+            );
           } else if (intent === 'approve' || intent === 'reject' || intent === 'submit' || await isRoleDeclared(destOwnerRole!)) {
             log.error(
               `workflow-gate: B2 apply: FAIL-CLOSED — no bodies found for role '${destOwnerRole}' on '${intent}'. Transition aborted per delegate-resolution contract.`,
