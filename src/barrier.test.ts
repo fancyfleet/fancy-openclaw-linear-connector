@@ -777,6 +777,29 @@ describe("detectStalledChildren — mocked Linear API", () => {
         );
       }
 
+      // AI-1493 introduced per-state SLA gating via ChildStateHistory (state-entry
+      // time), which supersedes the flat idle threshold for stall detection. The
+      // implementation state carries a 72h SLA, so the stale child must have entered
+      // its state beyond that window to trip; the recent child stays well within it.
+      if ((parsed.query ?? "").includes("ChildStateHistory")) {
+        const vars = (JSON.parse(bodyText).variables ?? {}) as { id?: string };
+        const enteredAt =
+          vars.id === "AI-2001"
+            ? new Date(now - 80 * 60 * 60 * 1000).toISOString() // 80h ago — breaches 72h implementation SLA
+            : new Date(now - 10 * 60 * 1000).toISOString(); // 10 min ago — within SLA
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                labels: { nodes: [{ name: "state:implementation" }] },
+                history: { nodes: [{ __typename: "IssueHistory", createdAt: enteredAt }] },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
       throw new Error(`unexpected query: ${(parsed.query ?? "").slice(0, 80)}`);
     };
 
@@ -899,6 +922,24 @@ describe("surfaceStalledChildren — §5.5 tripwire", () => {
       if ((parsed.query ?? "").includes("ChildActivity")) {
         return new Response(
           JSON.stringify({ data: { issue: { updatedAt: staleTime } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // AI-1493: stall detection gates on state-entry time vs the per-state SLA.
+      // implementation carries a 72h SLA, so the child must have entered its state
+      // beyond that window (here 80h ago) to be surfaced as stalled.
+      if ((parsed.query ?? "").includes("ChildStateHistory")) {
+        const enteredAt = new Date(now - 80 * 60 * 60 * 1000).toISOString(); // 80h ago — breaches 72h SLA
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                labels: { nodes: [{ name: "state:implementation" }] },
+                history: { nodes: [{ __typename: "IssueHistory", createdAt: enteredAt }] },
+              },
+            },
+          }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
