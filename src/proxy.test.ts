@@ -51,11 +51,19 @@ containers:
     grants: [linear:transition]
   - id: deployment
     grants: [linear:transition, deploy:execute]
+  - id: reviewer
+    grants: [linear:transition]
 roles:
   - id: steward
     requires: [human:escalate]
   - id: deployment
     requires: [deploy:execute]
+  # INF-524: code-review is a non-terminal owner_role, so it must have a reachable
+  # body — a candidate set of 0 is now rejected at registration and fail-closed at
+  # runtime. Give submit→code-review a singleton target so B2 exercises the
+  # transition write, not the delegate guard.
+  - id: code-review
+    requires: [linear:transition]
 bodies:
   - id: astrid
     container: steward
@@ -66,6 +74,9 @@ bodies:
   - id: hanzo
     container: deployment
     fills_roles: [deployment]
+  - id: cra
+    container: reviewer
+    fills_roles: [code-review]
 `;
 
 const TEST_WORKFLOW_YAML = `
@@ -120,7 +131,7 @@ function writeAgents(dir: string): string {
   const file = path.join(dir, "agents.json");
   fs.writeFileSync(
     file,
-    JSON.stringify({ agents: [{ name: "charles", linearUserId: "u1", openclawAgent: "charles", accessToken: "tok", host: "local" }, { name: "hanzo", linearUserId: "u2", openclawAgent: "hanzo", accessToken: "tok2", host: "local" }] }),
+    JSON.stringify({ agents: [{ name: "charles", linearUserId: "u1", openclawAgent: "charles", accessToken: "tok", host: "local" }, { name: "hanzo", linearUserId: "u2", openclawAgent: "hanzo", accessToken: "tok2", host: "local" }, { name: "cra", linearUserId: "u3", openclawAgent: "cra", accessToken: "tok3", host: "local" }] }),
     "utf8"
   );
   return file;
