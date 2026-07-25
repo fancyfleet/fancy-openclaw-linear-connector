@@ -41,6 +41,8 @@ containers:
     grants: [linear:transition]
   - id: engine
     grants: [linear:transition]
+  - id: reviewer
+    grants: [linear:transition]
 
 roles:
   - id: dev
@@ -53,6 +55,12 @@ roles:
     requires: [linear:transition]
   - id: engine
     requires: [linear:transition]
+  # INF-524: code-review must have a reachable body — a 0-body non-terminal
+  # owner_role is now rejected at registration (unreachable state) and fail-closed
+  # at runtime (candidate set of 0). Give the canonical dev-impl submit→code-review
+  # target a singleton so this fan-out test exercises the transition, not the guard.
+  - id: code-review
+    requires: [linear:transition]
 
 bodies:
   - id: hanzo
@@ -61,6 +69,9 @@ bodies:
   - id: charles
     container: dev
     fills_roles: [dev]
+  - id: cra
+    container: reviewer
+    fills_roles: [code-review]
   - id: astrid
     container: steward
     fills_roles: [steward]
@@ -765,6 +776,7 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
         { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-c", clientSecret: "a-s", accessToken: "a-t", refreshToken: "a-r" },
         { name: "charles", linearUserId: "charles-linear-uuid", clientId: "c-c", clientSecret: "c-s", accessToken: "c-t", refreshToken: "c-r" },
         { name: "hanzo", linearUserId: "hanzo-linear-uuid", clientId: "h-c", clientSecret: "h-s", accessToken: "h-t", refreshToken: "h-r" },
+        { name: "cra", linearUserId: "cra-linear-uuid", clientId: "cr-c", clientSecret: "cr-s", accessToken: "cr-t", refreshToken: "cr-r" },
       ],
     }), "utf8");
     process.env.AGENTS_FILE = agentsFile;
