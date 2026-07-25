@@ -116,8 +116,37 @@ function makeLinearFetch(opts: {
   liveState: "intake" | "review" | "sign-off" | "done";
   verifyDelegateId?: string | null;
   verifyState?: "intake" | "review" | "sign-off" | "done";
-}): { fetch: typeof globalThis.fetch; calls: FetchCall[] } {
+  partialDestinationWrite?: boolean;
+}): {
+  fetch: typeof globalThis.fetch;
+  calls: FetchCall[];
+  getSnapshot: () => {
+    state: "intake" | "review" | "sign-off" | "done";
+    delegateId: string | null;
+    assigneeId: string | null;
+    nativeStateId: string;
+  };
+} {
   const calls: FetchCall[] = [];
+  const nativeStateIdByWorkflowState: Record<"intake" | "review" | "sign-off" | "done", string> = {
+    intake: "native-todo",
+    review: "native-doing",
+    "sign-off": "native-thinking",
+    done: "native-done",
+  };
+  const stateByLabelId: Record<string, "intake" | "review" | "sign-off" | "done"> = {
+    "state-intake": "intake",
+    "state-review": "review",
+    "state-sign-off": "sign-off",
+    "state-done": "done",
+  };
+  let snapshot = {
+    state: opts.liveState,
+    delegateId: opts.liveState === "sign-off" ? "u-ai" : "u-astrid",
+    assigneeId: "u-original-assignee" as string | null,
+    nativeStateId: nativeStateIdByWorkflowState[opts.liveState],
+  };
+
   const mockFetch: typeof globalThis.fetch = async (_url, init) => {
     const body = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as FetchCall;
     calls.push(body);
@@ -130,8 +159,10 @@ function makeLinearFetch(opts: {
             id: "internal-inf-562",
             identifier: "INF-562",
             team: { id: "team-inf" },
-            labels: { nodes: labelsFor(opts.liveState) },
-            delegate: { id: opts.liveState === "sign-off" ? "u-ai" : "u-astrid" },
+            labels: { nodes: labelsFor(snapshot.state) },
+            delegate: snapshot.delegateId ? { id: snapshot.delegateId } : null,
+            assignee: snapshot.assigneeId ? { id: snapshot.assigneeId } : null,
+            state: { id: snapshot.nativeStateId },
           },
         },
       });
@@ -159,29 +190,43 @@ function makeLinearFetch(opts: {
       });
     }
     if (query.includes("ApplyAtomicTransition")) {
+      const labelIds = Array.isArray(body.variables.labelIds) ? body.variables.labelIds as string[] : [];
+      const nextState = labelIds.map((id) => stateByLabelId[id]).find(Boolean);
+      if (nextState) {
+        snapshot.state = nextState;
+      }
+      if (typeof body.variables.stateId === "string") {
+        snapshot.nativeStateId = body.variables.stateId;
+      }
+      if (Object.prototype.hasOwnProperty.call(body.variables, "delegateId")) {
+        const requestedDelegate = body.variables.delegateId as string | null;
+        if (opts.partialDestinationWrite && nextState === "sign-off") {
+          snapshot.delegateId = null;
+        } else {
+          snapshot.delegateId = requestedDelegate;
+        }
+      }
+      if (Object.prototype.hasOwnProperty.call(body.variables, "assigneeId")) {
+        snapshot.assigneeId = body.variables.assigneeId as string | null;
+      }
       return json({ data: { issueUpdate: { success: true } } });
     }
     if (query.includes("VerifyTransitionWrite")) {
-      const nativeStateIdByWorkflowState: Record<string, string> = {
-        intake: "native-todo",
-        review: "native-doing",
-        "sign-off": "native-thinking",
-        done: "native-done",
-      };
-      const verifyState = opts.verifyState ?? opts.liveState;
+      const verifyState = opts.verifyState ?? snapshot.state;
       return json({
         data: {
           issue: {
             labels: { nodes: labelsFor(verifyState) },
-            delegate: opts.verifyDelegateId === null ? null : { id: opts.verifyDelegateId ?? "u-ai" },
-            state: { id: nativeStateIdByWorkflowState[verifyState] },
+            delegate: opts.verifyDelegateId === null ? null : snapshot.delegateId ? { id: opts.verifyDelegateId ?? snapshot.delegateId } : null,
+            assignee: snapshot.assigneeId ? { id: snapshot.assigneeId } : null,
+            state: { id: snapshot.nativeStateId },
           },
         },
       });
     }
     throw new Error(`unexpected Linear query: ${query.slice(0, 100)}`);
   };
-  return { fetch: mockFetch, calls };
+  return { fetch: mockFetch, calls, getSnapshot: () => ({ ...snapshot }) };
 }
 
 describe("INF-562 governed sign-off and terminal escape regressions", () => {
@@ -215,11 +260,10 @@ describe("INF-562 governed sign-off and terminal escape regressions", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it("AC1: failed sign-off delegate persistence does not mark review->sign-off as authoritatively applied", async () => {
-    const { fetch: mock } = makeLinearFetch({
+  it("AC1: failed sign-off delegate persistence rolls back review state and ownership facets", async () => {
+    const { fetch: mock, calls, getSnapshot } = makeLinearFetch({
       liveState: "review",
-      verifyState: "sign-off",
-      verifyDelegateId: null,
+      partialDestinationWrite: true,
     });
     globalThis.fetch = mock;
 
@@ -230,6 +274,21 @@ describe("INF-562 governed sign-off and terminal escape regressions", () => {
     expect(result.status).toBe("failed");
     expect(result.code).toBe("transition-write-unverified");
     expect(getAppliedState("INF-562")).toBeNull();
+    expect(getSnapshot()).toEqual({
+      state: "review",
+      delegateId: "u-astrid",
+      assigneeId: "u-original-assignee",
+      nativeStateId: "native-doing",
+    });
+
+    const transitionCalls = calls.filter((call) => call.query.includes("ApplyAtomicTransition"));
+    const rollback = transitionCalls[transitionCalls.length - 1];
+    expect(rollback?.variables).toMatchObject({
+      labelIds: ["wf-task", "state-review"],
+      delegateId: "u-astrid",
+      assigneeId: "u-original-assignee",
+      stateId: "native-doing",
+    });
   });
 
   it("AC2: registered task sign-off holds when a stale review continue snapshot is replayed", async () => {
