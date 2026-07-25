@@ -538,32 +538,42 @@ export async function runBootstrapReconciliationSweep(
     }
   }
 
-  // ── Pass 2: Enrolled tickets that are native-Done with merged PRs (AI-2016 AC3) ──
+  // ── Pass 2: Enrolled tickets whose native terminal state should close facets ──
   for (const ticket of candidates) {
     const hasStateLabel = ticket.labels.some((l) => l.name.startsWith("state:"));
     if (!hasStateLabel) continue; // only enrolled tickets
+    const hasTerminalDoneLabel = ticket.labels.some((l) => l.name === "state:done");
 
     try {
-      // Fetch native state — must be terminal (completed) to auto-close
+      // Fetch native state. Completed tickets still require merged PR proof;
+      // canceled/duplicate tickets are already terminal and should only have
+      // stale workflow facets stripped without changing native state.
       const stateData = await queryEnrolledTicketState(ticket.id, authToken, fetchFn);
-      if (!stateData || !stateData.state || stateData.state.type !== "completed") continue;
+      if (!stateData || !stateData.state) continue;
 
-      // Fetch PR status — must have merged PRs to confirm shipped
-      const prStatus = await queryEnrolledPRStatus(ticket.id, authToken, fetchFn);
-      if (!prStatus || !prStatus.hasMergedPR) continue;
+      const nativeType = stateData.state.type.toLowerCase();
+      if (nativeType === "completed") {
+        // Fetch PR status — must have merged PRs to confirm shipped.
+        const prStatus = await queryEnrolledPRStatus(ticket.id, authToken, fetchFn);
+        if (!prStatus || !prStatus.hasMergedPR) continue;
+      } else if (nativeType !== "canceled" && nativeType !== "cancelled" && nativeType !== "duplicate") {
+        continue;
+      } else if (hasTerminalDoneLabel) {
+        continue;
+      }
 
-      // Native-Done + merged PRs: close the workflow record
+      // Native terminal: close the stale workflow record without writing stateId.
       const closed = await closeEnrolledTicket(ticket.id, authToken, fetchFn);
       if (closed) {
         result.healed++;
         log.info(
-          `bootstrap-reconciliation: closed enrolled shipped ticket ${ticket.identifier}` +
-          ` (native state: ${stateData.state.name}, merged PRs confirmed)`,
+          `bootstrap-reconciliation: closed enrolled terminal ticket ${ticket.identifier}` +
+          ` (native state: ${stateData.state.name})`,
         );
         alertBus.notify({
           severity: "warning",
           source: "bootstrap-reconciled",
-          title: `Bootstrap reconciliation closed enrolled shipped ticket ${ticket.identifier}`,
+          title: `Bootstrap reconciliation closed enrolled terminal ticket ${ticket.identifier}`,
           detail: {
             ticket: ticket.identifier,
             issueId: ticket.id,
