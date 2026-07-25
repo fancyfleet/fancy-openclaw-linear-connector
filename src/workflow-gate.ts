@@ -1114,6 +1114,8 @@ interface TicketContext {
   labels: string[];
   /** Linear user ID of the current delegate, or null if unset. */
   delegateId: string | null;
+  /** Native Linear workflow state, used to recognize already-terminal zombies. */
+  nativeState: { type?: string; name?: string } | null;
   /**
    * AI-2357: the human issue identifier (e.g. "AI-2357"), as returned by Linear.
    * The caller's `issueId` is whatever the mutation carried — a UUID on the
@@ -1137,7 +1139,7 @@ interface TicketContext {
  * configured posture.
  */
 async function fetchTicketContext(issueId: string, authToken: string): Promise<TicketContext> {
-  const query = `query IssueContext($id: String!) { issue(id: $id) { identifier labels { nodes { name } } delegate { id } } }`;
+  const query = `query IssueContext($id: String!) { issue(id: $id) { identifier labels { nodes { name } } delegate { id } state { type name } } }`;
   try {
     const res = await fetch(LINEAR_API_URL, {
       method: "POST",
@@ -1153,6 +1155,7 @@ async function fetchTicketContext(issueId: string, authToken: string): Promise<T
           identifier?: string;
           labels?: { nodes: Array<{ name: string }> };
           delegate?: { id: string } | null;
+          state?: { type?: string; name?: string } | null;
         };
       };
     };
@@ -1160,18 +1163,40 @@ async function fetchTicketContext(issueId: string, authToken: string): Promise<T
     const issue = data.data?.issue;
     if (!issue) {
       log.warn(`workflow-gate: issue ${issueId} not found in context fetch — returning fetchFailed`);
-      return { labels: [], delegateId: null, identifier: null, fetchFailed: true };
+      return { labels: [], delegateId: null, nativeState: null, identifier: null, fetchFailed: true };
     }
     return {
       labels: (issue?.labels?.nodes ?? []).map((n) => n.name),
       delegateId: issue?.delegate?.id ?? null,
+      nativeState: issue?.state ?? null,
       identifier: issue?.identifier ?? null,
       fetchFailed: false,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log.warn(`workflow-gate: context fetch failed for ${issueId}: ${msg}`);
-    return { labels: [], delegateId: null, identifier: null, fetchFailed: true };
+    return { labels: [], delegateId: null, nativeState: null, identifier: null, fetchFailed: true };
+  }
+}
+
+async function fetchNativeState(
+  issueId: string,
+  authToken: string,
+): Promise<{ id?: string; type?: string; name?: string } | null> {
+  const query = `query IssueContextNativeState($id: String!) { issue(id: $id) { state { id type name } } }`;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: issueId } }),
+    });
+    type Resp = { data?: { issue?: { state?: { id?: string; type?: string; name?: string } | null } | null } };
+    const data = (await res.json()) as Resp;
+    return data.data?.issue?.state ?? null;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: native-state fetch failed for ${issueId}: ${msg}`);
+    return null;
   }
 }
 
@@ -2782,7 +2807,13 @@ export async function checkWorkflowRules(
     }
   }
 
-  const { labels, delegateId: fetchedDelegateId, identifier: fetchedIdentifier, fetchFailed } = await fetchTicketContext(issueId, authToken);
+  const {
+    labels,
+    delegateId: fetchedDelegateId,
+    nativeState,
+    identifier: fetchedIdentifier,
+    fetchFailed,
+  } = await fetchTicketContext(issueId, authToken);
 
   // AI-1860: use snapshotted delegateId for authorization checks when provided.
   // snapshotDelegateId is the delegateId captured at command start (first mutation);
@@ -3229,6 +3260,14 @@ export async function checkWorkflowRules(
   const match = transitions.find((t) => t.command === resolvedIntent);
 
   if (!match) {
+    if (resolvedIntent === "complete" && isTerminalIssueState(nativeState)) {
+      log.info(
+        `workflow-gate: clean terminal exit — allowing 'complete' from state '${currentState}' on ${issueId} ` +
+        `because native Linear state is already terminal (${nativeState?.name ?? nativeState?.type ?? "unknown"})`,
+      );
+      return null;
+    }
+
     const legalMoves = [...transitions.map((t) => t.command), breakGlassCommand].join(", ");
     // AI-2055: `needs-human` is not a transition in any workflow def, so a governed
     // ticket rejects it here — before the mutation, so nothing is half-applied and no
@@ -4690,13 +4729,21 @@ export async function applyStateTransition(
     const b2ResolvedIntent = intent === "force-deploy" ? "continue" : intent;
     matchedTransition = stateNode?.transitions?.find((t) => t.command === b2ResolvedIntent);
     if (!matchedTransition) {
-      // Should not happen — B1 already validated the command — but fail-open.
-      log.warn(
-        `workflow-gate: B2 apply: no transition for '${intent}' in state '${currentStateName}' on ${issueId} — skipping`,
-      );
-      return { status: "failed", code: "no-transition", detail: `no transition for '${intent}' in state '${currentStateName}'`, from: currentStateName };
+      if (intent === "complete") {
+        toStateName = "__terminal_sync__";
+        log.info(
+          `workflow-gate: B2 apply: ${issueId} complete clean-exit from '${currentStateName}' routed to terminal sync`,
+        );
+      } else {
+        // Should not happen — B1 already validated the command — but fail-open.
+        log.warn(
+          `workflow-gate: B2 apply: no transition for '${intent}' in state '${currentStateName}' on ${issueId} — skipping`,
+        );
+        return { status: "failed", code: "no-transition", detail: `no transition for '${intent}' in state '${currentStateName}'`, from: currentStateName };
+      }
+    } else {
+      toStateName = matchedTransition.to;
     }
-    toStateName = matchedTransition.to;
   }
 
   // INF-311: clean up artifact binding and implementer record BEFORE the
@@ -4805,6 +4852,62 @@ export async function applyStateTransition(
       `workflow-gate: B2 apply: ${issueId} retired — removed state:* and wf:* labels, cleared delegate`,
     );
     return { status: "applied", code: "retired", from: currentStateName, to: "__retired__" };
+  }
+
+  // ── Special target: __terminal_sync__ (INF-560) ────────────────────────
+  // A governed `complete` from an active/stale workflow label is legal only
+  // when Linear is already terminal. Sync workflow facets without changing a
+  // natively canceled issue to Done.
+  if (toStateName === "__terminal_sync__") {
+    const native = await fetchNativeState(issueId, authToken);
+    if (!isTerminalIssueState(native)) {
+      log.warn(`workflow-gate: B2 apply: terminal sync blocked — ${issueId} native state is not terminal`);
+      return {
+        status: "blocked",
+        code: "native-state-not-terminal",
+        detail: `'complete' clean-exit refused: ${issueId} native Linear state is not terminal.`,
+        from: currentStateName,
+        to: "__terminal_sync__",
+      };
+    }
+
+    const nativeType = (native?.type ?? "").toLowerCase();
+    const nativeName = (native?.name ?? "").toLowerCase();
+    const nativeStateIdOverride = typeof native?.id === "string" && native.id.length > 0
+      ? native.id
+      : undefined;
+    const nativeStateOverride = nativeStateIdOverride
+      ? undefined
+      : nativeType === "completed" || nativeName === "done"
+        ? undefined
+        : "invalid";
+    const synced = await setStateAtomic(issue.identifier ?? issueId, "done", null, authToken, {
+      force: true,
+      operationalEventStore: options?.operationalEventStore,
+      enrolledTicketsStore: options?.enrolledTicketsStore,
+      nativeStateIdOverride,
+      nativeStateOverride,
+    });
+    if (!synced.ok) {
+      log.error(`workflow-gate: B2 apply: terminal sync failed for ${issueId}: ${synced.error}`);
+      emitTransitionWriteFailure({
+        identifier: issue.identifier ?? issueId,
+        from: currentStateName,
+        to: "done",
+        intent,
+        agent: options?.bodyId ?? null,
+        outcome: { ok: false, attempts: 1, failureKind: "mutation", divergent: [], unverified: false },
+        operationalEventStore: options?.operationalEventStore,
+      });
+      return {
+        status: "failed",
+        code: "atomic-mutation-failed",
+        detail: `terminal sync did not apply: ${synced.error}`,
+        from: currentStateName,
+        to: "done",
+      };
+    }
+    return { status: "applied", code: "terminal-sync", from: currentStateName, to: "done" };
   }
 
   // ── AI-1992: Pre-transition fan-out spec gate (AC5) ──────────────────────
@@ -6703,6 +6806,14 @@ export interface SetStateAtomicOptions {
    * explanatory error.
    */
   force?: boolean;
+  /**
+   * Override the native Linear state projection for terminal repairs that need
+   * to preserve Canceled/Invalid rather than resolving the target workflow
+   * state's default native_state.
+   */
+  nativeStateOverride?: string;
+  /** Exact native Linear state UUID to write when preserving an existing terminal state. */
+  nativeStateIdOverride?: string;
 }
 
 /**
@@ -6783,13 +6894,15 @@ export async function setStateAtomic(
 
   // Step 5: Resolve native Linear state id.
   let resolvedNativeStateId: string | null | undefined = undefined;
-  if (def) {
-    const destNativeState = def.states.find((s) => s.id === targetState)?.native_state;
-    if (destNativeState) {
-      const nativeId = await resolveNativeStateId(issue.teamId, destNativeState, authToken);
-      if (!nativeId) return fail(`could not resolve native stateId for '${destNativeState}' on team ${issue.teamId}`, fromState);
-      resolvedNativeStateId = nativeId;
-    }
+  const destNativeState =
+    options?.nativeStateOverride ??
+    (def ? def.states.find((s) => s.id === targetState)?.native_state : undefined);
+  if (options?.nativeStateIdOverride) {
+    resolvedNativeStateId = options.nativeStateIdOverride;
+  } else if (destNativeState) {
+    const nativeId = await resolveNativeStateId(issue.teamId, destNativeState, authToken);
+    if (!nativeId) return fail(`could not resolve native stateId for '${destNativeState}' on team ${issue.teamId}`, fromState);
+    resolvedNativeStateId = nativeId;
   }
 
   // Step 6: Resolve delegate Linear user id.
