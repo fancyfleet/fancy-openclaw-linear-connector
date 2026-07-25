@@ -603,6 +603,9 @@ function makeFanoutIntegrationFetch(opts: {
     if (query.includes("ApplyAtomicTransition")) {
       return json({ issueUpdate: { success: true } });
     }
+    if (query.includes("IssueWithComments")) {
+      return json({ issue: { id: "parent-internal-id", description: opts.parentDescription, comments: { nodes: [] } } });
+    }
     if (query.includes("IssueParent") && !query.includes("IssueTeamParent")) {
       return json({ issue: { parent: null } });
     }
@@ -686,6 +689,21 @@ function makeBarrierFetch(opts: {
     }
     if (query.includes("ParentLabels") || query.includes("ParentState") || query.includes("IssueLabels")) {
       return json({ issue: { id: "parent-internal-id", team: { id: "team-uuid" }, labels: { nodes: parentLabels } } });
+    }
+    if (query.includes("TeamStates") || (query.includes("team(") && query.includes("states"))) {
+      return json({
+        team: {
+          states: {
+            nodes: [
+              { id: "ns-thinking", name: "Thinking", type: "started" },
+              { id: "ns-doing", name: "Doing", type: "started" },
+              { id: "ns-managing", name: "Managing", type: "started" },
+              { id: "ns-done", name: "Done", type: "completed" },
+              { id: "ns-invalid", name: "Invalid", type: "canceled" },
+            ],
+          },
+        },
+      });
     }
     if (query.includes("TeamLabels")) {
       const commonLabels = [

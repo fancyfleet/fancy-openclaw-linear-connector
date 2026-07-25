@@ -74,8 +74,17 @@ function writeWorkflowDef(overrides: Partial<Record<string, unknown>> = {}): str
       { id: "escape",   native_state: "invalid" },
     ],
   };
+  const terminalBarrierDef = {
+    id: "terminal-barrier",
+    entry_state: "managing",
+    states: [
+      { id: "managing", native_state: "managing", owner_role: "steward", barrier: true, transitions: [{ command: "complete", to: "done" }] },
+      { id: "done", native_state: "done", kind: "terminal" },
+      { id: "escape", native_state: "invalid", kind: "terminal" },
+    ],
+  };
   const p = path.join(tmpDir, `wf-defs-${Date.now()}.yaml`);
-  fs.writeFileSync(p, `---\n${yaml.dump(def)}\n---\n${yaml.dump(uxAuditDef)}`, "utf8");
+  fs.writeFileSync(p, `---\n${yaml.dump(def)}\n---\n${yaml.dump(uxAuditDef)}\n---\n${yaml.dump(terminalBarrierDef)}`, "utf8");
   return p;
 }
 
@@ -118,8 +127,8 @@ function makeMockFetch(opts: {
   /** Spy for capture of issueUpdate calls */
   onIssueUpdate?: (issueId: string, input: Record<string, unknown>) => void;
   onBarrierTransition?: (parentId: string, toState: string) => void;
-}): { fetch: typeof globalThis.fetch; issueUpdateCalls: Array<{ issueId: string; stateId?: string; labelIds?: string[] }> } {
-  const issueUpdateCalls: Array<{ issueId: string; stateId?: string; labelIds?: string[] }> = [];
+}): { fetch: typeof globalThis.fetch; issueUpdateCalls: Array<{ issueId: string; stateId?: string; labelIds?: string[]; delegateId?: unknown; assigneeId?: unknown }> } {
+  const issueUpdateCalls: Array<{ issueId: string; stateId?: string; labelIds?: string[]; delegateId?: unknown; assigneeId?: unknown }> = [];
 
   const defaultTeamStates: MockTeamState[] = opts.teamStates ?? [
     { id: "ns-todo-1",     name: "Todo",     type: "unstarted" },
@@ -214,7 +223,7 @@ function makeMockFetch(opts: {
       const input = (variables.input as Record<string, unknown> | undefined) ?? variables;
       const stateId = (input.stateId as string | undefined) ?? (variables.stateId as string | undefined);
       const labelIds = (input.labelIds as string[] | undefined) ?? (variables.labelIds as string[] | undefined);
-      issueUpdateCalls.push({ issueId, stateId, labelIds });
+      issueUpdateCalls.push({ issueId, stateId, labelIds, delegateId: input.delegateId, assigneeId: input.assigneeId });
       opts.onIssueUpdate?.(issueId, input);
       return new Response(
         JSON.stringify({
@@ -230,6 +239,14 @@ function makeMockFetch(opts: {
     if (query.includes("TeamLabels") || (query.includes("team(") && query.includes("labels"))) {
       return new Response(
         JSON.stringify({ data: { team: { labels: { nodes: [] } } } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    if (query.includes("issueLabelCreate")) {
+      const name = variables.name as string;
+      return new Response(
+        JSON.stringify({ data: { issueLabelCreate: { success: true, issueLabel: { id: `lbl-${name}` } } } }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
@@ -526,6 +543,40 @@ describe("AC2 — dropped webhook: anti-entropy detects and reconciles missed ba
 
     expect(result.barrierMissedFound).toBe(1);
     expect(result.barrierMissedReconciled).toBe(1);
+  });
+
+  it("terminal barrier repair writes target state label, native state, and clears ownership together", async () => {
+    const { fetch, issueUpdateCalls } = makeMockFetch({
+      issues: [
+        {
+          id: "uuid-AI-550",
+          identifier: "AI-550",
+          teamId: "team-ai",
+          labels: [
+            { id: "lbl-wf", name: "wf:terminal-barrier" },
+            { id: "lbl-st", name: "state:managing" },
+          ],
+          nativeStateId: "ns-managing-1",
+          nativeStateName: "Managing",
+          children: [
+            { identifier: "AI-551", labels: [{ name: "wf:dev-impl" }, { name: "state:done" }] },
+          ],
+        },
+      ],
+    });
+    globalThis.fetch = fetch;
+
+    const result = await runAntiEntropyPass({ authToken: "tok-test" });
+
+    expect(result.barrierMissedFound).toBe(1);
+    expect(result.barrierMissedReconciled).toBe(1);
+    expect(issueUpdateCalls).toContainEqual({
+      issueId: "uuid-AI-550",
+      labelIds: ["lbl-wf", "lbl-state:done"],
+      stateId: "ns-done-1",
+      delegateId: null,
+      assigneeId: null,
+    });
   });
 
   it("does NOT advance a parent in managing when at least one child is non-terminal", async () => {
