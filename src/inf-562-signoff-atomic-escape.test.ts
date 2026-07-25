@@ -16,7 +16,7 @@ import { afterEach, beforeEach, describe, expect, it } from "@jest/globals";
 import { reloadAgents } from "./agents.js";
 import { resetConfigHealth } from "./config-health.js";
 import { resetPolicyCache } from "./escalation-gate.js";
-import { applyStateTransition, resetWorkflowCache, resolveMetaIntent } from "./workflow-gate.js";
+import { applyStateTransition, loadWorkflowRegistry, resetWorkflowCache, resolveMetaIntent } from "./workflow-gate.js";
 import { _resetAppliedStateStore, getAppliedState } from "./store/applied-state-store.js";
 
 const WORKFLOW_YAML = `
@@ -58,6 +58,8 @@ states:
     native_state: done
     transitions: []
 `;
+
+const REGISTERED_TASK_WORKFLOW = path.resolve(process.cwd(), "src/registered-defs/task.yaml");
 
 const POLICY_YAML = `
 capabilities:
@@ -230,14 +232,27 @@ describe("INF-562 governed sign-off and terminal escape regressions", () => {
     expect(getAppliedState("INF-562")).toBeNull();
   });
 
-  it("AC2: a review-stage continue snapshot is not reused to satisfy the sign-off gate", async () => {
-    const { fetch: mock } = makeLinearFetch({ liveState: "sign-off" });
+  it("AC2: registered task sign-off holds when a stale review continue snapshot is replayed", async () => {
+    process.env.WORKFLOW_DEF_PATH = REGISTERED_TASK_WORKFLOW;
+    resetWorkflowCache();
+
+    const { fetch: mock, calls } = makeLinearFetch({ liveState: "sign-off" });
     globalThis.fetch = mock;
 
     const result = await resolveMetaIntent("continue-workflow", "INF-562", "Bearer tok-astrid", "review");
 
     expect(result).toEqual({
       error: expect.stringMatching(/sign-off.*explicit.*owner/i),
+    });
+    expect(calls.some((call) => call.query.includes("ApplyAtomicTransition"))).toBe(false);
+
+    const registry = await loadWorkflowRegistry();
+    const task = registry.get("task");
+    const signOff = task?.states.find((state) => state.id === "sign-off");
+    expect(signOff).toMatchObject({
+      kind: "approval_gate",
+      owner_role: "requester",
+      native_state: "todo",
     });
   });
 

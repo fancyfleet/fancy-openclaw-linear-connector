@@ -133,7 +133,7 @@ states:
 
   - id: sign-off
     owner_role: requester          # SAME body as intake (instance-bound: matt or ai)
-    kind: normal
+    kind: approval_gate            # INF-562: rests for requester sign-off; prior review approval cannot auto-complete it
     native_state: todo
     transitions:
       - command: accept
