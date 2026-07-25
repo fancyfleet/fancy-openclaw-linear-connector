@@ -177,12 +177,145 @@ states:
     native_state: done
 `;
 
+const INF649_SYNTHETIC_ENGINE_POLICY_YAML = `
+capabilities:
+  - id: linear:transition
+  - id: human:escalate
+
+containers:
+  - id: steward-container
+    grants: [linear:transition, human:escalate]
+  - id: requester-container
+    grants: [linear:transition]
+  - id: worker-container
+    grants: [linear:transition]
+
+roles:
+  - id: steward
+    requires: [human:escalate]
+  - id: engine
+    requires: [linear:transition]
+    synthetic: true
+    no_body: true
+  - id: no-body-engine
+    requires: [linear:transition]
+    synthetic: true
+    no_body: true
+  - id: requester
+    requires: [linear:transition]
+  - id: worker
+    requires: [linear:transition]
+  - id: design
+    requires: [linear:transition]
+  - id: ui-audit
+    requires: [linear:transition]
+
+bodies:
+  - id: astrid
+    container: steward-container
+    fills_roles: [steward, requester]
+  - id: ai
+    container: requester-container
+    fills_roles: [requester]
+  - id: igor
+    container: worker-container
+    fills_roles: [worker]
+`;
+
+const INF649_ENGINE_SPAWN_WORKFLOW_YAML = `
+id: inf649-engine-spawn
+version: 1
+entry_state: intake
+states:
+  - id: intake
+    owner_role: steward
+    native_state: todo
+    transitions:
+      - command: submit
+        to: spawning
+  - id: spawning
+    owner_role: engine
+    native_state: doing
+    transitions:
+      - command: spawned
+        to: custom-engine-step
+  - id: custom-engine-step
+    owner_role: no-body-engine
+    native_state: doing
+    transitions:
+      - command: finish
+        to: done
+  - id: done
+    kind: terminal
+    native_state: done
+`;
+
+const INF649_TASK_SIGNOFF_WITH_REQUESTER_CRITERIA_YAML = `
+id: inf649-task
+version: 1
+entry_state: doing
+states:
+  - id: doing
+    owner_role: worker
+    native_state: todo
+    transitions:
+      - command: submit
+        to: review
+  - id: review
+    owner_role: steward
+    native_state: todo
+    transitions:
+      - command: approve
+        to: sign-off
+        assign:
+          mode: required
+          selection_criteria: original-requester
+  - id: sign-off
+    owner_role: requester
+    native_state: todo
+    transitions:
+      - command: accept
+        to: done
+  - id: done
+    kind: terminal
+    native_state: done
+`;
+
+const INF649_TASK_SIGNOFF_WITHOUT_REQUESTER_CRITERIA_YAML = INF649_TASK_SIGNOFF_WITH_REQUESTER_CRITERIA_YAML.replace(
+  "        assign:\n          mode: required\n          selection_criteria: original-requester",
+  "        assign: { mode: auto }",
+);
+
+const INF649_REAL_UNSTAFFED_WORKFLOW_YAML = `
+id: inf649-real-unstaffed
+version: 1
+entry_state: intake
+states:
+  - id: intake
+    owner_role: steward
+    native_state: todo
+    transitions:
+      - command: route-design
+        to: design-review
+      - command: route-ui-audit
+        to: ui-audit-review
+  - id: design-review
+    owner_role: design
+    native_state: doing
+    transitions: []
+  - id: ui-audit-review
+    owner_role: ui-audit
+    native_state: doing
+    transitions: []
+`;
+
 const AGENTS_JSON = {
   agents: [
     { name: "astrid", linearUserId: "u-astrid", accessToken: "tok-astrid", host: "local" },
     { name: "igor", linearUserId: "u-igor", accessToken: "tok-igor", host: "local" },
     { name: "felix", linearUserId: "u-felix", accessToken: "tok-felix", host: "local" },
     { name: "charles", linearUserId: "u-charles", accessToken: "tok-charles", host: "local" },
+    { name: "ai", linearUserId: "u-ai", accessToken: "tok-ai", host: "local" },
   ],
 };
 
@@ -200,6 +333,20 @@ function writeFixtureFiles(policyYaml: string, workflowYaml: string): void {
   process.env.CAPABILITY_POLICY_PATH = path.join(dir, "capability-policy.yaml");
   process.env.WORKFLOW_DEFS_DIR = defsDir;
   process.env.WORKFLOW_DEF_PATH = path.join(defsDir, "inf524.yaml");
+  process.env.AGENTS_FILE = path.join(dir, "agents.json");
+  process.env.DATA_DIR = path.join(dir, "data");
+  process.env.WORKFLOW_DEF_STATE_SNAPSHOT_PATH = path.join(dir, "workflow-def-state-snapshot.json");
+  reloadAgents();
+}
+
+function writeFixtureSet(policyYaml: string, workflows: Record<string, string>): void {
+  fs.writeFileSync(path.join(dir, "capability-policy.yaml"), policyYaml, "utf8");
+  for (const [fileName, workflowYaml] of Object.entries(workflows)) {
+    fs.writeFileSync(path.join(defsDir, fileName), workflowYaml, "utf8");
+  }
+  fs.writeFileSync(path.join(dir, "agents.json"), JSON.stringify(AGENTS_JSON, null, 2), "utf8");
+  process.env.CAPABILITY_POLICY_PATH = path.join(dir, "capability-policy.yaml");
+  process.env.WORKFLOW_DEFS_DIR = defsDir;
   process.env.AGENTS_FILE = path.join(dir, "agents.json");
   process.env.DATA_DIR = path.join(dir, "data");
   process.env.WORKFLOW_DEF_STATE_SNAPSHOT_PATH = path.join(dir, "workflow-def-state-snapshot.json");
@@ -355,6 +502,40 @@ describe("INF-524 AC2/AC3: registration-time delegate reachability validation", 
     expect(diagnostics.join("\n")).toMatch(/owner_role 'dev'/i);
     expect(diagnostics.join("\n")).toMatch(/igor.*felix|felix.*igor/i);
     expect(diagnostics.join("\n")).toMatch(/selection criteria|--target|assign/i);
+  });
+});
+
+describe("INF-649: synthetic engine reachability exemption + requester selection criteria", () => {
+  it("accepts synthetic engine-driven states and task requester criteria while still failing real unstaffed roles", async () => {
+    writeFixtureSet(INF649_SYNTHETIC_ENGINE_POLICY_YAML, {
+      "engine-spawn.yaml": INF649_ENGINE_SPAWN_WORKFLOW_YAML,
+      "task-signoff.yaml": INF649_TASK_SIGNOFF_WITH_REQUESTER_CRITERIA_YAML,
+      "real-unstaffed.yaml": INF649_REAL_UNSTAFFED_WORKFLOW_YAML,
+    });
+
+    const result = await reloadWorkflowDefs();
+    const diagnostics = result.ok ? [] : result.diagnostics;
+    const text = diagnostics.join("\n");
+
+    expect(result.ok).toBe(false);
+    expect(text).toMatch(/real-unstaffed.*design-review.*owner_role 'design'/i);
+    expect(text).toMatch(/real-unstaffed.*ui-audit-review.*owner_role 'ui-audit'/i);
+    expect(text).not.toMatch(/engine-spawn.*owner_role 'engine'.*candidate set of 0/i);
+    expect(text).not.toMatch(/engine-spawn.*owner_role 'no-body-engine'.*candidate set of 0/i);
+    expect(text).not.toMatch(/task-signoff.*owner_role 'requester'.*multiple candidates/i);
+  });
+
+  it("rejects wf:task sign-off when multi-candidate requester routing has no explicit selection criteria", async () => {
+    writeFixtureSet(INF649_SYNTHETIC_ENGINE_POLICY_YAML, {
+      "task-signoff.yaml": INF649_TASK_SIGNOFF_WITHOUT_REQUESTER_CRITERIA_YAML,
+    });
+
+    const result = await reloadWorkflowDefs();
+    const diagnostics = result.ok ? [] : result.diagnostics;
+
+    expect(result.ok).toBe(false);
+    expect(diagnostics.join("\n")).toMatch(/task-signoff.*sign-off.*owner_role 'requester'/i);
+    expect(diagnostics.join("\n")).toMatch(/selection criteria|original-requester|assign/i);
   });
 });
 
