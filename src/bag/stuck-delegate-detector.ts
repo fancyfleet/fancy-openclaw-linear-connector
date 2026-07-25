@@ -41,6 +41,7 @@ import type { OperationalEventStore } from "../store/operational-event-store.js"
 import type { SessionTracker } from "./session-tracker.js";
 import type { PendingWorkBag } from "./pending-work-bag.js";
 import { normalizeSessionKey } from "../session-key.js";
+import { isNativelyTerminal } from "../terminality.js";
 import { deliverMessageToAgent, type DeliveryConfig } from "../delivery/index.js";
 import type { DispatchAckTracker } from "./dispatch-ack-tracker.js";
 
@@ -182,18 +183,17 @@ function parseEnvInt(name: string, defaultVal: number): number {
 
 /** Terminal workflow `state:*` labels that satisfy a parent's N→1 barrier. */
 const TERMINAL_CHILD_STATES = new Set(["done", "escape"]);
-/** Native Linear state types that count as terminal (issue closed). */
-const TERMINAL_NATIVE_STATE_TYPES = new Set(["completed", "canceled"]);
 
 /**
  * Is a child issue in a terminal state? A child satisfies the parent barrier if
- * its native Linear state is completed/canceled, or it carries a terminal
- * workflow `state:*` label (done/escape). Mirrors the barrier subsystem's
- * child-terminality contract (see barrier.ts) so suppression and auto-advance
- * agree on when a barrier is closed.
+ * its native Linear state is natively terminal (completed/canceled/duplicate,
+ * per the shared `isNativelyTerminal` classifier in ../terminality.ts), or it
+ * carries a terminal workflow `state:*` label (done/escape). Mirrors the barrier
+ * subsystem's child-terminality contract (see barrier.ts) so suppression and
+ * auto-advance agree on when a barrier is closed.
  */
 function isChildTerminal(nativeStateType: string | null, labels: string[]): boolean {
-  if (nativeStateType && TERMINAL_NATIVE_STATE_TYPES.has(nativeStateType)) return true;
+  if (isNativelyTerminal(nativeStateType)) return true;
   const workflowState = getCurrentState(labels);
   return workflowState !== null && TERMINAL_CHILD_STATES.has(workflowState);
 }
@@ -697,12 +697,13 @@ export async function defaultFetchStuckCandidates(
       // with no possible resolution. Treat native terminality as authoritative
       // and never surface a retired issue as a stuck candidate — matching the
       // INF-205 guard the delegation sweep and first-action watchdog already
-      // apply. Reuses this module's TERMINAL_NATIVE_STATE_TYPES (completed/
-      // canceled) — the same native-terminal set used for child-barrier
-      // suppression. (The `state:*`/delegate cleanup on the retired ticket is
-      // owned by the reconciliation sweeps' native-terminal crosscheck, not this
-      // read-only detector.)
-      if (issue.state?.type && TERMINAL_NATIVE_STATE_TYPES.has(issue.state.type)) {
+      // apply. Uses the shared `isNativelyTerminal` classifier (../terminality.ts,
+      // native types completed/canceled/duplicate) — the single source of truth
+      // for native terminality across barrier, sweeps, and this detector, and the
+      // same set used for child-barrier suppression above. (The `state:*`/delegate
+      // cleanup on the retired ticket is owned by the reconciliation sweeps'
+      // native-terminal crosscheck, not this read-only detector.)
+      if (isNativelyTerminal(issue.state?.type)) {
         log.info(
           `Stuck-delegate: skipping ${issue.identifier} — Linear entity is natively terminal ` +
           `(state.type='${issue.state?.type ?? "null"}', label state:${currentState}); ` +
