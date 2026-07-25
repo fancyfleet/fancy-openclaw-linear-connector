@@ -51,6 +51,7 @@ import { AlertBus } from "./alerts/alert-bus.js";
 import { AlertStore } from "./alerts/alert-store.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
 import { resetCronRegistryForTest, getRegisteredCrons } from "./cron/registry.js";
+import { reloadAgents } from "./agents.js";
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
 
@@ -119,10 +120,24 @@ interface FetchScenario {
   mutationSuccess?: boolean;
   /** If true, the query fetch throws a network error. */
   networkError?: boolean;
+  /** INF-585: return a GraphQL-validation-style error for the governed (wf:*) query. */
+  governedQueryError?: boolean;
+  /** INF-585: return a GraphQL-validation-style error for the ad-hoc query. */
+  adhocQueryError?: boolean;
+  /** INF-585: HTTP status for the injected query error (default 200, Linear-style). */
+  queryErrorStatus?: number;
 }
 
 function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
-  const { governedTickets = [], adhocDelegatedTickets = [], labelUpdates, mutationSuccess = true, networkError = false } = scenario;
+  const { governedTickets = [], adhocDelegatedTickets = [], labelUpdates, mutationSuccess = true, networkError = false, governedQueryError = false, adhocQueryError = false, queryErrorStatus = 200 } = scenario;
+  const graphqlErrorResponse = () =>
+    new Response(
+      JSON.stringify({
+        data: null,
+        errors: [{ message: "Field 'foo' is not defined by type 'IssueFilter'" }],
+      }),
+      { status: queryErrorStatus, headers: { "Content-Type": "application/json" } },
+    );
   const allTickets = [...governedTickets, ...adhocDelegatedTickets];
   const labelsByIssueId = new Map<string, Array<{ id: string; name: string }>>();
   for (const ticket of allTickets) {
@@ -137,6 +152,8 @@ function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
 
     // Ad-hoc delegated-tickets query (non-wf:* tickets with delegate set)
     if (body.includes("AdhocDelegationReconciliation")) {
+      // INF-585: simulate a query-level failure (200-with-errors or non-2xx).
+      if (adhocQueryError) return graphqlErrorResponse();
       // INF-334: Simulate GraphQL validation error for schema-illegal filters.
       // Re-enable this check to verify the production code no longer sends these fields.
       if (body.includes("none:") || body.includes("isSet:")) {
@@ -167,6 +184,8 @@ function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
 
     // Governed-tickets query (wf:* labeled)
     if (body.includes("DelegationReconciliation") && !body.includes("AdhocDelegationReconciliation") || body.includes("wf:") || body.includes("GovernedTickets")) {
+      // INF-585: simulate a query-level failure (200-with-errors or non-2xx).
+      if (governedQueryError) return graphqlErrorResponse();
       const nodes = governedTickets.map((t) => ({
         id: t.id,
         identifier: t.identifier,
@@ -782,6 +801,67 @@ describe("AC3: each heal emits operational event + alert-bus notify; failures al
     expect(result.errors.length).toBeGreaterThanOrEqual(1);
     expect(alerts.length).toBeGreaterThanOrEqual(1);
     expect(alerts.some((a) => a.severity === "warning" || a.severity === "critical")).toBe(true);
+    eventStore.close();
+  });
+
+  // ── INF-585: query-level failures must fail loud, not swallow to [] ──────
+  it("INF-585: fails loud when the governed (wf:*) query returns GraphQL errors", async () => {
+    const eventStore = makeEventStore();
+    const { bus, alerts } = makeTestAlertBus();
+
+    // 200-with-errors, exactly how Linear reports an invalid filter. The old
+    // governed query read `nodes ?? []` with no guard → this was swallowed as
+    // an empty page and the sweep reported scanned:0 with no alert.
+    globalThis.fetch = makeReconciliationFetch({ governedQueryError: true });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async () => {},
+    });
+
+    expect(result.errors.length).toBeGreaterThanOrEqual(1);
+    expect(result.errors.some((e) => e.includes("GovernedTickets query failed"))).toBe(true);
+    expect(alerts.length).toBeGreaterThanOrEqual(1);
+    eventStore.close();
+  });
+
+  it("INF-585: fails loud when the ad-hoc query returns GraphQL errors", async () => {
+    const eventStore = makeEventStore();
+    const { bus, alerts } = makeTestAlertBus();
+
+    globalThis.fetch = makeReconciliationFetch({ adhocQueryError: true });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async () => {},
+    });
+
+    expect(result.errors.length).toBeGreaterThanOrEqual(1);
+    expect(result.errors.some((e) => e.includes("AdhocDelegationReconciliation query failed"))).toBe(true);
+    expect(alerts.length).toBeGreaterThanOrEqual(1);
+    eventStore.close();
+  });
+
+  it("INF-585: fails loud on a non-2xx (HTTP 400) query response", async () => {
+    const eventStore = makeEventStore();
+    const { bus, alerts } = makeTestAlertBus();
+
+    // HTTP 400 GRAPHQL_VALIDATION_FAILED — the exact status reproduced on the ticket.
+    globalThis.fetch = makeReconciliationFetch({ governedQueryError: true, queryErrorStatus: 400 });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async () => {},
+    });
+
+    expect(result.errors.length).toBeGreaterThanOrEqual(1);
+    expect(alerts.length).toBeGreaterThanOrEqual(1);
     eventStore.close();
   });
 
@@ -2268,6 +2348,111 @@ describe("INF-332 AC3: Combined governed + ad-hoc pagination works together", ()
     expect(result.scanned).toBe(15);
     expect(result.healed).toBe(15);
     expect(wakeDispatches).toHaveLength(15);
+    eventStore.close();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// INF-589: the governed heal must wake by the resolved OpenClaw agent id, not
+//          the Linear delegate display name. When the delegate's display name
+//          (e.g. "Felix (Unity Dev)") differs from the OpenClaw id ("felix"),
+//          passing the display name to wakeFn routes an unresolvable
+//          `openclaw/Felix (Unity Dev)` and the wake dies in
+//          delivered-pending-ack while the sweep still reports healed:1.
+// ══════════════════════════════════════════════════════════════════════════
+
+describe("INF-589: governed heal wakes by resolved OpenClaw id, not Linear display name", () => {
+  const FELIX_LINEAR_ID = "felix-linear-uuid";
+  const FELIX_DISPLAY_NAME = "Felix (Unity Dev)";
+  const FELIX_OPENCLAW_ID = "felix";
+
+  let agentsDir: string;
+  let prevAgentsFile: string | undefined;
+  let prevEncKey: string | undefined;
+  let prevEncKeyFile: string | undefined;
+
+  beforeEach(() => {
+    prevAgentsFile = process.env.AGENTS_FILE;
+    prevEncKey = process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
+    prevEncKeyFile = process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
+    delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
+    delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
+
+    agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf589-agents-"));
+    const agentsFile = path.join(agentsDir, "agents.json");
+    // Seed a roster where the Linear display name differs from the OpenClaw id.
+    fs.writeFileSync(
+      agentsFile,
+      JSON.stringify({
+        agents: [
+          {
+            name: FELIX_OPENCLAW_ID,
+            linearUserId: FELIX_LINEAR_ID,
+            clientId: "cid",
+            clientSecret: "csecret",
+            accessToken: "atok",
+            refreshToken: "rtok",
+          },
+        ],
+      }),
+      "utf8",
+    );
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+  });
+
+  afterEach(() => {
+    if (prevAgentsFile === undefined) delete process.env.AGENTS_FILE;
+    else process.env.AGENTS_FILE = prevAgentsFile;
+    if (prevEncKey === undefined) delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
+    else process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = prevEncKey;
+    if (prevEncKeyFile === undefined) delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
+    else process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE = prevEncKeyFile;
+    reloadAgents();
+    fs.rmSync(agentsDir, { recursive: true, force: true });
+  });
+
+  it("wakes with the OpenClaw agent id (felix), never the Linear display name", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: Array<{ agentName: string; ticketIdentifier: string }> = [];
+    const { bus } = makeTestAlertBus();
+
+    globalThis.fetch = makeReconciliationFetch({
+      governedTickets: [
+        {
+          id: "issue-felix-stranded",
+          identifier: "LSO-24",
+          updatedAt: OLD_TIMESTAMP,
+          labels: [WF_LABEL, STATE_IMPLEMENTATION_LABEL],
+          delegateId: FELIX_LINEAR_ID,
+          delegateName: FELIX_DISPLAY_NAME,
+          teamId: TEAM_ID,
+        },
+      ],
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (agentName, ticketIdentifier) => {
+        wakeDispatches.push({ agentName, ticketIdentifier });
+      },
+    });
+
+    expect(result.healed).toBe(1);
+    expect(wakeDispatches).toHaveLength(1);
+    // The core assertion: resolved OpenClaw id, NOT the Linear display name.
+    expect(wakeDispatches[0].agentName).toBe(FELIX_OPENCLAW_ID);
+    expect(wakeDispatches[0].agentName).not.toBe(FELIX_DISPLAY_NAME);
+    expect(wakeDispatches[0].ticketIdentifier).toBe("LSO-24");
+
+    // Ledger consistency: the dispatch is recorded under the resolved id so the
+    // idempotency check and lease key line up with what delivery records.
+    const events = eventStore.query({ key: "linear-LSO-24", limit: 50 });
+    const dispatch = events.find((e) => e.outcome === "dispatch-accepted");
+    expect(dispatch?.agent).toBe(FELIX_OPENCLAW_ID);
+
     eventStore.close();
   });
 });
