@@ -62,6 +62,8 @@ export interface SessionMetadata {
   ticketId: string;           // e.g. "linear-AI-1010"
   sessionKey: string;         // OpenClaw session key, e.g. "agent:igor:linear-AI-1010"
   sessionFile: string | null; // path to JSONL file, null if not found
+  sessionIndexStatus?: string | null;
+  sessionIndexStartedAt?: number | null;
   sessionStartedAt: number;   // ms timestamp
   lastActivityAt: number;     // ms timestamp
   timeoutMs: number;
@@ -99,9 +101,40 @@ export interface LinearTicketSnapshot {
   commentCountAtTimeout: number | null;
 }
 
+export type StaleFailureStage =
+  | "gateway-dispatch"
+  | "session-start-or-container"
+  | "model-or-first-output"
+  | "first-output-capture"
+  | "agent-turn"
+  | "unknown";
+
+export interface WakeLifecycleEntry {
+  occurredAt: string;
+  outcome: string;
+  deliveryMode: string | null;
+  attemptCount: number | null;
+  runId: string | null;
+  wakeId: string | null;
+  errorSummary: string | null;
+  gateway: string | null;
+  workflowState: string | null;
+}
+
+export interface WakeTelemetry {
+  lifecycle: WakeLifecycleEntry[];
+  deliveryAccepted: boolean;
+  firstOutputObserved: boolean;
+  sessionFileFound: boolean;
+  lastOutcome: string | null;
+  lastOutcomeAt: string | null;
+  suspectedFailureStage: StaleFailureStage;
+}
+
 export interface StaleSnapshot {
   capturedAt: string;           // ISO timestamp
   metadata: SessionMetadata;
+  wakeTelemetry: WakeTelemetry;
   lastAssistantMessage: LastAssistantMessage | null;
   lastToolCall: ToolCallEntry | null;
   toolCallSummary: ToolCallSummary;
@@ -133,6 +166,10 @@ export interface ForensicsConfig {
   redispatchDbPath?: string;
   /** Max C2/C4 re-dispatch attempts before escalating to human. Default: 3 (STALE_REDISPATCH_MAX_ATTEMPTS env) */
   maxRedispatchAttempts?: number;
+}
+
+export interface BuildSnapshotOptions {
+  wakeLifecycle?: WakeLifecycleEntry[];
 }
 
 const DEFAULT_LOOP_THRESHOLD = 20;
@@ -271,6 +308,7 @@ function readSessionJsonl(filePath: string): JsonlEvent[] {
 export function buildSnapshot(
   stale: StaleSessionInput,
   config: ForensicsConfig = {},
+  options: BuildSnapshotOptions = {},
 ): StaleSnapshot {
   const now = Date.now();
   const openclawHome = config.openclawHome ?? path.join(os.homedir(), ".openclaw");
@@ -293,6 +331,8 @@ export function buildSnapshot(
     ticketId: stale.sessionKey,
     sessionKey: `agent:${getOpenclawAgentName(stale.agentId)}:${stale.sessionKey}`,
     sessionFile,
+    sessionIndexStatus: sessionInfo?.status ?? null,
+    sessionIndexStartedAt: sessionInfo?.sessionStartedAt ?? null,
     sessionStartedAt: stale.startedAt,
     lastActivityAt: now,
     timeoutMs: stale.timeoutMs,
@@ -313,11 +353,17 @@ export function buildSnapshot(
 
   // Classify
   const classification = classify(lastAssistant, toolCalls, errors, loopThreshold);
+  const wakeTelemetry = buildWakeTelemetry({
+    lifecycle: options.wakeLifecycle ?? [],
+    sessionFileFound: sessionFile !== null && fs.existsSync(sessionFile),
+    firstOutputObserved: Boolean(lastAssistant || toolCalls.totalCalls > 0 || errors.length > 0),
+  });
 
   const diagnosticPath = "";
   const snapshot: StaleSnapshot = {
     capturedAt: new Date(now).toISOString(),
     metadata,
+    wakeTelemetry,
     lastAssistantMessage: lastAssistant,
     lastToolCall: lastToolCall,
     toolCallSummary: toolCalls,
@@ -328,6 +374,42 @@ export function buildSnapshot(
   };
 
   return snapshot;
+}
+
+function buildWakeTelemetry(input: {
+  lifecycle: WakeLifecycleEntry[];
+  firstOutputObserved: boolean;
+  sessionFileFound: boolean;
+}): WakeTelemetry {
+  const lifecycle = [...input.lifecycle].sort((a, b) => a.occurredAt.localeCompare(b.occurredAt));
+  const deliveryAccepted = lifecycle.some((event) =>
+    ["delivered", "dispatch-accepted", "delivery-pending-ack", "stale-c4-repoke"].includes(event.outcome),
+  );
+  const hasDispatchFailure = lifecycle.some((event) =>
+    ["delivery-failed", "dispatch-undeliverable", "stale-c4-repoke-failed"].includes(event.outcome),
+  );
+  const last = lifecycle[lifecycle.length - 1] ?? null;
+
+  let suspectedFailureStage: StaleFailureStage = "unknown";
+  if (hasDispatchFailure && !deliveryAccepted) {
+    suspectedFailureStage = "gateway-dispatch";
+  } else if (deliveryAccepted && !input.sessionFileFound) {
+    suspectedFailureStage = "session-start-or-container";
+  } else if (deliveryAccepted && input.sessionFileFound && !input.firstOutputObserved) {
+    suspectedFailureStage = "model-or-first-output";
+  } else if (deliveryAccepted && input.firstOutputObserved) {
+    suspectedFailureStage = "agent-turn";
+  }
+
+  return {
+    lifecycle,
+    deliveryAccepted,
+    firstOutputObserved: input.firstOutputObserved,
+    sessionFileFound: input.sessionFileFound,
+    lastOutcome: last?.outcome ?? null,
+    lastOutcomeAt: last?.occurredAt ?? null,
+    suspectedFailureStage,
+  };
 }
 
 // ── Extraction helpers ──────────────────────────────────────────────────────
@@ -552,6 +634,11 @@ export function appendDigestEntry(snapshot: StaleSnapshot, config: ForensicsConf
     ticket: snapshot.metadata.ticketId,
     classification: snapshot.classification,
     classificationName: STALE_CLASS_NAMES[snapshot.classification],
+    suspectedFailureStage: snapshot.wakeTelemetry.suspectedFailureStage,
+    deliveryAccepted: snapshot.wakeTelemetry.deliveryAccepted,
+    sessionFileFound: snapshot.wakeTelemetry.sessionFileFound,
+    firstOutputObserved: snapshot.wakeTelemetry.firstOutputObserved,
+    lastWakeOutcome: snapshot.wakeTelemetry.lastOutcome,
     totalDurationMs: snapshot.metadata.totalDurationMs,
     toolCallCount: snapshot.toolCallSummary.totalCalls,
     stopReason: snapshot.lastAssistantMessage?.stopReason ?? null,

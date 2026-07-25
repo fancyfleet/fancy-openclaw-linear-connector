@@ -142,6 +142,54 @@ describe("buildSnapshot", () => {
     expect(snapshot.toolCallSummary.totalCalls).toBe(0); // nonexistent file = no events
     expect(snapshot.lastAssistantMessage).toBeNull();
     expect(snapshot.linearTicket.identifier).toBe("AI-1010");
+    expect(snapshot.wakeTelemetry.suspectedFailureStage).toBe("unknown");
+    expect(snapshot.wakeTelemetry.lifecycle).toHaveLength(0);
+  });
+
+  test("adds wake telemetry when delivery was accepted but no session file/output exists", () => {
+    const snapshot = buildSnapshot(
+      {
+        agentId: "astrid",
+        sessionKey: "linear-INF-196",
+        startedAt: Date.now() - 30 * 60 * 1000,
+        timeoutMs: 25 * 60 * 1000,
+        pendingTickets: [],
+      },
+      { openclawHome: "/nonexistent" },
+      {
+        wakeLifecycle: [
+          {
+            occurredAt: "2026-07-25T17:00:21.800Z",
+            outcome: "routed",
+            deliveryMode: "pending-bag",
+            attemptCount: null,
+            runId: null,
+            wakeId: "wake-linear-INF-196-test",
+            errorSummary: null,
+            gateway: null,
+            workflowState: "evaluating",
+          },
+          {
+            occurredAt: "2026-07-25T17:00:24.007Z",
+            outcome: "dispatch-accepted",
+            deliveryMode: "wake-up",
+            attemptCount: 1,
+            runId: "2136378f-c672-43bc-aa5a-0408c528c3a3",
+            wakeId: "wake-linear-INF-196-test",
+            errorSummary: null,
+            gateway: "astrid",
+            workflowState: "evaluating",
+          },
+        ],
+      },
+    );
+
+    expect(snapshot.classification).toBe("C4");
+    expect(snapshot.wakeTelemetry.deliveryAccepted).toBe(true);
+    expect(snapshot.wakeTelemetry.sessionFileFound).toBe(false);
+    expect(snapshot.wakeTelemetry.firstOutputObserved).toBe(false);
+    expect(snapshot.wakeTelemetry.lastOutcome).toBe("dispatch-accepted");
+    expect(snapshot.wakeTelemetry.suspectedFailureStage).toBe("session-start-or-container");
   });
 });
 
@@ -291,6 +339,15 @@ function makeSnapshot(cls: StaleSnapshot["classification"]): StaleSnapshot {
       lastActivityAt: Date.now(),
       timeoutMs: 25 * 60 * 1000,
       totalDurationMs: 30 * 60 * 1000,
+    },
+    wakeTelemetry: {
+      lifecycle: [],
+      deliveryAccepted: false,
+      firstOutputObserved: true,
+      sessionFileFound: false,
+      lastOutcome: null,
+      lastOutcomeAt: null,
+      suspectedFailureStage: "agent-turn",
     },
     lastAssistantMessage: null,
     lastToolCall: { name: "exec", arguments: { command: "npm test" }, result: "no-result", timestamp: new Date().toISOString() },
