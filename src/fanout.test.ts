@@ -1112,6 +1112,9 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     parentDescription?: string;
     /** Parent issue title. */
     parentTitle?: string;
+    /** When false, child issueCreate returns a Linear refusal. */
+    childCreateSucceeds?: boolean;
+    childCreateError?: string;
   }): typeof globalThis.fetch {
     const parentLabels = opts.parentLabels ?? [
       { id: "wf-lbl", name: "wf:ux-audit" },
@@ -1120,6 +1123,8 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     const teamLabels = opts.teamLabels ?? [];
     const parentTitle = opts.parentTitle ?? "UX Audit";
     const parentDescription = opts.parentDescription ?? "## Findings\n- **Finding A**: Desc A\n- **Finding B**: Desc B\n";
+    const childCreateSucceeds = opts.childCreateSucceeds ?? true;
+    const childCreateError = opts.childCreateError ?? "Title must match <icon> <Project> Cycle <N> - <Theme>";
     let childCount = 0;
 
     return async (url, init) => {
@@ -1207,6 +1212,27 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
         );
       }
 
+      // INF-212 / INF-635: fan-out spec-description fetch. The pre-transition
+      // spec gate resolves findings via fetchFanoutSpecDescription's
+      // `IssueWithComments` query (description + last 10 comments), not
+      // IssueTeamParent. Serve the same parentDescription so spec validation
+      // sees the findings. Without this the description reads back empty and the
+      // gate refuses every fan-out with `fanout-spec-invalid`.
+      if (query.includes("IssueWithComments")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                id: "parent-internal-id",
+                description: parentDescription,
+                comments: { nodes: [] },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
       // Fan-out: fetch parent context (IssueTeamParent) — now also returns internal UUID
       if (query.includes("IssueTeamParent")) {
         return new Response(
@@ -1236,6 +1262,15 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
       // Fan-out: create child issue
       if (query.includes("issueCreate")) {
         childCount++;
+        if (!childCreateSucceeds) {
+          return new Response(
+            JSON.stringify({
+              data: { issueCreate: { success: false, issue: null } },
+              errors: [{ message: childCreateError }],
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
         const input = (parsed.variables as Record<string, unknown>).input as Record<string, unknown>;
         return new Response(
           JSON.stringify({
@@ -1286,6 +1321,50 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     expect(commentCall).toBeDefined();
     const commentVars = commentCall!.body.variables as Record<string, unknown>;
     expect(commentVars.issueId).toBe("parent-internal-id");
+  });
+
+  it("INF-624: fails closed when preview succeeds but child creation creates zero children", async () => {
+    // INF-624's guard: the spec validates and the fan-out preview succeeds
+    // (attempted > 0), but every child issueCreate returns zero created. Provide
+    // the child workflow's team labels so the mint clears the INF-27 AC2 label
+    // check and actually reaches issueCreate, then reject the create at the API
+    // boundary (childCreateSucceeds:false) — the exact "preview OK, create
+    // returns 0" case the parent must fail closed on rather than advance into an
+    // orphaned barrier state.
+    const createError = "Linear rejected issueCreate: target workflow state is unavailable for team";
+    globalThis.fetch = makeIntegrationFetch({
+      teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ],
+      parentDescription: "## Findings\n- **LifeOS 2026-07-25 Sprint**: deployed sprint that fails at child creation\n",
+      childCreateSucceeds: false,
+      childCreateError: createError,
+    });
+
+    const result = await applyStateTransition("spawn", "AI-1439", "Bearer tok");
+
+    expect(result.status).toBe("failed");
+    expect(result.code).toBe("fanout-create-failed");
+    expect(result.detail).toContain(createError);
+
+    const childCreateCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
+    expect(childCreateCalls).toHaveLength(1);
+
+    const stateUpdateCall = fetchCalls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(stateUpdateCall).toBeUndefined();
+
+    const barrierFetch = fetchCalls.find((c) => (c.body.query ?? "").includes("ParentChildren"));
+    expect(barrierFetch).toBeUndefined();
+
+    const commentBodies = fetchCalls
+      .filter((c) => (c.body.query ?? "").includes("commentCreate"))
+      .map((c) => ((c.body.variables as Record<string, unknown>).body as string | undefined) ?? "");
+    expect(commentBodies.some((body) => body.includes("Spawn Preview"))).toBe(true);
+    const failureComment = commentBodies.find((body) => body.includes("Fan-out failed - transition not applied"));
+    expect(failureComment).toContain("proposed 1 child issue(s), but child creation created 0");
+    expect(failureComment).toContain("parent remains in `spawning`");
+    expect(failureComment).toContain(createError);
   });
 
   it("does NOT trigger fan-out for non-ux-audit workflows", async () => {
