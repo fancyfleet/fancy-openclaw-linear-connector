@@ -211,6 +211,8 @@ function makeBootstrapFetch(opts: {
           data: {
             issue: {
               id: ISSUE_INTERNAL_ID,
+              identifier: "AI-1565",
+              title: "Test ticket",
               team: { id: TEAM_ID },
               labels: {
                 nodes: opts.currentLabelNames.map((name) => {
@@ -241,6 +243,13 @@ function makeBootstrapFetch(opts: {
     if (body.includes("issueUpdate") || body.includes("ApplyAtomicTransition")) {
       return new Response(
         JSON.stringify({ data: { issueUpdate: { success: mutationSuccess } } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    if (body.includes("commentCreate")) {
+      return new Response(
+        JSON.stringify({ data: { commentCreate: { success: true, comment: { id: "comment-id" } } } }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
@@ -494,20 +503,37 @@ describe("AC5/AC7c: a second workflow's entry state resolves correctly", () => {
 // ── Tests: AC7d — missing/invalid def fails safe ─────────────────────────
 
 describe("AC7d: missing/invalid def fails safe", () => {
-  it("returns null without crashing when wf:unknown workflow has no registered def", async () => {
-    globalThis.fetch = makeBootstrapFetch({
-      currentLabelNames: ["wf:unknown-workflow"],
-    });
+  it("loudly rejects an unregistered workflow by stripping wf:* labels and posting a comment", async () => {
+    const calls: Array<{ body: string }> = [];
+    globalThis.fetch = async (url, init) => {
+      const body = typeof init?.body === "string" ? init.body : "";
+      calls.push({ body });
+      return makeBootstrapFetch({
+        currentLabelNames: ["wf:unknown-workflow", "bug"],
+      })(url, init);
+    };
 
     const event = makeIssueUpdateEvent({
-      currentLabelIds: ["label-wf-unknown-id"],
+      currentLabelIds: ["label-wf:unknown-workflow-id", "label-bug-id"],
       previousLabelIds: [],
     });
 
-    // Must not throw; should return null (fail safe)
-    await expect(
-      maybeBootstrapWorkflow(event, "test-token"),
-    ).resolves.toBeNull();
+    const result = await maybeBootstrapWorkflow(event, "test-token");
+
+    expect(result?.action).toBe("rejected");
+    expect(result?.workflowId).toBe("unknown-workflow");
+
+    const updateCall = calls.find((c) => c.body.includes("issueUpdate"));
+    expect(updateCall).toBeDefined();
+    const updateBody = JSON.parse(updateCall!.body) as { variables: { labelIds: string[]; delegateId?: string; assigneeId?: string } };
+    expect(updateBody.variables.labelIds).toEqual(["label-bug-id"]);
+    expect(updateBody.variables).not.toHaveProperty("delegateId");
+    expect(updateBody.variables).not.toHaveProperty("assigneeId");
+
+    const commentCall = calls.find((c) => c.body.includes("commentCreate"));
+    expect(commentCall).toBeDefined();
+    expect(commentCall!.body).toContain("mutation($issueId: String!, $body: String!)");
+    expect(commentCall!.body).toContain("unknown-workflow");
   });
 
   it("returns null when the Linear fetch fails (network error)", async () => {

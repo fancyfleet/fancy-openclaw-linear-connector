@@ -17,7 +17,7 @@ import path from "node:path";
 import { componentLogger, createLogger } from "./logger.js";
 import { loadWorkflowRegistry, type WorkflowDef } from "./workflow-gate.js";
 import { resolveBodiesForRole } from "./escalation-gate.js";
-import { findOrCreateLabel } from "./linear-helpers.js";
+import { findOrCreateLabel, postComment } from "./linear-helpers.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import type { LinearEvent, LinearIssueCreatedEvent, LinearIssueUpdatedEvent } from "./webhook/schema.js";
 import { getAgents, getAccessToken } from "./agents.js";
@@ -29,7 +29,7 @@ const LINEAR_API_URL = "https://api.linear.app/graphql";
 // ── Public result type ────────────────────────────────────────────────────────
 
 export interface BootstrapResult {
-  action: "bootstrapped" | "demoted";
+  action: "bootstrapped" | "demoted" | "rejected";
   workflowId?: string;
   entryState?: string;
   /** OpenClaw agent name of the newly-set delegate (bootstrapped only). */
@@ -156,6 +156,35 @@ export async function issueUpdateAtomic(
   } catch {
     return false;
   }
+}
+
+async function rejectUnregisteredWorkflow(
+  issue: IssueContext,
+  workflowId: string,
+  authToken: string,
+): Promise<BootstrapResult | null> {
+  const strippedLabelIds = issue.labels
+    .filter((label) => !label.name.startsWith("wf:"))
+    .map((label) => label.id);
+  const updateSuccess = await issueUpdateAtomic(issue.id, strippedLabelIds, authToken);
+  const commentSuccess = await postComment(
+    issue.id,
+    `[Connector] Workflow bootstrap rejected **${issue.identifier}**: unknown workflow \`${workflowId}\` is not registered. Removed the workflow label so the ticket will not remain in workflow-pending limbo.`,
+    authToken,
+  );
+  if (!updateSuccess || !commentSuccess) {
+    log.warn(
+      `workflow-bootstrap: rejected ${issue.id} — unknown workflow '${workflowId}' — cleanup update=${updateSuccess} comment=${commentSuccess}`,
+    );
+    return null;
+  }
+  log.info(`workflow-bootstrap: rejected ${issue.id} — unknown workflow '${workflowId}' — stripped wf:* labels`);
+  return {
+    action: "rejected",
+    workflowId,
+    ticketIdentifier: issue.identifier,
+    ticketTitle: issue.title,
+  };
 }
 
 // ── Main hook ─────────────────────────────────────────────────────────────────
@@ -314,8 +343,7 @@ export async function applyBootstrapToIssue(
 
   const def = registry.get(workflowId);
   if (!def?.entry_state) {
-    log.warn(`workflow-bootstrap: no def (or no entry_state) for workflow '${workflowId}' — skipping bootstrap`);
-    return null;
+    return rejectUnregisteredWorkflow(issue, workflowId, authToken);
   }
 
   const entryState = def.entry_state;

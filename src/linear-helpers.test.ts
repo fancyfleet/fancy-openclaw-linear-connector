@@ -17,7 +17,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, jest } from "@jest/globals";
-import { findOrCreateLabel } from "./linear-helpers.js";
+import { findOrCreateLabel, postComment } from "./linear-helpers.js";
 
 interface LabelFixture {
   id: string;
@@ -156,5 +156,41 @@ describe("findOrCreateLabel — group-aware resolution (AI-2176)", () => {
     const logged = errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
     expect(logged).toContain("A label with this name already exists.");
     expect(logged).toContain("state:product-definition");
+  });
+});
+
+describe("postComment — Linear commentCreate schema drift", () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    jest.restoreAllMocks();
+  });
+
+  it("declares issueId as String and logs GraphQL errors on non-success", async () => {
+    const warnSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+    let query = "";
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      const parsed = JSON.parse(String(init?.body ?? "{}")) as { query: string };
+      query = parsed.query;
+      return new Response(
+        JSON.stringify({
+          data: { commentCreate: { success: false } },
+          errors: [{ message: "Variable \"$issueId\" of type \"ID!\" used in position expecting type \"String\"." }],
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      );
+    }) as unknown as typeof globalThis.fetch;
+
+    await expect(postComment("issue-uuid", "body", "Bearer t")).resolves.toBe(false);
+
+    expect(query).toContain("$issueId: String!");
+    expect(query).not.toContain("$issueId: ID!");
+    const logged = warnSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(logged).toContain("expecting type");
   });
 });

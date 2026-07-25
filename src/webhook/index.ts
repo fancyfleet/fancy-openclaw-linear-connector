@@ -412,7 +412,11 @@ export function createWebhookRouter(
           const bootstrapResult = await maybeBootstrapWorkflow(event, bootstrapToken, enrolledTicketsStore);
           if (bootstrapResult) {
             log.info(`Workflow bootstrap: ${bootstrapResult.action} (wf:${bootstrapResult.workflowId ?? "unknown"})`);
-            const bootstrapOutcome = bootstrapResult.action === "bootstrapped" ? "bootstrap-bootstrapped" : "bootstrap-demoted";
+            const bootstrapOutcome = bootstrapResult.action === "bootstrapped"
+              ? "bootstrap-bootstrapped"
+              : bootstrapResult.action === "demoted"
+                ? "bootstrap-demoted"
+                : "bootstrap-rejected";
             appendOperationalEvent(operationalEventStore, { outcome: bootstrapOutcome, type: event.type });
 
             // AI-fix: after bootstrap, deliver a workflow-aware wake to the

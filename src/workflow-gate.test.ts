@@ -6651,7 +6651,7 @@ describe("checkRawMutationInterception — AI-1658: commentCreate interception",
   it("allows a raw commentCreate on a workflow ticket without intent header (supersedes AI-1658)", async () => {
     globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
     const body = {
-      query: "mutation M($issueId: ID!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success } }",
+      query: "mutation M($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success } }",
       variables: { issueId: "issue-uuid", body: "free-form comment on a workflow ticket" },
     };
     expect(await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles")).toBeNull();
@@ -6670,7 +6670,7 @@ describe("checkRawMutationInterception — AI-1658: commentCreate interception",
   it("passes commentCreate through on ad-hoc (non-workflow) ticket", async () => {
     globalThis.fetch = mockLabelFetch(AD_HOC_LABELS);
     const body = {
-      query: "mutation M($issueId: ID!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success } }",
+      query: "mutation M($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success } }",
       variables: { issueId: "issue-uuid", body: "just a comment on a regular ticket" },
     };
     const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
