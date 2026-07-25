@@ -327,30 +327,60 @@ describe("AC1 — classifyTicket: produces correct classification from labels + 
 });
 
 // ══════════════════════════════════════════════════════════════════════════
-// AC3 — classification must NOT depend on native Linear status
+// AC3 — native Linear status is a fail-safe TERMINAL signal only (INF-584)
+//
+// Bug B resilience is preserved: a missing/non-terminal native status never
+// overrides the label-based verdict, so active work is classified from labels +
+// delegate exactly as before. INF-584 adds one refinement — a fresh NATIVE
+// TERMINAL read (Invalid/canceled/duplicate/Done) forces "terminal", because a
+// retired ticket must never be rescued (re-delegating it re-arms a doomed wake).
 // ══════════════════════════════════════════════════════════════════════════
 
-describe("AC3 — classifyTicket ignores native Linear status entirely", () => {
-  it("classifyTicket receives no native-status parameter — no such param in signature", () => {
-    // The function must classify correctly using only labels + delegate + def.
-    // If classifyTicket accepted a nativeState param and used it, this test
-    // verifies that a 'Doing' status does not override a null delegate.
-    // We verify the signature has exactly 4 parameters.
-    expect(classifyTicket.length).toBe(4);
+describe("AC3 — classifyTicket: native status only forces terminal, never overrides active work", () => {
+  it("absent native status → classification is label + delegate driven (Bug B resilience)", () => {
+    // No nativeState arg → behaves exactly as the pre-INF-584 4-arg contract.
+    const result = classifyTicket(
+      ["wf:dev-impl", "state:write-tests"],
+      null, // no delegate
+      TEST_WORKFLOW_DEF,
+      DEFAULT_ROLE_RESOLVER,
+    );
+    expect(result).toBe<TicketClassification>("dormant");
   });
 
   it("dormant regardless of whether the native state is Doing, Todo, or Backlog", () => {
-    // All three should be dormant — no delegate set — not affected by native status
+    // A non-terminal native status must NOT override a null-delegate dormant verdict.
     const states = ["Doing", "Todo", "Backlog", "Thinking"] as const;
-    for (const _nativeState of states) {
-      // classifyTicket does not receive nativeState — always uses only labels + delegate
+    for (const nativeName of states) {
       const result = classifyTicket(
         ["wf:dev-impl", "state:write-tests"],
         null, // no delegate
         TEST_WORKFLOW_DEF,
         DEFAULT_ROLE_RESOLVER,
+        { name: nativeName, type: "started" }, // non-terminal native status
       );
       expect(result).toBe<TicketClassification>("dormant");
+    }
+  });
+
+  it("INF-584: native-terminal status forces terminal even when the workflow label is still active", () => {
+    // The AI-2628 shape: native Invalid (canceled) while the workflow label
+    // still reads state:implementation with a live delegate. Must be terminal so
+    // the sweep does not re-delegate a retired ticket.
+    for (const native of [
+      { name: "Invalid", type: "canceled" },
+      { name: "Cancelled", type: "cancelled" },
+      { name: "Duplicate", type: "duplicate" },
+      { name: "Done", type: "completed" },
+    ]) {
+      const result = classifyTicket(
+        ["wf:dev-impl", "state:implementation"],
+        "igor", // live (drifted-looking) delegate
+        TEST_WORKFLOW_DEF,
+        DEFAULT_ROLE_RESOLVER,
+        native,
+      );
+      expect(result).toBe<TicketClassification>("terminal");
     }
   });
 });

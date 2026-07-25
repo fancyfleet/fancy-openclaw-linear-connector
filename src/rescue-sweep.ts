@@ -3,11 +3,21 @@
  *
  * Safety net that periodically enumerates all wf:* tickets and rescues any that
  * have slipped into a broken shape — no delegate, no state label, or drifted
- * ownership. Detection uses labels + delegate only (NOT native Linear status),
- * so it survives the Bug B native-status breakage.
+ * ownership. Detection is label + delegate driven and survives the Bug B
+ * native-status breakage: when native status is missing/unavailable it is
+ * ignored entirely and classification uses only labels + delegate.
+ *
+ * INF-584 refinement: native status is consulted ONLY as a fail-safe TERMINAL
+ * signal. A ticket a human dragged to a native terminal state (Invalid/canceled/
+ * duplicate/Done) is retired — Linear refuses every mutation — so rescuing it
+ * (re-attaching a delegate) is harmful: it re-arms the delegation-reconciliation
+ * wake on a ticket the delegate can never act on. A fresh native-terminal read
+ * therefore forces "terminal". This can only ADD a terminal classification; a
+ * null/non-terminal native status never overrides the label-based verdict, so
+ * Bug B resilience for active work is preserved.
  *
  * Classification rules (mutually exclusive, evaluated in order):
- *   terminal  — state:done or state:escape (ignored)
+ *   terminal  — native terminal state, OR state:done / state:escape (ignored)
  *   malformed — has wf:* but no state:* label
  *   dormant   — non-terminal, has state:*, but delegate is null/absent
  *   drifted   — non-terminal, has state:*, but delegate body does not fill the
@@ -22,6 +32,7 @@ import yaml from "js-yaml";
 import { createLogger, componentLogger } from "./logger.js";
 import { defaultCapabilityPolicyPath } from "./instance-config.js";
 import { getLinearUserIdForAgent } from "./agents.js";
+import { isTerminalIssueState } from "./linear-actionable.js";
 import type { OperationalEventInput } from "./store/operational-event-store.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "rescue-sweep");
@@ -48,6 +59,13 @@ export interface SweepTicket {
   delegateId: string | null;
   /** Display name of the current delegate (optional, for logging) */
   delegateName?: string | null;
+  /**
+   * INF-584: native Linear state (name + type). A ticket dragged to a native
+   * terminal state (Invalid/canceled/duplicate/Done) is retired and unmutable;
+   * the rescue sweep must classify it terminal and never re-attach a delegate,
+   * or it re-arms the delegation-reconciliation wake on a dead ticket.
+   */
+  nativeState?: { name?: string; type?: string } | null;
 }
 
 export interface RescueAction {
@@ -144,9 +162,19 @@ export function classifyTicket(
   delegateId: string | null,
   workflowDef: { entry_state?: string; states: Array<{ id: string; owner_role?: string }> },
   roleBodiesForRole: (roleId: string) => string[],
+  nativeState?: { name?: string; type?: string } | null,
 ): TicketClassification {
   const stateLabel = labels.find((l) => l.startsWith("state:"));
   const stateId = stateLabel?.slice("state:".length);
+
+  // INF-584: native-terminal wins over labels. A human dragging a governed
+  // ticket to Invalid/canceled/duplicate/Done retires it — Linear refuses every
+  // mutation, so a rescue (re-delegate / re-enroll) is not just pointless but
+  // harmful: re-attaching a delegate re-arms the delegation-reconciliation wake
+  // on a ticket the delegate can never act on. Treat native terminality as
+  // terminal even when the workflow label still reads active (the AI-2628 shape:
+  // native canceled, label state:implementation).
+  if (isTerminalIssueState(nativeState)) return "terminal";
 
   // Terminal: done or escape — checked first, regardless of delegate
   if (stateId === "done" || stateId === "escape") return "terminal";
@@ -223,7 +251,7 @@ async function fetchWfTickets(authToken: string): Promise<FetchedTicket[]> {
           id
           identifier
           updatedAt
-          state { name }
+          state { name type }
           labels { nodes { id name } }
           delegate { id name }
           team { id }
@@ -241,6 +269,7 @@ async function fetchWfTickets(authToken: string): Promise<FetchedTicket[]> {
       id: string;
       identifier: string;
       updatedAt?: string;
+      state?: { name?: string; type?: string } | null;
       labels: { nodes: Array<{ id: string; name: string }> };
       delegate: { id: string; name: string } | null;
       team: { id: string } | null;
@@ -256,6 +285,7 @@ async function fetchWfTickets(authToken: string): Promise<FetchedTicket[]> {
       delegateId: n.delegate?.id ?? null,
       delegateName: n.delegate?.name ?? null,
       teamId: n.team?.id ?? "",
+      nativeState: n.state ?? null,
     }));
   } catch (err) {
     log.error(`fetchWfTickets failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -428,7 +458,7 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
     }
 
     const wfDef = workflowRegistry.get(wfId)!;
-    const classification = classifyTicket(ticket.labels, ticket.delegateId, wfDef, roleBodiesForRole);
+    const classification = classifyTicket(ticket.labels, ticket.delegateId, wfDef, roleBodiesForRole, ticket.nativeState);
     byClassification[classification] = (byClassification[classification] ?? 0) + 1;
 
     // Terminal and healthy tickets need no rescue

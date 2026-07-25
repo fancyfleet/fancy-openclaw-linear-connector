@@ -182,8 +182,14 @@ function parseEnvInt(name: string, defaultVal: number): number {
 
 /** Terminal workflow `state:*` labels that satisfy a parent's N→1 barrier. */
 const TERMINAL_CHILD_STATES = new Set(["done", "escape"]);
-/** Native Linear state types that count as terminal (issue closed). */
-const TERMINAL_NATIVE_STATE_TYPES = new Set(["completed", "canceled"]);
+/**
+ * Native Linear state types that count as terminal (issue closed).
+ * INF-584: include `duplicate` and the `cancelled` spelling — a ticket dragged
+ * to a Duplicate/Cancelled native state is just as retired (and just as
+ * unmutable) as a canceled one, and must not surface as a stuck candidate.
+ * Aligns with the canonical set in linear-actionable.ts (isTerminalIssueState).
+ */
+const TERMINAL_NATIVE_STATE_TYPES = new Set(["completed", "canceled", "cancelled", "duplicate"]);
 
 /**
  * Is a child issue in a terminal state? A child satisfies the parent barrier if

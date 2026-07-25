@@ -36,6 +36,7 @@ import {
   applyBootstrapToIssue,
 } from "./workflow-bootstrap.js";
 import { loadWorkflowRegistry, type WorkflowDef } from "./workflow-gate.js";
+import { isTerminalIssueState } from "./linear-actionable.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { registerCron, markCronRun, formatIntervalMs } from "./cron/registry.js";
 import { buildAgentMap } from "./agents.js";
@@ -97,6 +98,8 @@ type ReconciliationCandidate = {
   labels: Array<{ id: string; name: string }>;
   delegateId: string | null;
   teamId: string;
+  /** INF-584: native Linear state, for the native-terminality guard. */
+  nativeState?: { name?: string; type?: string } | null;
 };
 
 function workflowDefForLabel(registry: Map<string, WorkflowDef> | undefined, workflowLabel: string): WorkflowDef | undefined {
@@ -239,11 +242,31 @@ async function queryEnrolledPRStatus(
  * Inlines the queries rather than calling shared helpers because those
  * helpers use globalThis.fetch which the mock cannot intercept.
  */
+/**
+ * Outcome of a facet-close attempt on an enrolled terminal ticket.
+ * - "closed":  the issueUpdate succeeded — delegate cleared, the wf: and state:
+ *              labels stripped.
+ * - "retired": Linear refused the mutation because the entity is retired
+ *              ("Could not modify retired issue"). This is TERMINAL and
+ *              non-retryable — a human dragged the ticket to a native terminal
+ *              state, which retires it and blocks every mutation. The residual
+ *              facets cannot be cleared and re-trying every cadence only produces
+ *              noise. Pass 3 treats this as acknowledged, not a failure (INF-584).
+ * - "failed":  a transient/other failure — worth retrying next cadence.
+ */
+type CloseEnrolledOutcome = "closed" | "retired" | "failed";
+
+/** True when a Linear GraphQL error payload is the retired-entity refusal. */
+function isRetiredEntityError(errors: Array<{ message?: string }> | undefined): boolean {
+  if (!errors?.length) return false;
+  return errors.some((e) => typeof e.message === "string" && /retired/i.test(e.message));
+}
+
 async function closeEnrolledTicket(
   issueId: string,
   authToken: string,
   fetchFn: typeof fetch,
-): Promise<boolean> {
+): Promise<CloseEnrolledOutcome> {
   // Re-fetch to get label IDs for stripping (IssueWithLabels query)
   const labelsQuery = `
     query IssueWithLabelsForClose($id: String!) {
@@ -268,7 +291,7 @@ async function closeEnrolledTicket(
     const data = (await res.json()) as LResp;
     issueLabels = data.data?.issue?.labels?.nodes ?? [];
   } catch {
-    return false;
+    return "failed";
   }
 
   // Filter OUT labels that start with wf:* or state:*
@@ -293,11 +316,19 @@ async function closeEnrolledTicket(
         variables: { issueId, labelIds: keepIds },
       }),
     });
-    type MResp = { data?: { issueUpdate?: { success: boolean } } };
+    type MResp = {
+      data?: { issueUpdate?: { success: boolean } };
+      errors?: Array<{ message?: string }>;
+    };
     const data = (await res.json()) as MResp;
-    return data.data?.issueUpdate?.success ?? false;
+    if (data.data?.issueUpdate?.success) return "closed";
+    // INF-584: a retired entity refuses the mutation with a distinctive error.
+    // Surface it so Pass 3 stops retrying (and stops alerting) on a ticket that
+    // can never be healed via the API.
+    if (isRetiredEntityError(data.errors)) return "retired";
+    return "failed";
   } catch {
-    return false;
+    return "failed";
   }
 }
 
@@ -412,6 +443,7 @@ async function queryUnenrolledTickets(
           delegate { id }
           team { id }
           title
+          state { name type }
         }
       }
     }
@@ -433,6 +465,7 @@ async function queryUnenrolledTickets(
           labels: { nodes: Array<{ id: string; name: string }> };
           delegate: { id: string } | null;
           team: { id: string };
+          state?: { name?: string; type?: string } | null;
         }>;
       };
     };
@@ -447,6 +480,7 @@ async function queryUnenrolledTickets(
     labels: n.labels.nodes,
     delegateId: n.delegate?.id ?? null,
     teamId: n.team.id,
+    nativeState: n.state ?? null,
   }));
 }
 
@@ -585,6 +619,14 @@ export async function runBootstrapReconciliationSweep(
     const stateLabel = ticket.labels.find((l) => l.name.startsWith("state:"))?.name;
     if (!workflowLabel || !stateLabel || !ticket.delegateId) continue;
     if (!wakeFn || !opts.dispatchAckTracker) continue;
+    // INF-584: never dispatch an actionable-ack wake to a natively-terminal
+    // (retired) ticket. A human dragging a governed ticket to Invalid/canceled/
+    // Done retires it; the label state:* can still read actionable while the
+    // native state is terminal (the AI-2628 shape). Waking the delegate on a
+    // retired issue is a dead end — every verb it could run is a mutation Linear
+    // refuses. Native terminality wins over the label. Pass 3 below handles the
+    // (best-effort, may be refused) facet cleanup.
+    if (isTerminalIssueState(ticket.nativeState)) continue;
     if (!isActionableWorkflowLabelState(workflowRegistry, workflowLabel, stateLabel)) continue;
 
     const agentName = buildAgentMap()[ticket.delegateId];
@@ -627,8 +669,8 @@ export async function runBootstrapReconciliationSweep(
       }
 
       // Native terminal: close the stale workflow record without writing stateId.
-      const closed = await closeEnrolledTicket(ticket.id, authToken, fetchFn);
-      if (closed) {
+      const outcome = await closeEnrolledTicket(ticket.id, authToken, fetchFn);
+      if (outcome === "closed") {
         result.healed++;
         log.info(
           `bootstrap-reconciliation: closed enrolled terminal ticket ${ticket.identifier}` +
@@ -645,6 +687,22 @@ export async function runBootstrapReconciliationSweep(
           },
           ticket: ticket.identifier,
         });
+      } else if (outcome === "retired") {
+        // INF-584: Linear refuses ALL mutations on a retired entity, so the
+        // facet cleanup (delegate-clear + wf:*/state:* strip) can never apply
+        // via the API — a human dragged the ticket to a native terminal state,
+        // which retires it. The residual facets stay put; there is no API path
+        // to remove them. This is TERMINAL, not a failure: do NOT push an error
+        // and do NOT alert, or the sweep re-reports the same un-healable ticket
+        // every cadence forever. The wake paths (delegation-reconciliation Pass,
+        // bootstrap Pass 2, stuck-delegate detector) already skip natively-
+        // terminal tickets, so the residual facets are inert — nothing acts on
+        // them. Log once per cadence at info for observability.
+        log.info(
+          `bootstrap-reconciliation: enrolled terminal ticket ${ticket.identifier} is retired ` +
+          `(native state: ${stateData.state.name}) — facets un-healable via API (Linear refuses ` +
+          `mutations on retired issues); leaving residual wf:*/state:*/delegate in place`,
+        );
       } else {
         result.errors.push(`close enrolled mutation failed for ${ticket.identifier}`);
         log.warn(`bootstrap-reconciliation: close enrolled mutation returned false for ${ticket.identifier}`);
