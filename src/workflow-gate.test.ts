@@ -6120,6 +6120,204 @@ bodies:
   });
 });
 
+// ── INF-621: sprint-spawner propose-brief structured-section guard ─────────
+
+const INF621_POLICY_YAML = `
+capabilities:
+  - id: linear:transition
+  - id: human:escalate
+  - id: sprint:signoff
+
+containers:
+  - id: steward
+    grants: [linear:transition, human:escalate]
+  - id: sprint-signoff
+    grants: [linear:transition, sprint:signoff]
+
+roles:
+  - id: steward
+    requires: [human:escalate]
+  - id: engine
+    requires: [linear:transition]
+
+bodies:
+  - id: astrid
+    container: steward
+    fills_roles: [steward]
+  - id: ai
+    container: sprint-signoff
+    fills_roles: []
+`;
+
+const INF621_WORKFLOW_YAML = `
+id: sprint-spawner
+entry_state: determining-scope
+
+break_glass:
+  command: escape
+  owner_role: steward
+
+states:
+  - id: determining-scope
+    owner_role: steward
+    kind: normal
+    native_state: doing
+    transitions:
+      - command: propose-brief
+        to: spawning-scope
+        requires_capability: sprint:signoff
+        designated_approver: true
+
+  - id: spawning-scope
+    owner_role: engine
+    kind: normal
+    native_state: doing
+    fanout:
+      spec_source: structured
+      child_workflow: wf:sprint-scoping
+      initial_delegate: astrid
+    transitions:
+      - command: spawn
+        to: scoping
+
+  - id: scoping
+    owner_role: steward
+    kind: normal
+    native_state: doing
+    transitions: []
+`;
+
+function makeInf621Fetch(
+  description: string,
+  comments: Array<{ body: string; createdAt: string }>,
+): typeof globalThis.fetch {
+  return async (_url, init) => {
+    const bodyText = typeof init?.body === "string" ? init.body : "";
+    if (bodyText.includes("StructuredBriefContext")) {
+      return new Response(
+        JSON.stringify({
+          data: {
+            issue: {
+              description,
+              comments: { nodes: comments },
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (bodyText.includes("delegate")) {
+      return new Response(
+        JSON.stringify({
+          data: {
+            issue: {
+              identifier: "INF-621",
+              labels: { nodes: [{ name: "wf:sprint-spawner" }, { name: "state:determining-scope" }] },
+              delegate: { id: "astrid-linear-uuid" },
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response(
+      JSON.stringify({
+        data: {
+          issue: {
+            labels: { nodes: [{ name: "wf:sprint-spawner" }, { name: "state:determining-scope" }] },
+          },
+        },
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  };
+}
+
+describe("INF-621: sprint-spawner propose-brief structured-section guard", () => {
+  let inf621Dir: string;
+  let inf621OrigFetch: typeof globalThis.fetch;
+  let inf621OrigWorkflowPath: string | undefined;
+  let inf621OrigPolicyPath: string | undefined;
+
+  beforeAll(() => {
+    inf621Dir = fs.mkdtempSync(path.join(os.tmpdir(), "inf621-test-"));
+    const workflowFile = path.join(inf621Dir, "sprint-spawner.yaml");
+    fs.writeFileSync(workflowFile, INF621_WORKFLOW_YAML, "utf8");
+    inf621OrigWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    const policyFile = path.join(inf621Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, INF621_POLICY_YAML, "utf8");
+    inf621OrigPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+  });
+
+  afterAll(() => {
+    process.env.WORKFLOW_DEF_PATH = inf621OrigWorkflowPath;
+    process.env.CAPABILITY_POLICY_PATH = inf621OrigPolicyPath;
+    try { fs.rmSync(inf621Dir, { recursive: true }); } catch { /* best-effort */ }
+  });
+
+  beforeEach(() => {
+    inf621OrigFetch = globalThis.fetch;
+    resetWorkflowCache();
+    resetPolicyCache();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = inf621OrigFetch;
+  });
+
+  it("refuses the LIF-45 Cycle 8 shape before stale ## structured content can fan out", async () => {
+    globalThis.fetch = makeInf621Fetch(
+      "## structured\n- **Old Cycle 7 Scoping**: stale prior-cycle scope",
+      [
+        {
+          body: "Approved brief:\n- **LIF-45 Cycle 8 Scoping**: current brief for the next scoping child",
+          createdAt: "2026-07-25T12:40:00.000Z",
+        },
+      ],
+    );
+
+    const result = await checkWorkflowRules(
+      "propose-brief",
+      "INF-621",
+      "Bearer tok",
+      "ai",
+      null,
+      "ai-linear-uuid",
+    );
+
+    expect(result).not.toBeNull();
+    expect(result).toContain("stale or inconsistent '## structured'");
+    expect(result).toContain("Update ## structured before requesting Ai signoff/advance");
+  });
+
+  it("allows Ai's sprint:signoff designated-approver path when ## structured matches the signed-off brief", async () => {
+    const currentBrief = "- **LIF-45 Cycle 8 Scoping**: current brief for the next scoping child";
+    globalThis.fetch = makeInf621Fetch(
+      `## structured\n${currentBrief}`,
+      [
+        {
+          body: `Approved brief:\n${currentBrief}`,
+          createdAt: "2026-07-25T12:40:00.000Z",
+        },
+      ],
+    );
+
+    const result = await checkWorkflowRules(
+      "propose-brief",
+      "INF-621",
+      "Bearer tok",
+      "ai",
+      null,
+      "ai-linear-uuid",
+    );
+
+    expect(result).toBeNull();
+  });
+});
+
 // ── AI-1493: Atomic transitions + deterministic owner-routing ──────────────
 
 describe("applyStateTransition — AI-1493 atomic transitions", () => {

@@ -1175,6 +1175,112 @@ async function fetchTicketContext(issueId: string, authToken: string): Promise<T
   }
 }
 
+type StructuredBriefContext = {
+  description: string | null;
+  comments: Array<{ body: string | null; createdAt?: string | null }>;
+};
+
+async function fetchStructuredBriefContext(issueId: string, authToken: string): Promise<StructuredBriefContext | null> {
+  const query = `
+    query StructuredBriefContext($id: String!) {
+      issue(id: $id) {
+        description
+        comments(first: 10) {
+          nodes { body createdAt }
+        }
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: issueId } }),
+    });
+    type Resp = {
+      data?: {
+        issue?: {
+          description?: string | null;
+          comments?: { nodes?: Array<{ body?: string | null; createdAt?: string | null }> };
+        } | null;
+      };
+    };
+    const data = (await res.json()) as Resp;
+    const issue = data.data?.issue;
+    if (!issue) return null;
+    const comments = [...(issue.comments?.nodes ?? [])]
+      .map((c) => ({ body: c.body ?? null, createdAt: c.createdAt ?? null }))
+      .sort((a, b) => Date.parse(b.createdAt ?? "") - Date.parse(a.createdAt ?? ""));
+    return { description: issue.description ?? null, comments };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: structured brief context fetch failed for ${issueId}: ${msg}`);
+    return null;
+  }
+}
+
+function normalizeBriefText(value: string | undefined): string {
+  return (value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function briefKey(finding: Finding): string {
+  return `${normalizeBriefText(finding.title)}\n${normalizeBriefText(finding.description)}`;
+}
+
+function extractLatestBriefFromComments(comments: StructuredBriefContext["comments"], specSource: string): Finding | null {
+  for (const comment of comments) {
+    const body = comment.body ?? "";
+    const sectionEntries = extractSpecFindings(body, specSource);
+    if (sectionEntries.length === 1) return sectionEntries[0];
+
+    const bulletEntries = extractSpecFindings(`## ${specSource}\n${body}`, specSource);
+    if (bulletEntries.length === 1) return bulletEntries[0];
+  }
+  return null;
+}
+
+async function validateSprintSpawnerStructuredBrief(
+  issueId: string,
+  authToken: string,
+  specSource: string,
+): Promise<string | null> {
+  const sectionName = `## ${specSource}`;
+  const context = await fetchStructuredBriefContext(issueId, authToken);
+  if (!context) {
+    return (
+      `[Proxy] 'propose-brief' blocked: unable to validate the '${sectionName}' section on ${issueId}. ` +
+      `Update ${sectionName} to exactly one current scoping-child bullet before requesting Ai signoff/advance.`
+    );
+  }
+
+  const descriptionEntries = extractSpecFindings(context.description, specSource);
+  if (descriptionEntries.length !== 1) {
+    return (
+      `[Proxy] 'propose-brief' blocked: ${issueId} must contain exactly one current '${sectionName}' bullet ` +
+      `for the intended scoping child; found ${descriptionEntries.length}. ` +
+      `Update ${sectionName} before requesting Ai signoff/advance.`
+    );
+  }
+
+  const latestBrief = extractLatestBriefFromComments(context.comments, specSource);
+  if (!latestBrief) {
+    return (
+      `[Proxy] 'propose-brief' blocked: could not find a current signed-off brief comment to compare with '${sectionName}'. ` +
+      `Update ${sectionName} to the signed-off brief before requesting Ai signoff/advance.`
+    );
+  }
+
+  if (briefKey(descriptionEntries[0]) !== briefKey(latestBrief)) {
+    return (
+      `[Proxy] 'propose-brief' blocked: stale or inconsistent '${sectionName}' section on ${issueId}. ` +
+      `The ticket description's structured bullet does not match the latest signed-off brief comment. ` +
+      `Update ${sectionName} before requesting Ai signoff/advance.`
+    );
+  }
+
+  return null;
+}
+
 /**
  * Fetch label nodes with IDs plus the team ID for a Linear issue.
  * Used by B2 to build the label set for the atomic state swap mutation.
@@ -3268,6 +3374,9 @@ export async function checkWorkflowRules(
     );
   }
 
+  // Resolve destination state for transition-specific precondition gates.
+  const destStateNode = def.states.find((s) => s.id === match.to);
+
   // Capability gate — e.g. deploy:execute is Hanzo-only (§16.2).
   // Unknown callers (humans on the sign-off path) bypass capability checks.
   //
@@ -3304,6 +3413,25 @@ export async function checkWorkflowRules(
         `Legal moves: ${legalMoves}.`
       );
     }
+  }
+
+  // INF-621: sprint-spawner propose-brief must not advance into spawning-scope
+  // unless the destination fanout source (`## structured`) already matches the
+  // signed-off brief. Otherwise the engine will mint a scoping child from stale
+  // description content even when the current brief lives in comments.
+  const nextFanoutSpecSource = destStateNode?.fanout?.spec_source;
+  if (
+    workflowId === "sprint-spawner" &&
+    currentState === "determining-scope" &&
+    resolvedIntent === "propose-brief" &&
+    nextFanoutSpecSource
+  ) {
+    const structuredBlock = await validateSprintSpawnerStructuredBrief(
+      issueId,
+      authToken,
+      nextFanoutSpecSource,
+    );
+    if (structuredBlock) return structuredBlock;
   }
 
   // AI-1731 / INF-443: Comment requirement gate.
@@ -3484,9 +3612,6 @@ export async function checkWorkflowRules(
       log.info(`workflow-gate: deploy-probe SUCCEEDED for ${issueId}`);
     }
   }
-
-  // Resolve destination state for subsequent gates.
-  const destStateNode = def.states.find((s) => s.id === match.to);
 
   // ── AI-2476: Merged-PR release gate re-armed (§5.6) ──────────────────
   // A wf:dev-impl ticket must not leave merge or deploy states forward without
