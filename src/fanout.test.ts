@@ -744,6 +744,67 @@ describe("executeFanout — mocked Linear API", () => {
     const commentCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("commentCreate"));
     expect(commentCalls.length).toBeGreaterThanOrEqual(1);
   });
+
+  // ── INF-643: missing-label refuse must be loud, and a missing integration_verify
+  //    label must NOT hard-refuse the primary fan-out ──────────────────────────
+  const INTEGRATION_VERIFY_CONFIG = {
+    spec_source: "findings",
+    child_workflow: "wf:dev-impl",
+    integration_verify: {
+      child_workflow: "wf:integration-verify",
+      per_capability: true,
+      blocked_by: "capability-components",
+    },
+  } as FanoutConfig;
+
+  it("INF-643: missing integration_verify label skips enrichment with a warning — primary children still mint", async () => {
+    const findings: Finding[] = [
+      { title: "Component A", classification: "traces-to-capability", capability: "checkout" },
+      { title: "Component B", classification: "traces-to-capability", capability: "checkout" },
+    ];
+
+    // Team has the primary wf:dev-impl label but NOT wf:integration-verify — the
+    // exact LIF-251 shape. Pre-fix this refused silently (created:0, errors:[]).
+    globalThis.fetch = makeFanoutFetch({
+      teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ],
+    });
+
+    const result = await executeFanout("AI-1439", "Bearer tok", INTEGRATION_VERIFY_CONFIG, {
+      skipPreview: true,
+      findingsOverride: findings,
+    });
+
+    // Primary children mint; the missing secondary label does not refuse.
+    expect(result.refused).toBe(false);
+    expect(result.created).toBe(2);
+    expect(result.childIdentifiers).toEqual(["AI-2001", "AI-2002"]);
+    // No integration-verify child was minted (label unresolved → skipped).
+    expect(result.childIdentifiers).not.toContain("Integration verify");
+  });
+
+  it("INF-643: a missing PRIMARY workflow label still refuses — loudly, with a populated errors array", async () => {
+    const findings: Finding[] = [{ title: "Impl A" }, { title: "Impl B" }];
+
+    // Team lacks wf:dev-impl entirely — minting would produce inert tickets.
+    globalThis.fetch = makeFanoutFetch({
+      teamLabels: [{ id: "existing-state-intake", name: "state:intake" }],
+    });
+
+    const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, {
+      skipPreview: true,
+      findingsOverride: findings,
+    });
+
+    expect(result.refused).toBe(true);
+    expect(result.created).toBe(0);
+    // The refusal is never silent: at least one reported error naming the label.
+    expect(result.errors.length).toBeGreaterThanOrEqual(1);
+    expect(result.errors.some((e) => e.message.includes("wf:dev-impl"))).toBe(true);
+    expect(result.errors.some((e) => e.message.includes("does not exist in team"))).toBe(true);
+  });
 });
 
 // ── Integration: applyStateTransition triggers fan-out ─────────────────────

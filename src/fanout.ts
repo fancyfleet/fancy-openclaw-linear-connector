@@ -1685,29 +1685,56 @@ export async function executeFanout(
   }
 
   // INF-27 AC2: workflow labels are governed routing contracts. Refuse the
-  // whole fan-out before any mint if the target team lacks any referenced wf:*.
+  // whole fan-out before any mint if the target team lacks a PRIMARY child
+  // workflow label — minting there produces an inert ticket no engine picks up.
+  //
+  // INF-643: two hardenings on this gate, both learned from a silent LIF-251
+  // wedge (spawn-impl refused with `created:0, errors:[]`, no alarm):
+  //   1. The `integration_verify.child_workflow` label is a SECONDARY, post-mint
+  //      enrichment target, not a primary child workflow. A missing one must
+  //      NOT hard-refuse the primary fan-out — it is skipped-with-warning here
+  //      and no-ops in the enrichment block below. (Previously it was pushed
+  //      into the must-exist set and hard-set `refused=true`.)
+  //   2. EVERY missing primary label is reported, not just the first per finding
+  //      — the old reporting loop iterated `toSpawn`, so a missing non-`toSpawn`
+  //      label (i.e. integration_verify) set `refused=true` but was `continue`d
+  //      over, yielding a silent refusal. We now iterate the missing set itself.
   const workflowLabelIds = new Map<string, string>();
-  const distinctWorkflowLabels = [...new Set(toSpawn.map((f) => f.child_workflow ?? childWorkflowLabel))];
-  if (config.integration_verify?.child_workflow) {
-    distinctWorkflowLabels.push(config.integration_verify.child_workflow);
+  const primaryWorkflowLabels = [...new Set(toSpawn.map((f) => f.child_workflow ?? childWorkflowLabel))];
+  const integrationVerifyLabel = config.integration_verify?.child_workflow;
+  const labelsToResolve = [...primaryWorkflowLabels];
+  if (integrationVerifyLabel && !labelsToResolve.includes(integrationVerifyLabel)) {
+    labelsToResolve.push(integrationVerifyLabel);
   }
-  for (const labelName of distinctWorkflowLabels) {
+  for (const labelName of labelsToResolve) {
     const labelId = await findLabel(parentCtx.teamId, labelName, authToken);
     if (labelId) {
       workflowLabelIds.set(labelName, labelId);
     }
   }
-  const missingWorkflowLabels = distinctWorkflowLabels.filter((labelName) => !workflowLabelIds.has(labelName));
-  if (missingWorkflowLabels.length > 0) {
+
+  // INF-643: a missing integration_verify label is skip-with-warning, never a
+  // refusal. The enrichment block below no-ops when the label is unresolved, so
+  // the primary implementation children still mint.
+  if (integrationVerifyLabel && !workflowLabelIds.has(integrationVerifyLabel)) {
+    log.warn(
+      `fanout: integration_verify workflow label '${integrationVerifyLabel}' does not exist in team ${parentCtx.teamId} — ` +
+        "skipping integration-verify enrichment for this fan-out; primary children still mint.",
+    );
+  }
+
+  const missingPrimaryLabels = primaryWorkflowLabels.filter((labelName) => !workflowLabelIds.has(labelName));
+  if (missingPrimaryLabels.length > 0) {
     result.refused = true;
-    for (let i = 0; i < toSpawn.length; i++) {
-      const labelName = toSpawn[i].child_workflow ?? childWorkflowLabel;
-      if (!missingWorkflowLabels.includes(labelName)) continue;
+    // INF-643: report EVERY missing primary label. A refusal with an empty
+    // `errors` array is the exact silent-wedge failure this gate must prevent.
+    for (const labelName of missingPrimaryLabels) {
+      const findingIndex = toSpawn.findIndex((f) => (f.child_workflow ?? childWorkflowLabel) === labelName);
       const message =
         `Refusing fan-out (INF-27 AC2): workflow label '${labelName}' does not exist in team ${parentCtx.teamId}. ` +
         "Minting there would produce an inert ticket that no workflow engine picks up. " +
         "Create the label in the target team, or mint into a team that defines it.";
-      result.errors.push({ findingIndex: i, message });
+      result.errors.push({ findingIndex: findingIndex >= 0 ? findingIndex : -1, message });
       log.error(`fanout: ${message}`);
     }
     return result;
@@ -1925,10 +1952,12 @@ export async function executeFanout(
     const verifyWorkflow = config.integration_verify.child_workflow;
     const verifyWfLabelId = workflowLabelIds.get(verifyWorkflow);
     if (!verifyWfLabelId) {
-      result.errors.push({
-        findingIndex: -1,
-        message: `Failed to resolve integration verification workflow label '${verifyWorkflow}'`,
-      });
+      // INF-643: skip-with-warning — a missing integration_verify label must not
+      // fail the fan-out. The primary children already minted; this enrichment
+      // step is secondary. The pre-mint gate already warned; this is the no-op.
+      log.warn(
+        `fanout: skipping integration-verify enrichment — workflow label '${verifyWorkflow}' unresolved in team ${parentCtx.teamId}.`,
+      );
     } else {
       const groups = new Map<string, Array<{ internalId: string; identifier: string; finding: Finding }>>();
       for (const component of createdComponents) {
