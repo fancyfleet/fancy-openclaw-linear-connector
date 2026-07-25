@@ -47,7 +47,7 @@ export interface ProposedChild {
   title: string;
   /** Description (optional). */
   description?: string;
-  /** Workflow the child will be created with (always dev-impl). */
+  /** Workflow label the child will be created with. */
   workflow: string;
   /** Seed acceptance criteria extracted from the finding. */
   seedAc: string;
@@ -67,6 +67,11 @@ export interface SpawnPreview {
   requiresApproval: boolean;
   /** Cap check result. */
   capResult: CapCheckResult;
+}
+
+function normalizeWorkflowLabel(workflow: string | undefined): string {
+  const raw = workflow?.trim() || "wf:dev-impl";
+  return raw.startsWith("wf:") ? raw : `wf:${raw}`;
 }
 
 /** Result of checking caps against a proposed spawn. */
@@ -280,7 +285,7 @@ export async function generateSpawnPreview(
     index: i,
     title: f.title,
     description: f.description,
-    workflow: f.child_workflow ?? "dev-impl",
+    workflow: normalizeWorkflowLabel(f.child_workflow),
     // Seed AC: derive from the finding title + description
     seedAc: f.description
       ? `${f.title}: ${f.description}`
@@ -325,7 +330,7 @@ export function formatPreviewComment(preview: SpawnPreview): string {
   ];
 
   for (const child of preview.children) {
-    lines.push(`${child.index + 1}. **${child.title}** (wf:${child.workflow})`);
+    lines.push(`${child.index + 1}. **${child.title}** (${normalizeWorkflowLabel(child.workflow)})`);
     if (child.description) {
       lines.push(`   _${child.description}_`);
     }

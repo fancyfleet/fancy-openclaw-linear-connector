@@ -105,7 +105,7 @@ states:
     # (sprint-arm-scope, sprint-arm-ux, sprint-arm-design, sprint-arm-spike).
     fanout:
       spec_source: structured
-      child_workflow: wf:sprint-arm-scope    # representative — actual per-arm spec in source
+      child_workflow: wf:sprint-arm-required # sentinel only; each structured entry must carry [wf:sprint-arm-*]
       initial_delegate: astrid
     transitions:
       - command: spawn

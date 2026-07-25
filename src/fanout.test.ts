@@ -810,6 +810,34 @@ describe("executeFanout — mocked Linear API", () => {
     expect(result.errors[1].findingIndex).toBe(2);
   });
 
+  it("captures per-finding mint exceptions as structured errors", async () => {
+    const findings: Finding[] = [
+      { title: "Finding 1" },
+      { title: "Finding 2" },
+    ];
+
+    globalThis.fetch = makeFanoutFetch({
+      teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-todo", name: "state:todo" },
+      ],
+    });
+
+    const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, {
+      skipPreview: true,
+      findingsOverride: findings,
+      lookupEntryState: async () => {
+        throw new Error("state lookup timeout");
+      },
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.attempted).toBe(2);
+    expect(result.errors).toHaveLength(2);
+    expect(result.errors[0].message).toContain("state lookup timeout");
+    expect(fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"))).toHaveLength(0);
+  });
+
   // AC4: A child may itself be an orchestrator — minting is uniform regardless (§5.4)
   it("creates children uniformly as dev-impl regardless of content (AC4: §5.4)", async () => {
     const findings: Finding[] = [

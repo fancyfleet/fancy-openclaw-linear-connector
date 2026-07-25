@@ -1039,6 +1039,18 @@ export function validateFanoutSpec(
       );
     }
   }
+  if (registeredWorkflows && config.spec_source.toLowerCase() === "structured") {
+    const markerLessStructured = findings.find((f) => !f.child_workflow);
+    if (markerLessStructured) {
+      return {
+        ok: false,
+        reason:
+          `fan-out structured spec entry "${markerLessStructured.title}" is missing an explicit [wf:...] marker. ` +
+          `Structured fan-out entries must declare their child workflow; marker-less entries must not inherit ` +
+          `the fanout config default.`,
+      };
+    }
+  }
   // AI-2199: validate per-entry child workflow ids against the registry.
   // When registeredWorkflows is provided, every finding with child_workflow
   // set must reference a registered workflow id. Fail-closed: one unregistered
@@ -2022,6 +2034,7 @@ export async function executeFanout(
     // INF-113: sanitize the title before passing to Linear — strip bracketed
     // issue-refs ([XX-N]) so the auto-linkifier doesn't mangle or truncate.
     const childTitle = sanitizeTitle(finding.title);
+    try {
 
     // INF-307 AC1: reject spec-hash marker titles (dangling -->).
     // The Cycle 4 spawner leak materialized internal HTML-comment spec-registry
@@ -2205,6 +2218,14 @@ export async function executeFanout(
         message: `Failed to create child for finding: "${childTitle}"`,
       });
       log.warn(`fanout: failed to create child for finding ${i + 1}/${toSpawn.length}: "${childTitle}"`);
+    }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      result.errors.push({
+        findingIndex: i,
+        message: `Failed to mint child for finding "${childTitle}": ${msg}`,
+      });
+      log.error(`fanout: mint loop failed for finding ${i + 1}/${toSpawn.length}: "${childTitle}" — ${msg}`);
     }
   }
 
