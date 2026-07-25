@@ -25,6 +25,7 @@ const issuePayload = {
     team: { id: "team-1", key: "ENG" },
     assignee: { id: "user-1", name: "Bob" },
     labelIds: ["label-a", "label-b"],
+    labels: { nodes: [{ name: "wf:task" }, { name: "state:doing" }] },
     url: "https://linear.app/org/issue/ENG-42",
     createdAt: "2026-04-10T09:55:00.000Z",
     updatedAt: "2026-04-10T10:00:00.000Z",
@@ -88,6 +89,7 @@ describe("normalizeLinearEvent — Issue create", () => {
     expect(data.teamKey).toBe("ENG");
     expect(data.assigneeName).toBe("Bob");
     expect(data.labelIds).toEqual(["label-a", "label-b"]);
+    expect(data.labels).toEqual(["wf:task", "state:doing"]);
     expect(data.state.type).toBe("unstarted");
   });
 

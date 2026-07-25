@@ -31,6 +31,7 @@ import { createLogger, componentLogger } from "./logger.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import { getAccessToken, getLinearUserIdForAgent } from "./agents.js";
 import { resolveAgentIdentifiersForRole } from "./escalation-gate.js";
+import { getCurrentState, getWorkflowId, loadWorkflowDefById } from "./workflow-gate.js";
 
 const log = componentLogger(createLogger(), "delegate-ping-pong-detector");
 
@@ -64,6 +65,18 @@ export type ExemptTerminalTargetResolver = (
 ) => Promise<boolean> | boolean;
 
 /**
+ * Resolver deciding whether a dispatch target is already legal for the current
+ * workflow state. Ping-pong suppression is a loop breaker, not a workflow
+ * authority override; if the workflow def says the target fills the current
+ * state's owner_role, the dispatch must be allowed through.
+ */
+export type LegalWorkflowTargetResolver = (
+  agentName: string,
+  delegateId: string,
+  ticketLabels?: string[],
+) => Promise<boolean> | boolean;
+
+/**
  * Default terminal-target resolver: exempt when the target agent fills a
  * configured merge-gate/terminal role (default `deployment`, filled by Hanzo).
  * Resolves role → body identifiers via the capability policy and matches
@@ -86,6 +99,35 @@ export async function defaultExemptTerminalTargetResolver(
   } catch (err) {
     log.warn(
       `ping-pong exempt-target resolve failed (treating as non-exempt): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return false;
+  }
+}
+
+export async function defaultLegalWorkflowTargetResolver(
+  agentName: string,
+  _delegateId: string,
+  ticketLabels?: string[],
+): Promise<boolean> {
+  if (!ticketLabels?.length) return false;
+  const workflowId = getWorkflowId(ticketLabels);
+  if (!workflowId) return false;
+
+  try {
+    const def = await loadWorkflowDefById(workflowId);
+    if (!def) return false;
+    const currentState = getCurrentState(ticketLabels, def);
+    if (!currentState) return false;
+    const stateNode = def.states.find((s) => s.id === currentState);
+    if (!stateNode || stateNode.kind === "terminal" || !stateNode.owner_role) return false;
+
+    const identifiers = await resolveAgentIdentifiersForRole(stateNode.owner_role);
+    return identifiers.has(agentName.toLowerCase().trim());
+  } catch (err) {
+    log.warn(
+      `ping-pong legal-workflow-target resolve failed (treating as non-exempt): ${
         err instanceof Error ? err.message : String(err)
       }`,
     );
@@ -424,12 +466,14 @@ export class DelegatePingPongDetector {
   private config: DelegatePingPongConfig;
   private operationalEventStore?: OperationalEventStore;
   private isExemptTerminalTarget: ExemptTerminalTargetResolver;
+  private isLegalWorkflowTarget: LegalWorkflowTargetResolver;
 
   constructor(
     chainTracker?: DelegateChainTracker,
     config?: Partial<DelegatePingPongConfig>,
     operationalEventStore?: OperationalEventStore,
     exemptTargetResolver?: ExemptTerminalTargetResolver,
+    legalWorkflowTargetResolver?: LegalWorkflowTargetResolver,
   ) {
     this.chainTracker = chainTracker ?? new DelegateChainTracker(config);
     this.config = {
@@ -440,6 +484,7 @@ export class DelegatePingPongDetector {
     };
     this.operationalEventStore = operationalEventStore;
     this.isExemptTerminalTarget = exemptTargetResolver ?? defaultExemptTerminalTargetResolver;
+    this.isLegalWorkflowTarget = legalWorkflowTargetResolver ?? defaultLegalWorkflowTargetResolver;
   }
 
   getChainTracker(): DelegateChainTracker {
@@ -457,6 +502,7 @@ export class DelegatePingPongDetector {
     delegateId: string,
     agentName: string,
     now?: number,
+    ticketLabels?: string[],
   ): Promise<PingPongHandlingResult> {
     this.chainTracker.recordAssignment(ticketId, delegateId, agentName, now);
     const detection = this.chainTracker.detectCycle(ticketId, now);
@@ -510,6 +556,58 @@ export class DelegatePingPongDetector {
           } catch (err) {
             log.error(
               `Operational event append failed for ping-pong exemption on ${ticketId}: ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+          }
+        }
+        return {
+          checked: true,
+          detection,
+          escalation: null,
+          suppressDispatch: false,
+        };
+      }
+
+      let legalWorkflowTarget = false;
+      try {
+        legalWorkflowTarget = await this.isLegalWorkflowTarget(agentName, delegateId, ticketLabels);
+      } catch (err) {
+        log.warn(
+          `ping-pong legal-workflow-target check failed for ${ticketId} (treating as non-exempt): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+
+      if (legalWorkflowTarget) {
+        const bounceCount = Object.values(detection.bounceCounts).reduce((a, b) => Math.max(a, b), 0);
+        log.warn(
+          `PING_PONG_EXEMPT_LEGAL_WORKFLOW_TARGET: issue=${ticketId} target=${agentName} ` +
+          `cyclingDelegates=${detection.cyclingDelegates.join(", ")} bounceCount=${bounceCount} ` +
+          "- cycle observed but dispatch allowed (target owns current workflow state).",
+        );
+        if (this.operationalEventStore) {
+          try {
+            this.operationalEventStore.append({
+              outcome: "ping-pong-exempt-legal-workflow-target",
+              agent: agentName,
+              key: ticketId,
+              sessionKey: ticketId,
+              deliveryMode: "delegate-ping-pong-detector",
+              attemptCount: bounceCount,
+              detail: {
+                ticketId,
+                target: agentName,
+                labels: ticketLabels ?? [],
+                cyclingDelegates: detection.cyclingDelegates,
+                bounceCounts: detection.bounceCounts,
+                maxAllowed: detection.maxAllowed,
+              },
+            });
+          } catch (err) {
+            log.error(
+              `Operational event append failed for ping-pong legal-workflow exemption on ${ticketId}: ${
                 err instanceof Error ? err.message : String(err)
               }`,
             );

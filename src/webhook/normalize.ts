@@ -22,6 +22,7 @@ function extractIssueData(data: Record<string, unknown>): LinearIssueData {
   const assignee = data.assignee
     ? (data.assignee as Record<string, unknown>)
     : null;
+  const labels = data.labels as { nodes?: Array<{ name?: unknown }> } | string[] | undefined;
 
   return {
     id: String(data.id ?? ""),
@@ -45,6 +46,9 @@ function extractIssueData(data: Record<string, unknown>): LinearIssueData {
     labelIds: Array.isArray(data.labelIds)
       ? (data.labelIds as unknown[]).map(String)
       : [],
+    labels: Array.isArray(labels)
+      ? labels.map(String)
+      : (labels?.nodes ?? []).map((node) => String(node.name ?? "")).filter(Boolean),
     url: String(data.url ?? ""),
     createdAt: String(data.createdAt ?? ""),
     updatedAt: String(data.updatedAt ?? ""),

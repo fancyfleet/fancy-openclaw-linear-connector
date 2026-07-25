@@ -21,6 +21,7 @@ import path from "path";
 import {
   DelegateChainTracker,
   DelegatePingPongDetector,
+  defaultLegalWorkflowTargetResolver,
   fireEscalation,
   shouldCheckDelegatePingPong,
   type DelegatePingPongConfig,
@@ -30,6 +31,8 @@ import {
   type PingPongHandlingResult,
 } from "./delegate-ping-pong-detector.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
+import { resetPolicyCache } from "./escalation-gate.js";
+import { resetWorkflowCache } from "./workflow-gate.js";
 
 function tempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "ping-pong-test-"));
@@ -365,6 +368,110 @@ describe("DelegatePingPongDetector", () => {
       // Ticket B should have a cycle
       expect(tracker.detectCycle("INF-218", now + 3000).hasCycle).toBe(true);
     });
+  });
+});
+
+describe("INF-661 - legal workflow targets are not ping-pong suppressed", () => {
+  const TASK_POLICY_YAML = `
+capabilities:
+  - id: linear:transition
+containers:
+  - id: dev
+    grants: [linear:transition]
+  - id: steward
+    grants: [linear:transition]
+roles:
+  - id: requester
+    requires: [linear:transition]
+  - id: department-head
+    requires: [linear:transition]
+  - id: worker
+    requires: [linear:transition]
+bodies:
+  - id: ai
+    openclaw_agent: ai
+    container: steward
+    fills_roles: [requester]
+  - id: astrid
+    openclaw_agent: astrid
+    container: steward
+    fills_roles: [department-head]
+  - id: igor
+    openclaw_agent: igor
+    container: dev
+    fills_roles: [worker]
+`;
+
+  let dir: string;
+  let oldWorkflowDefPath: string | undefined;
+  let oldWorkflowDefsDir: string | undefined;
+  let oldCapabilityPolicyPath: string | undefined;
+
+  beforeEach(() => {
+    dir = tempDir();
+    const defsDir = path.join(dir, "defs");
+    fs.mkdirSync(defsDir);
+    oldWorkflowDefPath = process.env.WORKFLOW_DEF_PATH;
+    oldWorkflowDefsDir = process.env.WORKFLOW_DEFS_DIR;
+    oldCapabilityPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+    fs.copyFileSync(
+      path.join(process.cwd(), "src/__fixtures__/canonical-task.yaml"),
+      path.join(defsDir, "task.yaml"),
+    );
+    fs.writeFileSync(path.join(dir, "capability-policy.yaml"), TASK_POLICY_YAML);
+    process.env.WORKFLOW_DEFS_DIR = defsDir;
+    process.env.WORKFLOW_DEF_PATH = path.join(defsDir, "task.yaml");
+    process.env.CAPABILITY_POLICY_PATH = path.join(dir, "capability-policy.yaml");
+    resetWorkflowCache();
+    resetPolicyCache();
+  });
+
+  afterEach(() => {
+    if (oldWorkflowDefPath === undefined) delete process.env.WORKFLOW_DEF_PATH;
+    else process.env.WORKFLOW_DEF_PATH = oldWorkflowDefPath;
+    if (oldWorkflowDefsDir === undefined) delete process.env.WORKFLOW_DEFS_DIR;
+    else process.env.WORKFLOW_DEFS_DIR = oldWorkflowDefsDir;
+    if (oldCapabilityPolicyPath === undefined) delete process.env.CAPABILITY_POLICY_PATH;
+    else process.env.CAPABILITY_POLICY_PATH = oldCapabilityPolicyPath;
+    resetWorkflowCache();
+    resetPolicyCache();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("INF-604 recovery sequence allows requester, department head, worker, and reviewer legal owners", async () => {
+    const config: Partial<DelegatePingPongConfig> = { maxBounces: 3, windowMs: 60_000 };
+    const eventStore = new OperationalEventStore(path.join(dir, "events.db"));
+    const detector = new DelegatePingPongDetector(
+      new DelegateChainTracker(config),
+      config,
+      eventStore,
+      () => false,
+      defaultLegalWorkflowTargetResolver,
+    );
+    const t = 5_000_000;
+    const ticketId = "INF-604";
+
+    const intake1 = await detector.checkAndHandle(ticketId, "user-ai", "Ai", t, ["wf:task", "state:intake"]);
+    const routing1 = await detector.checkAndHandle(ticketId, "user-astrid", "Astrid", t + 1_000, ["wf:task", "state:routing"]);
+    const doing1 = await detector.checkAndHandle(ticketId, "user-igor", "Igor", t + 2_000, ["wf:task", "state:doing"]);
+    const intake2 = await detector.checkAndHandle(ticketId, "user-ai", "Ai", t + 3_000, ["wf:task", "state:intake"]);
+    const routing2 = await detector.checkAndHandle(ticketId, "user-astrid", "Astrid", t + 4_000, ["wf:task", "state:routing"]);
+    const doing2 = await detector.checkAndHandle(ticketId, "user-igor", "Igor", t + 5_000, ["wf:task", "state:doing"]);
+    const intake3 = await detector.checkAndHandle(ticketId, "user-ai", "Ai", t + 6_000, ["wf:task", "state:intake"]);
+    const review = await detector.checkAndHandle(ticketId, "user-astrid", "Astrid", t + 7_000, ["wf:task", "state:review"]);
+
+    for (const result of [intake1, routing1, doing1, intake2, routing2, doing2, intake3, review]) {
+      expect(result.suppressDispatch).toBe(false);
+      expect(result.escalation).toBeNull();
+    }
+
+    expect(intake3.detection!.hasCycle).toBe(true);
+    expect(review.detection!.hasCycle).toBe(true);
+    const events = eventStore.query({ key: ticketId });
+    expect(events.some((e: { outcome: string; agent?: string | null }) =>
+      e.outcome === "ping-pong-exempt-legal-workflow-target" && e.agent === "Astrid",
+    )).toBe(true);
+    expect(events.some((e: { outcome: string }) => e.outcome === "ping-pong-cycle-detected")).toBe(false);
   });
 });
 

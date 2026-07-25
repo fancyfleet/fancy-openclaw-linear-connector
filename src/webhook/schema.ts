@@ -39,6 +39,8 @@ export interface LinearIssueData {
   /** Users mentioned in the issue/comment */
   mentionedUsers?: Array<{ id?: string; name?: string }>;
   labelIds: string[];
+  /** Label names present on the issue, e.g. ["wf:task", "state:doing"]. */
+  labels: string[];
   url: string;
   createdAt: string; // ISO 8601
   updatedAt: string; // ISO 8601

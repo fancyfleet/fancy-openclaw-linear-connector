@@ -98,9 +98,10 @@ async function checkDelegatePingPong(
 
   const mappedAgentName = buildAgentMap()[delegateId];
   const agentName = mappedAgentName ? getOpenclawAgentName(mappedAgentName) : delegate.name ?? delegateId;
+  const ticketLabels = Array.isArray(data?.labels) ? data.labels as string[] : undefined;
 
   try {
-    const result = await detector.checkAndHandle(ticketId, delegateId, agentName);
+    const result = await detector.checkAndHandle(ticketId, delegateId, agentName, undefined, ticketLabels);
     if (result.suppressDispatch) {
       log.warn(
         `Delegate ping-pong cycle detected for ${ticketId}; suppressing dispatch ` +
