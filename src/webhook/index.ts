@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import { Router, Request, Response } from "express";
-import { verifyLinearSignatureMulti, parseWebhookSecrets } from "./signature.js";
+import { matchWebhookSecret, parseWebhookSecrets } from "./signature.js";
+import { recordWebhookSeen } from "./registry.js";
 import { normalizeLinearEvent } from "./normalize.js";
 import type { LinearEvent } from "./schema.js";
 import { EventStore } from "../store/event-store.js";
@@ -256,6 +257,10 @@ export function createWebhookRouter(
       log.info(`Raw body length: ${rawBody?.length || 0} bytes`);
 
       // ── 3. Signature validation (skip if no secret configured) ────────────
+      // Track which secret matched so we can attribute the delivery to a specific
+      // registered webhook and stamp its "last seen" after the event normalizes
+      // (INF-615).
+      let matchedSecret: string | null = null;
       if (secrets.length > 0) {
         const signature = req.headers["x-linear-signature"] ?? req.headers["linear-signature"];
         if (!signature || typeof signature !== "string") {
@@ -271,9 +276,9 @@ export function createWebhookRouter(
           return;
         }
 
-        const signatureValid = verifyLinearSignatureMulti(rawBody, signature as string, secrets);
-      log.info(`Signature validation result: ${signatureValid ? "valid" : "invalid"}`);
-        if (!signatureValid) {
+        matchedSecret = matchWebhookSecret(rawBody, signature as string, secrets);
+      log.info(`Signature validation result: ${matchedSecret ? "valid" : "invalid"}`);
+        if (!matchedSecret) {
           appendOperationalEvent(operationalEventStore, { outcome: "signature-rejected", errorSummary: "Invalid signature" });
           res.status(401).json({ error: "Invalid signature" });
           return;
@@ -305,6 +310,22 @@ export function createWebhookRouter(
           detail: err instanceof Error ? err.message : String(err),
         });
         return;
+      }
+
+      // ── 6b. Attribute the delivery (INF-615) ──────────────────────────────
+      // Stamp "last seen" (and backfill the team label) for the secret that
+      // validated this delivery, so the admin console shows a live timestamp and
+      // team per registered webhook instead of a permanent "never". Best-effort:
+      // a sidecar write must never fail an otherwise-valid delivery.
+      if (matchedSecret) {
+        const teamKey = (event.data as Record<string, unknown> | undefined)?.teamKey;
+        try {
+          recordWebhookSeen(matchedSecret, {
+            teamKey: typeof teamKey === "string" ? teamKey : undefined,
+          });
+        } catch (err) {
+          log.warn(`recordWebhookSeen failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
 
       // ── 7. Deduplication ──────────────────────────────────────────────────

@@ -46,11 +46,35 @@ export function verifyLinearSignatureMulti(
   signature: string,
   secrets: string[]
 ): boolean {
+  return matchWebhookSecret(rawBody, signature, secrets) !== null;
+}
+
+/**
+ * Like {@link verifyLinearSignatureMulti}, but returns the secret that matched
+ * rather than a boolean — so the caller can attribute the delivery to a specific
+ * registered webhook (e.g. to stamp its "last seen" timestamp; INF-615).
+ *
+ * Shares the short-circuit-on-first-match behaviour of the boolean variant, so
+ * the timing profile is unchanged: a matching secret still stops the scan, and
+ * each attempt uses the constant-time comparison in `verifyLinearSignature`.
+ *
+ * @returns the first secret whose HMAC validates `signature`, or `null` if none.
+ */
+export function matchWebhookSecret(
+  rawBody: Buffer,
+  signature: string,
+  secrets: string[]
+): string | null {
   if (!signature || secrets.length === 0) {
-    return false;
+    return null;
   }
 
-  return secrets.some(secret => verifyLinearSignature(rawBody, signature, secret));
+  for (const secret of secrets) {
+    if (verifyLinearSignature(rawBody, signature, secret)) {
+      return secret;
+    }
+  }
+  return null;
 }
 
 /**

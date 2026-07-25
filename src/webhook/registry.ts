@@ -39,6 +39,14 @@ export type AddResult =
 
 const SECRETS_KEY = "LINEAR_WEBHOOK_SECRETS";
 
+/**
+ * INF-615 — minimum interval between `lastSeen` disk writes for a given secret on
+ * the delivery hot path. "Last seen within the last minute" is precise enough to
+ * spot a drifted/failing webhook while keeping the sidecar off the write path of
+ * every single event. A metadata change (new team label) flushes regardless.
+ */
+const SEEN_THROTTLE_MS = 60_000;
+
 /** Resolve the env file that holds LINEAR_WEBHOOK_SECRETS. */
 function envFilePath(): string {
   // dist/webhook/registry.js → ../../.env resolves to the repo root in prod.
@@ -143,6 +151,53 @@ export function listWebhooks(): WebhookRow[] {
       lastSeen: m?.lastSeen ?? null,
     };
   });
+}
+
+/**
+ * INF-615 — stamp a "last seen" timestamp (and backfill the team label) for the
+ * secret that just validated an inbound delivery.
+ *
+ * This is the piece that was missing: `listWebhooks` always read `lastSeen` from
+ * the sidecar, but nothing ever wrote it, so every row showed "never". It also
+ * closes the URL/Team-empty gap for secrets that were injected straight into
+ * `LINEAR_WEBHOOK_SECRETS` (secret-sync) and so never went through `addWebhook`:
+ * the first delivery creates their sidecar stub, and — when the delivered event
+ * carries a team key — labels the row with the team it actually belongs to. An
+ * operator-supplied `teamLabel` is never overwritten; the URL stays whatever the
+ * console stored (it isn't recoverable from a delivery, so orphans keep it blank).
+ *
+ * Called on the hot delivery path, so writes are throttled: `lastSeen` is only
+ * re-persisted once per `SEEN_THROTTLE_MS` per secret unless there is also a
+ * metadata change (a fresh team label) worth flushing. Best-effort by design —
+ * the caller swallows failures so a metadata write can never fail a delivery.
+ */
+export function recordWebhookSeen(
+  secret: string,
+  opts: { teamKey?: string; now?: number } = {},
+): void {
+  const now = opts.now ?? Date.now();
+  const teamKey = typeof opts.teamKey === "string" ? opts.teamKey.trim() : "";
+
+  const envFile = envFilePath();
+  const id = webhookId(secret);
+  const meta = readMeta(envFile);
+  const existing = meta[id];
+
+  // Backfill the team label only when we have one and none is stored yet — never
+  // clobber a label the operator typed in the console.
+  const nextTeamLabel = existing?.teamLabel || teamKey;
+  const teamChanged = nextTeamLabel !== (existing?.teamLabel ?? "");
+
+  const prevSeen = existing?.lastSeen ? Date.parse(existing.lastSeen) : NaN;
+  const seenFresh = !Number.isNaN(prevSeen) && now - prevSeen < SEEN_THROTTLE_MS;
+  if (seenFresh && !teamChanged) return; // nothing worth a disk write
+
+  meta[id] = {
+    url: existing?.url ?? "",
+    teamLabel: nextTeamLabel,
+    lastSeen: new Date(now).toISOString(),
+  };
+  writeMeta(envFile, meta);
 }
 
 /** AC2 + AC4 — validate, persist the secret, store metadata, echo the new row. */
