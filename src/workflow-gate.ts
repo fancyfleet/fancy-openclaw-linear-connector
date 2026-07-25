@@ -5356,6 +5356,41 @@ export async function applyStateTransition(
         }
       }
 
+      // (a2) INF-545: break-glass escape must never demand a `--target`.
+      // The escape edge re-enters at break_glass.to (e.g. `intake`), whose
+      // owner_role can be a multi-body role (the task workflow's `intake` is
+      // owned by `requester`, ∈ {matt, ai, astrid}). Normal multi-body
+      // resolution below (§(c)) fail-closes asking the caller to re-run with
+      // `--target`, but the `linear escape` CLI exposes no such flag — so the
+      // proxy demands a flag the CLI cannot supply and every stuck-delegate
+      // break-glass hook fails deterministically (INF-540 incident).
+      //
+      // Route custody of the recovered ticket to the escaping caller instead:
+      // by the time we reach B2, checkWorkflowRules' §4.4 gate has already
+      // proven the caller is either the ticket's current delegate or a workflow
+      // steward, so this is deterministic and needs no target. From the
+      // recovery state the caller drives the ticket forward (`continue-workflow`)
+      // or hands it off. An explicit `--target`, if ever wired into the CLI,
+      // still wins via §(a) above.
+      if (
+        resolvedDelegateId === undefined &&
+        intent === breakGlassCommand &&
+        !explicitTarget &&
+        options?.bodyId
+      ) {
+        const callerAgent = getAgent(options.bodyId);
+        if (callerAgent?.linearUserId) {
+          resolvedDelegateId = callerAgent.linearUserId;
+          log.info(
+            `workflow-gate: B2 apply: ${issueId} break-glass '${intent}' → routing recovered ticket to escaping caller '${options.bodyId}' (delegate=${resolvedDelegateId}); no --target required (INF-545)`,
+          );
+        } else {
+          log.warn(
+            `workflow-gate: B2 apply: ${issueId} break-glass '${intent}' caller '${options.bodyId}' has no linearUserId — falling back to role resolution`,
+          );
+        }
+      }
+
       // (b) Deterministic prior-implementer routing (def-driven).
       if (resolvedDelegateId === undefined && wantsPriorImplementer) {
         const priorImplementer = await getImplementer(issueId);
