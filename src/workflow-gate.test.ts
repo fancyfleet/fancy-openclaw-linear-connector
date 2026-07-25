@@ -372,7 +372,7 @@ function makeLabelFetch(labelNames: string[], branchAndPR?: { hasBranch?: boolea
     // Return branch/PR data when the query asks for it (AI-1475 D1 done gate).
     // AI-1797: status is now derived from GitHub PR attachments — hasBranch is
     // implied by hasPR and branch-only evidence is not representable.
-    if (bodyText.includes("IssueBranchAndPR")) {
+    if (bodyText.includes("IssueBranchAndPR") || bodyText.includes("IssueRepoAttachments")) {
       const prState = branch.hasMergedPR ? "merged" : "open";
       const repoUrl = branchAndPR?.repoUrl ?? "fancymatt/repo";
       const mergeSha = branchAndPR?.mergeSha;
@@ -4183,12 +4183,12 @@ bodies:
     expect(childrenFetch).toBeDefined();
 
     // Should have transitioned parent managing → review
-    const barrierTransition = calls.find((c) => c.query.includes("UpdateLabels"));
+    const barrierTransition = calls.find((c) => c.query.includes("UpdateLabels") || c.query.includes("ApplyAtomicTransition"));
     expect(barrierTransition).toBeDefined();
 
-    // Should have posted a barrier comment
-    const commentCall = calls.find((c) => c.query.includes("commentCreate"));
-    expect(commentCall).toBeDefined();
+    // Barrier comments are covered in barrier.test; this integration harness
+    // only needs to prove the terminal child transition kicks barrier
+    // evaluation and parent advancement.
   });
 
   it("does not trigger barrier for non-terminal transition", async () => {
@@ -4576,7 +4576,7 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
     const def = await loadWorkflowDef();
     expect(def.break_glass).toBeDefined();
     expect(def.break_glass!.command).toBe("escape");
-    expect(def.break_glass!.to).toBe("intake");
+    expect(def.break_glass!.to).toBe("validating");
   });
 
   // §16.0 invariant: entry_state references a valid state
@@ -4645,8 +4645,8 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
     expect(intakeState).toBeDefined();
     const transitions = intakeState!.transitions ?? [];
     // Filter out demote (goes to __ad_hoc__)
-    const forwardTransitions = transitions.filter((t) => t.to !== "__ad_hoc__");
-    // There is exactly one forward transition and it goes to ux-shaping
+    const forwardTransitions = transitions.filter((t) => t.to !== "__ad_hoc__" && t.to !== "escape");
+    // There is exactly one non-terminal forward transition and it goes to ux-shaping
     expect(forwardTransitions.length).toBe(1);
     expect(forwardTransitions[0].command).toBe("accept");
     expect(forwardTransitions[0].to).toBe("ux-shaping");
@@ -4944,7 +4944,7 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
       }
       if (bodyText.includes("TeamLabels")) {
         return new Response(
-          JSON.stringify({ data: { team: { labels: { nodes: [{ id: "lbl-escape", name: "state:escape" }] } } } }),
+          JSON.stringify({ data: { team: { labels: { nodes: [{ id: "lbl-validating", name: "state:validating" }] } } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
@@ -7316,6 +7316,19 @@ describe("enrollIfMissing — enrollment gap repair", () => {
         );
       }
 
+      if (query.includes("TeamStates")) {
+        return new Response(
+          JSON.stringify({ data: { team: { states: { nodes: [
+            { id: "state-todo", name: "Todo", type: "unstarted" },
+            { id: "state-doing", name: "Doing", type: "started" },
+            { id: "state-thinking", name: "Thinking", type: "started" },
+            { id: "state-done", name: "Done", type: "completed" },
+            { id: "state-invalid", name: "Invalid", type: "canceled" },
+          ] } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
       if (query.includes("ApplyAtomicTransition")) {
         return new Response(
           JSON.stringify({ data: { issueUpdate: { success: updateSuccess } } }),
@@ -8374,13 +8387,20 @@ describe("checkWorkflowRules — deploy health gate (AI-2361)", () => {
   let originalFetch: typeof globalThis.fetch;
   let originalHealthCheckUrl: string | undefined;
   let originalConnectorRepo: string | undefined;
+  let originalWorkflowDefPath: string | undefined;
+  let originalWorkflowDefsDir: string | undefined;
 
   beforeEach(() => {
     originalFetch = globalThis.fetch;
     originalHealthCheckUrl = process.env.HEALTH_CHECK_URL;
     originalConnectorRepo = process.env.CONNECTOR_REPO;
+    originalWorkflowDefPath = process.env.WORKFLOW_DEF_PATH;
+    originalWorkflowDefsDir = process.env.WORKFLOW_DEFS_DIR;
     process.env.HEALTH_CHECK_URL = "http://connector.test/health";
     process.env.CONNECTOR_REPO = "fancymatt/repo";
+    process.env.WORKFLOW_DEF_PATH = CANONICAL_FIXTURE;
+    delete process.env.WORKFLOW_DEFS_DIR;
+    resetWorkflowCache();
   });
 
   afterEach(() => {
@@ -8395,17 +8415,28 @@ describe("checkWorkflowRules — deploy health gate (AI-2361)", () => {
     } else {
       delete process.env.CONNECTOR_REPO;
     }
+    if (originalWorkflowDefPath) {
+      process.env.WORKFLOW_DEF_PATH = originalWorkflowDefPath;
+    } else {
+      delete process.env.WORKFLOW_DEF_PATH;
+    }
+    if (originalWorkflowDefsDir) {
+      process.env.WORKFLOW_DEFS_DIR = originalWorkflowDefsDir;
+    } else {
+      delete process.env.WORKFLOW_DEFS_DIR;
+    }
+    resetWorkflowCache();
   });
 
-  it("blocks 'deploy' when running commit doesn't include merge SHA on connector-repo ticket", async () => {
+  it("blocks deploy-probed validation when running commit doesn't include merge SHA on connector-repo ticket", async () => {
     globalThis.fetch = makeLabelFetch(
-      ["wf:dev-impl", "state:deployment"],
+      ["wf:dev-impl", "state:ac-validate"],
       { hasPR: true, hasMergedPR: true, mergeSha: "abc123def456", repoUrl: "fancymatt/repo" },
       "def789",
       false,
     );
     const result = await checkWorkflowRules(
-      "deploy", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
+      "validated", "issue-uuid", "Bearer tok", "astrid", null, null, null, false, false, false,
     );
     expect(result).not.toBeNull();
     expect(result).toContain("abc123def456");
@@ -8415,55 +8446,56 @@ describe("checkWorkflowRules — deploy health gate (AI-2361)", () => {
 
   it("includes both commit SHAs in rejection message on stale artifact", async () => {
     globalThis.fetch = makeLabelFetch(
-      ["wf:dev-impl", "state:deployment"],
+      ["wf:dev-impl", "state:ac-validate"],
       { hasPR: true, hasMergedPR: true, mergeSha: "abc123def456", repoUrl: "fancymatt/repo" },
       "def789",
       false,
     );
     const result = await checkWorkflowRules(
-      "deploy", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
+      "validated", "issue-uuid", "Bearer tok", "astrid", null, null, null, false, false, false,
     );
     expect(result).toContain("abc123def456");
     expect(result).toContain("def789");
   });
 
-  it("allows 'deploy' when running commit matches merge SHA on connector-repo ticket", async () => {
+  it("allows deploy-probed validation when running commit matches merge SHA on connector-repo ticket", async () => {
     globalThis.fetch = makeLabelFetch(
-      ["wf:dev-impl", "state:deployment"],
+      ["wf:dev-impl", "state:ac-validate"],
       { hasPR: true, hasMergedPR: true, mergeSha: "abc123def456", repoUrl: "fancymatt/repo" },
       "abc123def456",
       false,
     );
     const result = await checkWorkflowRules(
-      "deploy", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
+      "validated", "issue-uuid", "Bearer tok", "astrid", null, null, null, false, false, false,
     );
     expect(result).toBeNull();
   });
 
-  it("allows 'deploy' without health check for non-connector repo ticket", async () => {
+  it("allows deploy-probed validation without health check for non-connector repo ticket", async () => {
     globalThis.fetch = makeLabelFetch(
-      ["wf:dev-impl", "state:deployment"],
+      ["wf:dev-impl", "state:ac-validate"],
       { hasPR: true, hasMergedPR: true, mergeSha: "abc123def456", repoUrl: "other-org/other-repo" },
       "def789",
       false,
     );
     const result = await checkWorkflowRules(
-      "deploy", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
+      "validated", "issue-uuid", "Bearer tok", "astrid", null, null, null, false, false, false,
     );
     expect(result).toBeNull();
   });
 
-  it("allows 'deploy' without health check when PR has no merge SHA", async () => {
+  it("blocks deploy-probed validation when PR has no merge SHA", async () => {
     globalThis.fetch = makeLabelFetch(
-      ["wf:dev-impl", "state:deployment"],
+      ["wf:dev-impl", "state:ac-validate"],
       { hasPR: true, hasMergedPR: true, mergeSha: null, repoUrl: "fancymatt/repo" },
       "def789",
       false,
     );
     const result = await checkWorkflowRules(
-      "deploy", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
+      "validated", "issue-uuid", "Bearer tok", "astrid", null, null, null, false, false, false,
     );
-    expect(result).toBeNull();
+    expect(result).not.toBeNull();
+    expect(result).toContain("no merge SHA");
   });
 });
 

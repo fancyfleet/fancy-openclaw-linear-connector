@@ -640,6 +640,25 @@ describe("Integration: applyStateTransition + B-4 review", () => {
 
       // Workflow def loading happens via fs, not fetch
 
+      if (query.includes("TeamStates")) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            data: {
+              team: {
+                states: {
+                  nodes: [
+                    { id: "state-todo", name: "Todo", type: "unstarted" },
+                    { id: "state-doing", name: "Doing", type: "started" },
+                    { id: "state-done", name: "Done", type: "completed" },
+                  ],
+                },
+              },
+            },
+          }),
+        } as any);
+      }
+
       // Fetch issue with labels (for context in applyStateTransition)
       if (query.includes("labels") && query.includes("issue(id:")) {
         return Promise.resolve({
@@ -795,7 +814,7 @@ describe("Integration: applyStateTransition + B-4 review", () => {
     resetWorkflowCache();
 
     setupMockFetch({
-      description: "- [x] Some AC",
+      description: "- [x] Some AC\n\n## Findings\n- **Follow-up gap**: Rework required",
     });
 
     const fetchCalls: any[] = [];

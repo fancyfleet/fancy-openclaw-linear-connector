@@ -22,7 +22,7 @@ entry_state: doing
 
 break_glass:
   command: escape
-  to: escape
+  to: doing
   owner_role: steward
 
 states:
@@ -65,7 +65,3 @@ states:
     kind: terminal
     native_state: done
     satisfies_parent_barrier: true   # signals the parent managing-arms barrier
-
-  - id: escape
-    kind: terminal
-    native_state: invalid            # abnormal termination → Canceled column

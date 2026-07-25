@@ -65,6 +65,7 @@ const SPRINT_YAML = `
 id: sprint
 states:
   - id: intake
+    owner_role: steward
     native_state: todo
     transitions: []
 `;
@@ -226,6 +227,11 @@ describe("INF-424 Spawner Transition Race", () => {
           data: { issue: { id: parentInternalId, identifier: issueId, labels: { nodes: [{ name: "wf:sprint-spawner" }, { name: "state:spawning-scope" }] }, delegate: { id: "u-astrid" }, state: { id: "s1" } } }
         }));
       }
+      if (q.includes("query IssueWithComments")) {
+        return new Response(JSON.stringify({
+          data: { issue: { id: parentInternalId, description: "## findings\n- **Cycle 5**: brief", comments: { nodes: [] } } }
+        }));
+      }
       if (q.includes("query IssueTeamParent")) {
         return new Response(JSON.stringify({
           data: { issue: { id: parentInternalId, title: "Parent", description: "## findings\n- **Cycle 5**: brief", team: { id: "t1" }, labels: { nodes: [{ name: "wf:sprint-spawner" }] } } }
@@ -243,7 +249,7 @@ describe("INF-424 Spawner Transition Race", () => {
       }
       if (q.includes("query TeamLabels")) {
         return new Response(JSON.stringify({
-          data: { team: { labels: { nodes: [{ id: "wf-l", name: "wf:sprint-spawner" }, { id: "wf-s", name: "wf:sprint" }, { id: "st-i", name: "state:intake" }, { id: "st-m", name: "state:managing" }] } } }
+          data: { team: { labels: { nodes: [{ id: "wf-l", name: "wf:sprint-spawner" }, { id: "wf-s", name: "wf:sprint" }, { id: "st-i", name: "state:intake" }, { id: "st-t", name: "state:todo" }, { id: "st-m", name: "state:managing" }] } } }
         }));
       }
       if (q.includes("query TeamStateLabels")) {

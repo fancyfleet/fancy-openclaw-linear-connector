@@ -95,9 +95,13 @@ describe("INF-331: oob-reconcile-sweep calls markCronRun", () => {
   afterEach(() => {
     jest.useRealTimers();
     jest.restoreAllMocks();
+    delete process.env.WORKFLOW_DEF_PATH;
+    delete process.env.WORKFLOW_DEFS_DIR;
   });
 
   it("marks lastRunAt after a registered tick completes", async () => {
+    process.env.WORKFLOW_DEF_PATH = "/tmp/inf-331-missing-workflow.yaml";
+    delete process.env.WORKFLOW_DEFS_DIR;
     const { resetCronRegistryForTest, getRegisteredCrons } =
       await import("./cron/registry.js");
     const { registerOobReconcileCron } =
@@ -303,19 +307,26 @@ describe("INF-331: rescue-sweep calls markCronRun", () => {
   afterEach(() => {
     jest.useRealTimers();
     jest.restoreAllMocks();
+    delete process.env.WORKFLOW_DEF_PATH;
+    delete process.env.WORKFLOW_DEFS_DIR;
+    delete process.env.RESCUE_SWEEP_INTERVAL;
+    delete process.env.LINEAR_API_KEY;
   });
 
   it("marks lastRunAt after a registered tick completes", async () => {
+    process.env.WORKFLOW_DEF_PATH = "/tmp/inf-331-missing-workflow.yaml";
+    delete process.env.WORKFLOW_DEFS_DIR;
+    process.env.RESCUE_SWEEP_INTERVAL = "50ms";
+    process.env.LINEAR_API_KEY = "test-token";
     const { resetCronRegistryForTest, getRegisteredCrons } =
       await import("./cron/registry.js");
-    const { registerRescueSweepCron } =
+    const { registerRescueSweepCron, _runRescueSweepIterationForTest } =
       await import("./cron/rescue-sweep-cron.js");
 
     resetCronRegistryForTest();
     registerRescueSweepCron();
 
-    // Advance past immediate first run + one full interval.
-    await jest.advanceTimersByTimeAsync(50);
+    await _runRescueSweepIterationForTest();
 
     expectLastRunAtStamped(getRegisteredCrons(), "rescue-sweep");
   });
@@ -378,19 +389,22 @@ describe("INF-331: done-ticket-detector calls markCronRun", () => {
   afterEach(() => {
     jest.useRealTimers();
     jest.restoreAllMocks();
+    delete process.env.DONE_DETECTOR_INTERVAL;
+    delete process.env.LINEAR_API_KEY;
   });
 
   it("marks lastRunAt after a registered tick completes", async () => {
+    process.env.DONE_DETECTOR_INTERVAL = "50ms";
+    process.env.LINEAR_API_KEY = "test-token";
     const { resetCronRegistryForTest, getRegisteredCrons } =
       await import("./cron/registry.js");
-    const { registerDoneTicketDetectorCron } =
+    const { registerDoneTicketDetectorCron, _runDoneTicketDetectorIterationForTest } =
       await import("./cron/done-ticket-detector.js");
 
     resetCronRegistryForTest();
     registerDoneTicketDetectorCron();
 
-    // Advance past immediate first run + one full interval.
-    await jest.advanceTimersByTimeAsync(50);
+    await _runDoneTicketDetectorIterationForTest();
 
     expectLastRunAtStamped(getRegisteredCrons(), "done-ticket-detector");
   });
