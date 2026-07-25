@@ -74,6 +74,10 @@ interface DevSprintTitleParts {
   icon: string;
 }
 
+const DEV_SPRINT_TITLE_SHAPE_ERROR =
+  `sprint title must include a unique leading icon, cycle number, and theme in the format ` +
+  `"<icon> <Project> Cycle <N> — <Theme>".`;
+
 function parseDevSprintTitle(title: string): DevSprintTitleParts | null {
   const trimmed = title.trim();
   const icon = trimmed.split(/\s+/, 1)[0] ?? "";
@@ -81,6 +85,46 @@ function parseDevSprintTitle(title: string): DevSprintTitleParts | null {
   if (!/\bCycle\s+\d+\b/i.test(trimmed)) return null;
   if (!/\s[—–-]\s+\S/.test(trimmed)) return null;
   return { icon };
+}
+
+function sprintTitleShapeError(title: string): string {
+  return `Refusing fan-out: ${DEV_SPRINT_TITLE_SHAPE_ERROR} Invalid sprint title: "${title}".`;
+}
+
+function validateSprintChildTitleShapes(
+  findings: Finding[],
+  defaultChildWorkflow: string,
+): { ok: true } | { ok: false; findingIndex: number; message: string } {
+  for (let i = 0; i < findings.length; i++) {
+    const finding = findings[i];
+    const childWorkflow = finding.child_workflow ?? defaultChildWorkflow;
+    if (childWorkflow !== "wf:dev-sprint") continue;
+    if (parseDevSprintTitle(finding.title)) continue;
+    return { ok: false, findingIndex: i, message: sprintTitleShapeError(finding.title) };
+  }
+  return { ok: true };
+}
+
+let fanoutPreviewCreateRegistered = false;
+
+export function registerFanoutPreviewCreate(): void {
+  fanoutPreviewCreateRegistered = true;
+  log.info("fanout: preview/create component registered (shared sprint title validation active)");
+}
+
+export function getFanoutPreviewCreateLiveness(): {
+  registered: boolean;
+  subscribed: boolean;
+  sprintTitleValidation: { preview: boolean; create: boolean };
+} {
+  return {
+    registered: fanoutPreviewCreateRegistered,
+    subscribed: fanoutPreviewCreateRegistered,
+    sprintTitleValidation: {
+      preview: true,
+      create: true,
+    },
+  };
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────
@@ -1009,6 +1053,13 @@ export function validateFanoutSpec(
         `after AC definition.`,
     };
   }
+  const sprintTitleValidation = validateSprintChildTitleShapes(findings, config.child_workflow);
+  if (!sprintTitleValidation.ok) {
+    return {
+      ok: false,
+      reason: sprintTitleValidation.message,
+    };
+  }
   if (config.classification_required) {
     const field = config.classification_field?.trim() || "classification";
     const allowed = new Set(config.allowed_classifications ?? []);
@@ -1746,6 +1797,25 @@ export async function executeFanout(
         `Refusing fan-out: "${unsupportedArm.title}" is an implementation arm seed, but '${config.spec_source}' ` +
         `spawn-arms only supports shaping arms (scope, spike, ux, design). Move implementation work to spawn-impl.`,
     });
+    return result;
+  }
+  const sprintTitleValidation = validateSprintChildTitleShapes(findings, childWorkflowLabel);
+  if (!sprintTitleValidation.ok) {
+    result.refused = true;
+    result.errors.push({
+      findingIndex: sprintTitleValidation.findingIndex,
+      message: sprintTitleValidation.message,
+    });
+    await postPreviewComment(
+      parentCtx.internalId,
+      `⛔️ **Fan-out refused — invalid sprint title.**\n\n${sprintTitleValidation.message}\n\n` +
+        `No preview was generated and no children were created. Fix the title and retry the fan-out.`,
+      authToken,
+    );
+    log.warn(
+      `fanout: REFUSED — invalid sprint title shape before preview/create for ${parentIssueId}: ` +
+        sprintTitleValidation.message,
+    );
     return result;
   }
 

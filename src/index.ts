@@ -22,6 +22,7 @@ import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, N
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 import { reconciliationWakeFn as reconciliationWakeWithLeaseCheck } from "./bag/reconciliation-wake.js";
 import { getAutoEnrollLiveness, getTicketNoActivityTimeoutMs, getWorkflowRegistryLiveness, loadWorkflowRegistry } from "./workflow-gate.js";
+import { getFanoutPreviewCreateLiveness, registerFanoutPreviewCreate } from "./fanout.js";
 import { getDefStateMigrationLiveness, registerDefStateMigrationRunner } from "./def-state-migration.js";
 import { getFixtureDriftLiveness, runFixtureDriftCheck } from "./fixture-drift-detector.js";
 import { registerTranscriptRedaction, getTranscriptRedactionHealth } from "./transcript-redaction.js";
@@ -513,6 +514,9 @@ export function createApp(options?: CreateAppOptions) {
       // completes; false means every fanout outcome is absent → current-behavior
       // → potential vacuous advance. Observable at ac-validate without log access.
       fanoutOutcomeStore: getFanoutOutcomeStoreLiveness(),
+      // INF-623: fanout preview/create component liveness — registered at
+      // bootstrap and using one sprint-title validator before preview or create.
+      fanoutPreviewCreate: getFanoutPreviewCreateLiveness(),
       // AI-2582: transcript redaction sweep — periodic .trajectory.jsonl
       // credential redaction. status is "idle"/"running"/"error"; lastRun
       // is null before the first sweep fires.
@@ -609,6 +613,7 @@ export function createApp(options?: CreateAppOptions) {
   // the /admin/api/proposals review console (C5) and the apply pipeline's
   // idempotency/retry surface (AC4.8).
   const proposalStore = new ProposalStore(options?.proposalsDbPath);
+  registerFanoutPreviewCreate();
   const agentQueue = new AgentQueue(options?.agentQueueDbPath);
   const bag = new PendingWorkBag(options?.bagDbPath);
   const wakeConfig = {
