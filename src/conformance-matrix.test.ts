@@ -475,6 +475,29 @@ describe("buildConformanceMatrix — AC2: legal cells pass checkWorkflowRules", 
     (c) => c.expected === "allow",
   );
 
+  // INF-524: a transition whose destination owner_role has >1 candidate and whose
+  // `assign.mode` is `required` now demands an explicit target at checkWorkflowRules
+  // (matching what the connector's applyStateTransition already enforces — the guard
+  // is now reachable through the natural verb, not just the escape hatch). The
+  // operator would supply that target; the conformance harness must too, or the
+  // cell is legal-by-command but incomplete-by-target. Singleton / mode:auto
+  // destinations still auto-resolve, so they take no target here.
+  const roleBodies: Record<string, string[]> = {};
+  for (const b of (testPolicy.bodies ?? []) as Array<{ id: string; fills_roles?: string[] }>) {
+    for (const r of b.fills_roles ?? []) (roleBodies[r] ??= []).push(b.id);
+  }
+  function targetForLegalCell(cell: (typeof legalCells)[number]): string | null {
+    const t = testDef.states
+      .find((s) => s.id === cell.state)
+      ?.transitions?.find((tr) => tr.command === cell.command);
+    if (!t || t.assign?.mode !== "required") return null;
+    const destRole = testDef.states.find((s) => s.id === t.to)?.owner_role;
+    const members = destRole ? roleBodies[destRole] ?? [] : [];
+    if (members.length <= 1) return null; // singleton auto-resolves without a target
+    // Pick a candidate distinct from the caller so not-implementer/not-self hold.
+    return members.find((m) => m !== cell.caller.bodyId) ?? members[0];
+  }
+
   it.each(legalCells)(
     "allow: state=$state command=$command caller=$caller.kind($caller.bodyId) stakes=$flags.stakeLabel",
     async (cell) => {
@@ -489,7 +512,7 @@ describe("buildConformanceMatrix — AC2: legal cells pass checkWorkflowRules", 
         "issue-uuid",
         "Bearer tok",
         cell.caller.bodyId,
-        null,
+        targetForLegalCell(cell),
         cell.caller.linearUserId ?? null,
       );
       expect(result).toBeNull();

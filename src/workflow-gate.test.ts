@@ -74,6 +74,8 @@ containers:
     grants: [linear:transition, human:escalate, workflow:break-glass, workflow:force-deploy]
   - id: code-review
     grants: [linear:transition]
+  - id: host-deploy
+    grants: [linear:transition, deploy:execute, infra:ssh]
 
 roles:
   - id: dev
@@ -86,11 +88,18 @@ roles:
     requires: [human:escalate]
   - id: code-review
     requires: [linear:transition]
+  - id: merge
+    requires: [linear:transition]
+  - id: host-deploy
+    requires: [infra:ssh]
 
 bodies:
   - id: hanzo
     container: deployment
-    fills_roles: [deployment]
+    fills_roles: [deployment, merge]
+  - id: grover
+    container: host-deploy
+    fills_roles: [host-deploy]
   - id: charles
     container: dev
     fills_roles: [dev]
@@ -318,6 +327,7 @@ beforeAll(() => {
     agents: [
       { name: "reviewer", linearUserId: "reviewer-linear-uuid", clientId: "r-client", clientSecret: "r-secret", accessToken: "r-token", refreshToken: "r-refresh" },
       { name: "hanzo", linearUserId: "hanzo-linear-uuid", clientId: "h-client", clientSecret: "h-secret", accessToken: "h-token", refreshToken: "h-refresh" },
+      { name: "grover", linearUserId: "grover-linear-uuid", clientId: "g-client", clientSecret: "g-secret", accessToken: "g-token", refreshToken: "g-refresh" },
       { name: "charles", linearUserId: "charles-linear-uuid", clientId: "c-client", clientSecret: "c-secret", accessToken: "c-token", refreshToken: "c-refresh" },
       { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-client", clientSecret: "a-secret", accessToken: "a-token", refreshToken: "a-refresh" },
     ],
@@ -3912,11 +3922,16 @@ roles:
     requires: [deploy:execute]
   - id: engine
     requires: [linear:transition]
+  # INF-524: submit→code-review requires a reachable code-review body (0-body
+  # non-terminal roles are now rejected/fail-closed). Filled by charles (already
+  # in this fixture's agents.json) so the barrier tests exercise the transition.
+  - id: code-review
+    requires: [linear:transition]
 
 bodies:
   - id: charles
     container: dev
-    fills_roles: [dev]
+    fills_roles: [dev, code-review]
   - id: engine-1
     container: engine
     fills_roles: [engine]
@@ -4076,8 +4091,8 @@ bodies:
         );
       }
 
-      // Barrier: label swap (via issueUpdateLabels → UpdateLabels mutation)
-      if (q.includes("UpdateLabels")) {
+      // Barrier: label/native transition write.
+      if (q.includes("UpdateLabels") || q.includes("ApplyBarrierTransition")) {
         return new Response(
           JSON.stringify({ data: { issueUpdate: { success: true } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
@@ -4155,7 +4170,7 @@ bodies:
     expect(childrenFetch).toBeDefined();
 
     // Should have transitioned parent managing → review
-    const barrierTransition = calls.find((c) => c.query.includes("UpdateLabels"));
+    const barrierTransition = calls.find((c) => c.query.includes("ApplyBarrierTransition"));
     expect(barrierTransition).toBeDefined();
 
     // Should have posted a barrier comment
@@ -4716,6 +4731,27 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
+      // Fetch issue with labels (for applyStateTransition). This must be matched
+      // before broad delegate/issueUpdate branches because the query includes
+      // delegate fields and the release-line fetch shape requires team + id data.
+      if (bodyText.includes("IssueWithLabels")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                id: "internal-uuid",
+                identifier: "AI-1234",
+                team: { id: "team-uuid" },
+                labels: { nodes: [{ id: "lbl-1", name: "wf:sprint" }, { id: "lbl-2", name: "state:intake" }] },
+                delegate: null,
+                assignee: null,
+                state: null,
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
       // Atomic transition-write mutation (state + labels + delegate in one).
       // Must be matched BEFORE the broad "delegate" context-fetch branch:
       // AI-2359 gave the ux-researcher singleton (maya) a linearUserId, so the
@@ -4736,21 +4772,6 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
       if (bodyText.includes("delegate")) {
         return new Response(
           JSON.stringify({ data: { issue: { labels: { nodes: [{ name: "wf:sprint" }, { name: "state:intake" }] }, delegate: null } } }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        );
-      }
-      // Fetch issue with labels (for applyStateTransition)
-      if (bodyText.includes("IssueWithLabels")) {
-        return new Response(
-          JSON.stringify({
-            data: {
-              issue: {
-                id: "internal-uuid",
-                team: { id: "team-uuid" },
-                labels: { nodes: [{ id: "lbl-1", name: "wf:sprint" }, { id: "lbl-2", name: "state:intake" }] },
-              },
-            },
-          }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
@@ -6791,6 +6812,7 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
         { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-client", clientSecret: "a-secret", accessToken: "a-token", refreshToken: "a-refresh" },
         { name: "reviewer", linearUserId: "reviewer-linear-uuid", clientId: "r-client", clientSecret: "r-secret", accessToken: "r-token", refreshToken: "r-refresh" },
         { name: "hanzo", linearUserId: "hanzo-linear-uuid", clientId: "h-client", clientSecret: "h-secret", accessToken: "h-token", refreshToken: "h-refresh" },
+        { name: "grover", linearUserId: "grover-linear-uuid", clientId: "g-client", clientSecret: "g-secret", accessToken: "g-token", refreshToken: "g-refresh" },
       ],
     }, null, 2), "utf8");
     originalConformanceAgentsFile = process.env.AGENTS_FILE;
@@ -6882,8 +6904,12 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
             data: {
               issue: {
                 id: "conf-internal-uuid",
+                identifier: "AI-CONF",
                 team: { id: "conf-team-uuid" },
                 labels: { nodes: currentLabels.map((name) => ({ id: `lbl-${name}`, name })) },
+                delegate: null,
+                assignee: null,
+                state: null,
               },
             },
           }),
