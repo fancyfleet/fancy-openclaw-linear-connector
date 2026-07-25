@@ -72,6 +72,7 @@ interface MockTicket {
   delegateId: string | null;
   delegateName: string | null;
   teamId: string;
+  state?: { name?: string; type?: string } | null;
   title?: string;
 }
 
@@ -156,6 +157,7 @@ function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
         labels: { nodes: t.labels },
         delegate: t.delegateId ? { id: t.delegateId, name: t.delegateName } : null,
         team: { id: t.teamId },
+        state: t.state ?? { name: "In Progress", type: "started" },
       }));
       return new Response(
         JSON.stringify({ data: { issues: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } } }),
@@ -173,6 +175,7 @@ function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
         labels: { nodes: t.labels },
         delegate: t.delegateId ? { id: t.delegateId, name: t.delegateName } : null,
         team: { id: t.teamId },
+        state: t.state ?? { name: "In Progress", type: "started" },
       }));
       return new Response(
         JSON.stringify({ data: { issues: { nodes } } }),
@@ -425,6 +428,40 @@ describe("AC1: sweep detects stranded delegations and re-dispatches", () => {
 
     expect(result.healed).toBe(0);
     expect(wakeDispatches).toHaveLength(0);
+    eventStore.close();
+  });
+
+  it("skips tickets whose native Linear state is terminal even when workflow labels are active", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: string[] = [];
+    const { bus } = makeTestAlertBus();
+
+    globalThis.fetch = makeReconciliationFetch({
+      governedTickets: [
+        {
+          id: "issue-invalid",
+          identifier: "AI-2628",
+          updatedAt: OLD_TIMESTAMP,
+          labels: [WF_LABEL, STATE_IMPLEMENTATION_LABEL],
+          delegateId: DELEGATE_LINEAR_ID,
+          delegateName: DELEGATE_AGENT_NAME,
+          teamId: TEAM_ID,
+          state: { name: "Invalid", type: "canceled" },
+        },
+      ],
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (_, id) => { wakeDispatches.push(id); },
+    });
+
+    expect(result.healed).toBe(0);
+    expect(result.bootstrapHealed).toBe(0);
+    expect(wakeDispatches).toHaveLength(0);
+    expect(eventStore.query({ key: "linear-AI-2628", limit: 20 })).toHaveLength(0);
     eventStore.close();
   });
 });

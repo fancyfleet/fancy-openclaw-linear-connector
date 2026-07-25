@@ -26,6 +26,7 @@ import {
   applyBootstrapToIssue,
 } from "./workflow-bootstrap.js";
 import { autoEnrollPlainDelegation } from "./workflow-gate.js";
+import { isTerminalIssueState } from "./linear-actionable.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
 import { OperationalEventStore, type OperationalEventStore as OperationalEventStoreType } from "./store/operational-event-store.js";
@@ -88,6 +89,8 @@ interface GovernedTicket {
   delegateName: string | null;
   teamId: string;
   plainDelegation?: boolean;
+  /** INF-584: native Linear state, for native-terminality guard. */
+  nativeState?: { name?: string; type?: string } | null;
 }
 
 type LinearIssueNode = {
@@ -97,6 +100,7 @@ type LinearIssueNode = {
   labels: { nodes: Array<{ id: string; name: string }> };
   delegate: { id: string; name: string } | null;
   team: { id: string };
+  state?: { name?: string; type?: string } | null;
 };
 
 type IssuesPageResp = {
@@ -162,6 +166,7 @@ async function queryGovernedTickets(
             labels { nodes { id name } }
             delegate { id name }
             team { id }
+            state { name type }
           }
           pageInfo {
             hasNextPage
@@ -205,6 +210,7 @@ async function queryGovernedTickets(
     delegateName: n.delegate?.name ?? null,
     teamId: n.team.id,
     plainDelegation: false,
+    nativeState: n.state ?? null,
   }));
 }
 
@@ -235,6 +241,7 @@ async function queryAdhocDelegatedTickets(
             labels { nodes { id name } }
             delegate { id name }
             team { id }
+            state { name type }
           }
           pageInfo {
             hasNextPage
@@ -297,6 +304,7 @@ async function queryAdhocDelegatedTickets(
     delegateName: n.delegate?.name ?? null,
     teamId: n.team.id,
     plainDelegation: true,
+    nativeState: n.state ?? null,
   }));
 }
 
@@ -494,7 +502,17 @@ export async function runDelegationReconciliationSweep(
 
   // ── Process each ticket ───────────────────────────────────────────────
   for (const ticket of filtered) {
-    // Skip terminal tickets
+    // Native Linear terminality wins over stale workflow labels on retired issues.
+    if (isTerminalIssueState(ticket.nativeState)) {
+      log.info(
+        `delegation-reconciliation: skipping ${ticket.identifier} — Linear entity is natively terminal ` +
+        `(state.type='${ticket.nativeState?.type ?? "null"}', name='${ticket.nativeState?.name ?? "null"}'); ` +
+        `no legal transition exists on a retired issue`,
+      );
+      continue;
+    }
+
+    // Skip terminal tickets (workflow-label terminal: state:done/escape/canceled)
     if (isTerminal(ticket.labels)) continue;
 
     // ── AC2: wf:* but no state:* and no delegate (dropped enrollment) ────
