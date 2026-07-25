@@ -29,6 +29,7 @@ import { componentLogger, createLogger } from "./logger.js";
 import { findLabel, findOrCreateLabel } from "./linear-helpers.js";
 import { generateSpawnPreview, checkCaps, formatPreviewComment, formatCapRefusalComment, parseSpawnCaps, type SpawnPreview, type CapCheckResult, type SpawnCaps, type FindingInput } from "./spawn-preview.js";
 import type { FanoutConfig, SpawnIfConfig, WorkflowDef } from "./workflow-gate.js";
+import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "fanout");
 
@@ -292,6 +293,18 @@ function cleanSpawnChildDescription(description: string | null | undefined, pare
   clean = clean.replace(parentLine, "");
   clean = clean.trim();
   return clean || undefined;
+}
+
+function workflowDefForLabel(registry: Map<string, WorkflowDef> | undefined, workflowLabel: string): WorkflowDef | undefined {
+  if (!registry) return undefined;
+  return registry.get(workflowLabel) ?? registry.get(workflowLabel.replace(/^wf:/, ""));
+}
+
+function isWorkflowStateActionable(def: WorkflowDef | undefined, stateLabel: string): boolean {
+  if (!def) return false;
+  const stateId = stateLabel.replace(/^state:/, "");
+  const state = def.states.find((s) => s.id === stateId);
+  return Boolean(state?.owner_role && state.kind !== "terminal");
 }
 
 // ── Finding extraction ────────────────────────────────────────────────────
@@ -1353,6 +1366,14 @@ export async function executeFanout(
      * auto-migrate children to escape (terminal).
      */
     lookupEntryState?: (workflowLabel: string) => Promise<string | undefined>;
+    /**
+     * INF-570: workflow registry and dispatch seams used to route children born
+     * directly into an actionable entry state through the canonical wake/ack
+     * contract. Omitted callers preserve the historical no-dispatch behavior.
+     */
+    workflowRegistry?: Map<string, WorkflowDef>;
+    dispatchAckTracker?: DispatchAckTracker;
+    wakeFn?: (agentName: string, ticketIdentifier: string) => Promise<void>;
   },
 ): Promise<FanoutResult> {
   const result: FanoutResult = {
@@ -1788,6 +1809,23 @@ export async function executeFanout(
       createdInternalIds.push(child.internalId);
       createdComponents.push({ ...child, finding });
       log.info(`fanout: created child ${child.identifier} — "${childTitle}" (finding ${i + 1}/${toSpawn.length})`);
+
+      const delegateAgentName = finding.delegate ?? config.initial_delegate;
+      if (
+        delegateAgentName &&
+        delegateId &&
+        options?.wakeFn &&
+        options.dispatchAckTracker &&
+        isWorkflowStateActionable(workflowDefForLabel(options.workflowRegistry, findingWorkflow), stateLabelName)
+      ) {
+        try {
+          await options.wakeFn(delegateAgentName, child.identifier);
+          options.dispatchAckTracker.recordDispatch(delegateAgentName, child.identifier);
+        } catch (wakeErr) {
+          const wakeMsg = wakeErr instanceof Error ? wakeErr.message : String(wakeErr);
+          log.warn(`fanout: wake failed for child ${child.identifier} → ${delegateAgentName}: ${wakeMsg}`);
+        }
+      }
     } else {
       result.errors.push({
         findingIndex: i,

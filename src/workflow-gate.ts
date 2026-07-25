@@ -1921,6 +1921,7 @@ async function fetchBranchAndPRStatus(
     // sync merge status (externally-created branches).
     let hasMergedPR = false;
     let prMetadataAvailable = false;
+    let mergeSha: string | null = null;
     for (const n of prNodes) {
       const meta = n.metadata ?? {};
       const status = (meta as { status?: unknown; state?: unknown }).status ?? (meta as { state?: unknown }).state;
@@ -1928,6 +1929,12 @@ async function fetchBranchAndPRStatus(
         prMetadataAvailable = true;
         if (status.toLowerCase() === "merged") {
           hasMergedPR = true;
+          const metadataMergeSha =
+            (meta as { mergeCommitSha?: unknown; merge_commit_sha?: unknown }).mergeCommitSha ??
+            (meta as { merge_commit_sha?: unknown }).merge_commit_sha;
+          if (typeof metadataMergeSha === "string" && metadataMergeSha.trim()) {
+            mergeSha = metadataMergeSha.trim();
+          }
         }
       }
     }
@@ -1976,7 +1983,6 @@ async function fetchBranchAndPRStatus(
     // metadata can be stale — a merged PR may still show "open" in Linear for
     // minutes or longer. The GitHub API is the source of truth. Check both
     // attachment-based and description-scanned URLs for full coverage.
-    let mergeSha: string | null = null;
     if (allPrUrls.length > 0) {
       const res = await verifyPrMergeStateViaGitHub(allPrUrls);
       if (res.merged) {
@@ -2929,7 +2935,6 @@ export async function checkWorkflowRules(
       "migrate-state",
       "rewind",
       "handoff-work",
-      "refuse-work",
       "set-state",
       "complete",
       "cancel",
@@ -3544,7 +3549,11 @@ export async function checkWorkflowRules(
   if (match.requires_deploy_probe && !breakGlassOverride) {
     const repoRefs = await resolveTicketRepoRefs(labels, issueId, authToken);
     // Only enforce for connector-family repos.
-    const isConnectorRepo = repoRefs.some(r => r.includes("fancy-openclaw-linear-connector"));
+    const configuredConnectorRepo = process.env.CONNECTOR_REPO;
+    const isConnectorRepo = repoRefs.some((r) =>
+      r.includes("fancy-openclaw-linear-connector") ||
+      (configuredConnectorRepo ? r.includes(configuredConnectorRepo) : false)
+    );
     
     if (isConnectorRepo) {
       const branchStatus = await fetchBranchAndPRStatus(issueId, authToken, fetchedIdentifier);
@@ -3763,24 +3772,31 @@ export async function checkWorkflowRules(
   // which is never blocked here. Repo resolution: `repo:*` labels + GitHub
   // attachments; unresolvable or unflagged repos pass (guard is opt-in per
   // repo). Break-glass is exempt (steward recovery path, identity-gated).
-  if (intent === "deploy" && !breakGlassOverride) {
+  const skipsDeployState =
+    workflowId === "dev-impl" &&
+    currentState === "merge" &&
+    intent === "continue" &&
+    match.to === "ac-validate" &&
+    def.states.some((s) => s.id === "deploy");
+  if ((intent === "deploy" || skipsDeployState) && !breakGlassOverride) {
     const repoRefs = await resolveTicketRepoRefs(labels, issueId, authToken);
     const flagged = reposWithoutCiAutoDeploy(repoRefs);
     if (flagged.length > 0) {
       const repoList = flagged.join("', '");
-      log.warn(`workflow-gate: AI-1795 no-CI-auto-deploy guard blocked 'deploy' on ${issueId} (repo '${repoList}', agent=${bodyId})`);
+      const blockedVerb = skipsDeployState ? "continue" : "deploy";
+      log.warn(`workflow-gate: AI-1795 no-CI-auto-deploy guard blocked '${blockedVerb}' on ${issueId} (repo '${repoList}', agent=${bodyId})`);
       notify({
         severity: "warning",
         source: "deploy-policy",
-        title: `no-CI-auto-deploy guard blocked 'deploy' (repo: ${flagged.join(", ")})`,
-        detail: `Ticket ${issueId}: 'deploy' would advance to ac-validate without the merged artifact running. Agent must use 'handoff-host-deploy' → host-deploy instead.`,
+        title: `no-CI-auto-deploy guard blocked '${blockedVerb}' (repo: ${flagged.join(", ")})`,
+        detail: `Ticket ${issueId}: '${blockedVerb}' would advance to ac-validate without the merged artifact running. Agent must route through deploy/host-deploy first.`,
         agent: bodyId,
         ticket: issueId,
       });
       const legalMoves = [...transitions.filter((t) => t.command !== "deploy").map((t) => cliVerbFor(t)), breakGlassCommand].join(", ");
       return (
-        `[Proxy] 'deploy' blocked: repo '${repoList}' has no CI auto-deploy — merging alone leaves the running service on the old build, ` +
-        `and AC validation would verify a stale artifact. Use 'handoff-host-deploy' to route through host-deploy instead. ` +
+        `[Proxy] '${blockedVerb}' blocked: repo '${repoList}' has no CI auto-deploy — merging alone leaves the running service on the old build, ` +
+        `and AC validation would verify a stale artifact. Route through deploy / host-deploy before AC validation. ` +
         `Legal moves: ${legalMoves}.`
       );
     }
@@ -4445,6 +4461,17 @@ export interface ApplyStateTransitionOptions {
    * Providing `null` here is equivalent to `resolvedDelegateId = null` (terminal state).
    */
   delegateOverride?: string | null;
+  /** INF-570: canonical wake delivery for actionable fan-out children. */
+  fanoutWakeFn?: (agentName: string, ticketIdentifier: string) => Promise<void>;
+  /** INF-570: ack tracker for actionable fan-out child dispatches. */
+  getDispatchAckTracker?: () => import("./bag/dispatch-ack-tracker.js").DispatchAckTracker | undefined;
+  /** INF-92: transition-stamped delegate wake hook. */
+  onTransitionWake?: (dispatch: {
+    agentName: string;
+    ticketIdentifier: string;
+    workflowState: string;
+    source: "transition";
+  }) => void | Promise<void>;
 }
 
 /**
@@ -5154,7 +5181,7 @@ export async function applyStateTransition(
   // INF-124: for handoff self-loop, don't short-circuit — the delegate
   // write (via delegateOverride or the target field in the forwarded mutation
   // body) must still fire. Skip the idempotency check entirely.
-  if (intent === "handoff" || intent === "handoff-work") {
+  if (intent === "handoff-work") {
     log.info(`workflow-gate: B2 apply: ${issueId} handoff self-loop at state '${toStateName}' — continuing to delegate write`);
   } else if (currentStateName === toStateName) {
     const targetLabelName = `state:${toStateName}`;
@@ -5190,7 +5217,7 @@ export async function applyStateTransition(
       }
       // INF-124: for handoff self-loop, don't short-circuit — the delegate
       // must be written even though the state label doesn't change.
-      if (intent === "handoff") {
+      if (intent === "handoff-work") {
         log.info(
           `workflow-gate: B2 apply: ${issueId} handoff self-loop at state '${toStateName}' — continuing to delegate write`,
         );
@@ -5739,6 +5766,22 @@ export async function applyStateTransition(
       (resolvedDelegateId != null ? ` delegate=${resolvedDelegateId}` : resolvedDelegateId === null ? ` delegate=cleared` : ``) +
       (resolvedNativeStateId ? ` native=${destNativeState}(${resolvedNativeStateId})` : ``),
     );
+
+    if (!isTerminal && resolvedDelegateId && options?.onTransitionWake) {
+      const delegateAgent = getAgents().find((a) => a.linearUserId === resolvedDelegateId);
+      if (delegateAgent) {
+        await options.onTransitionWake({
+          agentName: delegateAgent.name,
+          ticketIdentifier: issue.identifier ?? issueId,
+          workflowState: toStateName,
+          source: "transition",
+        });
+      } else {
+        log.warn(
+          `workflow-gate: B2 apply: transition wake skipped for ${issueId} — no agent maps to delegate ${resolvedDelegateId}`,
+        );
+      }
+    }
   } else {
     log.error(
       `workflow-gate: B2 apply: transition write FAILED for ${issueId} after ${writeOutcome.attempts} attempt(s) (${writeOutcome.failureKind})` +
@@ -5777,8 +5820,8 @@ export async function applyStateTransition(
     }
   }
 
-  // Clean up artifact binding and implementer record on escape/demote
-  if (toStateName === "escape" || toStateName === "__ad_hoc__") {
+  // Clean up artifact binding and implementer record on break-glass/demote.
+  if (intent === "escape" || toStateName === "__ad_hoc__") {
     removeArtifact(issueId);
     await removeAcRecord(issueId);
   }
@@ -5855,6 +5898,7 @@ export async function applyStateTransition(
   if (applied && pendingFanout) {
     try {
       log.info(`workflow-gate: AI-1992 fan-out: triggering fan-out for ${issueId} (${currentStateName} → ${toStateName}, child=${pendingFanout.config.child_workflow})`);
+      const fanoutWorkflowRegistry = new Map<string, WorkflowDef>();
       const fanoutResult = await executeFanout(issueId, authToken, pendingFanout.config, {
         findingsOverride: pendingFanout.findings,
         // INF-111: resolve each child workflow's true entry_state from its
@@ -5863,8 +5907,12 @@ export async function applyStateTransition(
         lookupEntryState: async (wfLabel: string) => {
           const defId = wfLabel.startsWith("wf:") ? wfLabel.slice(3) : wfLabel;
           const def = await loadWorkflowDefById(defId);
+          if (def) fanoutWorkflowRegistry.set(defId, def);
           return def?.entry_state ? `state:${def.entry_state}` : undefined;
         },
+        workflowRegistry: fanoutWorkflowRegistry,
+        wakeFn: options?.fanoutWakeFn,
+        dispatchAckTracker: options?.getDispatchAckTracker?.(),
       });
       spawnIfEvaluationFailed = fanoutResult.spawnIfResult?.outcome === "failed";
       if (fanoutResult.created > 0) {
@@ -6915,6 +6963,8 @@ export interface SetStateAtomicResult {
   error?: string;
   /** Body name that received the re-dispatch after the state write, if any. */
   redispatched?: string;
+  /** Machine-readable dispatch failure when re-dispatch fallback was needed. */
+  dispatchFailure?: { reasonCode: string; error?: string };
   /** Linear internal UUID of the issue (set on success). AI-1954 attribution. */
   internalId?: string;
 }
@@ -6944,6 +6994,27 @@ export interface SetStateAtomicOptions {
   nativeStateOverride?: string;
   /** Exact native Linear state UUID to write when preserving an existing terminal state. */
   nativeStateIdOverride?: string;
+}
+
+async function dispatchWithRetry(
+  sendWakeUp: (agentId: string, ticketId: string) => Promise<void>,
+  agentId: string,
+  ticketId: string,
+  maxAttempts = 4,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  let lastError = "";
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await sendWakeUp(agentId, ticketId);
+      return { ok: true };
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      if (attempt < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, 10 * attempt));
+      }
+    }
+  }
+  return { ok: false, error: lastError };
 }
 
 /**
@@ -7104,6 +7175,7 @@ export async function setStateAtomic(
   // Step 9: Re-dispatch to the new state's owner (AI-1607).
   // Fail-open: errors are logged but never block the set-state result.
   let redispatched: string | undefined;
+  let dispatchFailure: SetStateAtomicResult["dispatchFailure"] | undefined;
   if (def && options?.sendWakeUp) {
     const destNode = def.states.find((s) => s.id === targetState);
     const ownerRole = destNode?.owner_role;
@@ -7112,11 +7184,29 @@ export async function setStateAtomic(
       try {
         const roleBodies = await resolveBodiesForRole(ownerRole);
         if (roleBodies.length === 1) {
-          await options.sendWakeUp(roleBodies[0], ticketIdentifier);
-          redispatched = roleBodies[0];
-          log.info(
-            `workflow-gate: set-state: re-dispatched ${ticketIdentifier} to '${roleBodies[0]}' (role '${ownerRole}') after advancing to '${targetState}'`,
-          );
+          const targetBody = roleBodies[0];
+          const outcome = await dispatchWithRetry(options.sendWakeUp, targetBody, ticketIdentifier);
+          if (outcome.ok) {
+            redispatched = targetBody;
+            log.info(
+              `workflow-gate: set-state: re-dispatched ${ticketIdentifier} to '${targetBody}' (role '${ownerRole}') after advancing to '${targetState}'`,
+            );
+          } else {
+            dispatchFailure = { reasonCode: "session-never-spawned", error: outcome.error };
+            try {
+              await options.sendWakeUp("ai", ticketIdentifier);
+            } catch (fallbackErr) {
+              log.warn(
+                `workflow-gate: set-state: fallback dispatch to ai failed for ${ticketIdentifier}: ${
+                  fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)
+                } — continuing`,
+              );
+            }
+            redispatched = "ai";
+            log.warn(
+              `workflow-gate: set-state: re-dispatch to '${targetBody}' failed after retry for ${ticketIdentifier}; falling back to ai`,
+            );
+          }
         } else if (roleBodies.length > 1) {
           // INF-58: when delegate is already resolved for a multi-body role,
           // dispatch directly to the delegate body instead of skipping.
@@ -7126,11 +7216,28 @@ export async function setStateAtomic(
               return agent?.linearUserId === resolvedDelegateId;
             });
             if (delegateBody) {
-              await options.sendWakeUp(delegateBody, ticketIdentifier);
-              redispatched = delegateBody;
-              log.info(
-                `workflow-gate: set-state: re-dispatched ${ticketIdentifier} to '${delegateBody}' (role '${ownerRole}') after advancing to '${targetState}' — delegate pre-set for multi-body role`,
-              );
+              const outcome = await dispatchWithRetry(options.sendWakeUp, delegateBody, ticketIdentifier);
+              if (outcome.ok) {
+                redispatched = delegateBody;
+                log.info(
+                  `workflow-gate: set-state: re-dispatched ${ticketIdentifier} to '${delegateBody}' (role '${ownerRole}') after advancing to '${targetState}' — delegate pre-set for multi-body role`,
+                );
+              } else {
+                dispatchFailure = { reasonCode: "session-never-spawned", error: outcome.error };
+                try {
+                  await options.sendWakeUp("ai", ticketIdentifier);
+                } catch (fallbackErr) {
+                  log.warn(
+                    `workflow-gate: set-state: fallback dispatch to ai failed for ${ticketIdentifier}: ${
+                      fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)
+                    } — continuing`,
+                  );
+                }
+                redispatched = "ai";
+                log.warn(
+                  `workflow-gate: set-state: re-dispatch to '${delegateBody}' failed after retry for ${ticketIdentifier}; falling back to ai`,
+                );
+              }
             } else {
               log.warn(
                 `workflow-gate: set-state: skipping re-dispatch for ${ticketIdentifier} — delegate (linearUserId=${resolvedDelegateId}) is not a member of role '${ownerRole}'`,
@@ -7153,7 +7260,15 @@ export async function setStateAtomic(
     }
   }
 
-  return { ok: true, ticketId: ticketIdentifier, from: fromState, to: targetState, internalId: issue.internalId, ...(redispatched ? { redispatched } : {}) };
+  return {
+    ok: true,
+    ticketId: ticketIdentifier,
+    from: fromState,
+    to: targetState,
+    internalId: issue.internalId,
+    ...(redispatched ? { redispatched } : {}),
+    ...(dispatchFailure ? { dispatchFailure } : {}),
+  };
 }
 
 /**

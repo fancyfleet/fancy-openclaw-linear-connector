@@ -34,10 +34,12 @@ import { componentLogger, createLogger } from "./logger.js";
 import {
   fetchIssueContext,
   applyBootstrapToIssue,
-  type WorkflowDef,
 } from "./workflow-bootstrap.js";
+import { loadWorkflowRegistry, type WorkflowDef } from "./workflow-gate.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { registerCron, markCronRun, formatIntervalMs } from "./cron/registry.js";
+import { buildAgentMap } from "./agents.js";
+import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "bootstrap-reconciliation");
 
@@ -64,6 +66,8 @@ export interface ReconciliationSweepOptions {
   alertBus?: AlertBus;
   /** Called to wake the first-owner delegate after a successful heal. */
   wakeFn?: (agentName: string, ticketIdentifier: string) => Promise<void>;
+  /** Dispatch ack tracker used by the watchdog/reconciliation backstop. */
+  dispatchAckTracker?: DispatchAckTracker;
   /** Injectable fetch (tests). Defaults to global fetch. */
   fetchFn?: typeof fetch;
 }
@@ -84,6 +88,51 @@ export interface ReconciliationSweepResult {
 interface EnrolledTicketNativeState {
   state: { id: string; name: string; type: string } | null;
   delegate: { id: string } | null;
+}
+
+type ReconciliationCandidate = {
+  id: string;
+  identifier: string;
+  updatedAt: string;
+  labels: Array<{ id: string; name: string }>;
+  delegateId: string | null;
+  teamId: string;
+};
+
+function workflowDefForLabel(registry: Map<string, WorkflowDef> | undefined, workflowLabel: string): WorkflowDef | undefined {
+  if (!registry) return undefined;
+  return registry.get(workflowLabel) ?? registry.get(workflowLabel.replace(/^wf:/, ""));
+}
+
+function isActionableWorkflowLabelState(
+  registry: Map<string, WorkflowDef> | undefined,
+  workflowLabel: string,
+  stateLabel: string,
+): boolean {
+  const def = workflowDefForLabel(registry, workflowLabel);
+  const state = def?.states.find((s) => s.id === stateLabel.replace(/^state:/, ""));
+  return Boolean(state?.owner_role && state.kind !== "terminal");
+}
+
+function hasDispatchRecord(ackTracker: DispatchAckTracker, agentName: string, ticketIdentifier: string): boolean {
+  return ackTracker
+    .listFiltered({ agentId: agentName, limit: 1000 })
+    .some((entry) => entry.ticketId === `linear-${ticketIdentifier}` || entry.ticketId === ticketIdentifier);
+}
+
+async function loadDispatchWorkflowRegistry(
+  opts: ReconciliationSweepOptions,
+  wakeFn: ReconciliationSweepOptions["wakeFn"],
+): Promise<Map<string, WorkflowDef> | undefined> {
+  if (opts.workflowRegistry) return opts.workflowRegistry;
+  if (!opts.dispatchAckTracker || !wakeFn) return undefined;
+  try {
+    return await loadWorkflowRegistry();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`bootstrap-reconciliation: could not load workflow registry for actionable dispatch pass: ${msg}`);
+    return undefined;
+  }
 }
 
 /**
@@ -351,16 +400,7 @@ async function reconcileTerminalNativeState(
 async function queryUnenrolledTickets(
   authToken: string,
   fetchFn: typeof fetch,
-): Promise<
-  Array<{
-    id: string;
-    identifier: string;
-    updatedAt: string;
-    labels: Array<{ id: string; name: string }>;
-    delegateId: string | null;
-    teamId: string;
-  }>
-> {
+): Promise<ReconciliationCandidate[]> {
   const query = `
     query BootstrapReconciliation {
       issues(filter: { labels: { some: { name: { startsWith: "wf:" } } } }) {
@@ -430,6 +470,7 @@ export async function runBootstrapReconciliationSweep(
   // Tests inject their own bus to assert alert behavior.
   const alertBus = opts.alertBus ?? getAlertBus();
   const wakeFn = opts.wakeFn;
+  const workflowRegistry = await loadDispatchWorkflowRegistry(opts, wakeFn);
 
   const result: ReconciliationSweepResult = {
     scanned: 0,
@@ -538,7 +579,30 @@ export async function runBootstrapReconciliationSweep(
     }
   }
 
-  // ── Pass 2: Enrolled tickets whose native terminal state should close facets ──
+  // ── Pass 2: Enrolled actionable tickets missing dispatch records (INF-570) ──
+  for (const ticket of candidates) {
+    const workflowLabel = ticket.labels.find((l) => l.name.startsWith("wf:"))?.name;
+    const stateLabel = ticket.labels.find((l) => l.name.startsWith("state:"))?.name;
+    if (!workflowLabel || !stateLabel || !ticket.delegateId) continue;
+    if (!wakeFn || !opts.dispatchAckTracker) continue;
+    if (!isActionableWorkflowLabelState(workflowRegistry, workflowLabel, stateLabel)) continue;
+
+    const agentName = buildAgentMap()[ticket.delegateId];
+    if (!agentName) continue;
+    if (hasDispatchRecord(opts.dispatchAckTracker, agentName, ticket.identifier)) continue;
+
+    try {
+      await wakeFn(agentName, ticket.identifier);
+      opts.dispatchAckTracker.recordDispatch(agentName, ticket.identifier);
+      log.info(`bootstrap-reconciliation: dispatched missing actionable ack for ${ticket.identifier} to ${agentName}`);
+    } catch (wakeErr) {
+      const wakeMsg = wakeErr instanceof Error ? wakeErr.message : String(wakeErr);
+      result.errors.push(`actionable dispatch failed for ${ticket.identifier}: ${wakeMsg}`);
+      log.warn(`bootstrap-reconciliation: actionable dispatch failed for ${ticket.identifier}: ${wakeMsg}`);
+    }
+  }
+
+  // ── Pass 3: Enrolled tickets whose native terminal state should close facets ──
   for (const ticket of candidates) {
     const hasStateLabel = ticket.labels.some((l) => l.name.startsWith("state:"));
     if (!hasStateLabel) continue; // only enrolled tickets
@@ -599,9 +663,9 @@ export async function runBootstrapReconciliationSweep(
     }
   }
 
-  // ── Pass 3: Terminal workflow label but active native state (INF-497) ────────
-  // The mirror image of Pass 2. Pass 2 closes tickets that are native-Done but
-  // still carry live workflow labels. Pass 3 handles the inverse: the workflow
+  // ── Pass 4: Terminal workflow label but active native state (INF-497) ────────
+  // The mirror image of Pass 3. Pass 3 closes tickets that are native-Done but
+  // still carry live workflow labels. Pass 4 handles the inverse: the workflow
   // record already reached terminal `done` (label `state:done`) but the native
   // Linear state was never advanced off an active column — the INF-496 shape
   // (`wf:task` + `state:done` + native `To Do` + null delegate). The null-delegate
@@ -621,7 +685,7 @@ export async function runBootstrapReconciliationSweep(
       const stateData = await queryEnrolledTicketState(ticket.id, authToken, fetchFn);
       if (!stateData || !stateData.state) continue;
       // Already terminal (completed/canceled) → nothing to reconcile. A native-Done
-      // ticket with live labels is Pass 2's job; a canceled ticket must not be
+      // ticket with live labels is Pass 3's job; a canceled ticket must not be
       // force-completed.
       if (stateData.state.type === "completed" || stateData.state.type === "canceled") continue;
 
@@ -704,6 +768,8 @@ export function registerBootstrapReconciliationCron(
      *  Required for AC1 in the prod path — index.ts wires this to the same
      *  delivery mechanism the webhook bootstrap path uses. */
     wakeFn?: (agentName: string, ticketIdentifier: string) => Promise<void>;
+    /** Dispatch ack tracker used by the watchdog/reconciliation backstop. */
+    dispatchAckTracker?: DispatchAckTracker;
   },
 ): NodeJS.Timeout {
   const intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
@@ -722,6 +788,7 @@ export function registerBootstrapReconciliationCron(
       authToken: opts.authToken,
       alertBus: opts.alertBus,
       wakeFn: opts.wakeFn,
+      dispatchAckTracker: opts.dispatchAckTracker,
     }).catch((err) => {
       log.error(
         `bootstrap-reconciliation: unexpected sweep failure: ${err instanceof Error ? err.message : String(err)}`,

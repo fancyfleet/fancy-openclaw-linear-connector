@@ -151,8 +151,8 @@ describe("INF-27 AC2: mint guard — an absent wf:* label must fail loudly, not 
   // ── AC2 core: absent wf:* label ⇒ loud refusal, zero inert tickets ────────
 
   it("AC2: refuses the fan-out when the target team does not define the wf:* label — and mints NOTHING", async () => {
-    // The LIF-2 shape: team defines state:intake but NO wf:dev-impl.
-    globalThis.fetch = makeFanoutFetch({ teamLabels: [{ id: "existing-state-label", name: "state:intake" }] });
+    // The LIF-2 shape: team defines the entry state but NO wf:dev-impl.
+    globalThis.fetch = makeFanoutFetch({ teamLabels: [{ id: "existing-state-label", name: "state:todo" }] });
 
     const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, {
       skipPreview: true,
@@ -179,7 +179,7 @@ describe("INF-27 AC2: mint guard — an absent wf:* label must fail loudly, not 
     // Today's per-finding `continue` (fanout.ts:1096) would partial-spawn the
     // rest of the findings. A partial spawn is exactly the LIF-2 failure mode:
     // some children exist, the barrier's view is wrong, the parent falls through.
-    globalThis.fetch = makeFanoutFetch({ teamLabels: [{ id: "existing-state-label", name: "state:intake" }] });
+    globalThis.fetch = makeFanoutFetch({ teamLabels: [{ id: "existing-state-label", name: "state:todo" }] });
 
     const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, {
       skipPreview: true,
@@ -200,7 +200,7 @@ describe("INF-27 AC2: mint guard — an absent wf:* label must fail loudly, not 
     globalThis.fetch = makeFanoutFetch({
       teamLabels: [
         { id: "existing-wf-label", name: "wf:dev-impl" },
-        { id: "existing-state-label", name: "state:intake" },
+        { id: "existing-state-label", name: "state:todo" },
       ],
     });
 
@@ -228,7 +228,7 @@ describe("INF-27 AC2: mint guard — an absent wf:* label must fail loudly, not 
     globalThis.fetch = makeFanoutFetch({
       teamLabels: [
         { id: "existing-wf-label", name: "wf:dev-impl" },
-        { id: "existing-state-label", name: "state:intake" },
+        { id: "existing-state-label", name: "state:todo" },
       ],
     });
 
@@ -251,11 +251,11 @@ describe("INF-27 AC2: mint guard — an absent wf:* label must fail loudly, not 
     }
   });
 
-  it("BLAST-RADIUS PIN (passes today by design): state:intake is still create-on-miss — the guard is scoped to wf:* only", async () => {
+  it("BLAST-RADIUS PIN (passes today by design): state:todo is still create-on-miss — the guard is scoped to wf:* only", async () => {
     // NOT a red test. AC2 names the `wf:*` label specifically. `state:*` labels
     // are engine-owned bookkeeping and are legitimately created on demand; the
     // guard must not over-refuse and start rejecting teams that simply have not
-    // been stamped with state:intake yet.
+    // been stamped with state:todo yet.
     globalThis.fetch = makeFanoutFetch({ teamLabels: [{ id: "existing-wf-label", name: "wf:dev-impl" }] });
 
     const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, {
@@ -263,7 +263,7 @@ describe("INF-27 AC2: mint guard — an absent wf:* label must fail loudly, not 
       findingsOverride: [{ title: "Only finding" }],
     });
 
-    expect(labelCreateCallsFor("state:intake")).toHaveLength(1);
+    expect(labelCreateCallsFor("state:todo")).toHaveLength(1);
     expect(result.refused).toBe(false);
     expect(result.created).toBe(1);
   });

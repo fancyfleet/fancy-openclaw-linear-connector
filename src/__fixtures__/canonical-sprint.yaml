@@ -7,6 +7,7 @@
 #
 # Verbatim copy of the canonical vault file at:
 #   ai-systems/projects/fleet-orchestration-redesign/workflows/sprint.yaml
+# Runtime source is loaded from WORKFLOW_DEFS_DIR in deployed connector configs.
 # Used as a test fixture so CI can exercise the canonical schema without
 # depending on the vault being present. Keep in sync with the vault source.
 #
@@ -19,7 +20,7 @@ entry_state: intake
 
 break_glass:
   command: escape               # x-openclaw-linear-intent value that triggers break-glass (§4.4)
-  to: escape
+  to: validating
   owner_role: steward           # implicit escape edge from EVERY state (design.md §4.4)
 
 states:
@@ -81,8 +82,3 @@ states:
     kind: terminal
     native_state: done
     satisfies_parent_barrier: true   # uniform terminal contract (design.md §5.4)
-
-  - id: escape
-    kind: terminal
-    native_state: invalid
-    # break-glass terminal; steward decides if Matt escalation is warranted (design.md §11)

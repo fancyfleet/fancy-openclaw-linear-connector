@@ -85,6 +85,15 @@ async function runSweepIteration(operationalEventStore?: OperationalEventStore):
   }
 }
 
+export async function _runRescueSweepIterationForTest(
+  operationalEventStore?: OperationalEventStore,
+): Promise<void> {
+  if (process.env.NODE_ENV !== "test") {
+    throw new Error("_runRescueSweepIterationForTest is test-only");
+  }
+  await runSweepIteration(operationalEventStore);
+}
+
 /**
  * Register the rescue sweep as an in-process recurring job.
  * Interval is controlled by RESCUE_SWEEP_INTERVAL env var (default: 1h).
@@ -102,13 +111,13 @@ export function registerRescueSweepCron(operationalEventStore?: OperationalEvent
   const firstRunTimer = setTimeout(() => {
     void runSweepIteration(operationalEventStore);
   }, 0);
-  firstRunTimer.unref();
+  if (process.env.NODE_ENV !== "test") firstRunTimer.unref();
 
   // Recurring interval.
   const timer = setInterval(() => {
     void runSweepIteration(operationalEventStore);
   }, intervalMs);
-  timer.unref();
+  if (process.env.NODE_ENV !== "test") timer.unref();
 
   log.info(
     `[rescue-sweep] Rescue sweep scheduled every ${intervalMs}ms (RESCUE_SWEEP_INTERVAL=${process.env.RESCUE_SWEEP_INTERVAL ?? "1h"})` +
