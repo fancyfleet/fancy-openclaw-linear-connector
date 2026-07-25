@@ -1,6 +1,6 @@
 import crypto from "crypto";
 import { Router, Request, Response } from "express";
-import { matchLinearSignature, parseWebhookSecrets } from "./signature.js";
+import { diagnoseLinearSignatureMismatch, matchLinearSignature, parseWebhookSecrets } from "./signature.js";
 import { recordWebhookSeen } from "./registry.js";
 import { normalizeLinearEvent } from "./normalize.js";
 import type { LinearEvent } from "./schema.js";
@@ -357,6 +357,25 @@ export function createWebhookRouter(
             detail: { ...diagnostic, loadedHmacCount: secrets.length },
           });
           webhookSecretDriftTracker.record({ diagnostic, secretCount: secrets.length });
+          const mismatchDiagnostic = diagnoseLinearSignatureMismatch(rawBody, signature, secrets);
+          if (mismatchDiagnostic.armed) {
+            if (mismatchDiagnostic.match) {
+              log.warn(
+                `INF-586 signature reject diagnostic matched transform=${mismatchDiagnostic.match.transform} ` +
+                `secretIndex=${mismatchDiagnostic.match.secretIndex} ` +
+                `secretFingerprint=${mismatchDiagnostic.match.secretFingerprint} ` +
+                `bytes=${mismatchDiagnostic.match.originalLength}->${mismatchDiagnostic.match.candidateLength} ` +
+                `remainingBudget=${mismatchDiagnostic.remainingBudget}`,
+              );
+            } else {
+              log.warn(
+                `INF-586 signature reject diagnostic found no transform match ` +
+                `tested=${mismatchDiagnostic.testedTransforms}x${mismatchDiagnostic.testedSecrets} ` +
+                `rawBodyPath=${mismatchDiagnostic.rawBodyPath ?? "(not written)"} ` +
+                `remainingBudget=${mismatchDiagnostic.remainingBudget}`,
+              );
+            }
+          }
           res.status(401).json({ error: "Invalid signature" });
           return;
         }
