@@ -71,7 +71,11 @@ import { getRescueSweepState } from "./rescue-sweep-state.js";
 import { getDetectorState } from "./done-ticket-detector-state.js";
 import { registerFirstActionWatchdogCron } from "./first-action-watchdog.js";
 import { getFirstActionWatchdogState } from "./first-action-watchdog-state.js";
-import { classifyCrossCheckIssue, type CrossCheckIssue } from "./first-action-crosscheck.js";
+import {
+  classifyCrossCheckIssue,
+  fetchCrossCheckIssueWithFallback,
+  type CrossCheckTokenCandidate,
+} from "./first-action-crosscheck.js";
 import { StallReasonCode, type StallReason, type WakeFailureDiagnostic } from "./wake-observability/index.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
 import { getCapabilityPolicy } from "./escalation-gate.js";
@@ -1951,23 +1955,29 @@ if (isEntryPoint) {
       // INF-604: select archivedAt/trashed so a soft-deleted (trashed) issue,
       // which still resolves through the archive on a node query, is detected
       // instead of reading as a live governed ticket and drawing endless wakes.
-      const query = `query($id: String!) { issue(id: $id) { id archivedAt trashed state { type } labels { nodes { name } } } }`;
-      let issue: CrossCheckIssue | null;
-      try {
-        const res = await fetch(LINEAR_API_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: reconciliationAuthToken },
-          body: JSON.stringify({ query, variables: { id: t.ticket } }),
-        });
-        const data = (await res.json()) as { data?: { issue?: CrossCheckIssue | null } };
-        if (data.data === undefined) return "unknown"; // auth/transport error — fail open
-        issue = data.data?.issue ?? null;
-      } catch {
+      //
+      // Follow-up from live LSO-8 evidence: the shared ai token can 401 on a
+      // trashed issue even though the steward/delegate token can read it. Try
+      // scoped tokens before returning unknown; do not treat a bare 401 as stale.
+      const tokenCandidates: CrossCheckTokenCandidate[] = [
+        { source: "steward:astrid", token: getAccessToken("astrid") },
+        { source: t.delegate, token: getAccessToken(t.delegate) },
+        { source: "ai", token: getAccessToken("ai") },
+        { source: "reconciliation", token: reconciliationAuthToken },
+        { source: "env", token: process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY },
+      ];
+      const fetched = await fetchCrossCheckIssueWithFallback({
+        fetchFn: fetch,
+        linearApiUrl: LINEAR_API_URL,
+        ticket: t.ticket,
+        tokenCandidates,
+      });
+      if (fetched.status === "unknown") {
         return "unknown";
       }
       // Interpretation is a pure, unit-tested function (INF-604); this closure
       // owns only the mirror side-effect each verdict implies.
-      const action = classifyCrossCheckIssue(issue, t.state);
+      const action = classifyCrossCheckIssue(fetched.issue, t.state);
       if (action.verdict === "live") return "live";
       switch (action.heal) {
         case "deleted":

@@ -24,6 +24,7 @@ import path from "node:path";
 import { describe, it, expect, beforeEach, afterEach, jest } from "@jest/globals";
 import {
   classifyCrossCheckIssue,
+  fetchCrossCheckIssueWithFallback,
   type CrossCheckIssue,
 } from "./first-action-crosscheck.js";
 import {
@@ -138,6 +139,72 @@ describe("classifyCrossCheckIssue — INF-604 trashed/archived detection", () =>
         "intake",
       ),
     ).toEqual({ verdict: "live" });
+  });
+});
+
+describe("fetchCrossCheckIssueWithFallback — INF-604 archived auth fallback", () => {
+  it("tries the steward/delegate token after a 401/missing-data response", async () => {
+    const fetchFn = jest
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce({
+        json: async () => ({ errors: [{ message: "Linear API returned 401" }] }),
+        status: 401,
+      } as Response)
+      .mockResolvedValueOnce({
+        json: async () => ({
+          data: {
+            issue: {
+              trashed: true,
+              archivedAt: "2026-07-24T20:49:00.000Z",
+              state: { type: "started" },
+              labels: {
+                nodes: [{ name: "wf:dev-sprint" }, { name: "state:ac-definition" }],
+              },
+            },
+          },
+        }),
+        status: 200,
+      } as Response);
+
+    const fetched = await fetchCrossCheckIssueWithFallback({
+      fetchFn,
+      linearApiUrl: "https://linear.example/graphql",
+      ticket: "LSO-8",
+      tokenCandidates: [
+        { source: "ai", token: "ai-token" },
+        { source: "steward:astrid", token: "astrid-token" },
+      ],
+    });
+
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    expect(fetchFn.mock.calls[0]?.[1]?.headers).toMatchObject({
+      Authorization: "Bearer ai-token",
+    });
+    expect(fetchFn.mock.calls[1]?.[1]?.headers).toMatchObject({
+      Authorization: "Bearer astrid-token",
+    });
+    expect(fetched).toMatchObject({ status: "ok", source: "steward:astrid" });
+    if (fetched.status !== "ok") throw new Error("expected cross-check fetch to succeed");
+    expect(classifyCrossCheckIssue(fetched.issue, "ac-definition")).toEqual({
+      verdict: "stale",
+      heal: "trashed",
+    });
+  });
+
+  it("returns unknown after all token candidates fail instead of marking stale", async () => {
+    const fetchFn = jest.fn<typeof fetch>().mockResolvedValue({
+      json: async () => ({ errors: [{ message: "Linear API returned 401" }] }),
+      status: 401,
+    } as Response);
+
+    await expect(
+      fetchCrossCheckIssueWithFallback({
+        fetchFn,
+        linearApiUrl: "https://linear.example/graphql",
+        ticket: "OTHER-1",
+        tokenCandidates: [{ source: "ai", token: "ai-token" }],
+      }),
+    ).resolves.toMatchObject({ status: "unknown" });
   });
 });
 

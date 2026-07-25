@@ -30,6 +30,77 @@ export interface CrossCheckIssue {
   labels?: { nodes?: Array<{ name: string }> } | null;
 }
 
+export const CROSS_CHECK_ISSUE_QUERY =
+  `query($id: String!) { issue(id: $id) { id archivedAt trashed state { type } labels { nodes { name } } } }`;
+
+export interface CrossCheckTokenCandidate {
+  source: string;
+  token: string | undefined | null;
+}
+
+export type CrossCheckIssueFetchResult =
+  | { status: "ok"; source: string; issue: CrossCheckIssue | null }
+  | { status: "unknown"; error: string };
+
+interface CrossCheckIssueGraphqlBody {
+  data?: { issue?: CrossCheckIssue | null };
+  errors?: Array<{ message?: string }>;
+}
+
+function bearer(token: string): string {
+  return /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
+}
+
+/**
+ * Fetch the authoritative issue node for an on-breach cross-check.
+ *
+ * INF-604 follow-up: trashed issues can return 401 for one app/user token while
+ * remaining readable through the steward/delegate token. Try each scoped token
+ * before returning "unknown"; do not classify a bare 401 as stale.
+ */
+export async function fetchCrossCheckIssueWithFallback(args: {
+  fetchFn: typeof fetch;
+  linearApiUrl: string;
+  ticket: string;
+  tokenCandidates: CrossCheckTokenCandidate[];
+}): Promise<CrossCheckIssueFetchResult> {
+  let lastError = "no Linear token available";
+  const seenTokens = new Set<string>();
+
+  for (const candidate of args.tokenCandidates) {
+    const token = candidate.token?.trim();
+    if (!token || seenTokens.has(token)) continue;
+    seenTokens.add(token);
+
+    try {
+      const res = await args.fetchFn(args.linearApiUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: bearer(token),
+        },
+        body: JSON.stringify({
+          query: CROSS_CHECK_ISSUE_QUERY,
+          variables: { id: args.ticket },
+        }),
+      });
+      const body = (await res.json()) as CrossCheckIssueGraphqlBody;
+      if (body.data !== undefined) {
+        return {
+          status: "ok",
+          source: candidate.source,
+          issue: body.data.issue ?? null,
+        };
+      }
+      lastError = `${candidate.source} returned ${res.status}: ${body.errors?.[0]?.message ?? "missing data"}`;
+    } catch (err) {
+      lastError = `${candidate.source} threw: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
+  return { status: "unknown", error: lastError };
+}
+
 /**
  * The heal action a stale verdict implies. The caller maps each to the concrete
  * enrolled-mirror mutation:
