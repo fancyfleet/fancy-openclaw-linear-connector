@@ -265,6 +265,27 @@ export async function resolveBodiesForRole(roleId: string): Promise<string[]> {
 }
 
 /**
+ * INF-574: identifiers (body id + `openclaw_agent` alias, lowercased) for every
+ * body that fills the given role.
+ *
+ * `resolveBodiesForRole` returns policy body ids only. The delegate ping-pong
+ * detector needs to recognize a dispatch to a terminal merge-gate owner from the
+ * openclaw agent name the webhook carries, which may be the body id OR its
+ * `openclaw_agent` alias. This returns both, case-folded, so membership can be
+ * tested regardless of which identifier a caller holds.
+ */
+export async function resolveAgentIdentifiersForRole(roleId: string): Promise<Set<string>> {
+  const policy = await loadPolicy();
+  const out = new Set<string>();
+  for (const b of policy.bodies ?? []) {
+    if (!(b.fills_roles ?? []).includes(roleId)) continue;
+    out.add(b.id.toLowerCase());
+    if (b.openclaw_agent) out.add(b.openclaw_agent.toLowerCase());
+  }
+  return out;
+}
+
+/**
  * Returns true when the role is explicitly declared in the capability policy.
  * This lets workflow runtime distinguish a real |C|=0 role from older/minimal
  * test policies that do not model every workflow role.

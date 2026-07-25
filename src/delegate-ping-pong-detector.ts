@@ -30,12 +30,68 @@
 import { createLogger, componentLogger } from "./logger.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import { getAccessToken, getLinearUserIdForAgent } from "./agents.js";
+import { resolveAgentIdentifiersForRole } from "./escalation-gate.js";
 
 const log = componentLogger(createLogger(), "delegate-ping-pong-detector");
 
 const DEFAULT_MAX_BOUNCES = 3;
 const DEFAULT_WINDOW_MS = 30 * 60 * 1000; // 30 minutes
 const LINEAR_API_URL = "https://api.linear.app/graphql";
+
+// INF-574: roles whose members are terminal, non-oscillation dispatch targets.
+// A dispatch TO the merge-gate owner (Hanzo, role `deployment`) is the legitimate
+// terminal action of a workflow, never a bounce — so it must not be suppressed as
+// ping-pong even when some OTHER delegate cycled in the window (the INF-573 repro:
+// repeated intake bounces cycle the steward, which then suppresses the correct,
+// first dispatch to Hanzo). Overridable via PING_PONG_EXEMPT_ROLES (csv).
+const DEFAULT_EXEMPT_TERMINAL_ROLES = ["deployment"];
+
+function parseExemptRoles(): string[] {
+  const raw = process.env.PING_PONG_EXEMPT_ROLES;
+  if (raw === undefined) return [...DEFAULT_EXEMPT_TERMINAL_ROLES];
+  const roles = raw.split(",").map((r) => r.trim().toLowerCase()).filter(Boolean);
+  return roles.length ? roles : [...DEFAULT_EXEMPT_TERMINAL_ROLES];
+}
+
+/**
+ * Resolver deciding whether a dispatch's target agent is a terminal merge-gate
+ * owner that must be exempt from ping-pong suppression. Injectable so tests can
+ * stub the policy without a fixture; the default consults the capability policy.
+ */
+export type ExemptTerminalTargetResolver = (
+  agentName: string,
+  delegateId: string,
+) => Promise<boolean> | boolean;
+
+/**
+ * Default terminal-target resolver: exempt when the target agent fills a
+ * configured merge-gate/terminal role (default `deployment`, filled by Hanzo).
+ * Resolves role → body identifiers via the capability policy and matches
+ * case-insensitively against the openclaw agent name. Fails CLOSED to
+ * not-exempt (normal oscillation protection stands) on any resolution error —
+ * the exemption is a narrow safety valve, never a way to disable the guard.
+ */
+export async function defaultExemptTerminalTargetResolver(
+  agentName: string,
+  _delegateId: string,
+): Promise<boolean> {
+  const target = agentName?.toLowerCase().trim();
+  if (!target) return false;
+  try {
+    for (const roleId of parseExemptRoles()) {
+      const identifiers = await resolveAgentIdentifiersForRole(roleId);
+      if (identifiers.has(target)) return true;
+    }
+    return false;
+  } catch (err) {
+    log.warn(
+      `ping-pong exempt-target resolve failed (treating as non-exempt): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return false;
+  }
+}
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -154,15 +210,30 @@ export class DelegateChainTracker {
 
   /**
    * Detect whether a ticket's delegate chain shows a ping-pong cycle.
+   *
+   * INF-574: a cycle is counted in BOUNCES (returns), not raw occurrences. The
+   * class was always meant to catch the A→B→A shape — a delegate that *returns*
+   * after a different delegate held the ticket — but the original code counted
+   * bare occurrences, so a monotonic forward routing chain (or duplicate
+   * delegate-change webhooks for a single delegate) was miscounted identically
+   * to real oscillation. Collapsing consecutive runs of the same delegate before
+   * counting closes that: A→A→A is one bounce, A→B→A is two. This strengthens
+   * real A↔B protection AND stops false-positives on legitimate forward progress.
    */
   detectCycle(ticketId: string, now?: number): CycleDetectionResult {
     const timestampMs = now ?? Date.now();
     const chain = this.pruneChain(this.chains.get(ticketId) ?? [], timestampMs);
     this.chains.set(ticketId, chain);
 
+    // Count bounces: an assignment only counts when it changes the delegate from
+    // the immediately preceding one (a genuine hand-off/return), so consecutive
+    // re-assignments of the same delegate collapse to a single bounce.
     const bounceCounts: Record<string, number> = {};
+    let prevDelegateId: string | null = null;
     for (const assignment of chain) {
+      if (assignment.delegateId === prevDelegateId) continue;
       bounceCounts[assignment.delegateId] = (bounceCounts[assignment.delegateId] ?? 0) + 1;
+      prevDelegateId = assignment.delegateId;
     }
 
     const cyclingDelegates = Object.entries(bounceCounts)
@@ -352,11 +423,13 @@ export class DelegatePingPongDetector {
   private chainTracker: DelegateChainTracker;
   private config: DelegatePingPongConfig;
   private operationalEventStore?: OperationalEventStore;
+  private isExemptTerminalTarget: ExemptTerminalTargetResolver;
 
   constructor(
     chainTracker?: DelegateChainTracker,
     config?: Partial<DelegatePingPongConfig>,
     operationalEventStore?: OperationalEventStore,
+    exemptTargetResolver?: ExemptTerminalTargetResolver,
   ) {
     this.chainTracker = chainTracker ?? new DelegateChainTracker(config);
     this.config = {
@@ -366,6 +439,7 @@ export class DelegatePingPongDetector {
         (parseInt(process.env.PING_PONG_WINDOW_MS ?? "", 10) || DEFAULT_WINDOW_MS),
     };
     this.operationalEventStore = operationalEventStore;
+    this.isExemptTerminalTarget = exemptTargetResolver ?? defaultExemptTerminalTargetResolver;
   }
 
   getChainTracker(): DelegateChainTracker {
@@ -390,6 +464,65 @@ export class DelegatePingPongDetector {
     let suppressDispatch = false;
 
     if (detection.hasCycle) {
+      // INF-574: a dispatch whose TARGET is a terminal merge-gate owner (Hanzo,
+      // role `deployment`) is the legitimate terminal action, not a bounce. The
+      // per-delegate counter fires on ANY cycling delegate in the window, so a
+      // repaired "third attempt that is finally the correct route to the merge
+      // gate" gets suppressed because some earlier delegate (the steward, from
+      // repeated intake bounces) cycled — the exact INF-573 failure. Let this
+      // dispatch through and do not escalate. Narrowly scoped to the target
+      // being the merge-gate role; every other route still suppresses (AC2).
+      let exempt = false;
+      try {
+        exempt = await this.isExemptTerminalTarget(agentName, delegateId);
+      } catch (err) {
+        log.warn(
+          `ping-pong exempt-target check failed for ${ticketId} (treating as non-exempt): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+
+      if (exempt) {
+        const bounceCount = Object.values(detection.bounceCounts).reduce((a, b) => Math.max(a, b), 0);
+        log.warn(
+          `PING_PONG_EXEMPT_TERMINAL_TARGET: issue=${ticketId} target=${agentName} ` +
+          `cyclingDelegates=${detection.cyclingDelegates.join(", ")} bounceCount=${bounceCount} ` +
+          "— cycle observed but dispatch allowed (terminal merge-gate owner).",
+        );
+        if (this.operationalEventStore) {
+          try {
+            this.operationalEventStore.append({
+              outcome: "ping-pong-exempt-terminal-target",
+              agent: agentName,
+              key: ticketId,
+              sessionKey: ticketId,
+              deliveryMode: "delegate-ping-pong-detector",
+              attemptCount: bounceCount,
+              detail: {
+                ticketId,
+                target: agentName,
+                cyclingDelegates: detection.cyclingDelegates,
+                bounceCounts: detection.bounceCounts,
+                maxAllowed: detection.maxAllowed,
+              },
+            });
+          } catch (err) {
+            log.error(
+              `Operational event append failed for ping-pong exemption on ${ticketId}: ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+          }
+        }
+        return {
+          checked: true,
+          detection,
+          escalation: null,
+          suppressDispatch: false,
+        };
+      }
+
       escalation = await fireEscalation(
         ticketId,
         detection.cyclingDelegates,
