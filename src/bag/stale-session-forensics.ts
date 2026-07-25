@@ -9,7 +9,12 @@
  *   5. Writes a diagnostic snapshot to ~/.openclaw/diagnostics/stale-sessions/
  *
  * The connector and OpenClaw share the same host (Nakazawa), so session files
- * are directly readable from ~/.openclaw/agents/<agentId>/sessions/.
+ * are directly readable — but NOT always from ~/.openclaw/agents/<agentId>/.
+ * Only bare-metal agents (grover, main) live there. Containerized agents
+ * (astrid, igor, ai, hanzo, …) run in their own container whose OpenClaw home
+ * is bind-mounted at ~/.openclaw/containers/<container>/config, so their real
+ * session store is ~/.openclaw/containers/<container>/config/agents/<agent>/.
+ * See resolveSessionStoreDirs (INF-664).
  */
 
 import fs from "node:fs";
@@ -153,8 +158,102 @@ interface SessionIndexEntry {
 }
 
 /**
- * Find the session file for a given (agentId, sessionKey) by reading
- * OpenClaw's sessions.json index.
+ * Resolve the candidate session-store directories for an agent, most-likely
+ * first.
+ *
+ * Bare-metal agents (grover, main) keep their sessions at
+ * `<home>/agents/<agent>/sessions`. Containerized agents run inside a container
+ * whose OpenClaw home is bind-mounted at `<home>/containers/<container>/config`,
+ * so their real store is `<home>/containers/<container>/config/agents/<agent>/sessions`.
+ *
+ * Before INF-664, forensics only looked at the bare-metal path. For every
+ * containerized agent (astrid, igor, ai, …) that path was missing or a stale
+ * husk, so the transcript read back empty and `classify()` returned C4
+ * ("never started") unconditionally — manufacturing a redispatch/escalation
+ * storm on sessions that had, in fact, done real work. We now enumerate all
+ * container homes too and let the caller pick the store that actually holds the
+ * session (preferring an on-disk transcript, then recency).
+ */
+export function resolveSessionStoreDirs(openclawAgentName: string, openclawHome: string): string[] {
+  const dirs: string[] = [];
+  const seen = new Set<string>();
+  const add = (dir: string): void => {
+    if (seen.has(dir)) return;
+    seen.add(dir);
+    dirs.push(dir);
+  };
+
+  // 1. Bare-metal / host path (unchanged legacy behavior, tried first).
+  add(path.join(openclawHome, "agents", openclawAgentName, "sessions"));
+
+  // 2. Containerized paths: <home>/containers/<container>/config/agents/<agent>/sessions.
+  const containersRoot = path.join(openclawHome, "containers");
+  try {
+    for (const entry of fs.readdirSync(containersRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      add(path.join(containersRoot, entry.name, "config", "agents", openclawAgentName, "sessions"));
+    }
+  } catch {
+    // No containers dir (bare-metal-only install) — host path above is enough.
+  }
+
+  return dirs;
+}
+
+/**
+ * Match a (agentName, sessionKey) against a single sessions.json index.
+ * Returns the index entry, or null when the store is absent or has no match.
+ */
+function matchSessionInIndex(
+  openclawAgentName: string,
+  sessionKey: string,
+  sessionsDir: string,
+): SessionIndexEntry | null {
+  const indexPath = path.join(sessionsDir, "sessions.json");
+  try {
+    if (!fs.existsSync(indexPath)) return null;
+
+    const raw = fs.readFileSync(indexPath, "utf8");
+    const index = JSON.parse(raw) as Record<string, Record<string, unknown>>;
+
+    const toEntry = (val: Record<string, unknown>): SessionIndexEntry => ({
+      sessionId: String(val.sessionId ?? ""),
+      sessionFile: String(val.sessionFile ?? path.join(sessionsDir, `${val.sessionId}.jsonl`)),
+      sessionStartedAt: typeof val.sessionStartedAt === "number" ? val.sessionStartedAt : undefined,
+      status: typeof val.status === "string" ? val.status : undefined,
+    });
+
+    // Try exact match: agent:<agentId>:<sessionKey>
+    const openclawKey = `agent:${openclawAgentName}:${sessionKey}`;
+    const entry = index[openclawKey];
+    if (entry && typeof entry === "object") return toEntry(entry);
+
+    // Fallback: try with hook prefix
+    const hookKey = `agent:${openclawAgentName}:hook:${sessionKey}`;
+    const hookEntry = index[hookKey];
+    if (hookEntry && typeof hookEntry === "object") return toEntry(hookEntry);
+
+    // Fallback: scan keys for a match containing the sessionKey
+    for (const [key, val] of Object.entries(index)) {
+      if (key.includes(sessionKey.toLowerCase()) && typeof val === "object" && val.sessionId) {
+        return toEntry(val);
+      }
+    }
+
+    return null;
+  } catch (err) {
+    log.warn(`Failed to read sessions index ${indexPath}: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+/**
+ * Find the session file for a given (agentId, sessionKey) by reading OpenClaw's
+ * sessions.json index across every candidate store (host + per-container),
+ * because containerized agents do not live under `<home>/agents/<agent>`
+ * (INF-664). Among stores that carry the key, prefer one whose transcript
+ * actually exists on disk, then the most-recently-started — this discards a
+ * stale host husk in favor of the live container store when both match.
  */
 function findSessionFile(
   agentId: string,
@@ -162,60 +261,24 @@ function findSessionFile(
   openclawHome: string,
 ): SessionIndexEntry | null {
   const openclawAgentName = getOpenclawAgentName(agentId);
-  const sessionsDir = path.join(openclawHome, "agents", openclawAgentName, "sessions");
-  const indexPath = path.join(sessionsDir, "sessions.json");
+  const matches: SessionIndexEntry[] = [];
+  for (const sessionsDir of resolveSessionStoreDirs(openclawAgentName, openclawHome)) {
+    const match = matchSessionInIndex(openclawAgentName, sessionKey, sessionsDir);
+    if (match) matches.push(match);
+  }
 
-  try {
-    if (!fs.existsSync(indexPath)) {
-      log.debug(`Sessions index not found: ${indexPath}`);
-      return null;
-    }
-
-    const raw = fs.readFileSync(indexPath, "utf8");
-    const index = JSON.parse(raw) as Record<string, Record<string, unknown>>;
-
-    // Try exact match: agent:<agentId>:<sessionKey>
-    const openclawKey = `agent:${openclawAgentName}:${sessionKey}`;
-    const entry = index[openclawKey];
-    if (entry && typeof entry === "object") {
-      return {
-        sessionId: String(entry.sessionId ?? ""),
-        sessionFile: String(entry.sessionFile ?? path.join(sessionsDir, `${entry.sessionId}.jsonl`)),
-        sessionStartedAt: typeof entry.sessionStartedAt === "number" ? entry.sessionStartedAt : undefined,
-        status: typeof entry.status === "string" ? entry.status : undefined,
-      };
-    }
-
-    // Fallback: try with hook prefix
-    const hookKey = `agent:${openclawAgentName}:hook:${sessionKey}`;
-    const hookEntry = index[hookKey];
-    if (hookEntry && typeof hookEntry === "object") {
-      return {
-        sessionId: String(hookEntry.sessionId ?? ""),
-        sessionFile: String(hookEntry.sessionFile ?? path.join(sessionsDir, `${hookEntry.sessionId}.jsonl`)),
-        sessionStartedAt: typeof hookEntry.sessionStartedAt === "number" ? hookEntry.sessionStartedAt : undefined,
-        status: typeof hookEntry.status === "string" ? hookEntry.status : undefined,
-      };
-    }
-
-    // Fallback: scan keys for a match containing the sessionKey
-    for (const [key, val] of Object.entries(index)) {
-      if (key.includes(sessionKey.toLowerCase()) && typeof val === "object" && val.sessionId) {
-        return {
-          sessionId: String(val.sessionId),
-          sessionFile: String(val.sessionFile ?? path.join(sessionsDir, `${val.sessionId}.jsonl`)),
-          sessionStartedAt: typeof val.sessionStartedAt === "number" ? val.sessionStartedAt : undefined,
-          status: typeof val.status === "string" ? val.status : undefined,
-        };
-      }
-    }
-
-    log.debug(`No session found in index for ${openclawKey}`);
-    return null;
-  } catch (err) {
-    log.warn(`Failed to read sessions index: ${err instanceof Error ? err.message : String(err)}`);
+  if (matches.length === 0) {
+    log.debug(`No session found in any store for agent:${openclawAgentName}:${sessionKey}`);
     return null;
   }
+  if (matches.length === 1) return matches[0];
+
+  // Multiple stores carry the key (e.g. a stale host husk + the live container
+  // store). Prefer a match with an on-disk transcript, then the newest start.
+  const onDisk = matches.filter((m) => Boolean(m.sessionFile) && fs.existsSync(m.sessionFile));
+  const pool = onDisk.length > 0 ? onDisk : matches;
+  pool.sort((a, b) => (b.sessionStartedAt ?? 0) - (a.sessionStartedAt ?? 0));
+  return pool[0];
 }
 
 // ── Session JSONL parsing ───────────────────────────────────────────────────

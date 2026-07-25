@@ -1,5 +1,5 @@
 import { jest } from "@jest/globals";
-import { classify, buildRecoveryComment, type ToolCallSummary, type LastAssistantMessage, type StaleSnapshot, STALE_CLASS_NAMES, buildSnapshot, writeSnapshot, aggregateDigest, formatDigestSummary, recoverTicket } from "./stale-session-forensics.js";
+import { classify, buildRecoveryComment, type ToolCallSummary, type LastAssistantMessage, type StaleSnapshot, STALE_CLASS_NAMES, buildSnapshot, writeSnapshot, aggregateDigest, formatDigestSummary, recoverTicket, resolveSessionStoreDirs } from "./stale-session-forensics.js";
 import { StaleRedispatchCounter } from "./stale-redispatch-counter.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -145,6 +145,101 @@ describe("buildSnapshot", () => {
   });
 });
 
+// ── containerized session-store resolution (INF-664) ────────────────────────
+
+describe("resolveSessionStoreDirs (INF-664)", () => {
+  let home: string;
+  beforeAll(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), "oc-home-"));
+    fs.mkdirSync(path.join(home, "containers", "workflow", "config"), { recursive: true });
+    fs.mkdirSync(path.join(home, "containers", "dev", "config"), { recursive: true });
+    fs.writeFileSync(path.join(home, "containers", "not-a-dir"), "x"); // ignored (file)
+  });
+  afterAll(() => { fs.rmSync(home, { recursive: true, force: true }); });
+
+  test("host path is first, container paths follow", () => {
+    const dirs = resolveSessionStoreDirs("astrid", home);
+    expect(dirs[0]).toBe(path.join(home, "agents", "astrid", "sessions"));
+    expect(dirs).toContain(path.join(home, "containers", "workflow", "config", "agents", "astrid", "sessions"));
+    expect(dirs).toContain(path.join(home, "containers", "dev", "config", "agents", "astrid", "sessions"));
+  });
+
+  test("no containers dir → host path only, no throw", () => {
+    const bare = fs.mkdtempSync(path.join(os.tmpdir(), "oc-bare-"));
+    try {
+      const dirs = resolveSessionStoreDirs("grover", bare);
+      expect(dirs).toEqual([path.join(bare, "agents", "grover", "sessions")]);
+    } finally {
+      fs.rmSync(bare, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("buildSnapshot — containerized agent transcript (INF-664)", () => {
+  let home: string;
+  const agentId = "astrid";
+  const sessionKey = "linear-INF-196";
+
+  beforeAll(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), "oc-home-"));
+    // Stale host husk: carries the key but points at a transcript that does not exist.
+    const hostSessions = path.join(home, "agents", agentId, "sessions");
+    fs.mkdirSync(hostSessions, { recursive: true });
+    fs.writeFileSync(
+      path.join(hostSessions, "sessions.json"),
+      JSON.stringify({
+        [`agent:${agentId}:${sessionKey}`]: {
+          sessionId: "stale-host-000",
+          sessionFile: path.join(hostSessions, "stale-host-000.jsonl"), // never created
+          sessionStartedAt: 1000,
+        },
+      }),
+    );
+
+    // Live container store: the real transcript with actual work.
+    const contSessions = path.join(home, "containers", "workflow", "config", "agents", agentId, "sessions");
+    fs.mkdirSync(contSessions, { recursive: true });
+    const transcript = path.join(contSessions, "live-container-999.jsonl");
+    fs.writeFileSync(transcript, [
+      JSON.stringify({ type: "session", id: "live-container-999", timestamp: "2026-07-25T16:35:00Z" }),
+      JSON.stringify({
+        type: "message",
+        timestamp: "2026-07-25T16:40:00Z",
+        message: {
+          role: "assistant",
+          stopReason: "end_turn",
+          content: [
+            { type: "toolCall", name: "linear", arguments: { cmd: "observe-issue INF-196" } },
+            { type: "text", text: "Swept every active spawner, updated status on The Helm, and filed the blocker follow-up. Handing back for validation." },
+          ],
+        },
+      }),
+    ].join("\n") + "\n");
+    fs.writeFileSync(
+      path.join(contSessions, "sessions.json"),
+      JSON.stringify({
+        [`agent:${agentId}:${sessionKey}`]: {
+          sessionId: "live-container-999",
+          sessionFile: transcript,
+          sessionStartedAt: 2000,
+          status: "done",
+        },
+      }),
+    );
+  });
+  afterAll(() => { fs.rmSync(home, { recursive: true, force: true }); });
+
+  test("reads the live container transcript, not the stale host husk → not C4", () => {
+    const snapshot = buildSnapshot(
+      { agentId, sessionKey, startedAt: Date.now() - 30 * 60 * 1000, timeoutMs: 25 * 60 * 1000, pendingTickets: [] },
+      { openclawHome: home },
+    );
+    expect(snapshot.metadata.sessionFile).toContain("live-container-999.jsonl");
+    expect(snapshot.toolCallSummary.totalCalls).toBe(1);
+    expect(snapshot.classification).not.toBe("C4");
+  });
+});
+
 // ── writeSnapshot ──────────────────────────────────────────────────────────
 
 describe("writeSnapshot", () => {
@@ -274,6 +369,50 @@ describe("StaleRedispatchCounter", () => {
     counter.incrementAndGet("linear-AI-B");
     expect(counter.get("linear-AI-A")).toBe(2);
     expect(counter.get("linear-AI-B")).toBe(1);
+  });
+});
+
+// ── windowed reset (INF-664) ────────────────────────────────────────────────
+
+describe("StaleRedispatchCounter — windowed reset (INF-664)", () => {
+  let dbPath: string;
+
+  beforeEach(() => {
+    dbPath = `/tmp/stale-redispatch-window-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+  });
+  afterEach(() => {
+    for (const suffix of ["", "-wal", "-shm"]) {
+      try { fs.unlinkSync(dbPath + suffix); } catch { /* ignore */ }
+    }
+  });
+
+  test("a stall older than the window starts a fresh burst at 1, not the old total", () => {
+    // 1ms window → any prior stall is already 'stale' by the next call.
+    const counter = new StaleRedispatchCounter(dbPath, 1);
+    try {
+      expect(counter.incrementAndGet("linear-INF-196")).toBe(1);
+      // Force last_attempt_at into the past so the age exceeds the 1s-min window.
+      (counter as unknown as { db: import("better-sqlite3").Database }).db
+        .prepare(`UPDATE stale_redispatch_attempts SET last_attempt_at = datetime('now','-10 minutes') WHERE ticket_id = ?`)
+        .run("linear-INF-196");
+      // Next stall is a fresh burst — the steady climb to 30/3 is gone.
+      expect(counter.incrementAndGet("linear-INF-196")).toBe(1);
+      expect(counter.incrementAndGet("linear-INF-196")).toBe(2);
+    } finally {
+      counter.close();
+    }
+  });
+
+  test("stalls inside the window still compound toward the cap", () => {
+    // Large window → nothing resets; consecutive stalls accumulate as before.
+    const counter = new StaleRedispatchCounter(dbPath, 24 * 60 * 60 * 1000);
+    try {
+      expect(counter.incrementAndGet("linear-INF-424")).toBe(1);
+      expect(counter.incrementAndGet("linear-INF-424")).toBe(2);
+      expect(counter.incrementAndGet("linear-INF-424")).toBe(3);
+    } finally {
+      counter.close();
+    }
   });
 });
 
