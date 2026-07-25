@@ -4622,7 +4622,12 @@ async function postComment(internalIssueId: string, body: string, authToken: str
       return;
     }
   } catch (err) {
-    log.warn(`workflow-gate: failed to post comment on ${internalIssueId}: ${err instanceof Error ? err.message : String(err)}`);
+    // INF-590: log at error, not warn. This catch is the fail-close path for a
+    // swallowed comment-post failure (defeating the INF-12/INF-127 remedy
+    // comment) and belongs at the same severity as the five checks above.
+    // It also kept CI red: CI runs with LOG_LEVEL=error, which suppresses warn,
+    // so the network-failure branch logged nothing and its test asserted 0 calls.
+    log.error(`workflow-gate: failed to post comment on ${internalIssueId}: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 export const _postCommentForTests = postComment;
