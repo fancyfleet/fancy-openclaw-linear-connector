@@ -43,6 +43,7 @@ import type { MutationAuditStore, MutationAuditInput, ChangeType } from "./store
 import { isTerminalState } from "./barrier.js";
 import { getAgent, getAgentByProxyToken } from "./agents.js";
 import type { NoActivityDetector } from "./bag/no-activity-detector.js";
+import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
 import { IssueCreateDedupCache, extractIssueCreateInput, fingerprintIssueCreate, isSuccessfulIssueCreate, DEFAULT_DEDUP_TTL_MS, type Claim } from "./issue-create-dedup.js";
 import { checkArtifactDisclosure } from "./artifact-disclosure.js";
@@ -546,6 +547,10 @@ export interface ProxyDeps {
   onProxyCall?: (agentId: string, ticketId: string) => void;
   /** AI-2565: dispatch lease store for CAS stale-snapshot enforcement on terminal transitions. */
   dispatchLeaseStore?: DispatchLeaseStore;
+  /** INF-570: canonical wake delivery for actionable fan-out children. */
+  fanoutWakeFn?: (agentName: string, ticketIdentifier: string) => Promise<void>;
+  /** INF-570: ack tracker for actionable fan-out child dispatches. */
+  getDispatchAckTracker?: () => DispatchAckTracker | undefined;
 }
 
 export async function handleProxyRequest(req: Request, res: Response, deps?: ProxyDeps): Promise<void> {
@@ -1392,6 +1397,8 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             enrolledTicketsStore: deps?.enrolledTicketsStore,
             operationalEventStore: deps?.operationalEventStore,
             delegateOverride,
+            fanoutWakeFn: deps?.fanoutWakeFn,
+            getDispatchAckTracker: deps?.getDispatchAckTracker,
           });
 
           // ── AI-2554: Structured transition audit record ──────────────

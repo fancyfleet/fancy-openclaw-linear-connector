@@ -4445,6 +4445,10 @@ export interface ApplyStateTransitionOptions {
    * Providing `null` here is equivalent to `resolvedDelegateId = null` (terminal state).
    */
   delegateOverride?: string | null;
+  /** INF-570: canonical wake delivery for actionable fan-out children. */
+  fanoutWakeFn?: (agentName: string, ticketIdentifier: string) => Promise<void>;
+  /** INF-570: ack tracker for actionable fan-out child dispatches. */
+  getDispatchAckTracker?: () => import("./bag/dispatch-ack-tracker.js").DispatchAckTracker | undefined;
 }
 
 /**
@@ -5855,6 +5859,7 @@ export async function applyStateTransition(
   if (applied && pendingFanout) {
     try {
       log.info(`workflow-gate: AI-1992 fan-out: triggering fan-out for ${issueId} (${currentStateName} → ${toStateName}, child=${pendingFanout.config.child_workflow})`);
+      const fanoutWorkflowRegistry = new Map<string, WorkflowDef>();
       const fanoutResult = await executeFanout(issueId, authToken, pendingFanout.config, {
         findingsOverride: pendingFanout.findings,
         // INF-111: resolve each child workflow's true entry_state from its
@@ -5863,8 +5868,12 @@ export async function applyStateTransition(
         lookupEntryState: async (wfLabel: string) => {
           const defId = wfLabel.startsWith("wf:") ? wfLabel.slice(3) : wfLabel;
           const def = await loadWorkflowDefById(defId);
+          if (def) fanoutWorkflowRegistry.set(defId, def);
           return def?.entry_state ? `state:${def.entry_state}` : undefined;
         },
+        workflowRegistry: fanoutWorkflowRegistry,
+        wakeFn: options?.fanoutWakeFn,
+        dispatchAckTracker: options?.getDispatchAckTracker?.(),
       });
       spawnIfEvaluationFailed = fanoutResult.spawnIfResult?.outcome === "failed";
       if (fanoutResult.created > 0) {
