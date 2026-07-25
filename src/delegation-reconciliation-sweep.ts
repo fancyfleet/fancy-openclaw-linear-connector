@@ -186,6 +186,19 @@ async function queryGovernedTickets(
     });
 
     const data = (await res.json()) as IssuesPageResp;
+
+    // INF-585: fail loud on a non-2xx response or a 200-with-errors GraphQL
+    // validation failure. Previously the governed query read `nodes ?? []`
+    // with no guard, so a bad response (e.g. HTTP 400 GRAPHQL_VALIDATION_FAILED,
+    // or Linear's 200-with-`errors` for an invalid filter) was swallowed as an
+    // empty page → the sweep reported `scanned:0` and woke nobody. Throwing
+    // surfaces the failure via runDelegationReconciliationSweep's catch, which
+    // records it in result.errors and fires an alert-bus notify.
+    if (!res.ok || (data.errors && data.errors.length > 0)) {
+      const detail = data.errors?.[0]?.message ?? `HTTP ${res.status}`;
+      throw new Error(`GovernedTickets query failed: ${detail}`);
+    }
+
     nodes.push(...(data.data?.issues?.nodes ?? []));
 
     const pageInfo = data.data?.issues?.pageInfo;
@@ -263,12 +276,15 @@ async function queryAdhocDelegatedTickets(
     const data = (await res.json()) as IssuesPageResp;
 
     // INF-334: Linear returns 200 with "errors" for invalid filters.
-    if (data.errors && data.errors.length > 0) {
-      const msg = `delegation-reconciliation: AdhocDelegationReconciliation query failed: ${data.errors[0].message}`;
-      log.error(msg);
-      // We don't throw here to avoid killing the whole sweep, but we skip
-      // the adhoc part of this tick.
-      return [];
+    // INF-585: fail loud instead of returning []. The old behavior logged and
+    // returned an empty page, so an invalid filter (or an HTTP 400) reported
+    // `scanned:0` with no alert — indistinguishable from "no ad-hoc tickets to
+    // reconcile," which is exactly how the original broken filter went
+    // unnoticed. Throwing surfaces the failure via
+    // runDelegationReconciliationSweep's catch (result.errors + alert-bus).
+    if (!res.ok || (data.errors && data.errors.length > 0)) {
+      const detail = data.errors?.[0]?.message ?? `HTTP ${res.status}`;
+      throw new Error(`AdhocDelegationReconciliation query failed: ${detail}`);
     }
 
     const pageNodes = data.data?.issues?.nodes ?? [];

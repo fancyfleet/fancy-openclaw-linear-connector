@@ -119,10 +119,24 @@ interface FetchScenario {
   mutationSuccess?: boolean;
   /** If true, the query fetch throws a network error. */
   networkError?: boolean;
+  /** INF-585: return a GraphQL-validation-style error for the governed (wf:*) query. */
+  governedQueryError?: boolean;
+  /** INF-585: return a GraphQL-validation-style error for the ad-hoc query. */
+  adhocQueryError?: boolean;
+  /** INF-585: HTTP status for the injected query error (default 200, Linear-style). */
+  queryErrorStatus?: number;
 }
 
 function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
-  const { governedTickets = [], adhocDelegatedTickets = [], labelUpdates, mutationSuccess = true, networkError = false } = scenario;
+  const { governedTickets = [], adhocDelegatedTickets = [], labelUpdates, mutationSuccess = true, networkError = false, governedQueryError = false, adhocQueryError = false, queryErrorStatus = 200 } = scenario;
+  const graphqlErrorResponse = () =>
+    new Response(
+      JSON.stringify({
+        data: null,
+        errors: [{ message: "Field 'foo' is not defined by type 'IssueFilter'" }],
+      }),
+      { status: queryErrorStatus, headers: { "Content-Type": "application/json" } },
+    );
   const allTickets = [...governedTickets, ...adhocDelegatedTickets];
   const labelsByIssueId = new Map<string, Array<{ id: string; name: string }>>();
   for (const ticket of allTickets) {
@@ -137,6 +151,8 @@ function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
 
     // Ad-hoc delegated-tickets query (non-wf:* tickets with delegate set)
     if (body.includes("AdhocDelegationReconciliation")) {
+      // INF-585: simulate a query-level failure (200-with-errors or non-2xx).
+      if (adhocQueryError) return graphqlErrorResponse();
       // INF-334: Simulate GraphQL validation error for schema-illegal filters.
       // Re-enable this check to verify the production code no longer sends these fields.
       if (body.includes("none:") || body.includes("isSet:")) {
@@ -167,6 +183,8 @@ function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
 
     // Governed-tickets query (wf:* labeled)
     if (body.includes("DelegationReconciliation") && !body.includes("AdhocDelegationReconciliation") || body.includes("wf:") || body.includes("GovernedTickets")) {
+      // INF-585: simulate a query-level failure (200-with-errors or non-2xx).
+      if (governedQueryError) return graphqlErrorResponse();
       const nodes = governedTickets.map((t) => ({
         id: t.id,
         identifier: t.identifier,
@@ -782,6 +800,67 @@ describe("AC3: each heal emits operational event + alert-bus notify; failures al
     expect(result.errors.length).toBeGreaterThanOrEqual(1);
     expect(alerts.length).toBeGreaterThanOrEqual(1);
     expect(alerts.some((a) => a.severity === "warning" || a.severity === "critical")).toBe(true);
+    eventStore.close();
+  });
+
+  // ── INF-585: query-level failures must fail loud, not swallow to [] ──────
+  it("INF-585: fails loud when the governed (wf:*) query returns GraphQL errors", async () => {
+    const eventStore = makeEventStore();
+    const { bus, alerts } = makeTestAlertBus();
+
+    // 200-with-errors, exactly how Linear reports an invalid filter. The old
+    // governed query read `nodes ?? []` with no guard → this was swallowed as
+    // an empty page and the sweep reported scanned:0 with no alert.
+    globalThis.fetch = makeReconciliationFetch({ governedQueryError: true });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async () => {},
+    });
+
+    expect(result.errors.length).toBeGreaterThanOrEqual(1);
+    expect(result.errors.some((e) => e.includes("GovernedTickets query failed"))).toBe(true);
+    expect(alerts.length).toBeGreaterThanOrEqual(1);
+    eventStore.close();
+  });
+
+  it("INF-585: fails loud when the ad-hoc query returns GraphQL errors", async () => {
+    const eventStore = makeEventStore();
+    const { bus, alerts } = makeTestAlertBus();
+
+    globalThis.fetch = makeReconciliationFetch({ adhocQueryError: true });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async () => {},
+    });
+
+    expect(result.errors.length).toBeGreaterThanOrEqual(1);
+    expect(result.errors.some((e) => e.includes("AdhocDelegationReconciliation query failed"))).toBe(true);
+    expect(alerts.length).toBeGreaterThanOrEqual(1);
+    eventStore.close();
+  });
+
+  it("INF-585: fails loud on a non-2xx (HTTP 400) query response", async () => {
+    const eventStore = makeEventStore();
+    const { bus, alerts } = makeTestAlertBus();
+
+    // HTTP 400 GRAPHQL_VALIDATION_FAILED — the exact status reproduced on the ticket.
+    globalThis.fetch = makeReconciliationFetch({ governedQueryError: true, queryErrorStatus: 400 });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async () => {},
+    });
+
+    expect(result.errors.length).toBeGreaterThanOrEqual(1);
+    expect(alerts.length).toBeGreaterThanOrEqual(1);
     eventStore.close();
   });
 
