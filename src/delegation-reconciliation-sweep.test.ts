@@ -794,6 +794,93 @@ describe("AC3: each heal emits operational event + alert-bus notify; failures al
     eventStore.close();
   });
 
+  it("INF-660: uses a schema-valid ad-hoc query and filters wf labels client-side", async () => {
+    const eventStore = makeEventStore();
+    const { bus } = makeTestAlertBus();
+    let adhocQuery = "";
+    const wakeDispatches: string[] = [];
+
+    globalThis.fetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const body = typeof init?.body === "string" ? init.body : "";
+
+      if (body.includes("TicketDelegateHistory")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                history: { nodes: [] },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (body.includes("AdhocDelegationReconciliation")) {
+        adhocQuery = body;
+        return new Response(
+          JSON.stringify({
+            data: {
+              issues: {
+                nodes: [
+                  {
+                    id: "issue-governed-from-adhoc-query",
+                    identifier: "AI-660-WF",
+                    updatedAt: OLD_TIMESTAMP,
+                    title: "Governed ticket returned by broad ad-hoc query",
+                    labels: { nodes: [WF_LABEL, STATE_IMPLEMENTATION_LABEL] },
+                    delegate: { id: DELEGATE_LINEAR_ID, name: DELEGATE_AGENT_NAME },
+                    team: { id: TEAM_ID },
+                  },
+                  {
+                    id: "issue-plain-from-adhoc-query",
+                    identifier: "AI-660-PLAIN",
+                    updatedAt: OLD_TIMESTAMP,
+                    title: "Plain delegated ticket returned by broad ad-hoc query",
+                    labels: { nodes: [] },
+                    delegate: { id: DELEGATE_LINEAR_ID, name: DELEGATE_AGENT_NAME },
+                    team: { id: TEAM_ID },
+                  },
+                ],
+                pageInfo: { hasNextPage: false, endCursor: null },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      return new Response(
+        JSON.stringify({
+          data: {
+            issues: {
+              nodes: [],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (_agentName, ticketIdentifier) => {
+        wakeDispatches.push(ticketIdentifier);
+      },
+    });
+
+    expect(result.errors).toHaveLength(0);
+    expect(result.scanned).toBe(1);
+    expect(wakeDispatches).toEqual(["AI-660-PLAIN"]);
+    expect(adhocQuery).toContain("AdhocDelegationReconciliation");
+    expect(adhocQuery).toContain("delegate: { isMe: false }");
+    expect(adhocQuery).not.toContain("labels: { none:");
+    eventStore.close();
+  });
+
   it("INF-585: fails loud on a non-2xx (HTTP 400) query response", async () => {
     const eventStore = makeEventStore();
     const { bus, alerts } = makeTestAlertBus();

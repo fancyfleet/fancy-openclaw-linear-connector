@@ -264,7 +264,7 @@ async function queryAdhocDelegatedTickets(
     const afterArg = cursor ? `, after: ${JSON.stringify(cursor)}` : "";
     const query = `
       query AdhocDelegationReconciliation {
-        issues(first: ${LINEAR_ISSUES_PAGE_SIZE}${afterArg}, filter: { labels: { none: { name: { startsWith: "wf:" } } }, delegate: { isSet: true } }) {
+        issues(first: ${LINEAR_ISSUES_PAGE_SIZE}${afterArg}, filter: { delegate: { isMe: false } }) {
           nodes {
             id
             identifier
