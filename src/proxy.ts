@@ -47,6 +47,7 @@ import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
 import { IssueCreateDedupCache, extractIssueCreateInput, fingerprintIssueCreate, isSuccessfulIssueCreate, DEFAULT_DEDUP_TTL_MS, type Claim } from "./issue-create-dedup.js";
 import { checkArtifactDisclosure } from "./artifact-disclosure.js";
+import { LINEAR_PROXY_PROTOCOL_VERSION, minWorkflowCliVersion } from "./proxy-compatibility.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
@@ -96,17 +97,6 @@ async function runWithTicketLock(
   } finally {
     inFlightTickets.delete(ticketId);
   }
-}
-
-/**
- * Minimum CLI version required to issue workflow mutations (AI-1397).
- * CLIs below this version lack proxy-side delegate guards and advancement
- * guards, so they must be rejected before any enforcement can be bypassed.
- * Override via PROXY_MIN_CLI_VERSION env for testing. Evaluated at request
- * time so tests can override the env var after module load.
- */
-function minWorkflowCliVersion(): string {
-  return process.env.PROXY_MIN_CLI_VERSION ?? "0.3.0";
 }
 
 /**
@@ -536,6 +526,9 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
   const opName = body?.operationName ?? "(unnamed)";
   const issueId = extractIssueId(body);
   const ticketCtx = issueId ? ` ticket=${issueId}` : "";
+
+  res.setHeader("X-Openclaw-Linear-Protocol-Version", LINEAR_PROXY_PROTOCOL_VERSION);
+  res.setHeader("X-Openclaw-Linear-Min-Cli-Version", minWorkflowCliVersion());
 
   // AI-1397: resolve caller's Linear user ID from agent config for delegate enforcement.
   const callerLinearUserId = getAgent(agentId)?.linearUserId ?? null;
