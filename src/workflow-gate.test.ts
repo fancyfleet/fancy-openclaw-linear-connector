@@ -3940,11 +3940,16 @@ roles:
     requires: [deploy:execute]
   - id: engine
     requires: [linear:transition]
+  # INF-524: submit→code-review requires a reachable code-review body (0-body
+  # non-terminal roles are now rejected/fail-closed). Filled by charles (already
+  # in this fixture's agents.json) so the barrier tests exercise the transition.
+  - id: code-review
+    requires: [linear:transition]
 
 bodies:
   - id: charles
     container: dev
-    fills_roles: [dev]
+    fills_roles: [dev, code-review]
   - id: engine-1
     container: engine
     fills_roles: [engine]

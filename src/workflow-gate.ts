@@ -659,6 +659,58 @@ export async function reloadWorkflowDefs(): Promise<
     }
   }
 
+  // INF-524: definition-time delegate reachability + selection-criteria validation.
+  // Every non-terminal owner-role state must have a non-empty candidate set (|C|>=1),
+  // and every multi-candidate destination state (|C|>1) must declare selection
+  // criteria on its inbound transitions (an `assign` block) so the engine knows how
+  // to pick. Reject at registration rather than letting the drift surface at runtime.
+  for (const [wfId, def] of newRegistry) {
+    // Precompute, per destination state, whether ANY inbound transition declares
+    // selection criteria (any `assign` metadata — mode/default/constraint).
+    const inboundSeen = new Set<string>();
+    const inboundHasSelection = new Map<string, boolean>();
+    for (const s of def.states ?? []) {
+      for (const t of s.transitions ?? []) {
+        inboundSeen.add(t.to);
+        const hasSel = Boolean(t.assign && (t.assign.mode || t.assign.default || t.assign.constraint));
+        inboundHasSelection.set(t.to, (inboundHasSelection.get(t.to) ?? false) || hasSel);
+      }
+    }
+
+    for (const s of def.states ?? []) {
+      const role = s.owner_role;
+      if (!role || s.kind === "terminal") continue;
+
+      let bodies: string[];
+      try {
+        bodies = await resolveBodiesForRole(role);
+      } catch {
+        bodies = []; // treat resolution failure as an unreachable role — fail loud below.
+      }
+
+      if (bodies.length === 0) {
+        diagnostics.push(
+          `${wfId}: state '${s.id}' is unreachable — owner_role '${role}' has a candidate set of 0 ` +
+            `(no available agent satisfies its delegate requirement). Add a body with '${role}' in its ` +
+            `\`fills_roles\` in capability-policy.yaml, or remove the state.`,
+        );
+      } else if (bodies.length > 1) {
+        // Multi-candidate: require selection criteria unless this is the entry state
+        // (dispatched at creation, no inbound transition to carry an `assign`).
+        const isEntry = def.entry_state === s.id;
+        const hasSelection = inboundHasSelection.get(s.id) ?? false;
+        if (!isEntry && inboundSeen.has(s.id) && !hasSelection) {
+          diagnostics.push(
+            `${wfId}: state '${s.id}' owner_role '${role}' has multiple candidates ` +
+              `(${bodies.join(", ")}) but declares no selection criteria — add an \`assign\` block ` +
+              `(e.g. \`mode: required\` for --target selection, or \`default: prior-implementer\`) to ` +
+              `the transition(s) routing into it.`,
+          );
+        }
+      }
+    }
+  }
+
   if (diagnostics.length > 0) {
     // Roll back: restore prior cache AND snapshot (loadWorkflowRegistry may
     // have written a new snapshot with the partial set).
@@ -3813,15 +3865,26 @@ export async function checkWorkflowRules(
     }
 
     if (legalBodies.length > 1) {
-      // For meta-intents (continue-workflow/request-revision) on assign.mode: required
-      // transitions, a target must be provided. The CLI's generic path does not carry
-      // the delegate in the forwarded mutation body (unlike named commands), so a
-      // missing target header means no delegate will be set — reject with the valid options.
-      if (!target && isMetaIntent && match.assign?.mode === 'required') {
-        return `[Proxy] '${intent}' requires an assignment target. Legal targets for role '${ownerRole}': ${legalBodies.join(', ')}.`;
+      // INF-524: |C|>1 requires an explicit valid choice. This applies to EVERY verb
+      // that routes into a multi-candidate role — meta-intents AND named verbs
+      // (accept/submit/approve, etc.) — not just the generic CLI path. The connector
+      // itself refuses a multi-body resolution without a --target (INF-546), so the
+      // guard the operator hits must be the verb they naturally reach for, not only
+      // the escape hatch. Transitions that auto-resolve (assign.default, e.g.
+      // prior-implementer routing) are exempt: mode:'required' is the marker for
+      // "an explicit target is mandatory here".
+      if (!target && match.assign?.mode === 'required') {
+        return (
+          `[Proxy] '${intent}' routes to role '${ownerRole}', which has multiple candidates ` +
+          `(${legalBodies.join(', ')}); this transition requires an explicit --target naming one of them. ` +
+          `Selection criteria: pick a candidate from [${legalBodies.join(', ')}].`
+        );
       }
       if (target && !legalBodies.includes(target)) {
-        return `[Proxy] '${target}' is not a legal assignment target for '${intent}'. Legal targets for role '${ownerRole}': ${legalBodies.join(', ')}.`;
+        return (
+          `[Proxy] '${target}' is not a legal assignment target for '${intent}' — it is not a candidate ` +
+          `for role '${ownerRole}'. Candidates (selection criteria): ${legalBodies.join(', ')}.`
+        );
       }
     } else if (legalBodies.length === 1) {
       if (target && target !== legalBodies[0]) {
@@ -5613,7 +5676,7 @@ export async function applyStateTransition(
               from: currentStateName,
               to: toStateName,
             });
-          } else if (intent === 'approve' || intent === 'reject' || await isRoleDeclared(destOwnerRole!)) {
+          } else if (intent === 'approve' || intent === 'reject' || intent === 'submit' || await isRoleDeclared(destOwnerRole!)) {
             log.error(
               `workflow-gate: B2 apply: FAIL-CLOSED — no bodies found for role '${destOwnerRole}' on '${intent}'. Transition aborted per delegate-resolution contract.`,
             );
