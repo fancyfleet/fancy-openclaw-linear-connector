@@ -1399,6 +1399,9 @@ describe("Integration: end-to-end spawn with per-entry child workflows", () => {
       if (query.includes("ApplyAtomicTransition")) {
         return jsonResp({ issueUpdate: { success: true } });
       }
+      if (query.includes("IssueWithComments")) {
+        return jsonResp({ issue: { id: "parent-internal-id", description: parentDescription, comments: { nodes: [] } } });
+      }
       if (query.includes("IssueTeamParent") || (query.includes("IssueParent") && !query.includes("ParentChildren"))) {
         return jsonResp({
           issue: {

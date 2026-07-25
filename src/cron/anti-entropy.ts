@@ -29,6 +29,7 @@ import yaml from "js-yaml";
 import { createLogger, componentLogger } from "../logger.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
 import { type WorkflowDef } from "../workflow-gate.js";
+import { findOrCreateLabel } from "../linear-helpers.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "anti-entropy");
 
@@ -275,6 +276,7 @@ async function issueUpdateLabelsAndState(
   labelIds: string[],
   stateId: string,
   authToken: string,
+  ownershipCleanup?: { delegateId: null; assigneeId: null },
 ): Promise<boolean> {
   const mutation = `
     mutation IssueUpdate($issueId: String!, $input: IssueUpdateInput!) {
@@ -286,7 +288,17 @@ async function issueUpdateLabelsAndState(
   const res = await fetch(LINEAR_API_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: authToken },
-    body: JSON.stringify({ query: mutation, variables: { issueId, input: { labelIds, stateId } } }),
+    body: JSON.stringify({
+      query: mutation,
+      variables: {
+        issueId,
+        input: {
+          labelIds,
+          stateId,
+          ...(ownershipCleanup ?? {}),
+        },
+      },
+    }),
   });
   type Resp = { data?: { issueUpdate?: { success?: boolean } }; errors?: unknown[] };
   const data = (await res.json()) as Resp;
@@ -376,16 +388,26 @@ async function processIssue(
     const targetStateLabelName = `state:${barrierTarget}`;
 
     const currentLabelNode = labels.find((l) => l.name === currentStateLabelName);
+    const targetLabelId = await findOrCreateLabel(issue.team.id, targetStateLabelName, authToken);
+    if (!targetLabelId) {
+      result.errors.push(
+        `${issue.identifier}: barrier reconcile failed — could not resolve target label '${targetStateLabelName}'`,
+      );
+      return;
+    }
     const remainingIds = labels
       .filter((l) => l.id !== currentLabelNode?.id)
       .map((l) => l.id);
+    const nextLabelIds = Array.from(new Set([...remainingIds, targetLabelId]));
 
-    // We need to add the target state label. Since we can't add labels by
-    // name in this path (we need IDs), and the anti-entropy pass doesn't
-    // manage a label cache — we just update the native state + remove the
-    // old label. The label-sync cron or next enrollment pass will add the
-    // target state label.
-    const reconciled = await issueUpdateLabelsAndState(issue.id, remainingIds, nextNativeId, authToken);
+    const targetIsTerminalOrOwnerless = nextStateDef?.kind === "terminal" || !nextStateDef?.owner_role;
+    const reconciled = await issueUpdateLabelsAndState(
+      issue.id,
+      nextLabelIds,
+      nextNativeId,
+      authToken,
+      targetIsTerminalOrOwnerless ? { delegateId: null, assigneeId: null } : undefined,
+    );
     if (reconciled) result.barrierMissedReconciled++;
     log.info(
       `[anti-entropy] AC2 barrier ${issue.identifier}: ` +
