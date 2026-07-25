@@ -63,6 +63,10 @@ interface PolicyRole {
   requires: string[];
   /** Invariant: exactly ONE body fleet-wide may fill this role (§16.0). */
   exclusive?: boolean;
+  /** Synthetic engine/runtime role that is intentionally not filled by a policy body. */
+  synthetic?: boolean;
+  /** Explicit marker for roles that must not be staffed by a policy body. */
+  no_body?: boolean;
 }
 
 export interface CapabilityPolicy {
@@ -293,6 +297,17 @@ export async function resolveAgentIdentifiersForRole(roleId: string): Promise<Se
 export async function isRoleDeclared(roleId: string): Promise<boolean> {
   const policy = await loadPolicy();
   return (policy.roles ?? []).some((role) => role.id === roleId);
+}
+
+/**
+ * Returns true for explicitly declared synthetic engine/runtime roles that are
+ * intentionally bodyless. These roles are driven by the engine itself, not by a
+ * staffable Linear delegate, so registration reachability must skip |C|=0.
+ */
+export async function isSyntheticNoBodyRole(roleId: string): Promise<boolean> {
+  const policy = await loadPolicy();
+  const role = (policy.roles ?? []).find((candidate) => candidate.id === roleId);
+  return Boolean(role && role.synthetic === true && role.no_body === true);
 }
 
 /**

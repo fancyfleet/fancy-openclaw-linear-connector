@@ -39,7 +39,7 @@ import path from "node:path";
 import yaml from "js-yaml";
 import { componentLogger, createLogger, type Logger } from "./logger.js";
 import { defaultWorkflowDefPath } from "./instance-config.js";
-import { bodyHasCapability, resolveBodiesForRole, resolveBodiesWithCapability, isBodyKnown, isRoleDeclared } from "./escalation-gate.js";
+import { bodyHasCapability, resolveBodiesForRole, resolveBodiesWithCapability, isBodyKnown, isRoleDeclared, isSyntheticNoBodyRole } from "./escalation-gate.js";
 import { probeDeployOutcome } from "./deploy-probe.js";
 import { isTerminalIssueState } from "./linear-actionable.js";
 import type { ObservationStore } from "./store/observation-store.js";
@@ -627,6 +627,7 @@ export async function reloadWorkflowDefs(): Promise<
   // entry. If not, a def was silently excluded — roll back.
   const dir = process.env.WORKFLOW_DEFS_DIR || process.env.WORKFLOW_DEF_DIR || undefined;
   const diagnostics: string[] = [];
+  const sourceNameById = new Map<string, string>();
 
   if (dir) {
     try {
@@ -640,6 +641,7 @@ export async function reloadWorkflowDefs(): Promise<
           const raw = await fs.readFile(full, "utf8");
           const parsed = yaml.load(raw) as Record<string, unknown> | null;
           const id = parsed && typeof parsed.id === "string" ? parsed.id : null;
+          if (id) sourceNameById.set(id, f);
           if (id && !loadedIds.has(id)) {
             // Def was excluded; get the reason by attempting a load.
             try {
@@ -671,14 +673,22 @@ export async function reloadWorkflowDefs(): Promise<
   // criteria on its inbound transitions (an `assign` block) so the engine knows how
   // to pick. Reject at registration rather than letting the drift surface at runtime.
   for (const [wfId, def] of newRegistry) {
+    const sourceName = sourceNameById.get(wfId) ?? wfId;
     // Precompute, per destination state, whether ANY inbound transition declares
-    // selection criteria (any `assign` metadata — mode/default/constraint).
+    // selection criteria (`selection_criteria` or deterministic assign metadata).
     const inboundSeen = new Set<string>();
     const inboundHasSelection = new Map<string, boolean>();
     for (const s of def.states ?? []) {
       for (const t of s.transitions ?? []) {
         inboundSeen.add(t.to);
-        const hasSel = Boolean(t.assign && (t.assign.mode || t.assign.default || t.assign.constraint));
+        const hasSel = Boolean(
+          t.assign &&
+            (
+              Boolean(t.assign.default) ||
+              Boolean(t.assign.constraint) ||
+              (typeof t.assign.selection_criteria === "string" && t.assign.selection_criteria.trim().length > 0)
+            ),
+        );
         inboundHasSelection.set(t.to, (inboundHasSelection.get(t.to) ?? false) || hasSel);
       }
     }
@@ -695,8 +705,9 @@ export async function reloadWorkflowDefs(): Promise<
       }
 
       if (bodies.length === 0) {
+        if (await isSyntheticNoBodyRole(role)) continue;
         diagnostics.push(
-          `${wfId}: state '${s.id}' is unreachable — owner_role '${role}' has a candidate set of 0 ` +
+          `${sourceName}: state '${s.id}' is unreachable — owner_role '${role}' has a candidate set of 0 ` +
             `(no available agent satisfies its delegate requirement). Add a body with '${role}' in its ` +
             `\`fills_roles\` in capability-policy.yaml, or remove the state.`,
         );
@@ -707,9 +718,10 @@ export async function reloadWorkflowDefs(): Promise<
         const hasSelection = inboundHasSelection.get(s.id) ?? false;
         if (!isEntry && inboundSeen.has(s.id) && !hasSelection) {
           diagnostics.push(
-            `${wfId}: state '${s.id}' owner_role '${role}' has multiple candidates ` +
+            `${sourceName}: state '${s.id}' owner_role '${role}' has multiple candidates ` +
               `(${bodies.join(", ")}) but declares no selection criteria — add an \`assign\` block ` +
-              `(e.g. \`mode: required\` for --target selection, or \`default: prior-implementer\`) to ` +
+              `(e.g. \`mode: required\` with \`selection_criteria\`, \`selection_criteria: original-requester\`, ` +
+              `or \`default: prior-implementer\`) to ` +
               `the transition(s) routing into it.`,
           );
         }
