@@ -98,6 +98,8 @@ interface FetchScenario {
     labelNodes: Array<{ id: string; name: string }>;
     delegateId?: string | null;
     teamId: string;
+    /** INF-608: native Linear state for the terminality guard. Defaults to null (non-terminal). */
+    nativeState?: { name: string; type: string } | null;
   }>;
   /** Whether the issueUpdate mutation returns success. */
   mutationSuccess?: boolean;
@@ -134,6 +136,7 @@ function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
         labels: { nodes: t.labelNodes },
         delegate: t.delegateId ? { id: t.delegateId } : null,
         team: { id: t.teamId },
+        state: t.nativeState ?? null,
         title: `Ticket ${t.identifier}`,
       }));
       return new Response(
@@ -971,5 +974,132 @@ describe("registerBootstrapReconciliationCron: behavioral — heal produces aler
 
     alertSpy.mockRestore();
     _resetAlertBusForTests();
+  });
+});
+
+// ── INF-608: native-terminal tickets draw zero wakes from the bootstrap sweep ──
+//
+// Sibling defect to INF-604 / symmetric to INF-584. The bootstrap-reconciliation
+// sweep queried issues(filter: wf:*), which INCLUDES native-Done issues (Done is
+// not archived). A native-Done ticket carrying a wf:* label but missing its
+// state:* label was treated as "unenrolled" by Pass 1 and re-enrolled to the
+// entry state — Done → Doing — then its first owner (TDD) was woken, which put it
+// straight back to Done: the observed DSN-5 Done→Doing→Done loop. Passes 1 & 2 are
+// now gated by isTerminalIssueState(nativeState).
+describe("INF-608: native-terminal ticket missing state:* draws zero wakes (Pass 1)", () => {
+  it("does not re-enroll or wake a native-Done wf:* ticket with no state:* label", async () => {
+    const mutationCalls: string[] = [];
+    const wakeDispatches: Array<{ agentName: string; ticketIdentifier: string }> = [];
+    const { bus, alerts } = makeTestAlertBus();
+
+    globalThis.fetch = async (url, init) => {
+      const body = typeof init?.body === "string" ? init.body : "";
+      if (body.includes("issueUpdate") || body.includes("IssueUpdate")) {
+        mutationCalls.push(body);
+      }
+      return makeReconciliationFetch({
+        unenrolledTickets: [
+          {
+            id: ISSUE_ID_UNENROLLED,
+            identifier: "DSN-5",
+            updatedAt: OLD_TIMESTAMP,
+            // wf:* present, NO state:* — the "unenrolled" shape Pass 1 heals…
+            labelNodes: [{ id: WF_LABEL_ID, name: WF_LABEL_NAME }],
+            delegateId: null,
+            teamId: TEAM_ID,
+            // …but the Linear entity is natively Done. Native terminality wins.
+            nativeState: { name: "Done", type: "completed" },
+          },
+        ],
+      })(url, init);
+    };
+
+    const result = await runBootstrapReconciliationSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: WORKFLOW_REGISTRY as Map<string, Parameters<typeof runBootstrapReconciliationSweep>[0]["workflowRegistry"] extends Map<string, infer V> ? V : never>,
+      alertBus: bus,
+      wakeFn: async (agentName, ticketIdentifier) => {
+        wakeDispatches.push({ agentName, ticketIdentifier });
+      },
+    });
+
+    // AC1/AC2: zero heals, zero re-enrollment mutation, zero wakes.
+    expect(result.healed).toBe(0);
+    expect(wakeDispatches).toHaveLength(0);
+    expect(result.errors).toHaveLength(0);
+    // No issueUpdate mutation carrying the entry state:* label (no Done→Doing).
+    const combined = mutationCalls.join("\n");
+    expect(combined).not.toContain(STATE_INTAKE_LABEL_ID);
+    // No bootstrap-reconciled heal alert.
+    expect(alerts.filter((a) => a.source === "bootstrap-reconciled")).toHaveLength(0);
+  });
+
+  it("also skips a native-Canceled wf:* ticket with no state:* label", async () => {
+    const mutationCalls: string[] = [];
+    const wakeDispatches: string[] = [];
+    const { bus } = makeTestAlertBus();
+
+    globalThis.fetch = async (url, init) => {
+      const body = typeof init?.body === "string" ? init.body : "";
+      if (body.includes("issueUpdate") || body.includes("IssueUpdate")) {
+        mutationCalls.push(body);
+      }
+      return makeReconciliationFetch({
+        unenrolledTickets: [
+          {
+            id: ISSUE_ID_UNENROLLED,
+            identifier: "DSN-9",
+            updatedAt: OLD_TIMESTAMP,
+            labelNodes: [{ id: WF_LABEL_ID, name: WF_LABEL_NAME }],
+            delegateId: null,
+            teamId: TEAM_ID,
+            nativeState: { name: "Canceled", type: "canceled" },
+          },
+        ],
+      })(url, init);
+    };
+
+    const result = await runBootstrapReconciliationSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: WORKFLOW_REGISTRY as Map<string, Parameters<typeof runBootstrapReconciliationSweep>[0]["workflowRegistry"] extends Map<string, infer V> ? V : never>,
+      alertBus: bus,
+      wakeFn: async (_agent, id) => { wakeDispatches.push(id); },
+    });
+
+    expect(result.healed).toBe(0);
+    expect(wakeDispatches).toHaveLength(0);
+    expect(mutationCalls.join("\n")).not.toContain(STATE_INTAKE_LABEL_ID);
+  });
+
+  it("still heals a genuinely-unenrolled non-terminal ticket (guard does not over-skip)", async () => {
+    // Control: same shape but native state is active — the sweep must still heal.
+    const wakeDispatches: string[] = [];
+    const { bus } = makeTestAlertBus();
+
+    globalThis.fetch = async (url, init) => {
+      return makeReconciliationFetch({
+        unenrolledTickets: [
+          {
+            id: ISSUE_ID_UNENROLLED,
+            identifier: "AI-1799",
+            updatedAt: OLD_TIMESTAMP,
+            labelNodes: [{ id: WF_LABEL_ID, name: WF_LABEL_NAME }],
+            delegateId: null,
+            teamId: TEAM_ID,
+            nativeState: { name: "In Progress", type: "started" },
+          },
+        ],
+      })(url, init);
+    };
+
+    const result = await runBootstrapReconciliationSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: WORKFLOW_REGISTRY as Map<string, Parameters<typeof runBootstrapReconciliationSweep>[0]["workflowRegistry"] extends Map<string, infer V> ? V : never>,
+      alertBus: bus,
+      wakeFn: async (_agent, id) => { wakeDispatches.push(id); },
+    });
+
+    expect(result.healed).toBe(1);
+    expect(wakeDispatches).toHaveLength(1);
   });
 });
