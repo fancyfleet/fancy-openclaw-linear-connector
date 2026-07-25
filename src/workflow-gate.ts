@@ -5873,6 +5873,7 @@ export async function applyStateTransition(
   }
 
   let preTransitionFanoutResult: FanoutResult | null = null;
+  let fanoutThrew = false;
   if (pendingFanout) {
     try {
       log.info(`workflow-gate: AI-1992 fan-out preflight: triggering fan-out for ${issueId} before parent advance (${currentStateName} → ${toStateName}, child=${pendingFanout.config.child_workflow})`);
@@ -5926,6 +5927,7 @@ export async function applyStateTransition(
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      fanoutThrew = true;
       log.warn(`workflow-gate: B-2 fan-out: fan-out execution failed for ${issueId}: ${msg}`);
       return { status: "failed", code: "fanout-create-failed", detail: msg, from: currentStateName, to: toStateName };
     }
@@ -6165,7 +6167,8 @@ export async function applyStateTransition(
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      log.warn(`workflow-gate: B-2 fan-out: fan-out execution failed for ${issueId}: ${msg}`);
+      fanoutThrew = true;
+      log.error(`workflow-gate: B-2 fan-out: fan-out post-processing failed for ${issueId}: ${msg}`);
     }
   }
 
@@ -6187,9 +6190,15 @@ export async function applyStateTransition(
   // failed" from "write failed". Advancing would re-create LIF-2 (stale record
   // → stale set → all-terminal → advance). The parent stays put, which is the
   // alarm.
-  if (applied && destStateNode?.barrier === true && (spawnIfEvaluationFailed || fanoutRecordWriteFailed)) {
+  //
+  // INF-636: `fanoutThrew` — any unexpected fanout exception means the outcome is
+  // not trustworthy enough for vacuous barrier advancement. Keep the parent in
+  // the barrier state for steward retry instead of sailing past an unrun sprint.
+  if (applied && destStateNode?.barrier === true && (spawnIfEvaluationFailed || fanoutRecordWriteFailed || fanoutThrew)) {
     const reason = spawnIfEvaluationFailed
       ? "spawn_if predicate could not be evaluated"
+      : fanoutThrew
+        ? "fanout execution threw before a trustworthy outcome was recorded"
       : "fanout outcome record could not be persisted";
     log.error(
       `workflow-gate: INF-28: skipping barrier auto-advance for ${issueId} — ` +

@@ -136,6 +136,7 @@ describe("formatPreviewComment", () => {
     expect(comment).toContain("**Proposed children:** 3");
     expect(comment).toContain("**Tree depth:** 0");
     expect(comment).toContain("1. **Finding A**");
+    expect(comment).toContain("1. **Finding A** (wf:dev-impl)");
     expect(comment).toContain("2. **Finding B**");
     expect(comment).toContain("_Desc B_");
     expect(comment).toContain("3. **Finding C**");
@@ -179,6 +180,24 @@ describe("formatPreviewComment", () => {
 
     const comment = formatPreviewComment(preview);
     expect(comment).toContain("⚠️ **Steward approval required**");
+  });
+
+  it("does not double-prefix workflow labels that already include wf:", () => {
+    const preview = {
+      parentIssueId: "AI-1440",
+      childCount: 1,
+      children: [
+        { index: 0, title: "Finding A", workflow: "wf:dev-impl", seedAc: "Finding A" },
+      ],
+      currentDepth: 0,
+      requiresApproval: false,
+      capResult: checkCaps(1, 0),
+    };
+
+    const comment = formatPreviewComment(preview);
+
+    expect(comment).toContain("1. **Finding A** (wf:dev-impl)");
+    expect(comment).not.toContain("wf:wf:dev-impl");
   });
 });
 
@@ -299,7 +318,7 @@ describe("generateSpawnPreview — mocked depth", () => {
     expect(result.preview!.requiresApproval).toBe(false);
     expect(result.preview!.capResult.allowed).toBe(true);
     expect(result.preview!.children).toHaveLength(2);
-    expect(result.preview!.children[0].workflow).toBe("dev-impl");
+    expect(result.preview!.children[0].workflow).toBe("wf:dev-impl");
   });
 
   it("generates a preview for a child issue (depth=1)", async () => {

@@ -1483,9 +1483,8 @@ describe("INF-41: validateFanoutSpec rejects unregistered config default with ma
       child_workflow: "wf:sprint-arm-nonexistent",
     } as FanoutConfig;
 
-    // BACKWARD_COMPAT_SPEC has no per-entry [wf:...] markers — all findings
-    // are marker-less, so the config default applies to every one.
-    // The default 'wf:sprint-arm-nonexistent' is NOT in the registered set.
+    // BACKWARD_COMPAT_SPEC has no per-entry [wf:...] markers. Structured fan-out
+    // now fails closed before it can inherit the config default.
     const registeredWorkflows = new Set([
       "wf:sprint-arm-scope",
       "wf:sprint-arm-ux",
@@ -1497,18 +1496,18 @@ describe("INF-41: validateFanoutSpec rejects unregistered config default with ma
 
     expect(result.ok).toBe(false);
     if (!result.ok) {
-      expect(result.reason).toMatch(/config default.*unregistered|not a registered workflow/i);
+      expect(result.reason).toMatch(/missing an explicit \[wf:\.\.\.\] marker|marker-less/i);
     }
   });
 
-  it("returns ok:true when config default is registered and findings are marker-less", () => {
+  it("returns ok:false when structured findings are marker-less even if config default is registered", () => {
     const config = {
       spec_source: "Structured",
       child_workflow: "wf:sprint-arm-scope",
     } as FanoutConfig;
 
-    // All findings are marker-less (BACKWARD_COMPAT_SPEC), but the config
-    // default IS registered.
+    // All findings are marker-less (BACKWARD_COMPAT_SPEC). Structured fan-out
+    // must not silently inherit the config default, even if it is registered.
     const registeredWorkflows = new Set([
       "wf:sprint-arm-scope",
       "wf:sprint-arm-ux",
@@ -1518,9 +1517,9 @@ describe("INF-41: validateFanoutSpec rejects unregistered config default with ma
 
     const result = validateFanoutSpec(BACKWARD_COMPAT_SPEC, config, registeredWorkflows);
 
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.findings.length).toBeGreaterThan(0);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toMatch(/missing an explicit \[wf:\.\.\.\] marker|marker-less/i);
     }
   });
 
