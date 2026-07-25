@@ -65,6 +65,7 @@ import { getRescueSweepState } from "./rescue-sweep-state.js";
 import { getDetectorState } from "./done-ticket-detector-state.js";
 import { registerFirstActionWatchdogCron } from "./first-action-watchdog.js";
 import { getFirstActionWatchdogState } from "./first-action-watchdog-state.js";
+import { classifyCrossCheckIssue, type CrossCheckIssue } from "./first-action-crosscheck.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
 import { getCapabilityPolicy } from "./escalation-gate.js";
 import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
@@ -1875,45 +1876,50 @@ if (isEntryPoint) {
     // the mirror is corrected; the fresh entered_state_at re-arms a clean
     // ladder on the next sweep.
     crossCheck: async (t) => {
-      const query = `query($id: String!) { issue(id: $id) { id state { type } labels { nodes { name } } } }`;
-      let issue: { state?: { type?: string } | null; labels?: { nodes?: Array<{ name: string }> } } | null;
+      // INF-604: select archivedAt/trashed so a soft-deleted (trashed) issue,
+      // which still resolves through the archive on a node query, is detected
+      // instead of reading as a live governed ticket and drawing endless wakes.
+      const query = `query($id: String!) { issue(id: $id) { id archivedAt trashed state { type } labels { nodes { name } } } }`;
+      let issue: CrossCheckIssue | null;
       try {
         const res = await fetch(LINEAR_API_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: reconciliationAuthToken },
           body: JSON.stringify({ query, variables: { id: t.ticket } }),
         });
-        const data = (await res.json()) as { data?: { issue?: typeof issue } };
+        const data = (await res.json()) as { data?: { issue?: CrossCheckIssue | null } };
         if (data.data === undefined) return "unknown"; // auth/transport error — fail open
         issue = data.data?.issue ?? null;
       } catch {
         return "unknown";
       }
-      if (!issue) {
-        enrolledTicketsStore.markTerminal(t.ticket, "watchdog-crosscheck-deleted");
-        return "stale";
+      // Interpretation is a pure, unit-tested function (INF-604); this closure
+      // owns only the mirror side-effect each verdict implies.
+      const action = classifyCrossCheckIssue(issue, t.state);
+      if (action.verdict === "live") return "live";
+      switch (action.heal) {
+        case "deleted":
+          enrolledTicketsStore.markTerminal(t.ticket, "watchdog-crosscheck-deleted");
+          break;
+        case "trashed":
+          enrolledTicketsStore.markTerminal(t.ticket, "watchdog-crosscheck-trashed");
+          break;
+        case "terminal":
+          enrolledTicketsStore.markTerminal(t.ticket, "watchdog-crosscheck-terminal");
+          break;
+        case "demoted":
+          enrolledTicketsStore.demoteEnrolled(t.ticket);
+          break;
+        case "state-drift":
+          enrolledTicketsStore.recordTransition({
+            ticketId: t.ticket,
+            toState: action.toState,
+            delegate: t.delegate,
+            eventKind: "watchdog-reconciled",
+          });
+          break;
       }
-      const labels = issue.labels?.nodes ?? [];
-      const stateType = issue.state?.type;
-      const stateLabel = labels.find((l) => l.name.startsWith("state:"))?.name.slice("state:".length);
-      if (stateType === "completed" || stateType === "canceled" || stateType === "duplicate" || stateLabel === "done") {
-        enrolledTicketsStore.markTerminal(t.ticket, "watchdog-crosscheck-terminal");
-        return "stale";
-      }
-      if (!labels.some((l) => l.name.startsWith("wf:"))) {
-        enrolledTicketsStore.demoteEnrolled(t.ticket);
-        return "stale";
-      }
-      if (stateLabel && stateLabel !== t.state) {
-        enrolledTicketsStore.recordTransition({
-          ticketId: t.ticket,
-          toState: stateLabel,
-          delegate: t.delegate,
-          eventKind: "watchdog-reconciled",
-        });
-        return "stale";
-      }
-      return "live";
+      return "stale";
     },
     // Rung 2: alert the ops channel with ticket/state/delegate for the on-call.
     notify: (alert) =>
