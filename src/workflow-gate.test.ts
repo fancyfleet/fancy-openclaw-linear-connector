@@ -4760,25 +4760,38 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
-      // Issue context fetch (for delegate check in checkWorkflowRules)
-      if (bodyText.includes("delegate")) {
-        return new Response(
-          JSON.stringify({ data: { issue: { labels: { nodes: [{ name: "wf:sprint" }, { name: "state:intake" }] }, delegate: null } } }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        );
-      }
-      // Fetch issue with labels (for applyStateTransition)
+      // Fetch issue with labels (for applyStateTransition). Must be matched
+      // BEFORE the broad "delegate" context-fetch branch: INF-562 added
+      // `delegate { id }` / `assignee { id }` to the IssueWithLabels query, so
+      // its body now contains "delegate". Without this ordering the fetch is
+      // misrouted to the context branch (which returns no `team` field),
+      // fetchIssueWithLabels throws on `issue.team.id` and returns null, and
+      // applyStateTransition aborts with "could not fetch labels" before ever
+      // binding the artifact — the shape that regressed C-2 after the rebase
+      // onto INF-562. Response mirrors the expanded query so the new
+      // delegate/assignee/native-state facets resolve.
       if (bodyText.includes("IssueWithLabels")) {
         return new Response(
           JSON.stringify({
             data: {
               issue: {
                 id: "internal-uuid",
+                identifier: "TEST-1",
                 team: { id: "team-uuid" },
                 labels: { nodes: [{ id: "lbl-1", name: "wf:sprint" }, { id: "lbl-2", name: "state:intake" }] },
+                delegate: null,
+                assignee: null,
+                state: { id: "state-intake-uuid" },
               },
             },
           }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      // Issue context fetch (for delegate check in checkWorkflowRules)
+      if (bodyText.includes("delegate")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { labels: { nodes: [{ name: "wf:sprint" }, { name: "state:intake" }] }, delegate: null } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
