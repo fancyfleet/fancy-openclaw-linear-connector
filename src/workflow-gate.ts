@@ -4125,7 +4125,14 @@ export async function checkRawMutationInterception(
     );
   }
 
-  if (hasStateChange && !hasAssigneeChange && !hasLabelChange && !hasDelegateChange) {
+  // INF-543: governed native-state repair entry. A break-glass steward may reconcile
+  // a stale native mirror to the workflow label. stateId is the required anchor
+  // (hasStateChange); delegate/assignee may ride along and are each validated against
+  // their computed mirror inside validateNativeStateRepair (AC1). Label changes are
+  // NOT a repair facet, so a labelIds mutation stays on the normal block path below —
+  // repair may not touch the workflow label (AC3). Non-break-glass callers fall
+  // through to the block regardless.
+  if (hasStateChange && !hasLabelChange) {
     let canAttemptRepair = false;
     try {
       canAttemptRepair = !!bodyId && await bodyHasCapability(bodyId, "workflow:break-glass");
@@ -4163,6 +4170,65 @@ export async function checkRawMutationInterception(
     `(state: **${currentState}**). Use workflow commands instead:\n\n` +
     helpLines.join("\n")
   );
+}
+
+/**
+ * INF-543: Collect the set of IssueUpdateInput field keys present in an issueUpdate
+ * mutation, across all three encodings the raw-mutation detector already handles:
+ *   (a) variables.<...>.input = { field: ... }   — CLI/canonical shape
+ *   (b) input: { field: $var } inline            — key in query text, value in vars
+ *   (c) input: { field: "literal" } inline       — key and value in query text
+ *
+ * Used to enforce a strict allowlist on the governed native-state repair path: a
+ * break-glass caller may only write the native-mirror facets, and any other field
+ * piggybacking on the repair allowance must be surfaced here so it can be rejected.
+ * `id` (the issueUpdate ticket argument) is excluded — it is not an input field.
+ */
+export function collectRepairInputFields(
+  body: { query?: string; variables?: Record<string, unknown> } | null,
+): Set<string> {
+  const keys = new Set<string>();
+  const facetKeys = ["stateId", "delegateId", "assigneeId"];
+  // (a) Variables shape: GraphQL puts every input field in one object, so the
+  // object carrying a facet key holds the complete field set — collect its keys.
+  const visit = (obj: unknown): void => {
+    if (!obj || typeof obj !== "object") return;
+    if (Array.isArray(obj)) {
+      obj.forEach(visit);
+      return;
+    }
+    const rec = obj as Record<string, unknown>;
+    if (facetKeys.some((k) => k in rec)) {
+      Object.keys(rec).forEach((k) => keys.add(k));
+    }
+    Object.values(rec).forEach(visit);
+  };
+  visit(body?.variables ?? {});
+  // (b)/(c) Inlined shape: extract the top-level keys of the `input: { ... }`
+  // object literal in the query text (depth-tracked so nested-object keys are
+  // not mistaken for input fields).
+  const q = body?.query ?? "";
+  const open = /input\s*:\s*\{/.exec(q);
+  if (open) {
+    let depth = 1;
+    let i = open.index + open[0].length;
+    const start = i;
+    for (; i < q.length && depth > 0; i++) {
+      if (q[i] === "{") depth++;
+      else if (q[i] === "}") depth--;
+    }
+    const block = q.slice(start, i - 1);
+    let d = 0;
+    const tok = /(\w+)\s*:|[{}]/g;
+    let t: RegExpExecArray | null;
+    while ((t = tok.exec(block))) {
+      if (t[0] === "{") d++;
+      else if (t[0] === "}") d--;
+      else if (d === 0 && t[1]) keys.add(t[1]);
+    }
+  }
+  keys.delete("id");
+  return keys;
 }
 
 export async function validateNativeStateRepair(
@@ -4220,11 +4286,24 @@ export async function validateNativeStateRepair(
     return undefined;
   };
   const touches = (field: string) => queryHasField(field) || varsHaveKey(vars, field);
-  const forbidden = ["assigneeId", "delegateId", "labelIds", "addedLabelIds", "removedLabelIds"].filter(touches);
-  if (forbidden.length > 0) {
+
+  // INF-543 review: enforce a strict allowlist, not a denylist. A governed repair
+  // may ONLY write the native-mirror facets — stateId, delegateId, assigneeId.
+  // Every other IssueUpdateInput field (title, description, priority, dueDate,
+  // labelIds, …) is rejected, so the break-glass repair allowance cannot be used
+  // to piggyback an arbitrary edit onto a legitimate native-state reconciliation.
+  // Each allowed facet is additionally validated against its computed mirror below,
+  // so being on the allowlist is necessary but not sufficient.
+  const ALLOWED_REPAIR_FIELDS = ["stateId", "delegateId", "assigneeId"];
+  const disallowed = [...collectRepairInputFields(body)]
+    .filter((k) => !ALLOWED_REPAIR_FIELDS.includes(k))
+    .sort();
+  if (disallowed.length > 0) {
     return {
       ok: false,
-      message: `[Proxy] repair-native-state rejected: repair may only write stateId; found ${forbidden.join(", ")}.`,
+      message:
+        `[Proxy] repair-native-state rejected: repair may only write ${ALLOWED_REPAIR_FIELDS.join(", ")}; ` +
+        `found disallowed field(s) ${disallowed.join(", ")}.`,
     };
   }
   const requestedStateId = fieldValue(vars, "stateId");
@@ -4271,7 +4350,55 @@ export async function validateNativeStateRepair(
     );
   }
 
-  log.warn(`workflow-gate: repair-native-state ALLOW agent=${bodyId} ticket=${issueId} state=${currentState} native_state=${stateNode.native_state}`);
+  // INF-543 AC1: delegate reconciliation. If the repair carries a delegateId it
+  // must equal the deterministic mirror delegate for the current state — never an
+  // arbitrary body. The mirror is the same resolution a governed transition into
+  // this state would compute (singleton owner_role, or the state's prior-implementer
+  // routing). When the mirror is indeterminate (multi-body role with no single
+  // canonical owner), there is nothing to reconcile *to*, so a supplied delegateId
+  // is rejected rather than forwarded blind — that would re-open the arbitrary
+  // native-desync path this guard exists to close (AC3).
+  if (touches("delegateId")) {
+    const requestedDelegateId = fieldValue(vars, "delegateId");
+    const expectedDelegateId = await resolveTransitionDelegate(currentState, undefined, def, issueId);
+    if (expectedDelegateId === undefined) {
+      return {
+        ok: false,
+        message:
+          `[Proxy] repair-native-state rejected: the mirror delegate for state:${currentState} is not ` +
+          `deterministically resolvable (multi-body role); repair cannot reconcile delegateId. ` +
+          `Route the delegate through a workflow command instead.`,
+      };
+    }
+    const normDelegate = (v: unknown) => (v == null ? null : v);
+    if (normDelegate(requestedDelegateId) !== normDelegate(expectedDelegateId)) {
+      return {
+        ok: false,
+        message:
+          `[Proxy] repair-native-state rejected: requested delegateId does not match the mirror delegate ` +
+          `for state:${currentState}.`,
+      };
+    }
+  }
+
+  // INF-543 AC1: assignee reconciliation. Governed workflow tickets carry
+  // assigneeId:null alongside the agent delegate (AI-1395), so the only native
+  // mirror for assignee is null. The repair may CLEAR a stale assignee, but must
+  // never set one to an arbitrary user — a human assignment is not a mirror repair.
+  if (touches("assigneeId")) {
+    const requestedAssigneeId = fieldValue(vars, "assigneeId");
+    if (requestedAssigneeId != null) {
+      return {
+        ok: false,
+        message:
+          `[Proxy] repair-native-state rejected: the native mirror assignee for a workflow ticket is null; ` +
+          `repair may only clear a stale assignee (assigneeId:null), not set one.`,
+      };
+    }
+  }
+
+  const reconciled = ["stateId", touches("delegateId") ? "delegateId" : null, touches("assigneeId") ? "assigneeId" : null].filter(Boolean).join("+");
+  log.warn(`workflow-gate: repair-native-state ALLOW agent=${bodyId} ticket=${issueId} state=${currentState} native_state=${stateNode.native_state} fields=${reconciled}`);
   return { ok: true };
 }
 

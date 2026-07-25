@@ -149,7 +149,7 @@ function writeAgents(dir: string): string {
   const file = path.join(dir, "agents.json");
   fs.writeFileSync(
     file,
-    JSON.stringify({ agents: [{ name: "charles", linearUserId: "u1", openclawAgent: "charles", accessToken: "tok", host: "local" }, { name: "hanzo", linearUserId: "u2", openclawAgent: "hanzo", accessToken: "tok2", host: "local" }] }),
+    JSON.stringify({ agents: [{ name: "charles", linearUserId: "u1", openclawAgent: "charles", accessToken: "tok", host: "local" }, { name: "hanzo", linearUserId: "u2", openclawAgent: "hanzo", accessToken: "tok2", host: "local" }, { name: "astrid", linearUserId: "astrid-user", openclawAgent: "astrid", accessToken: "tok3", host: "local" }] }),
     "utf8"
   );
   return file;
@@ -1558,6 +1558,141 @@ describe("proxy — Layer 2 raw mutation interception (AI-1387)", () => {
     expect(res.body.errors).toBeDefined();
     expect(res.body.errors[0].message).toContain("repair-native-state rejected");
     expect(res.body.errors[0].message).toContain("does not match");
+    expect(calls.filter((c) => c.query.includes("issueUpdate")).length).toBe(0);
+  });
+
+  // INF-543 review follow-up: shared LIF-45 sprint-spawner fetch mock
+  // (state:managing, stale native Thinking, delegate astrid-user).
+  function installRepairFetch(calls: Array<{ query: string; variables?: Record<string, unknown> }>) {
+    globalThis.fetch = async (url: unknown, init?: RequestInit) => {
+      if (typeof url !== "string" || !url.includes("api.linear.app")) {
+        return originalFetch(url as URL | RequestInfo, init);
+      }
+      const parsed = JSON.parse(String(init?.body ?? "{}")) as { query?: string; variables?: Record<string, unknown> };
+      calls.push({ query: parsed.query ?? "", variables: parsed.variables });
+      if (parsed.query?.includes("IssueContext") || parsed.query?.includes("IssueLabels")) {
+        return new Response(JSON.stringify({
+          data: { issue: { identifier: "LIF-45", labels: { nodes: [{ name: "wf:sprint-spawner" }, { name: "state:managing" }] }, delegate: { id: "astrid-user" } } },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (parsed.query?.includes("IssueWithLabels")) {
+        return new Response(JSON.stringify({
+          data: {
+            issue: {
+              id: "issue-uuid",
+              identifier: "LIF-45",
+              team: { id: "lif-team" },
+              labels: { nodes: [{ id: "wf-label", name: "wf:sprint-spawner" }, { id: "state-label", name: "state:managing" }] },
+            },
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (parsed.query?.includes("TeamStates")) {
+        return new Response(JSON.stringify({
+          data: { team: { states: { nodes: [{ id: "state-thinking-uuid", name: "Thinking", type: "started" }, { id: "state-doing-uuid", name: "Doing", type: "started" }] } } },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ data: { issueUpdate: { success: true } } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+  }
+
+  function sendRepair(input: Record<string, unknown>) {
+    return request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "astrid")
+      .send({
+        query: "mutation Repair($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+        variables: { id: "issue-uuid", input },
+      });
+  }
+
+  it("rejects a native-state repair that piggybacks an unrelated IssueUpdateInput field", async () => {
+    writeWorkflowFile(dir, TEST_SPRINT_SPAWNER_WORKFLOW_YAML);
+    resetWorkflowCache();
+    resetNativeStateCache();
+    const calls: Array<{ query: string; variables?: Record<string, unknown> }> = [];
+    installRepairFetch(calls);
+
+    // stateId matches the mirror, but `priority` (and `title`) ride along — an
+    // allowlist must reject the whole payload rather than forward it.
+    const res = await sendRepair({ stateId: "state-doing-uuid", priority: 4, title: "sneaky edit" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("repair-native-state rejected");
+    expect(res.body.errors[0].message).toContain("may only write");
+    expect(res.body.errors[0].message).toContain("priority");
+    expect(res.body.errors[0].message).toContain("title");
+    // Nothing forwarded to Linear's issueUpdate.
+    expect(calls.filter((c) => c.query.includes("issueUpdate")).length).toBe(0);
+  });
+
+  it("allows a repair to clear a stale assignee (assigneeId:null) alongside the native state", async () => {
+    writeWorkflowFile(dir, TEST_SPRINT_SPAWNER_WORKFLOW_YAML);
+    resetWorkflowCache();
+    resetNativeStateCache();
+    const calls: Array<{ query: string; variables?: Record<string, unknown> }> = [];
+    installRepairFetch(calls);
+
+    const res = await sendRepair({ stateId: "state-doing-uuid", assigneeId: null });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+    expect(res.body.data.issueUpdate.success).toBe(true);
+    expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(false);
+    expect(calls.filter((c) => c.query.includes("issueUpdate")).length).toBe(1);
+  });
+
+  it("rejects a repair that sets assignee to an arbitrary user (mirror assignee is null)", async () => {
+    writeWorkflowFile(dir, TEST_SPRINT_SPAWNER_WORKFLOW_YAML);
+    resetWorkflowCache();
+    resetNativeStateCache();
+    const calls: Array<{ query: string; variables?: Record<string, unknown> }> = [];
+    installRepairFetch(calls);
+
+    const res = await sendRepair({ stateId: "state-doing-uuid", assigneeId: "some-human-user" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("repair-native-state rejected");
+    expect(res.body.errors[0].message).toContain("assignee");
+    expect(calls.filter((c) => c.query.includes("issueUpdate")).length).toBe(0);
+  });
+
+  it("allows a repair to reconcile the delegate to the state's mirror owner", async () => {
+    writeWorkflowFile(dir, TEST_SPRINT_SPAWNER_WORKFLOW_YAML);
+    resetWorkflowCache();
+    resetNativeStateCache();
+    const calls: Array<{ query: string; variables?: Record<string, unknown> }> = [];
+    installRepairFetch(calls);
+
+    // state:managing owner_role is the singleton `steward` → astrid (astrid-user).
+    const res = await sendRepair({ stateId: "state-doing-uuid", delegateId: "astrid-user" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+    expect(res.body.data.issueUpdate.success).toBe(true);
+    expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(false);
+    expect(calls.filter((c) => c.query.includes("issueUpdate")).length).toBe(1);
+  });
+
+  it("rejects a repair that reassigns the delegate to a body that is not the state mirror", async () => {
+    writeWorkflowFile(dir, TEST_SPRINT_SPAWNER_WORKFLOW_YAML);
+    resetWorkflowCache();
+    resetNativeStateCache();
+    const calls: Array<{ query: string; variables?: Record<string, unknown> }> = [];
+    installRepairFetch(calls);
+
+    const res = await sendRepair({ stateId: "state-doing-uuid", delegateId: "u2" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("repair-native-state rejected");
+    expect(res.body.errors[0].message).toContain("mirror delegate");
     expect(calls.filter((c) => c.query.includes("issueUpdate")).length).toBe(0);
   });
 
