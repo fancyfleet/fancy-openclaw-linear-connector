@@ -33,7 +33,7 @@ import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules, bodyHasCapability } from "./escalation-gate.js";
 import { checkLeakedCredentialGate } from "./leaked-credential-gate.js";
 import { checkStaleSnapshotForTerminal } from "./proxy-cas-check.js";
-import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, setStateAtomic, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
+import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, setStateAtomic, verifyCommentSatisfiedBy, fetchTicketVerification, resolveSignoffWakeTargets, SIGNOFF_WAKE_DISPATCHED_PHRASE, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
 import { buildTransitionAuditRecord, emitTransitionAuditRecord, verifyPostTransition, type GateResult, type TransitionAuditRecord } from "./transition-audit.js";
 import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import type { ObservationStore } from "./store/observation-store.js";
@@ -988,6 +988,36 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             errorSummary: p3rejection,
           });
         }
+        // INF-629: a non-holder's attempted designated-approver gated transition
+        // IS the signoff-request event. When the capability gate emitted the
+        // designated-approver signoff block, emit a wake to the approver so the
+        // signoff surfaces in their `linear queue` instead of stranding the loop.
+        // The fan-out wake is bounded by its own session-active + dispatch-lease
+        // guards, so repeated attempts on the same still-open signoff do not spam
+        // the approver. Fail-open: a wake-emission failure must never suppress the
+        // gate rejection the caller needs to see.
+        if (issueId && deps?.fanoutWakeFn && p3rejection.includes(SIGNOFF_WAKE_DISPATCHED_PHRASE)) {
+          try {
+            const { targets, identifier } = await resolveSignoffWakeTargets(issueId, effectiveIntent, authorization);
+            const wakeTicket = identifier ?? issueId;
+            for (const approver of targets) {
+              await deps.fanoutWakeFn(approver, wakeTicket);
+              log.info(`signoff-wake dispatched approver=${approver} ticket=${wakeTicket} intent=${effectiveIntent}`);
+            }
+            if (targets.length > 0) {
+              deps?.operationalEventStore?.append({
+                outcome: "signoff-wake-dispatched" as never,
+                type: "designated-approver-signoff",
+                agent: agentId,
+                key: issueId,
+                detail: { approvers: targets, intent: effectiveIntent },
+              });
+            }
+          } catch (err) {
+            log.warn(`signoff-wake emission failed ticket=${issueId}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+
         // AI-1857 AC4: include gate-verification snapshot so CLI can verify "no partial state was written"
         const gateDeclineResponse: Record<string, unknown> = { errors: [{ message: p3rejection }] };
         if (issueId) {

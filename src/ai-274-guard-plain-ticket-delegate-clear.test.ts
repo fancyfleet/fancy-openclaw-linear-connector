@@ -44,6 +44,8 @@ jest.unstable_mockModule("./workflow-gate.js", () => ({
   setStateAtomic: jest.fn(),
   verifyCommentSatisfiedBy: jest.fn(),
   fetchTicketVerification: jest.fn(),
+  resolveSignoffWakeTargets: jest.fn(),
+  SIGNOFF_WAKE_DISPATCHED_PHRASE: "A signoff wake has been dispatched",
 }));
 
 jest.unstable_mockModule("./barrier.js", () => ({

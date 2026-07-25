@@ -1845,6 +1845,67 @@ export async function fetchWorkflowLabels(issueId: string, authToken: string): P
 }
 
 /**
+ * INF-629: invariant substring embedded in the designated-approver
+ * capability-gate block message. The proxy request handler detects it in the
+ * gate rejection to emit a signoff wake to the designated approver. Keep in
+ * sync with the message construction in the capability gate above.
+ */
+export const SIGNOFF_WAKE_DISPATCHED_PHRASE = "A signoff wake has been dispatched";
+
+/**
+ * INF-629: For a non-holder's attempted designated-approver gated transition,
+ * resolve the approver body/bodies to wake and the ticket's canonical
+ * identifier. The proxy request handler calls this after the designated-approver
+ * capability gate has fired (SIGNOFF_WAKE_DISPATCHED_PHRASE) so a signoff wake
+ * reaches the approver's `linear queue`.
+ *
+ * Returns empty targets when the intent is not a designated-approver gated
+ * transition in the ticket's current state (the proxy only wakes on genuine
+ * signoff gates), and fails closed on any load/fetch error — a failed lookup
+ * must never fabricate a wake to the wrong body.
+ */
+export async function resolveSignoffWakeTargets(
+  issueId: string,
+  intent: string,
+  authToken: string,
+): Promise<{ targets: string[]; identifier: string | null }> {
+  const empty = { targets: [] as string[], identifier: null as string | null };
+  try {
+    const query = `query SignoffWakeContext($id: String!) { issue(id: $id) { identifier labels { nodes { name } } } }`;
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: issueId } }),
+    });
+    type Resp = {
+      data?: { issue?: { identifier?: string; labels?: { nodes: Array<{ name: string }> } } };
+    };
+    const data = (await res.json()) as Resp;
+    const issue = data.data?.issue;
+    if (!issue) return empty;
+    const identifier = issue.identifier ?? null;
+    const labels = (issue.labels?.nodes ?? []).map((n) => n.name);
+    const workflowId = getWorkflowId(labels);
+    if (!workflowId) return { targets: [], identifier };
+    const def = await loadWorkflowDefById(workflowId);
+    if (!def) return { targets: [], identifier };
+    const state = getCurrentState(labels, def);
+    const node = state ? def.states.find((s) => s.id === state) : undefined;
+    const tx = node?.transitions?.find((t) => t.command === intent);
+    if (!tx || tx.designated_approver !== true || !tx.requires_capability) {
+      return { targets: [], identifier };
+    }
+    const targets = await resolveBodiesWithCapability(tx.requires_capability);
+    return { targets, identifier };
+  } catch (err) {
+    log.warn(
+      `workflow-gate: resolveSignoffWakeTargets failed for ${issueId}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return empty;
+  }
+}
+
+/**
  * Heuristic: does this error message look like a transient network error?
  * Covers ECONNRESET, ETIMEDOUT, ENOTFOUND, fetch failed, etc.
  */
@@ -3430,6 +3491,19 @@ export async function checkWorkflowRules(
       // INF-197: designated_approver gates need a more specific message naming
       // the approver so the steward knows who to handoff to (the generic
       // "deployment body" was unactionable).
+      //
+      // INF-629: a non-holder's attempted designated-approver gated transition
+      // IS the signoff-request event (INF-603 accepted design) — not a dead-end.
+      // Rather than telling the caller the approver "must run it directly" (an
+      // unactionable instruction that stranded sprint-spawner loops), report that
+      // a signoff wake is being dispatched to the designated approver so it
+      // surfaces in their `linear queue`. The physical wake is emitted by the
+      // proxy request handler (which owns the fan-out dispatch machinery), keyed
+      // off SIGNOFF_WAKE_DISPATCHED_PHRASE; it is bounded by the fan-out
+      // session-active + dispatch-lease guards so repeated attempts do not spam
+      // the approver. The approver then fires '${intent}' directly via the
+      // designated-approver delegate bypass (they need not be the steward
+      // delegate), preserving author-cannot-self-bless.
       if (match.designated_approver === true) {
         const approverBodies = await resolveBodiesWithCapability(match.requires_capability);
         const approverNames = approverBodies.length > 0
@@ -3437,9 +3511,9 @@ export async function checkWorkflowRules(
           : `the body holding '${match.requires_capability}'`;
         return (
           `[Proxy] '${intent}' requires the '${match.requires_capability}' capability ` +
-          `(designated approver: ${approverNames}). ` +
-          `The designated approver must run '${intent}' directly to proceed. ` +
-          `Legal moves: ${legalMoves}.`
+          `(designated approver: ${approverNames}). ${SIGNOFF_WAKE_DISPATCHED_PHRASE} to ` +
+          `${approverNames} so the signoff surfaces in their queue; ${approverNames} can ` +
+          `run '${intent}' directly to complete the signoff. Legal moves: ${legalMoves}.`
         );
       }
       return (
