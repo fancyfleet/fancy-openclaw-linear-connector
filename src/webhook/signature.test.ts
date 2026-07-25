@@ -1,5 +1,16 @@
 import crypto from "crypto";
-import { verifyLinearSignature, verifyLinearSignatureMulti, matchLinearSignature, parseWebhookSecrets } from "./signature.js";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import {
+  candidateSignatureNormalizations,
+  diagnoseLinearSignatureMismatch,
+  matchLinearSignature,
+  parseWebhookSecrets,
+  resetSignatureRejectDiagnosticBudgetForTests,
+  verifyLinearSignature,
+  verifyLinearSignatureMulti,
+} from "./signature.js";
 
 const SECRET = "test-webhook-secret-abc123";
 const PRIVATE_SECRET = "private-team-secret-xyz789";
@@ -120,6 +131,93 @@ describe("matchLinearSignature (INF-617 — attribute delivery to a secret)", ()
     expect(matchLinearSignature(rawBody, sig, secrets) !== null).toBe(
       verifyLinearSignatureMulti(rawBody, sig, secrets),
     );
+  });
+});
+
+describe("diagnoseLinearSignatureMismatch (INF-586)", () => {
+  const originalEnv = process.env;
+  let diagnosticDir: string;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    diagnosticDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf586-signature-diagnostic-"));
+    process.env.LINEAR_WEBHOOK_REJECT_DIAGNOSTIC_DIR = diagnosticDir;
+    resetSignatureRejectDiagnosticBudgetForTests();
+  });
+
+  afterEach(() => {
+    fs.rmSync(diagnosticDir, { recursive: true, force: true });
+    process.env = originalEnv;
+    resetSignatureRejectDiagnosticBudgetForTests();
+  });
+
+  it("provides the requested twelve candidate normalizations", () => {
+    expect(candidateSignatureNormalizations(Buffer.from("a\n"))).toHaveLength(12);
+  });
+
+  it("is off by default", () => {
+    delete process.env.LINEAR_WEBHOOK_REJECT_DIAGNOSTIC_BUDGET;
+    const rawBody = Buffer.from(JSON.stringify({ type: "Comment" }));
+    const signature = makeSignature(rawBody.toString("utf8"), SECRET);
+
+    expect(diagnoseLinearSignatureMismatch(rawBody, signature, [SECRET])).toEqual({
+      armed: false,
+      remainingBudget: 0,
+      testedTransforms: 0,
+      testedSecrets: 0,
+      match: null,
+    });
+    expect(fs.readdirSync(diagnosticDir)).toEqual([]);
+  });
+
+  it("reports a deterministic transform match without persisting the raw body", () => {
+    process.env.LINEAR_WEBHOOK_REJECT_DIAGNOSTIC_BUDGET = "2";
+    const originalBody = JSON.stringify({ type: "Comment", action: "create" });
+    const rawBody = Buffer.from(`${originalBody}\n`);
+    const signature = makeSignature(originalBody, PRIVATE_SECRET);
+
+    const result = diagnoseLinearSignatureMismatch(rawBody, signature, [SECRET, PRIVATE_SECRET]);
+
+    expect(result).toMatchObject({
+      armed: true,
+      remainingBudget: 1,
+      testedTransforms: 12,
+      testedSecrets: 2,
+      match: {
+        transform: "trim-one-lf",
+        secretIndex: 1,
+        secretFingerprint: "z789",
+        originalLength: rawBody.length,
+        candidateLength: Buffer.byteLength(originalBody),
+      },
+    });
+    expect(result.rawBodyPath).toBeUndefined();
+    expect(fs.readdirSync(diagnosticDir)).toEqual([]);
+  });
+
+  it("persists the raw body only when no transform matches", () => {
+    process.env.LINEAR_WEBHOOK_REJECT_DIAGNOSTIC_BUDGET = "1";
+    const rawBody = Buffer.from(JSON.stringify({ type: "Comment", body: "sensitive-ish test payload" }));
+    const signature = makeSignature("different body", PRIVATE_SECRET);
+
+    const result = diagnoseLinearSignatureMismatch(rawBody, signature, [SECRET, PRIVATE_SECRET]);
+
+    expect(result.match).toBeNull();
+    expect(result.rawBodyPath).toBeDefined();
+    expect(fs.readFileSync(result.rawBodyPath!, "utf8")).toBe(rawBody.toString("utf8"));
+  });
+
+  it("auto-disarms after the configured budget is consumed", () => {
+    process.env.LINEAR_WEBHOOK_REJECT_DIAGNOSTIC_BUDGET = "1";
+    const rawBody = Buffer.from("body\n");
+    const signature = makeSignature("body", SECRET);
+
+    const first = diagnoseLinearSignatureMismatch(rawBody, signature, [SECRET]);
+    const second = diagnoseLinearSignatureMismatch(rawBody, signature, [SECRET]);
+
+    expect(first.armed).toBe(true);
+    expect(first.remainingBudget).toBe(0);
+    expect(second.armed).toBe(false);
   });
 });
 
