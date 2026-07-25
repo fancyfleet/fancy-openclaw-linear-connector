@@ -5789,6 +5789,25 @@ export async function applyStateTransition(
               from: currentStateName,
               to: toStateName,
             });
+          } else if (await isSyntheticNoBodyRole(destOwnerRole!)) {
+            // INF-671: synthetic engine-driven roles (declared `synthetic: true`
+            // + `no_body: true` in capability-policy.yaml, e.g. sprint-spawner's
+            // `spawning-scope` owner_role `engine`) are intentionally bodyless —
+            // the engine itself drives the fanout on the follow-on `spawn` intent,
+            // never a staffable Linear delegate. The `determining-scope ->
+            // spawning-scope` `propose-brief` path routes INTO such a state; there
+            // is no body to resolve, and the steward must RETAIN the delegate to
+            // fire `spawn`. Leave `resolvedDelegateId` undefined so the atomic
+            // write does not touch the delegate, and let the transition proceed
+            // instead of fail-closing. Twin of the registration-reachability skip
+            // (`isSyntheticNoBodyRole` in reloadWorkflowDefs and checkDelegate-
+            // Resolution) shipped in INF-649, which exempts these roles from the
+            // |C|=0 unreachable-state check but never reached this runtime apply
+            // path — so a def that registers cleanly still fail-closed the moment
+            // the governed transition into the engine-owned state was driven.
+            log.info(
+              `workflow-gate: B2 apply: role '${destOwnerRole}' is a synthetic engine-driven no-body role on '${intent}' for ${issueId} — no staffable delegate; delegate left untouched, transition proceeds`,
+            );
           } else if (intent === 'approve' || intent === 'reject' || intent === 'submit' || await isRoleDeclared(destOwnerRole!)) {
             log.error(
               `workflow-gate: B2 apply: FAIL-CLOSED — no bodies found for role '${destOwnerRole}' on '${intent}'. Transition aborted per delegate-resolution contract.`,
