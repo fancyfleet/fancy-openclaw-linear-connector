@@ -22,7 +22,7 @@
 import { createLogger, componentLogger } from "./logger.js";
 import { getAccessToken } from "./agents.js";
 import { loadWorkflowDefById, getWorkflowId, getCurrentState } from "./workflow-gate.js";
-import { resolveBodiesForRole } from "./escalation-gate.js";
+import { resolveBodiesForRole, resolveBodiesWithCapability } from "./escalation-gate.js";
 import { notify } from "./alerts/alert-bus.js";
 
 const log = componentLogger(createLogger(), "routing-guard");
@@ -145,6 +145,33 @@ export async function checkRoleGuardEnforced(
 
   // Terminal states have no meaningful role constraint on the recipient.
   if (stateNode.kind === "terminal") return { blocked: false };
+
+  // INF-629: a state with an outgoing `designated_approver` transition nominates
+  // the capability-holder(s) as legal signoff targets for that state, in ADDITION
+  // to the state's steward owner_role. When a signoff wake is routed to the
+  // designated approver (e.g. Ai holding sprint:signoff on sprint-spawner's
+  // determining-scope), the guard must not auto-correct it back to the steward.
+  // Treat any body holding a designated-approver transition's requires_capability
+  // as a legal target and pass the dispatch through.
+  const designatedApproverCaps = (stateNode.transitions ?? [])
+    .filter((t) => t.designated_approver === true && t.requires_capability)
+    .map((t) => t.requires_capability as string);
+  if (designatedApproverCaps.length > 0) {
+    const normalizedApproverTarget = targetAgentId.toLowerCase();
+    for (const cap of designatedApproverCaps) {
+      let approverBodies: string[] = [];
+      try {
+        approverBodies = await resolveBodiesWithCapability(cap);
+      } catch (err) {
+        log.warn(`routing-guard: failed to resolve designated-approver bodies for '${cap}' — skipping: ${err instanceof Error ? err.message : String(err)}`);
+        continue;
+      }
+      if (approverBodies.map((b) => b.toLowerCase()).includes(normalizedApproverTarget)) {
+        log.info(`routing-guard: '${targetAgentId}' is a designated approver (holds '${cap}') for state '${currentState}' (wf:${workflowId}) — legal signoff target`);
+        return { blocked: false };
+      }
+    }
+  }
 
   const ownerRole = stateNode.owner_role;
   if (!ownerRole) {
