@@ -78,6 +78,7 @@ import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
 import { onAlert as onConfigHealthAlert } from "./config-health.js";
 import { getRegistryPolicyStatus, startRegistryPolicyCheck } from "./registry-policy.js";
 import { resolveStartupCommit } from "./startup-commit.js";
+import { LINEAR_PROXY_PROTOCOL_VERSION, proxyCompatibilityPayload } from "./proxy-compatibility.js";
 import { getAccessToken, getAgent, getLinearUserIdForAgent, getAllTokenStatuses, isPolledForLinear } from "./agents.js";
 import { loadUniversalCanon, getCanonLiveness } from "./policy/universal-canon.js";
 import { loadRoster, getRoutingFunctionaryLiveness } from "./department-roster.js";
@@ -305,6 +306,13 @@ export function createApp(options?: CreateAppOptions) {
   // AI-1860: per-app authorization snapshot map — fresh per createApp() call so
   // test isolation is guaranteed and snapshots never outlive the app instance.
   const commandAuthSnapshots = new Map<string, { snapshotDelegateId: string | null; snapshotState: string | null; snapshotTicketDelegate: string | null; expiresAt: number }>();
+
+  app.get("/proxy/compatibility", (_req, res) => {
+    const payload = proxyCompatibilityPayload();
+    res.setHeader("X-Openclaw-Linear-Protocol-Version", LINEAR_PROXY_PROTOCOL_VERSION);
+    res.setHeader("X-Openclaw-Linear-Min-Cli-Version", payload.minCliVersion);
+    res.json(payload);
+  });
 
   app.post("/proxy/graphql", (req, res) => handleProxyRequest(req, res, {
     observationStore,

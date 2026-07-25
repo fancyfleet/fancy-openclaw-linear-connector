@@ -199,6 +199,22 @@ describe("proxy /proxy/graphql", () => {
     expect(res.body.errors).toBeDefined();
   });
 
+  it("advertises proxy compatibility as the connector-owned contract", async () => {
+    process.env.PROXY_MIN_CLI_VERSION = "9.8.7";
+
+    const res = await request(appState.app)
+      .get("/proxy/compatibility");
+
+    delete process.env.PROXY_MIN_CLI_VERSION;
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      protocolVersion: "1",
+      minCliVersion: "9.8.7",
+    });
+    expect(res.headers["x-openclaw-linear-protocol-version"]).toBe("1");
+    expect(res.headers["x-openclaw-linear-min-cli-version"]).toBe("9.8.7");
+  });
+
   it("forwards requests to Linear and returns the response transparently", async () => {
     const res = await request(appState.app)
       .post("/proxy/graphql")
@@ -208,6 +224,8 @@ describe("proxy /proxy/graphql", () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual(MOCK_RESPONSE);
+    expect(res.headers["x-openclaw-linear-protocol-version"]).toBe("1");
+    expect(res.headers["x-openclaw-linear-min-cli-version"]).toBe("0.3.0");
   });
 
   it("passes the Authorization header to Linear unchanged", async () => {
