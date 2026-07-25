@@ -1109,6 +1109,7 @@ describe("INF-552: registration primitive (synthetic workflow)", () => {
   const SYNTH_CREATOR_ID = "synth-creator-user-id";
   const SYNTH_STATE_ALPHA_LABEL_ID = "label-state-alpha-id";
   const SYNTH_WF_LABEL_ID = "label-wf-synthetic-flow-id";
+  const SYNTH_PENDING_LABEL_ID = "label-wf-pending-id";
 
   beforeAll(async () => {
     synthTmp = await fs.mkdtemp(path.join(os.tmpdir(), "inf552-synthetic-"));
@@ -1132,10 +1133,13 @@ describe("INF-552: registration primitive (synthetic workflow)", () => {
   function synthFetch(opts: {
     currentLabelNames: string[];
     calls?: string[];
+    /** INF-552: issue description carrying the wf:pending authoring marker. */
+    description?: string | null;
   }): typeof globalThis.fetch {
     const teamLabels = [
       { id: SYNTH_STATE_ALPHA_LABEL_ID, name: "state:alpha" },
       { id: SYNTH_WF_LABEL_ID, name: "wf:synthetic-flow" },
+      { id: SYNTH_PENDING_LABEL_ID, name: "wf:pending" },
     ];
     return async (_url: RequestInfo | URL, init?: RequestInit) => {
       const body = typeof init?.body === "string" ? init.body : "";
@@ -1158,6 +1162,7 @@ describe("INF-552: registration primitive (synthetic workflow)", () => {
                 },
                 delegate: null,
                 creator: { id: SYNTH_CREATOR_ID },
+                description: opts.description ?? null,
               },
             },
           }),
@@ -1252,5 +1257,116 @@ describe("INF-552: registration primitive (synthetic workflow)", () => {
     expect(comment).toBeDefined();
     expect(comment).toContain("no-such-flow");
     expect(comment).toContain("not registered");
+  });
+
+  // ── INF-552 CLI sentinel channel (wf:pending + description marker) ──────────
+  // The CLI cannot create wf:<id> labels, so `linear create --workflow <id>`
+  // attaches the fixed `wf:pending` sentinel and carries the verbatim id in a
+  // description marker. These prove the engine resolves that channel identically
+  // to a direct wf:<id> label — enroll (registered) / loud reject (unknown).
+  const marker = (id: string) => `Do the work.\n\n<!-- openclaw:workflow-request id="${id}" -->`;
+
+  it("(c) wf:pending + marker for a registered id → swaps sentinel for wf:<id>, enrolls at entry_state", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = synthFetch({
+      currentLabelNames: ["wf:pending"],
+      description: marker("synthetic-flow"),
+      calls,
+    });
+
+    const event = makeIssueUpdateEvent({
+      currentLabelIds: [SYNTH_PENDING_LABEL_ID],
+      previousLabelIds: [],
+    });
+    event.data.id = SYNTH_ISSUE_ID;
+    event.data.teamId = SYNTH_TEAM_ID;
+
+    const result = await maybeBootstrapWorkflow(event as never, "test-token");
+
+    expect(result).not.toBeNull();
+    expect(result?.action).toBe("bootstrapped");
+    // Resolved from the marker, not the (sentinel) label suffix.
+    expect(result?.workflowId).toBe("synthetic-flow");
+    expect(result?.entryState).toBe("alpha");
+
+    const mutation = calls.find(
+      (b) => b.includes("issueUpdate") || b.includes("ApplyAtomicTransition"),
+    );
+    expect(mutation).toBeDefined();
+    // Entry-state label stamped, concrete wf:<id> attached, sentinel dropped.
+    expect(mutation).toContain(SYNTH_STATE_ALPHA_LABEL_ID);
+    expect(mutation).toContain(SYNTH_WF_LABEL_ID);
+    expect(mutation).not.toContain(SYNTH_PENDING_LABEL_ID);
+  });
+
+  it("(d) wf:pending + marker for an unknown id → loud rejection to requester, no state:* stamped", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = synthFetch({
+      currentLabelNames: ["wf:pending"],
+      description: marker("no-such-flow"),
+      calls,
+    });
+
+    const event = makeIssueUpdateEvent({
+      currentLabelIds: [SYNTH_PENDING_LABEL_ID],
+      previousLabelIds: [],
+    });
+    event.data.id = SYNTH_ISSUE_ID;
+    event.data.teamId = SYNTH_TEAM_ID;
+
+    const result = await maybeBootstrapWorkflow(event as never, "test-token");
+
+    expect(result).not.toBeNull();
+    expect(result?.action).toBe("rejected");
+    // The rejected id is the marker's id, not "pending".
+    expect(result?.workflowId).toBe("no-such-flow");
+    expect(result?.rejectionReason).toContain("not registered");
+
+    const mutation = calls.find(
+      (b) => b.includes("issueUpdate") || b.includes("ApplyAtomicTransition"),
+    );
+    expect(mutation).toBeDefined();
+    expect(mutation).toContain(SYNTH_CREATOR_ID);
+    expect(mutation).toContain("assigneeId");
+    expect(mutation).not.toContain(SYNTH_STATE_ALPHA_LABEL_ID);
+    expect(mutation).not.toContain("state:");
+
+    const comment = calls.find((b) => b.includes("commentCreate"));
+    expect(comment).toBeDefined();
+    expect(comment).toContain("no-such-flow");
+    expect(comment).toContain("not registered");
+  });
+
+  it("(e) wf:pending with no readable marker → loud rejection (malformed authoring attempt), never a silent strand", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = synthFetch({
+      currentLabelNames: ["wf:pending"],
+      description: "Just a plain description, no marker.",
+      calls,
+    });
+
+    const event = makeIssueUpdateEvent({
+      currentLabelIds: [SYNTH_PENDING_LABEL_ID],
+      previousLabelIds: [],
+    });
+    event.data.id = SYNTH_ISSUE_ID;
+    event.data.teamId = SYNTH_TEAM_ID;
+
+    const result = await maybeBootstrapWorkflow(event as never, "test-token");
+
+    expect(result).not.toBeNull();
+    expect(result?.action).toBe("rejected");
+
+    // No entry state stamped; bounced to requester with a comment.
+    const mutation = calls.find(
+      (b) => b.includes("issueUpdate") || b.includes("ApplyAtomicTransition"),
+    );
+    expect(mutation).toBeDefined();
+    expect(mutation).not.toContain(SYNTH_STATE_ALPHA_LABEL_ID);
+    expect(mutation).toContain(SYNTH_CREATOR_ID);
+    const comment = calls.find((b) => b.includes("commentCreate"));
+    expect(comment).toBeDefined();
+    // Not the misleading "unknown workflow 'pending'" — a marker-specific reason.
+    expect(comment).toContain("no workflow-request marker");
   });
 });
