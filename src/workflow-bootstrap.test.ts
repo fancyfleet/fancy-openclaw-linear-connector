@@ -1238,16 +1238,16 @@ describe("INF-552: registration primitive (synthetic workflow)", () => {
     expect(result?.workflowId).toBe("no-such-flow");
     expect(result?.rejectionReason).toContain("not registered");
 
-    // The mutation must bounce to the requester and stamp NO state:* label.
+    // The mutation must clean up workflow labels and stamp NO state:* label.
     const mutation = calls.find(
       (b) => b.includes("issueUpdate") || b.includes("ApplyAtomicTransition"),
     );
     expect(mutation).toBeDefined();
-    // assignee = creator (returns it to whoever filed it)
-    expect(mutation).toContain(SYNTH_CREATOR_ID);
-    expect(mutation).toContain("assigneeId");
-    // delegate cleared
-    expect(mutation).toContain("delegateId");
+    // No requester bounce mutation: CLI-created tickets use the OAuth app as
+    // creator, and Linear rejects delegate clear + app-actor assignee together.
+    expect(mutation).not.toContain(SYNTH_CREATOR_ID);
+    expect(mutation).not.toContain("assigneeId");
+    expect(mutation).not.toContain("delegateId");
     // NO entry-state label was stamped
     expect(mutation).not.toContain(SYNTH_STATE_ALPHA_LABEL_ID);
     expect(mutation).not.toContain("state:");
@@ -1326,8 +1326,9 @@ describe("INF-552: registration primitive (synthetic workflow)", () => {
       (b) => b.includes("issueUpdate") || b.includes("ApplyAtomicTransition"),
     );
     expect(mutation).toBeDefined();
-    expect(mutation).toContain(SYNTH_CREATOR_ID);
-    expect(mutation).toContain("assigneeId");
+    expect(mutation).not.toContain(SYNTH_CREATOR_ID);
+    expect(mutation).not.toContain("assigneeId");
+    expect(mutation).not.toContain("delegateId");
     expect(mutation).not.toContain(SYNTH_STATE_ALPHA_LABEL_ID);
     expect(mutation).not.toContain("state:");
 
@@ -1357,13 +1358,15 @@ describe("INF-552: registration primitive (synthetic workflow)", () => {
     expect(result).not.toBeNull();
     expect(result?.action).toBe("rejected");
 
-    // No entry state stamped; bounced to requester with a comment.
+    // No entry state stamped; cleaned up with a comment.
     const mutation = calls.find(
       (b) => b.includes("issueUpdate") || b.includes("ApplyAtomicTransition"),
     );
     expect(mutation).toBeDefined();
     expect(mutation).not.toContain(SYNTH_STATE_ALPHA_LABEL_ID);
-    expect(mutation).toContain(SYNTH_CREATOR_ID);
+    expect(mutation).not.toContain(SYNTH_CREATOR_ID);
+    expect(mutation).not.toContain("assigneeId");
+    expect(mutation).not.toContain("delegateId");
     const comment = calls.find((b) => b.includes("commentCreate"));
     expect(comment).toBeDefined();
     // Not the misleading "unknown workflow 'pending'" — a marker-specific reason.

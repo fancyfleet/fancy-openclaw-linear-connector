@@ -324,7 +324,7 @@ export async function postComment(
   authToken: string,
 ): Promise<boolean> {
   const mutation = `
-    mutation($issueId: ID!, $body: String!) {
+    mutation($issueId: String!, $body: String!) {
       commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
     }
   `;
@@ -334,9 +334,15 @@ export async function postComment(
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({ query: mutation, variables: { issueId: issueInternalId, body } }),
     });
-    type Resp = { data?: { commentCreate?: { success: boolean } } };
+    type Resp = { data?: { commentCreate?: { success: boolean } }; errors?: unknown };
     const data = (await res.json()) as Resp;
-    return data.data?.commentCreate?.success ?? false;
+    const success = data.data?.commentCreate?.success === true;
+    if (!success) {
+      log.warn(
+        `comment post returned non-success for ${issueInternalId}: status=${res.status} errors=${data.errors ? JSON.stringify(data.errors) : "none"}`,
+      );
+    }
+    return success;
   } catch (err) {
     log.error(`comment post failed: ${err instanceof Error ? err.message : String(err)}`);
     return false;

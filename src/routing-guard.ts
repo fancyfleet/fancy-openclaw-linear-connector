@@ -399,7 +399,7 @@ async function postBlockingComment(
     correctionNote;
 
   const mutation = `
-    mutation($issueId: ID!, $body: String!) {
+    mutation($issueId: String!, $body: String!) {
       commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
     }
   `;

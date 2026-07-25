@@ -2587,7 +2587,7 @@ async function postAcCaptureWarningComment(
   cause: string,
 ): Promise<void> {
   const mutation = `
-    mutation($issueId: ID!, $body: String!) {
+    mutation($issueId: String!, $body: String!) {
       commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
     }
   `;
@@ -4482,7 +4482,7 @@ async function fetchFanoutSpecDescription(issueId: string, authToken: string, sp
  */
 async function postComment(internalIssueId: string, body: string, authToken: string): Promise<void> {
   const mutation = `
-    mutation CommentCreate($issueId: ID!, $body: String!) {
+    mutation CommentCreate($issueId: String!, $body: String!) {
       commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
     }
   `;
@@ -5216,7 +5216,7 @@ export async function applyStateTransition(
       // Post a diagnostic comment
       const internalId = issue.internalId;
       const mutation = `
-        mutation($issueId: ID!, $body: String!) {
+        mutation($issueId: String!, $body: String!) {
           commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
         }
       `;
@@ -5942,7 +5942,7 @@ async function postFanoutSummaryComment(
       : "");
 
   const mutation = `
-    mutation($issueId: ID!, $body: String!) {
+    mutation($issueId: String!, $body: String!) {
       commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
     }
   `;

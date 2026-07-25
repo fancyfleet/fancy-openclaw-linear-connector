@@ -585,8 +585,6 @@ export async function applyBootstrapToIssue(
  * does not, this replaces the old silent strand (wf:* present, no state:* ever
  * stamped) with a rejection that leaves an auditable trail:
  *   - strip the wf:* / state:* limbo labels so the ticket is plain ad-hoc again,
- *   - bounce it to the requester (assignee = creator, delegate cleared) so a
- *     human's queue surfaces it,
  *   - post a named-reason comment.
  *
  * Never throws — mutation/comment failures are absorbed by the underlying
@@ -611,17 +609,12 @@ async function rejectUnregisteredWorkflow(
     .filter((l) => !l.name.startsWith("wf:") && !l.name.startsWith("state:"))
     .map((l) => l.id);
 
-  // assigneeId = creator returns the ticket to whoever filed it (assignee means
-  // "a human must act"); delegateId: null clears any agent-ownership limbo. Only
-  // set assignee when the creator was resolvable — otherwise leave it untouched.
-  const assigneeId = issue.creatorId ?? undefined;
-  await issueUpdateAtomic(issue.id, strippedLabelIds, authToken, null, assigneeId);
+  // Label-only cleanup avoids Linear's app-actor failure shape for CLI-created
+  // tickets: delegateId:null + assigneeId:<OAuth app actor>.
+  await issueUpdateAtomic(issue.id, strippedLabelIds, authToken);
   await postComment(issue.id, reason, authToken);
 
-  log.warn(
-    `workflow-bootstrap: rejected ${issue.identifier ?? issue.id} — ${reason}; ` +
-      `bounced to requester (${issue.creatorId ?? "unknown"})`,
-  );
+  log.warn(`workflow-bootstrap: rejected ${issue.identifier ?? issue.id} — ${reason}; stripped workflow labels`);
 
   return {
     action: "rejected",

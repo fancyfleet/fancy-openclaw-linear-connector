@@ -830,7 +830,7 @@ export async function recoverTicket(
         method: "POST",
         headers: { "content-type": "application/json", authorization: authHeader },
         body: JSON.stringify({
-          query: `mutation($issueId: ID!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { comment { id } } }`,
+          query: `mutation($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { comment { id } } }`,
           variables: { issueId, body: rePokeComment },
         }),
       });
@@ -866,7 +866,7 @@ export async function recoverTicket(
       method: "POST",
       headers: { "content-type": "application/json", authorization: authHeader },
       body: JSON.stringify({
-        query: `mutation($issueId: ID!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { comment { id } } }`,
+        query: `mutation($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { comment { id } } }`,
         variables: { issueId, body: comment },
       }),
     });
