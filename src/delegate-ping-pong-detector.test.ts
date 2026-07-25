@@ -135,6 +135,22 @@ describe("DelegateChainTracker", () => {
       expect(result.maxAllowed).toBe(3);
     });
 
+    test("INF-578 AC1: does NOT count monotonic terminal repeats as oscillation", () => {
+      const now = Date.now();
+      const ticketId = "INF-578";
+      // Forward route settles on Hanzo as the terminal owner. Repeated delivery
+      // to the same terminal delegate is not A->B->A oscillation.
+      tracker.recordAssignment(ticketId, "user-requester", "Requester", now);
+      tracker.recordAssignment(ticketId, "user-hanzo", "Hanzo", now + 1000);
+      tracker.recordAssignment(ticketId, "user-hanzo", "Hanzo", now + 2000);
+      tracker.recordAssignment(ticketId, "user-hanzo", "Hanzo", now + 3000);
+
+      const result = tracker.detectCycle(ticketId, now + 4000);
+      expect(result.hasCycle).toBe(false);
+      expect(result.cyclingDelegates).not.toContain("user-hanzo");
+      expect(result.bounceCounts["user-hanzo"]).toBe(0);
+    });
+
     test("does NOT detect cycle when below threshold (N=3 default, 2 appearances)", () => {
       const now = Date.now();
       const ticketId = "GEN-263";
@@ -208,6 +224,20 @@ describe("DelegateChainTracker", () => {
       expect(result.cyclingDelegates).toHaveLength(2);
       expect(result.cyclingDelegates).toContain("user-hanzo");
       expect(result.cyclingDelegates).toContain("user-ai");
+    });
+
+    test("INF-578 AC3: detects true A->B->A->B oscillation", () => {
+      const tracker2 = new DelegateChainTracker({ maxBounces: 2, windowMs: 60000 });
+      const now = Date.now();
+      const ticketId = "INF-578";
+      tracker2.recordAssignment(ticketId, "user-hanzo", "Hanzo", now);
+      tracker2.recordAssignment(ticketId, "user-ai", "Ai", now + 1000);
+      tracker2.recordAssignment(ticketId, "user-hanzo", "Hanzo", now + 2000);
+      tracker2.recordAssignment(ticketId, "user-ai", "Ai", now + 3000);
+
+      const result = tracker2.detectCycle(ticketId, now + 4000);
+      expect(result.hasCycle).toBe(true);
+      expect(result.cyclingDelegates).toEqual(expect.arrayContaining(["user-hanzo", "user-ai"]));
     });
   });
 
@@ -299,6 +329,87 @@ describe("DelegatePingPongDetector", () => {
       expect(r3.suppressDispatch).toBe(true);
       expect(r3.detection!.hasCycle).toBe(true);
       expect(r3.detection!.cyclingDelegates).toContain("user-hanzo");
+    });
+
+    test("INF-578: forward requester route to terminal Hanzo on third assignment is not suppressed", async () => {
+      const config: Partial<DelegatePingPongConfig> = { maxBounces: 3, windowMs: 60000 };
+      const tracker = new DelegateChainTracker(config);
+      const detector = new DelegatePingPongDetector(tracker, config);
+
+      const now = Date.now();
+      const ticketId = "INF-578-forward";
+
+      const r1 = await detector.checkAndHandle(ticketId, "user-requester", "Requester", now);
+      const r2 = await detector.checkAndHandle(ticketId, "user-igor", "Igor", now + 1000);
+      const r3 = await detector.checkAndHandle(ticketId, "user-hanzo", "Hanzo", now + 2000);
+      const r4 = await detector.checkAndHandle(ticketId, "user-hanzo", "Hanzo", now + 3000);
+      const r5 = await detector.checkAndHandle(ticketId, "user-hanzo", "Hanzo", now + 4000);
+
+      expect(r1.suppressDispatch).toBe(false);
+      expect(r2.suppressDispatch).toBe(false);
+      expect(r3.suppressDispatch).toBe(false);
+      expect(r4.suppressDispatch).toBe(false);
+      expect(r5.suppressDispatch).toBe(false);
+      expect(r5.escalation).toBeNull();
+      expect(r5.detection!.hasCycle).toBe(false);
+    });
+
+    test("INF-578: true A->B->A->B oscillation is suppressed and escalated", async () => {
+      const config: Partial<DelegatePingPongConfig> = { maxBounces: 2, windowMs: 60000 };
+      const tracker = new DelegateChainTracker(config);
+      const detector = new DelegatePingPongDetector(tracker, config);
+
+      const now = Date.now();
+      const ticketId = "INF-578-oscillation";
+
+      const r1 = await detector.checkAndHandle(ticketId, "user-hanzo", "Hanzo", now);
+      const r2 = await detector.checkAndHandle(ticketId, "user-ai", "Ai", now + 1000);
+      const r3 = await detector.checkAndHandle(ticketId, "user-hanzo", "Hanzo", now + 2000);
+      const r4 = await detector.checkAndHandle(ticketId, "user-ai", "Ai", now + 3000);
+
+      expect(r1.suppressDispatch).toBe(false);
+      expect(r2.suppressDispatch).toBe(false);
+      expect(r3.detection!.hasCycle || r4.detection!.hasCycle).toBe(true);
+      expect(r4.suppressDispatch).toBe(true);
+      expect(r4.detection!.hasCycle).toBe(true);
+      expect(r4.detection!.cyclingDelegates).toEqual(expect.arrayContaining(["user-hanzo", "user-ai"]));
+      expect(r4.escalation).toMatchObject({
+        ticketId,
+        escalatedTo: "ai",
+        cyclingDelegates: expect.arrayContaining(["user-hanzo", "user-ai"]),
+      });
+    });
+
+    test("INF-578: merge-gate dispatch as Nth terminal assignment is never suppressed", async () => {
+      const config: Partial<DelegatePingPongConfig> = { maxBounces: 2, windowMs: 60000 };
+      const tracker = new DelegateChainTracker(config);
+      const detector = new DelegatePingPongDetector(tracker, config);
+
+      const now = Date.now();
+      const ticketId = "INF-578-merge-gate";
+
+      const results = [
+        await detector.checkAndHandle(ticketId, "user-requester", "Requester", now),
+        await detector.checkAndHandle(ticketId, "user-tdd", "TDD", now + 1000),
+        await detector.checkAndHandle(ticketId, "user-igor", "Igor", now + 2000),
+        await detector.checkAndHandle(ticketId, "user-charles", "Charles", now + 3000),
+        await detector.checkAndHandle(ticketId, "user-hanzo", "Hanzo", now + 4000),
+        await detector.checkAndHandle(ticketId, "user-hanzo", "Hanzo", now + 5000),
+        await detector.checkAndHandle(ticketId, "user-hanzo", "Hanzo", now + 6000),
+      ];
+
+      expect(results.map((result) => result.suppressDispatch)).toEqual([
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+      ]);
+      expect(results.at(-1)!.escalation).toBeNull();
+      expect(results.at(-1)!.detection!.hasCycle).toBe(false);
+      expect(results.at(-1)!.detection!.cyclingDelegates).not.toContain("user-hanzo");
     });
 
     test("single handoff between two delegates never trips cycle", async () => {
