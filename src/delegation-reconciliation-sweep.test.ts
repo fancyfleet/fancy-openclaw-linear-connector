@@ -51,6 +51,7 @@ import { AlertBus } from "./alerts/alert-bus.js";
 import { AlertStore } from "./alerts/alert-store.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
 import { resetCronRegistryForTest, getRegisteredCrons } from "./cron/registry.js";
+import { reloadAgents } from "./agents.js";
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
 
@@ -2347,6 +2348,111 @@ describe("INF-332 AC3: Combined governed + ad-hoc pagination works together", ()
     expect(result.scanned).toBe(15);
     expect(result.healed).toBe(15);
     expect(wakeDispatches).toHaveLength(15);
+    eventStore.close();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// INF-589: the governed heal must wake by the resolved OpenClaw agent id, not
+//          the Linear delegate display name. When the delegate's display name
+//          (e.g. "Felix (Unity Dev)") differs from the OpenClaw id ("felix"),
+//          passing the display name to wakeFn routes an unresolvable
+//          `openclaw/Felix (Unity Dev)` and the wake dies in
+//          delivered-pending-ack while the sweep still reports healed:1.
+// ══════════════════════════════════════════════════════════════════════════
+
+describe("INF-589: governed heal wakes by resolved OpenClaw id, not Linear display name", () => {
+  const FELIX_LINEAR_ID = "felix-linear-uuid";
+  const FELIX_DISPLAY_NAME = "Felix (Unity Dev)";
+  const FELIX_OPENCLAW_ID = "felix";
+
+  let agentsDir: string;
+  let prevAgentsFile: string | undefined;
+  let prevEncKey: string | undefined;
+  let prevEncKeyFile: string | undefined;
+
+  beforeEach(() => {
+    prevAgentsFile = process.env.AGENTS_FILE;
+    prevEncKey = process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
+    prevEncKeyFile = process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
+    delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
+    delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
+
+    agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf589-agents-"));
+    const agentsFile = path.join(agentsDir, "agents.json");
+    // Seed a roster where the Linear display name differs from the OpenClaw id.
+    fs.writeFileSync(
+      agentsFile,
+      JSON.stringify({
+        agents: [
+          {
+            name: FELIX_OPENCLAW_ID,
+            linearUserId: FELIX_LINEAR_ID,
+            clientId: "cid",
+            clientSecret: "csecret",
+            accessToken: "atok",
+            refreshToken: "rtok",
+          },
+        ],
+      }),
+      "utf8",
+    );
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+  });
+
+  afterEach(() => {
+    if (prevAgentsFile === undefined) delete process.env.AGENTS_FILE;
+    else process.env.AGENTS_FILE = prevAgentsFile;
+    if (prevEncKey === undefined) delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
+    else process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = prevEncKey;
+    if (prevEncKeyFile === undefined) delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
+    else process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE = prevEncKeyFile;
+    reloadAgents();
+    fs.rmSync(agentsDir, { recursive: true, force: true });
+  });
+
+  it("wakes with the OpenClaw agent id (felix), never the Linear display name", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: Array<{ agentName: string; ticketIdentifier: string }> = [];
+    const { bus } = makeTestAlertBus();
+
+    globalThis.fetch = makeReconciliationFetch({
+      governedTickets: [
+        {
+          id: "issue-felix-stranded",
+          identifier: "LSO-24",
+          updatedAt: OLD_TIMESTAMP,
+          labels: [WF_LABEL, STATE_IMPLEMENTATION_LABEL],
+          delegateId: FELIX_LINEAR_ID,
+          delegateName: FELIX_DISPLAY_NAME,
+          teamId: TEAM_ID,
+        },
+      ],
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (agentName, ticketIdentifier) => {
+        wakeDispatches.push({ agentName, ticketIdentifier });
+      },
+    });
+
+    expect(result.healed).toBe(1);
+    expect(wakeDispatches).toHaveLength(1);
+    // The core assertion: resolved OpenClaw id, NOT the Linear display name.
+    expect(wakeDispatches[0].agentName).toBe(FELIX_OPENCLAW_ID);
+    expect(wakeDispatches[0].agentName).not.toBe(FELIX_DISPLAY_NAME);
+    expect(wakeDispatches[0].ticketIdentifier).toBe("LSO-24");
+
+    // Ledger consistency: the dispatch is recorded under the resolved id so the
+    // idempotency check and lease key line up with what delivery records.
+    const events = eventStore.query({ key: "linear-LSO-24", limit: 50 });
+    const dispatch = events.find((e) => e.outcome === "dispatch-accepted");
+    expect(dispatch?.agent).toBe(FELIX_OPENCLAW_ID);
+
     eventStore.close();
   });
 });
