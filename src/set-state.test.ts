@@ -20,6 +20,7 @@ import yaml from "js-yaml";
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll, jest } from "@jest/globals";
 import { setStateAtomic } from "./workflow-gate.js";
 import { resetWorkflowCache } from "./workflow-gate.js";
+import { clearFanoutOutcomeStore } from "./fanout-outcome-store.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { reloadAgents } from "./agents.js";
 import { createApp } from "./index.js";
@@ -63,6 +64,38 @@ function writeWorkflowDef(dir: string): string {
     states: [
       { id: "intake", owner_role: "steward", kind: "normal", native_state: "todo", transitions: [{ command: "accept", to: "implementation" }] },
       { id: "implementation", owner_role: "dev", kind: "normal", native_state: "todo", transitions: [{ command: "submit", to: "done" }] },
+      { id: "done", kind: "terminal", native_state: "done" },
+      { id: "escape", kind: "terminal", native_state: "invalid" },
+    ],
+  };
+  fs.writeFileSync(file, yaml.dump(def), "utf8");
+  return file;
+}
+
+function writeFanoutWorkflowDef(dir: string): string {
+  const file = path.join(dir, "fanout-parent.yaml");
+  const def = {
+    id: "fanout-parent",
+    version: 1,
+    entry_state: "spawn",
+    break_glass: { command: "escape", to: "escape", owner_role: "steward" },
+    states: [
+      {
+        id: "spawn",
+        owner_role: "steward",
+        kind: "normal",
+        native_state: "doing",
+        fanout: { spec_source: "findings", child_workflow: "wf:dev-impl" },
+        transitions: [{ command: "spawn", to: "managing" }],
+      },
+      {
+        id: "managing",
+        owner_role: "steward",
+        kind: "normal",
+        native_state: "managing",
+        barrier: true,
+        transitions: [{ command: "complete", to: "done" }],
+      },
       { id: "done", kind: "terminal", native_state: "done" },
       { id: "escape", kind: "terminal", native_state: "invalid" },
     ],
@@ -246,9 +279,11 @@ describe("setStateAtomic (AI-1546)", () => {
     process.env.WORKFLOW_DEF_PATH = path.join(dir, "dev-impl.yaml");
     process.env.CAPABILITY_POLICY_PATH = path.join(dir, "capability-policy.yaml");
     process.env.AGENTS_FILE = path.join(dir, "agents.json");
+    process.env.FANOUT_OUTCOME_PATH = path.join(dir, "fanout-outcomes.json");
     reloadAgents();
     resetWorkflowCache();
     resetPolicyCache();
+    clearFanoutOutcomeStore();
     originalFetch = globalThis.fetch;
   });
 
@@ -258,6 +293,8 @@ describe("setStateAtomic (AI-1546)", () => {
     delete process.env.WORKFLOW_DEF_PATH;
     delete process.env.CAPABILITY_POLICY_PATH;
     delete process.env.AGENTS_FILE;
+    delete process.env.FANOUT_OUTCOME_PATH;
+    clearFanoutOutcomeStore();
   });
 
   // AC1 — atomic write; consistency re-check passes
@@ -339,6 +376,20 @@ describe("setStateAtomic (AI-1546)", () => {
     const result = await setStateAtomic("AI-9999", "nonexistent-state", undefined, "Bearer test-token");
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/unknown target state/);
+  });
+
+  it("INF-643: refuses set-state across a fan-out edge when no fan-out outcome exists", async () => {
+    const fanoutDef = writeFanoutWorkflowDef(dir);
+    process.env.WORKFLOW_DEF_PATH = fanoutDef;
+    resetWorkflowCache();
+    globalThis.fetch = makeSetStateFetch({
+      fromLabels: ["wf:fanout-parent", "state:spawn"],
+    });
+
+    const result = await setStateAtomic("AI-9999", "managing", undefined, "Bearer test-token");
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/crosses a fan-out edge with no recorded fan-out outcome/);
   });
 
   it("returns ok:false when the issue cannot be fetched", async () => {

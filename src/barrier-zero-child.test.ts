@@ -24,6 +24,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { evaluateBarrier, attemptBarrierTransition, isChildTerminal, type BarrierResult, type BarrierTransitionResult } from "./barrier.js";
+import { clearFanoutOutcomeStore, recordFanoutOutcome } from "./fanout-outcome-store.js";
 import { resetWorkflowCache } from "./workflow-gate.js";
 
 // AI-1992: barrier-ness is config-driven — the barrier engine reads the parent's
@@ -111,9 +112,11 @@ states:
 
 let _zeroChildDefsDir: string;
 let _origZeroChildDefsDir: string | undefined;
+let _origFanoutOutcomePath: string | undefined;
 
 beforeAll(() => {
   _origZeroChildDefsDir = process.env.WORKFLOW_DEFS_DIR;
+  _origFanoutOutcomePath = process.env.FANOUT_OUTCOME_PATH;
   _zeroChildDefsDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1730-defs-"));
   const fixturesDir = path.resolve(process.cwd(), "src/__fixtures__");
   for (const f of ["canonical-ux-audit.yaml", "canonical-sprint.yaml", "canonical-dev-impl.yaml"]) {
@@ -122,16 +125,39 @@ beforeAll(() => {
   fs.writeFileSync(path.join(_zeroChildDefsDir, "vocab-builder.yaml"), MINIMAL_VOCAB_BUILDER_YAML, "utf8");
   fs.writeFileSync(path.join(_zeroChildDefsDir, "word-build.yaml"), MINIMAL_WORD_BUILD_YAML, "utf8");
   process.env.WORKFLOW_DEFS_DIR = _zeroChildDefsDir;
+  process.env.FANOUT_OUTCOME_PATH = path.join(_zeroChildDefsDir, "fanout-outcomes.json");
   resetWorkflowCache();
 });
 
 afterAll(() => {
   if (_origZeroChildDefsDir !== undefined) process.env.WORKFLOW_DEFS_DIR = _origZeroChildDefsDir;
   else delete process.env.WORKFLOW_DEFS_DIR;
+  if (_origFanoutOutcomePath !== undefined) process.env.FANOUT_OUTCOME_PATH = _origFanoutOutcomePath;
+  else delete process.env.FANOUT_OUTCOME_PATH;
   resetWorkflowCache();
+  clearFanoutOutcomeStore();
 });
 
-beforeEach(() => resetWorkflowCache());
+beforeEach(() => {
+  resetWorkflowCache();
+  fs.rmSync(process.env.FANOUT_OUTCOME_PATH!, { force: true });
+  clearFanoutOutcomeStore();
+});
+
+async function recordWaivedOutcome(parentIdentifier = "AI-1730"): Promise<void> {
+  await recordFanoutOutcome(parentIdentifier, {
+    outcome: "waived",
+    recordedAt: "2026-07-25T00:00:00.000Z",
+  });
+}
+
+async function recordAwaitingOutcome(childIdentifiers: string[], parentIdentifier = "AI-1730"): Promise<void> {
+  await recordFanoutOutcome(parentIdentifier, {
+    outcome: "awaiting",
+    childIdentifiers,
+    recordedAt: "2026-07-25T00:00:00.000Z",
+  });
+}
 
 // Dynamic import for onManagingEntry — not yet exported from barrier.ts.
 // Using the module namespace avoids a static ESM import failure so the
@@ -302,6 +328,7 @@ describe("AC1: Parent with zero children auto-advances from managing on entry", 
     // AC1: Full end-to-end — a ux-audit parent in managing with no children
     // should auto-advance to review. Currently this errors out with
     // "No children found — barrier requires at least one child" (BUG).
+    await recordWaivedOutcome();
     globalThis.fetch = makeTransitionFetch({
       children: [],
       workflowId: "ux-audit",
@@ -318,6 +345,7 @@ describe("AC1: Parent with zero children auto-advances from managing on entry", 
 
   it("attemptBarrierTransition transitions sprint parent managing → validating when zero children", async () => {
     // AC1: sprint archetype also auto-advances (managing → validating).
+    await recordWaivedOutcome();
     globalThis.fetch = makeTransitionFetch({
       children: [],
       workflowId: "sprint",
@@ -390,6 +418,7 @@ describe("AC2: Parent where all children are already done auto-advances on entry
     // AC2: Race condition — children finished before the managing-state entry
     // barrier check runs. Should still auto-advance.
     // This already works — regression guard.
+    await recordAwaitingOutcome(["AI-2001", "AI-2002"]);
     globalThis.fetch = makeTransitionFetch({
       children: [
         { identifier: "AI-2001", labels: ["wf:dev-impl", "state:done"] },
@@ -408,6 +437,7 @@ describe("AC2: Parent where all children are already done auto-advances on entry
 
   it("auto-advance works with single child already done", async () => {
     // AC2 edge case: exactly one child, already done.
+    await recordAwaitingOutcome(["AI-2001"]);
     globalThis.fetch = makeTransitionFetch({
       children: [
         { identifier: "AI-2001", labels: ["wf:dev-impl", "state:done"] },
@@ -453,6 +483,7 @@ describe("AC3: Parent with N ≥ 1 in-progress children continues to wait", () =
 
   it("attemptBarrierTransition does NOT transition when children are in-progress", async () => {
     // AC3: Regression — this must not change.
+    await recordAwaitingOutcome(["AI-2001", "AI-2002"]);
     globalThis.fetch = makeTransitionFetch({
       children: [
         { identifier: "AI-2001", labels: ["wf:dev-impl", "state:implementation"] },
@@ -470,6 +501,7 @@ describe("AC3: Parent with N ≥ 1 in-progress children continues to wait", () =
 
   it("single in-progress child keeps parent in managing", async () => {
     // AC3: N=1 in-progress is still "wait".
+    await recordAwaitingOutcome(["AI-2001"]);
     globalThis.fetch = makeTransitionFetch({
       children: [
         { identifier: "AI-2001", labels: ["wf:dev-impl", "state:write-tests"] },
@@ -485,6 +517,7 @@ describe("AC3: Parent with N ≥ 1 in-progress children continues to wait", () =
 
   it("all children in intake (pre-implementation) keeps parent in managing", async () => {
     // AC3: children haven't started yet.
+    await recordAwaitingOutcome(["AI-2001", "AI-2002", "AI-2003"]);
     globalThis.fetch = makeTransitionFetch({
       children: [
         { identifier: "AI-2001", labels: ["wf:dev-impl", "state:intake"] },
@@ -564,6 +597,7 @@ describe("onManagingEntry — entry-time barrier check (AI-1730)", () => {
 
   it("AC1: immediately transitions ux-audit parent with zero children", async () => {
     const fn = requireOnManagingEntry();
+    await recordWaivedOutcome();
     globalThis.fetch = makeTransitionFetch({ children: [], workflowId: "ux-audit", parentState: "managing" });
 
     const result = await fn("AI-1730", "Bearer tok");
@@ -575,6 +609,7 @@ describe("onManagingEntry — entry-time barrier check (AI-1730)", () => {
 
   it("AC1: immediately transitions sprint parent with zero children", async () => {
     const fn = requireOnManagingEntry();
+    await recordWaivedOutcome();
     globalThis.fetch = makeTransitionFetch({ children: [], workflowId: "sprint", parentState: "managing" });
 
     const result = await fn("AI-1730", "Bearer tok");
@@ -583,8 +618,20 @@ describe("onManagingEntry — entry-time barrier check (AI-1730)", () => {
     expect(result!.transitioned).toBe(true);
   });
 
+  it("INF-643: holds a fan-out-backed barrier when no fan-out outcome was recorded", async () => {
+    const fn = requireOnManagingEntry();
+    globalThis.fetch = makeTransitionFetch({ children: [], workflowId: "sprint", parentState: "managing" });
+
+    const result = await fn("AI-1730", "Bearer tok");
+
+    expect(result).not.toBeNull();
+    expect(result!.transitioned).toBe(false);
+    expect(result!.error).toContain("Missing fan-out outcome");
+  });
+
   it("AC2: immediately transitions when all children are already done at entry (race condition)", async () => {
     const fn = requireOnManagingEntry();
+    await recordAwaitingOutcome(["AI-2001", "AI-2002"]);
     globalThis.fetch = makeTransitionFetch({
       children: [
         { identifier: "AI-2001", labels: ["wf:dev-impl", "state:done"] },
@@ -602,6 +649,7 @@ describe("onManagingEntry — entry-time barrier check (AI-1730)", () => {
 
   it("AC3: does NOT transition when N ≥ 1 in-progress children exist", async () => {
     const fn = requireOnManagingEntry();
+    await recordAwaitingOutcome(["AI-2001", "AI-2002"]);
     globalThis.fetch = makeTransitionFetch({
       children: [
         { identifier: "AI-2001", labels: ["wf:dev-impl", "state:implementation"] },
@@ -618,6 +666,7 @@ describe("onManagingEntry — entry-time barrier check (AI-1730)", () => {
 
   it("AC3: does NOT transition when a single in-progress child exists", async () => {
     const fn = requireOnManagingEntry();
+    await recordAwaitingOutcome(["AI-2001"]);
     globalThis.fetch = makeTransitionFetch({
       children: [
         { identifier: "AI-2001", labels: ["wf:dev-impl", "state:write-tests"] },
@@ -660,6 +709,7 @@ describe("vocab-builder / word-build workflows — zero-child auto-advance (AI-1
 
   it("AC1: vocab-builder parent with zero children auto-advances", async () => {
     const fn = requireOnManagingEntry();
+    await recordWaivedOutcome();
     globalThis.fetch = makeTransitionFetch({ children: [], workflowId: "vocab-builder", parentState: "managing" });
 
     const result = await fn("AI-1730", "Bearer tok");
@@ -670,6 +720,7 @@ describe("vocab-builder / word-build workflows — zero-child auto-advance (AI-1
 
   it("AC1: word-build parent with zero children auto-advances", async () => {
     const fn = requireOnManagingEntry();
+    await recordWaivedOutcome();
     globalThis.fetch = makeTransitionFetch({ children: [], workflowId: "word-build", parentState: "managing" });
 
     const result = await fn("AI-1730", "Bearer tok");
@@ -680,6 +731,11 @@ describe("vocab-builder / word-build workflows — zero-child auto-advance (AI-1
 
   it("AC2: word-build parent with single vocab-image child already done auto-advances (race condition)", async () => {
     const fn = requireOnManagingEntry();
+    await recordFanoutOutcome("AI-1730", {
+      outcome: "awaiting",
+      childIdentifiers: ["AI-2001"],
+      recordedAt: "2026-07-25T00:00:00.000Z",
+    });
     globalThis.fetch = makeTransitionFetch({
       children: [
         { identifier: "AI-2001", labels: ["wf:vocab-image", "state:done"] },
@@ -696,6 +752,7 @@ describe("vocab-builder / word-build workflows — zero-child auto-advance (AI-1
 
   it("AC3: word-build parent with in-progress vocab-image child does NOT auto-advance", async () => {
     const fn = requireOnManagingEntry();
+    await recordAwaitingOutcome(["AI-2001"]);
     globalThis.fetch = makeTransitionFetch({
       children: [
         { identifier: "AI-2001", labels: ["wf:vocab-image", "state:generating"] },

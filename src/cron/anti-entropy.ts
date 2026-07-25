@@ -22,7 +22,7 @@
  * the SLA sweep cron. Also upgraded AC2 to config-driven barrier detection.
  */
 
-import { isBarrierState, resolveBarrierTarget } from "../barrier.js";
+import { barrierRequiresFanoutOutcome, isBarrierState, resolveBarrierTarget } from "../barrier.js";
 
 import fs from "node:fs/promises";
 import yaml from "js-yaml";
@@ -30,6 +30,7 @@ import { createLogger, componentLogger } from "../logger.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
 import { type WorkflowDef } from "../workflow-gate.js";
 import { findOrCreateLabel } from "../linear-helpers.js";
+import { getFanoutOutcome } from "../fanout-outcome-store.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "anti-entropy");
 
@@ -347,6 +348,20 @@ async function processIssue(
   // `barrier: true` in the workflow definition whose children are all terminal
   // but whose barrier never auto-advanced (dropped webhook / cron blackout).
   if (isBarrierState(stateNode)) {
+    if (barrierRequiresFanoutOutcome(def, stateLabel)) {
+      const outcome = await getFanoutOutcome(issue.identifier);
+      if (!outcome) {
+        result.errors.push(
+          `${issue.identifier}: barrier reconcile held — missing fan-out outcome for fan-out-backed state '${stateLabel}'`,
+        );
+        log.error(
+          `[anti-entropy] INF-643 barrier hold ${issue.identifier}: ` +
+          `state:${stateLabel} requires a fan-out outcome before reconciliation`,
+        );
+        return;
+      }
+    }
+
     const children = issue.children.nodes;
     if (children.length === 0) return;
 

@@ -31,6 +31,7 @@ import {
   type AntiEntropyOptions,
   type AntiEntropyResult,
 } from "./anti-entropy.js";
+import { clearFanoutOutcomeStore } from "../fanout-outcome-store.js";
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
 
@@ -83,8 +84,25 @@ function writeWorkflowDef(overrides: Partial<Record<string, unknown>> = {}): str
       { id: "escape", native_state: "invalid", kind: "terminal" },
     ],
   };
+  const fanoutParentDef = {
+    id: "fanout-parent",
+    entry_state: "spawn",
+    break_glass: { command: "escape", to: "escape", owner_role: "steward" },
+    states: [
+      {
+        id: "spawn",
+        native_state: "doing",
+        owner_role: "steward",
+        fanout: { spec_source: "findings", child_workflow: "wf:dev-impl" },
+        transitions: [{ command: "spawn", to: "managing" }],
+      },
+      { id: "managing", native_state: "managing", owner_role: "steward", barrier: true, transitions: [{ command: "complete", to: "done" }] },
+      { id: "done", native_state: "done", kind: "terminal" },
+      { id: "escape", native_state: "invalid", kind: "terminal" },
+    ],
+  };
   const p = path.join(tmpDir, `wf-defs-${Date.now()}.yaml`);
-  fs.writeFileSync(p, `---\n${yaml.dump(def)}\n---\n${yaml.dump(uxAuditDef)}\n---\n${yaml.dump(terminalBarrierDef)}`, "utf8");
+  fs.writeFileSync(p, `---\n${yaml.dump(def)}\n---\n${yaml.dump(uxAuditDef)}\n---\n${yaml.dump(terminalBarrierDef)}\n---\n${yaml.dump(fanoutParentDef)}`, "utf8");
   return p;
 }
 
@@ -275,15 +293,19 @@ beforeEach(() => {
   originalFetch = globalThis.fetch;
   wfDefPath = writeWorkflowDef();
   process.env.WORKFLOW_DEF_PATH = wfDefPath;
+  process.env.FANOUT_OUTCOME_PATH = path.join(tmpDir, "fanout-outcomes.json");
   // Reset any module-level caches (workflow registry, native state cache).
   // The implementation must export reset helpers for testing.
   process.env.ANTI_ENTROPY_TEST_RESET = "1";
+  clearFanoutOutcomeStore();
 });
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
   delete process.env.WORKFLOW_DEF_PATH;
+  delete process.env.FANOUT_OUTCOME_PATH;
   delete process.env.ANTI_ENTROPY_TEST_RESET;
+  clearFanoutOutcomeStore();
 });
 
 // ── AC1: Native state desync reconciliation ────────────────────────────────
@@ -699,6 +721,35 @@ describe("AC2 — dropped webhook: anti-entropy detects and reconciles missed ba
 
     expect(result.barrierMissedFound).toBe(0);
     expect(result.barrierMissedReconciled).toBe(0);
+  });
+
+  it("INF-643: does not reconcile a fan-out-backed barrier when no fan-out outcome was recorded", async () => {
+    const { fetch, issueUpdateCalls } = makeMockFetch({
+      issues: [
+        {
+          id: "uuid-AI-910",
+          identifier: "AI-910",
+          teamId: "team-ai",
+          labels: [
+            { id: "lbl-wf", name: "wf:fanout-parent" },
+            { id: "lbl-st", name: "state:managing" },
+          ],
+          nativeStateId: "ns-managing-1",
+          nativeStateName: "Managing",
+          children: [
+            { identifier: "AI-911", labels: [{ name: "wf:dev-impl" }, { name: "state:done" }] },
+          ],
+        },
+      ],
+    });
+    globalThis.fetch = fetch;
+
+    const result = await runAntiEntropyPass({ authToken: "tok-test" });
+
+    expect(result.barrierMissedFound).toBe(0);
+    expect(result.barrierMissedReconciled).toBe(0);
+    expect(issueUpdateCalls).toHaveLength(0);
+    expect(result.errors.join("\n")).toContain("missing fan-out outcome");
   });
 });
 

@@ -46,7 +46,7 @@ import type { ObservationStore } from "./store/observation-store.js";
 import { recordObservation } from "./store/observation-write-path.js";
 import { getAgent, getAgents } from "./agents.js";
 import { executeFanout, shouldTriggerFanout, validateFanoutSpec, extractSpecFindings, autoDeriveArmFindings, deriveSpecFromPriorChildren, deriveStructuredFromChildren, upsertDerivedSpecSection, updateIssueDescription, type FanoutResult, type Finding } from "./fanout.js";
-import { recordFanoutOutcome } from "./fanout-outcome-store.js";
+import { hasFanoutOutcome, recordFanoutOutcome } from "./fanout-outcome-store.js";
 import { onChildTerminal, onManagingEntry, isTerminalState, evaluateBarrier } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
 import { fetchLastCommentByUser } from "./linear-helpers.js";
@@ -7250,6 +7250,25 @@ export async function setStateAtomic(
     if (!stateNode) {
       const valid = def.states.map((s) => s.id).join(", ");
       return fail(`unknown target state '${targetState}' in workflow '${workflowId}'; valid: ${valid}`, fromState);
+    }
+  }
+
+  // INF-643: set-state/native reconciliation must not skip a fan-out edge.
+  // If the source state declares fanout and the requested target is one of its
+  // normal forward targets, a recorded outcome is the proof the fan-out ran.
+  if (def && fromState && fromState !== targetState) {
+    const breakGlass = def.break_glass?.command ?? "escape";
+    const fromStateNode = def.states.find((s) => s.id === fromState);
+    const crossesFanoutEdge =
+      Boolean(fromStateNode?.fanout) &&
+      (fromStateNode?.transitions ?? []).some((transition) =>
+        transition.to === targetState && transition.command !== breakGlass,
+      );
+    if (crossesFanoutEdge && !(await hasFanoutOutcome(issue.identifier ?? ticketIdentifier))) {
+      return fail(
+        `set-state refused: '${fromState}' → '${targetState}' crosses a fan-out edge with no recorded fan-out outcome; run the governed transition instead`,
+        fromState,
+      );
     }
   }
 

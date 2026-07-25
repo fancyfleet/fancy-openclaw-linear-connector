@@ -66,6 +66,21 @@ export function isBarrierState(state: { barrier?: boolean } | undefined | null):
 }
 
 /**
+ * INF-643: A barrier reached from a fan-out state must have a recorded fan-out
+ * outcome. Without it, "zero/all-terminal children" is not proof the phase ran;
+ * it may mean the fan-out edge was bypassed.
+ */
+export function barrierRequiresFanoutOutcome(def: WorkflowDef, barrierStateId: string): boolean {
+  const breakGlass = def.break_glass?.command ?? "escape";
+  return def.states.some((state) => {
+    if (!state.fanout) return false;
+    return (state.transitions ?? []).some((transition) =>
+      transition.to === barrierStateId && transition.command !== breakGlass,
+    );
+  });
+}
+
+/**
  * Parse a per-state SLA duration string into milliseconds.
  * Accepts `<n>h`, `<n>m`, `<n>s`, or a bare millisecond number (e.g. "24h",
  * "90m", "3600000"). Returns null when the value can't be parsed.
@@ -677,9 +692,11 @@ export async function attemptBarrierTransition(
   // when the parent entered the barrier state.
   let childFilter = expectedChildren;
   let outcomeType: string | undefined;
+  let fanoutOutcomeWasRecorded = false;
   if (childFilter === undefined) {
     const outcome = await getFanoutOutcome(parentIdentifier);
     if (outcome) {
+      fanoutOutcomeWasRecorded = true;
       outcomeType = outcome.outcome;
       if (outcome.outcome === "awaiting" && outcome.childIdentifiers && outcome.childIdentifiers.length > 0) {
         childFilter = outcome.childIdentifiers;
@@ -781,6 +798,15 @@ export async function attemptBarrierTransition(
   if (!isBarrierState(currentStateDef)) {
     log.info(`barrier: parent ${parentIdentifier} state '${currentState}' (wf:${workflowId}) is not a barrier state — skipping`);
     result.error = `Parent state '${currentState}' on wf:${workflowId} is not a barrier state`;
+    return result;
+  }
+
+  if (!fanoutOutcomeWasRecorded && barrierRequiresFanoutOutcome(wfDef!, currentState)) {
+    result.error = "Missing fan-out outcome — barrier held (INF-643)";
+    log.error(
+      `barrier: INF-643 attemptBarrierTransition: ${parentIdentifier} at '${currentState}' ` +
+      `requires a recorded fan-out outcome before barrier advance`,
+    );
     return result;
   }
 
@@ -911,6 +937,20 @@ export async function onManagingEntry(
 ): Promise<BarrierTransitionResult | null> {
   // INF-28: Read the recorded fan-out outcome, if any.
   const outcome = await getFanoutOutcome(parentIdentifier);
+  const parentState = await fetchParentState(parentIdentifier, authToken);
+  let wfDef: WorkflowDef | null = null;
+  let currentState: string | null = null;
+  if (parentState) {
+    const workflowId = getWorkflowId(parentState.labels);
+    currentState = getCurrentState(parentState.labels);
+    if (workflowId) {
+      try {
+        wfDef = await loadWorkflowDefById(workflowId);
+      } catch {
+        wfDef = null;
+      }
+    }
+  }
 
   // INF-28: Handle non-advancing outcomes that block with or without alarm.
   if (outcome) {
@@ -998,6 +1038,20 @@ export async function onManagingEntry(
         break; // fall through to current behavior
       }
     }
+  }
+
+  if (!outcome && wfDef && currentState && barrierRequiresFanoutOutcome(wfDef, currentState)) {
+    log.error(
+      `barrier: INF-643 missing fan-out outcome for ${parentIdentifier} at '${currentState}' — ` +
+      `barrier will not advance on zero/all-terminal children`,
+    );
+    return {
+      transitioned: false,
+      parentIdentifier,
+      terminalCount: 0,
+      totalChildren: 0,
+      error: "Missing fan-out outcome — barrier held (INF-643)",
+    };
   }
 
   // 1. Evaluate the barrier (current behavior for absent / not-declared / waived)
