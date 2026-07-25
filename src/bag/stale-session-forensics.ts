@@ -32,6 +32,7 @@ type StaleSessionInput = {
   startedAt: number;
   timeoutMs: number;
   pendingTickets: string[];
+  wakeTelemetry?: WakeLifecycleEntry[];
 };
 
 // ── Classification taxonomy ─────────────────────────────────────────────────
@@ -99,9 +100,40 @@ export interface LinearTicketSnapshot {
   commentCountAtTimeout: number | null;
 }
 
+export type SuspectedFailureStage =
+  | "gateway-dispatch"
+  | "session-container-start"
+  | "model-first-output"
+  | "tool-result"
+  | "model-error"
+  | "post-output-transition"
+  | "unknown";
+
+export interface WakeLifecycleEntry {
+  occurredAt: string;
+  outcome: string;
+  type: string | null;
+  deliveryMode: string | null;
+  attemptCount: number | null;
+  runId: string | null;
+  sessionKey: string | null;
+  errorSummary: string | null;
+  wakeId: string | null;
+}
+
+export interface WakeTelemetry {
+  lifecycle: WakeLifecycleEntry[];
+  deliveryAccepted: boolean;
+  sessionFileFound: boolean;
+  firstOutputObserved: boolean;
+  lastWakeOutcome: string | null;
+  suspectedFailureStage: SuspectedFailureStage;
+}
+
 export interface StaleSnapshot {
   capturedAt: string;           // ISO timestamp
   metadata: SessionMetadata;
+  wakeTelemetry: WakeTelemetry;
   lastAssistantMessage: LastAssistantMessage | null;
   lastToolCall: ToolCallEntry | null;
   toolCallSummary: ToolCallSummary;
@@ -286,6 +318,19 @@ export function buildSnapshot(
   const toolCalls = extractToolCallSummary(events);
   const lastToolCall = toolCalls.last10.length > 0 ? toolCalls.last10[0] : null;
   const errors = extractErrors(events);
+  const classification = classify(lastAssistant, toolCalls, errors, loopThreshold);
+  const firstOutputObserved = Boolean(
+    lastAssistant?.fullText.trim() ||
+    lastAssistant?.hasToolCalls ||
+    toolCalls.totalCalls > 0
+  );
+  const wakeTelemetry = buildWakeTelemetry({
+    lifecycle: stale.wakeTelemetry ?? [],
+    sessionFileFound: sessionFile !== null,
+    firstOutputObserved,
+    classification,
+    errors,
+  });
 
   // Build metadata
   const metadata: SessionMetadata = {
@@ -311,13 +356,11 @@ export function buildSnapshot(
     commentCountAtTimeout: null,
   };
 
-  // Classify
-  const classification = classify(lastAssistant, toolCalls, errors, loopThreshold);
-
   const diagnosticPath = "";
   const snapshot: StaleSnapshot = {
     capturedAt: new Date(now).toISOString(),
     metadata,
+    wakeTelemetry,
     lastAssistantMessage: lastAssistant,
     lastToolCall: lastToolCall,
     toolCallSummary: toolCalls,
@@ -328,6 +371,48 @@ export function buildSnapshot(
   };
 
   return snapshot;
+}
+
+function buildWakeTelemetry(input: {
+  lifecycle: WakeLifecycleEntry[];
+  sessionFileFound: boolean;
+  firstOutputObserved: boolean;
+  classification: StaleClass;
+  errors: string[];
+}): WakeTelemetry {
+  const deliveryAcceptedOutcomes = new Set([
+    "delivered",
+    "delivery-pending-ack",
+    "dispatch-accepted",
+    "dispatched",
+    "stale-c4-repoke",
+  ]);
+  const deliveryAccepted = input.lifecycle.some((event) => deliveryAcceptedOutcomes.has(event.outcome));
+  const lastWakeOutcome = input.lifecycle.at(-1)?.outcome ?? null;
+  let suspectedFailureStage: SuspectedFailureStage = "unknown";
+
+  if (!deliveryAccepted) {
+    suspectedFailureStage = "gateway-dispatch";
+  } else if (!input.sessionFileFound) {
+    suspectedFailureStage = "session-container-start";
+  } else if (!input.firstOutputObserved) {
+    suspectedFailureStage = "model-first-output";
+  } else if (input.classification === "C2") {
+    suspectedFailureStage = "tool-result";
+  } else if (input.errors.length > 0 || input.classification === "C6") {
+    suspectedFailureStage = "model-error";
+  } else {
+    suspectedFailureStage = "post-output-transition";
+  }
+
+  return {
+    lifecycle: input.lifecycle,
+    deliveryAccepted,
+    sessionFileFound: input.sessionFileFound,
+    firstOutputObserved: input.firstOutputObserved,
+    lastWakeOutcome,
+    suspectedFailureStage,
+  };
 }
 
 // ── Extraction helpers ──────────────────────────────────────────────────────
@@ -557,6 +642,11 @@ export function appendDigestEntry(snapshot: StaleSnapshot, config: ForensicsConf
     stopReason: snapshot.lastAssistantMessage?.stopReason ?? null,
     errors: snapshot.errors.length,
     diagnosticPath: snapshot.diagnosticPath,
+    deliveryAccepted: snapshot.wakeTelemetry.deliveryAccepted,
+    sessionFileFound: snapshot.wakeTelemetry.sessionFileFound,
+    firstOutputObserved: snapshot.wakeTelemetry.firstOutputObserved,
+    lastWakeOutcome: snapshot.wakeTelemetry.lastWakeOutcome,
+    suspectedFailureStage: snapshot.wakeTelemetry.suspectedFailureStage,
   };
 
   fs.appendFileSync(digestPath, JSON.stringify(entry) + "\n", "utf8");
@@ -1075,6 +1165,11 @@ export interface DigestEntry {
   stopReason: string | null;
   errors: number;
   diagnosticPath: string;
+  deliveryAccepted?: boolean;
+  sessionFileFound?: boolean;
+  firstOutputObserved?: boolean;
+  lastWakeOutcome?: string | null;
+  suspectedFailureStage?: SuspectedFailureStage;
 }
 
 export interface DigestSummary {

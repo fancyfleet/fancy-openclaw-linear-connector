@@ -142,6 +142,39 @@ describe("buildSnapshot", () => {
     expect(snapshot.toolCallSummary.totalCalls).toBe(0); // nonexistent file = no events
     expect(snapshot.lastAssistantMessage).toBeNull();
     expect(snapshot.linearTicket.identifier).toBe("AI-1010");
+    expect(snapshot.wakeTelemetry.suspectedFailureStage).toBe("gateway-dispatch");
+  });
+
+  test("includes wake telemetry and derives session-container start failures", () => {
+    const snapshot = buildSnapshot(
+      {
+        agentId: "astrid",
+        sessionKey: "linear-INF-196",
+        startedAt: Date.now() - 30 * 60 * 1000,
+        timeoutMs: 25 * 60 * 1000,
+        pendingTickets: [],
+        wakeTelemetry: [
+          {
+            occurredAt: "2026-07-25T17:00:24.000Z",
+            outcome: "dispatch-accepted",
+            type: "hook",
+            deliveryMode: "gateway-api",
+            attemptCount: 1,
+            runId: "run-123",
+            sessionKey: "linear-INF-196",
+            errorSummary: null,
+            wakeId: "wake-123",
+          },
+        ],
+      },
+      { openclawHome: "/nonexistent" },
+    );
+
+    expect(snapshot.wakeTelemetry.deliveryAccepted).toBe(true);
+    expect(snapshot.wakeTelemetry.sessionFileFound).toBe(false);
+    expect(snapshot.wakeTelemetry.firstOutputObserved).toBe(false);
+    expect(snapshot.wakeTelemetry.lastWakeOutcome).toBe("dispatch-accepted");
+    expect(snapshot.wakeTelemetry.suspectedFailureStage).toBe("session-container-start");
   });
 });
 
@@ -172,6 +205,7 @@ describe("writeSnapshot", () => {
     const written = JSON.parse(fs.readFileSync(filePath, "utf8"));
     expect(written.capturedAt).toBe(snapshot.capturedAt);
     expect(written.metadata.agentId).toBe("test-agent");
+    expect(written.wakeTelemetry.suspectedFailureStage).toBe("gateway-dispatch");
   });
 });
 
@@ -291,6 +325,14 @@ function makeSnapshot(cls: StaleSnapshot["classification"]): StaleSnapshot {
       lastActivityAt: Date.now(),
       timeoutMs: 25 * 60 * 1000,
       totalDurationMs: 30 * 60 * 1000,
+    },
+    wakeTelemetry: {
+      lifecycle: [],
+      deliveryAccepted: false,
+      sessionFileFound: false,
+      firstOutputObserved: false,
+      lastWakeOutcome: null,
+      suspectedFailureStage: "gateway-dispatch",
     },
     lastAssistantMessage: null,
     lastToolCall: { name: "exec", arguments: { command: "npm test" }, result: "no-result", timestamp: new Date().toISOString() },

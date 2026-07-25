@@ -9,7 +9,7 @@ import { createLogger, componentLogger } from "./logger.js";
 import { handleOAuthCallback } from "./oauth-callback.js";
 import { EventStore } from "./store/event-store.js";
 import { NudgeStore } from "./store/nudge-store.js";
-import { OperationalEventStore } from "./store/operational-event-store.js";
+import { OperationalEventStore, type OperationalEvent } from "./store/operational-event-store.js";
 import { DeadLetterQueueStore } from "./dead-letter-queue.js";
 import { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import { ObservationStore } from "./store/observation-store.js";
@@ -29,7 +29,7 @@ import { registerTranscriptRedaction, getTranscriptRedactionHealth } from "./tra
 import { normalizeSessionKey } from "./session-key.js";
 import { applyEngagementStatus, registerEngagementNativeStateOverlay } from "./engagement-status.js";
 import { createAdminRouter } from "./admin.js";
-import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, STALE_CLASS_NAMES, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
+import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, STALE_CLASS_NAMES, type StaleSnapshot, type ForensicsConfig, type WakeLifecycleEntry } from "./bag/stale-session-forensics.js";
 import { checkLinearIssueRouting } from "./linear-actionable.js";
 import { assertDispatchTargetFetchable } from "./delivery/index.js";
 import { markDispatchIntegrityGateActive, getDispatchIntegrityState } from "./dispatch-integrity-state.js";
@@ -686,6 +686,28 @@ export function createApp(options?: CreateAppOptions) {
   /**
    * Process a single stale session: capture forensics, classify, recover ticket.
    */
+  function wakeLifecycleFor(stale: StaleSessionDetail): WakeLifecycleEntry[] {
+    const events = operationalEventStore.query({
+      key: stale.sessionKey,
+      since: new Date(stale.startedAt - 60_000).toISOString(),
+      limit: 200,
+    });
+    return events
+      .filter((event) => event.sessionKey === stale.sessionKey || event.key === stale.sessionKey)
+      .reverse()
+      .map((event: OperationalEvent): WakeLifecycleEntry => ({
+        occurredAt: event.occurredAt,
+        outcome: event.outcome,
+        type: event.type,
+        deliveryMode: event.deliveryMode,
+        attemptCount: event.attemptCount,
+        runId: event.runId,
+        sessionKey: event.sessionKey,
+        errorSummary: event.errorSummary,
+        wakeId: event.wakeId,
+      }));
+  }
+
   async function processStaleSession(stale: StaleSessionDetail): Promise<void> {
     log.warn(
       `Stale session: ${stale.agentId} [${stale.sessionKey}] ` +
@@ -693,7 +715,10 @@ export function createApp(options?: CreateAppOptions) {
     );
 
     // 1. Build forensic snapshot
-    const snapshot = buildSnapshot(stale, forensicsConfig);
+    const snapshot = buildSnapshot(
+      { ...stale, wakeTelemetry: wakeLifecycleFor(stale) },
+      forensicsConfig,
+    );
 
     // 2. Fetch current Linear ticket state for comparison
     const linearState = await fetchLinearTicketState(stale.sessionKey, stale.agentId);
@@ -727,6 +752,13 @@ export function createApp(options?: CreateAppOptions) {
         toolCallCount: snapshot.toolCallSummary.totalCalls,
         stopReason: snapshot.lastAssistantMessage?.stopReason,
         errorCount: snapshot.errors.length,
+        wakeTelemetry: {
+          deliveryAccepted: snapshot.wakeTelemetry.deliveryAccepted,
+          sessionFileFound: snapshot.wakeTelemetry.sessionFileFound,
+          firstOutputObserved: snapshot.wakeTelemetry.firstOutputObserved,
+          lastWakeOutcome: snapshot.wakeTelemetry.lastWakeOutcome,
+          suspectedFailureStage: snapshot.wakeTelemetry.suspectedFailureStage,
+        },
       },
     });
 
