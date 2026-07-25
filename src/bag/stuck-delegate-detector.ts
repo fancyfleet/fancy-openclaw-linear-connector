@@ -547,8 +547,18 @@ function defaultSendWakeFactory(
  *
  * Returns candidates matching the stuck pattern.
  */
-async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCandidate[]> {
-  const token = getAccessToken(agent.name);
+export async function defaultFetchStuckCandidates(
+  agent: AgentConfig,
+  deps?: {
+    /** Overridable for testing — resolves the agent's Linear access token. */
+    getToken?: (agentName: string) => string | null | undefined;
+    /** Overridable for testing — HTTP fetch. */
+    fetchImpl?: typeof fetch;
+  },
+): Promise<StuckCandidate[]> {
+  const getToken = deps?.getToken ?? getAccessToken;
+  const fetchImpl = deps?.fetchImpl ?? fetch;
+  const token = getToken(agent.name);
   if (!token) {
     log.warn(`No access token for agent ${agent.name}; skipping stuck-delegate check`);
     return [];
@@ -604,7 +614,7 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
   `;
 
   try {
-    const res = await fetch("https://api.linear.app/graphql", {
+    const res = await fetchImpl("https://api.linear.app/graphql", {
       method: "POST",
       headers: { "content-type": "application/json", authorization: authHeader },
       body: JSON.stringify({ query, variables: { delegateId: agent.linearUserId } }),
@@ -674,6 +684,32 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
 
       // Skip terminal states (done, escape)
       if (currentState === "done" || currentState === "escape") continue;
+
+      // INF-572: Skip Linear-retired entities. When Linear retires an issue
+      // out-of-band (native state type completed/canceled) the proxy's
+      // workflow-state cache can still hold a non-terminal `state:*`
+      // label + delegate (the AI-2628 repro: native Invalid/`canceled`, label
+      // still `state:implementation`, delegate still set). Such a ticket is a
+      // dead end for the delegate: every corrective verb is an `issueUpdate`
+      // (or even a `commentCreate`) and Linear refuses ALL mutations on a
+      // retired entity ("Entity is retired: issue ↳ Could not modify retired
+      // issue"). Re-prompting the delegate therefore recurs on every cadence
+      // with no possible resolution. Treat native terminality as authoritative
+      // and never surface a retired issue as a stuck candidate — matching the
+      // INF-205 guard the delegation sweep and first-action watchdog already
+      // apply. Reuses this module's TERMINAL_NATIVE_STATE_TYPES (completed/
+      // canceled) — the same native-terminal set used for child-barrier
+      // suppression. (The `state:*`/delegate cleanup on the retired ticket is
+      // owned by the reconciliation sweeps' native-terminal crosscheck, not this
+      // read-only detector.)
+      if (issue.state?.type && TERMINAL_NATIVE_STATE_TYPES.has(issue.state.type)) {
+        log.info(
+          `Stuck-delegate: skipping ${issue.identifier} — Linear entity is natively terminal ` +
+          `(state.type='${issue.state?.type ?? "null"}', label state:${currentState}); ` +
+          `no legal transition exists on a retired issue`,
+        );
+        continue;
+      }
 
       // Find when the current state:* label was last set (state entry time)
       // In the new Linear schema, IssueLabelPayload no longer exists as a fragment type.
