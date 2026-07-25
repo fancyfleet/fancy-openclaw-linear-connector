@@ -100,7 +100,7 @@ describe("postComment response validation (INF-127)", () => {
     );
   });
 
-  it("catches network-level failure and logs warn", async () => {
+  it("catches network-level failure and logs error", async () => {
     globalThis.fetch = async () => {
       throw new Error("ECONNREFUSED");
     };
