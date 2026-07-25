@@ -3793,6 +3793,7 @@ export async function checkWorkflowRules(
         ticket: issueId,
         dedupKey: `done-gate|force-deploy|${issueId}`,
       });
+      return null;
     }
     let branchStatus = await fetchBranchAndPRStatus(issueId, authToken, fetchedIdentifier);
     // AI-1497: retry once on null — transient Linear API failure during

@@ -2326,6 +2326,74 @@ describe("checkWorkflowRules — INF-112: non-Linear-generated branch (metadata-
     expect(result).toBeNull();
   });
 
+  it("INF-663: force-deploy from merge bypasses zero-evidence gate after capability check", async () => {
+    let branchEvidenceQueried = false;
+    globalThis.fetch = async (url: URL | string, init?: RequestInit) => {
+      const urlStr = typeof url === "string" ? url : url.href;
+      const bodyText = typeof init?.body === "string" ? init.body : "";
+
+      if (bodyText.includes("TeamStates")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              team: {
+                states: {
+                  nodes: [
+                    { id: "state-todo-uuid", name: "Todo", type: "unstarted" },
+                    { id: "state-doing-uuid", name: "Doing", type: "started" },
+                    { id: "state-done-uuid", name: "Done", type: "completed" },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (bodyText.includes("IssueBranchAndPR")) {
+        branchEvidenceQueried = true;
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                description: null,
+                attachments: { nodes: [] },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (bodyText.includes("IssueWithLabels") || bodyText.includes("IssueContext") || bodyText.includes("delegate")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                id: "internal-uuid",
+                labels: {
+                  nodes: [
+                    { name: "wf:dev-impl" },
+                    { name: "state:merge" },
+                  ],
+                },
+                delegate: null,
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      throw new Error(`unexpected fetch call: ${urlStr} ${bodyText.slice(0, 80)}`);
+    };
+
+    const result = await checkWorkflowRules("force-deploy", "issue-uuid", "Bearer tok", "astrid");
+    expect(result).toBeNull();
+    expect(branchEvidenceQueried).toBe(false);
+  });
+
   it("INF-527: force-deploy is allowed for the recovery steward (holds workflow:force-deploy)", async () => {
     // astrid's steward container grants workflow:force-deploy in TEST_POLICY_YAML,
     // mirroring the live policy (steward is a co-holder, not just Hanzo).
