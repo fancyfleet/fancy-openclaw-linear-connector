@@ -70,7 +70,7 @@ interface CapabilityPolicyBody {
 
 interface CapabilityPolicy {
   bodies?: CapabilityPolicyBody[];
-  roles?: Array<{ id: string }>;
+  roles?: Array<{ id: string; synthetic?: boolean; no_body?: boolean }>;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -160,6 +160,22 @@ function bodiesForRole(policy: CapabilityPolicy | null, roleId: string): string[
 
 function roleIsDeclared(policy: CapabilityPolicy, roleId: string): boolean {
   return (policy.roles ?? []).some((role) => role.id === roleId);
+}
+
+function roleIsSyntheticNoBody(policy: CapabilityPolicy, roleId: string): boolean {
+  const role = (policy.roles ?? []).find((candidate) => candidate.id === roleId);
+  return Boolean(role && role.synthetic === true && role.no_body === true);
+}
+
+function transitionDeclaresSelectionCriteria(transition: NonNullable<WorkflowState["transitions"]>[number]): boolean {
+  return Boolean(
+    transition.assign &&
+      (
+        Boolean(transition.assign.default) ||
+        Boolean(transition.assign.constraint) ||
+        (typeof transition.assign.selection_criteria === "string" && transition.assign.selection_criteria.trim().length > 0)
+      ),
+  );
 }
 
 // ── Invariant checks ──────────────────────────────────────────────────────
@@ -356,6 +372,7 @@ function checkDelegateResolution(
     const candidates = bodiesForRole(policy, state.owner_role) ?? [];
     if (candidates.length === 0) {
       if (!roleIsDeclared(policy, state.owner_role)) continue;
+      if (roleIsSyntheticNoBody(policy, state.owner_role)) continue;
       errors.push({
         invariant: "delegate-resolution",
         message: `State '${state.id}' owner_role '${state.owner_role}' resolves to no bodies.`,
@@ -367,14 +384,12 @@ function checkDelegateResolution(
     if (candidates.length > 1) {
       const entries = incoming.get(state.id) ?? [];
       for (const transition of entries) {
-        const selectionCriteria = transition.assign?.selection_criteria;
-        if (transition.assign?.mode !== "required" || typeof selectionCriteria !== "string" || selectionCriteria.trim() === "") {
+        if (!transitionDeclaresSelectionCriteria(transition)) {
           errors.push({
             invariant: "delegate-resolution",
             message:
               `State '${state.id}' owner_role '${state.owner_role}' resolves to multiple bodies ` +
-              `(${candidates.join(", ")}); incoming transition '${transition.command}' must require an explicit delegate ` +
-              `and declare selection criteria.`,
+              `(${candidates.join(", ")}); incoming transition '${transition.command}' must declare selection criteria.`,
             state: state.id,
           });
         }

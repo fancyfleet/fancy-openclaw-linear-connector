@@ -117,7 +117,9 @@ states:
       - command: approve
         to: sign-off
         generic: continue      # `linear continue-workflow` — sign-off auto-assigns the requester (singleton)
-        assign: { mode: auto }
+        assign:
+          mode: auto
+          selection_criteria: original-requester
       - command: request-changes
         to: doing
         generic: revision      # `linear request-revision`
