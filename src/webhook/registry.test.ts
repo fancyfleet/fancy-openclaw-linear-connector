@@ -7,7 +7,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { addWebhook, listWebhooks, recordWebhookSeen } from "./registry.js";
+import { addWebhook, listWebhooks, recordWebhookSeen, describeRegisteredWebhooks } from "./registry.js";
 
 const VALID_URL = "https://linear-webhook.fancymatt.com/webhook";
 const VALID_SECRET = "lin_wh_inf617_abcdef1234567890";
@@ -93,5 +93,46 @@ describe("INF-617 — recordWebhookSeen populates the admin table's last-seen", 
     const seenRow = rows.find((r) => r.lastSeen === "2026-07-25T14:00:00.000Z");
     expect(seenRow).toBeDefined();
     expect(rows.filter((r) => r.lastSeen !== null).length).toBe(1);
+  });
+});
+
+describe("INF-667 — describeRegisteredWebhooks yields an actionable diagnostic table", () => {
+  let envDir: string;
+  let envFile: string;
+
+  beforeEach(() => {
+    envDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf667-env-"));
+    envFile = path.join(envDir, ".env");
+    fs.writeFileSync(envFile, "");
+    process.env.WEBHOOK_ENV_FILE = envFile;
+    delete process.env.LINEAR_WEBHOOK_SECRETS;
+    delete process.env.LINEAR_WEBHOOK_SECRET;
+  });
+
+  afterEach(() => {
+    delete process.env.WEBHOOK_ENV_FILE;
+    delete process.env.LINEAR_WEBHOOK_SECRETS;
+    delete process.env.LINEAR_WEBHOOK_SECRET;
+    fs.rmSync(envDir, { recursive: true, force: true });
+  });
+
+  it("parses the ?team= key from the url and never leaks the full secret", () => {
+    const secret = "lin_wh_inf667_topsecret_do_not_leak";
+    addWebhook({ url: "https://ai.fcy.sh/?team=LSO", secret, teamLabel: "Loafsoft Operations" });
+
+    const table = describeRegisteredWebhooks();
+    const row = table.find((r) => r.teamLabel === "Loafsoft Operations")!;
+    expect(row.teamKey).toBe("LSO");
+    expect(row.id).toMatch(/^wh_[0-9a-f]{16}$/);
+    expect(row.url).toBe("https://ai.fcy.sh/?team=LSO");
+    expect(row.secretPreview).not.toContain("topsecret");
+    expect(JSON.stringify(table)).not.toContain(secret);
+  });
+
+  it("reports teamKey=null for a url with no ?team= hint", () => {
+    process.env.LINEAR_WEBHOOK_SECRETS = "lin_wh_inf667_env_seeded_secret_0001";
+    const [row] = describeRegisteredWebhooks();
+    expect(row.teamKey).toBeNull();
+    expect(row.teamLabel).toBe("");
   });
 });
