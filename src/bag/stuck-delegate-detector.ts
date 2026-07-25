@@ -37,6 +37,7 @@
 import { createLogger, componentLogger } from "../logger.js";
 import { getAccessToken, getAgents, isAgentLocal, isPolledForLinear, type AgentConfig } from "../agents.js";
 import { loadWorkflowDef, getCurrentState, getWorkflowId, type WorkflowDef } from "../workflow-gate.js";
+import { resolveBodiesForRole } from "../escalation-gate.js";
 import type { OperationalEventStore } from "../store/operational-event-store.js";
 import type { SessionTracker } from "./session-tracker.js";
 import type { PendingWorkBag } from "./pending-work-bag.js";
@@ -201,17 +202,88 @@ function isChildTerminal(nativeStateType: string | null, labels: string[]): bool
 // ── Build re-prompt message ──────────────────────────────────────────────────
 
 /**
+ * INF-555: Build the break-glass escape command for a stuck-delegate re-prompt,
+ * threading a concrete `--target` naming a body of the workflow's intake-owner
+ * role.
+ *
+ * Why this is not just `linear escape <ID>`: bare escape fail-closes at the
+ * proxy with `delegate-unresolved — multi-body role requires a --target`
+ * whenever the intake owner role has more than one body — precisely the tickets
+ * most likely to get stuck (INF-545). escape re-enters at `break_glass.to`, and
+ * the proxy resolves the new delegate from *that state's* `owner_role`
+ * (workflow-gate B2 apply: `destOwnerRole = destStateNode.owner_role`). So the
+ * `--target` must name a **body of the break_glass.to state's owner role** — a
+ * role name does not resolve (getAgent matches by body id, and target
+ * validation checks body membership). We resolve the bodies here and emit a
+ * concrete, copy-pastable target rather than a placeholder.
+ *
+ * Multi-body: we default `--target` to the first body (deterministic policy
+ * order; escape re-enters intake for re-triage, so any valid body is an
+ * acceptable initial delegate) and name the alternatives so the agent can route
+ * elsewhere. Single body: emit it concretely. Unresolvable role / no bodies:
+ * fall back to bare escape (a genuinely single-body role still auto-resolves at
+ * the proxy).
+ *
+ * Sequencing (INF-555 blocked-on INF-545 / fancy-openclaw-linear-skill#97):
+ * `--target` must exist on installed CLIs before this text ships, else agents
+ * on an older CLI get `error: unknown option '--target'`. Verified deployed
+ * (installed CLI 0.4.7 exposes `--target` on `escape`) before this landed.
+ */
+export async function buildEscapeCommand(
+  ticketId: string,
+  def: WorkflowDef,
+  resolveBodies: (role: string) => Promise<string[]> = resolveBodiesForRole,
+): Promise<{ command: string; note: string }> {
+  const breakGlassCommand = def.break_glass?.command ?? "escape";
+  const bare = `linear ${breakGlassCommand} ${ticketId}`;
+
+  // The delegate on escape re-entry is resolved from the break_glass.to state's
+  // owner_role; fall back to break_glass.owner_role only if that state declares none.
+  const intakeStateId = def.break_glass?.to;
+  const intakeState = intakeStateId ? def.states.find((s) => s.id === intakeStateId) : undefined;
+  const intakeOwnerRole = intakeState?.owner_role ?? def.break_glass?.owner_role;
+  if (!intakeOwnerRole) {
+    return { command: bare, note: "" };
+  }
+
+  let bodies: string[];
+  try {
+    bodies = await resolveBodies(intakeOwnerRole);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(
+      `Stuck-delegate: could not resolve bodies for intake owner role '${intakeOwnerRole}' on ${ticketId}: ${msg} — emitting bare escape`,
+    );
+    return { command: bare, note: "" };
+  }
+
+  if (bodies.length === 0) {
+    // Role names no bodies we can pin — bare escape is the honest fallback; a
+    // genuinely single-body role still auto-resolves at the proxy.
+    return { command: bare, note: "" };
+  }
+
+  const command = `${bare} --target ${bodies[0]}`;
+  const note =
+    bodies.length > 1
+      ? ` (--target defaults to '${bodies[0]}'; intake owner role '${intakeOwnerRole}' also fillable by: ${bodies.slice(1).join(", ")})`
+      : "";
+  return { command, note };
+}
+
+/**
  * Build a targeted re-prompt for a stuck delegate. Includes the exact legal
  * commands for the current state, referencing the completion-comment-without-
  * transition failure mode.
  */
-export function buildRePrompt(
+export async function buildRePrompt(
   ticketId: string,
   currentState: string,
   def: WorkflowDef,
-): string {
-  const breakGlassCommand = def.break_glass?.command ?? "escape";
+  resolveBodies: (role: string) => Promise<string[]> = resolveBodiesForRole,
+): Promise<string> {
   const stateNode = def.states.find((s) => s.id === currentState);
+  const { command: escapeCmd, note: escapeNote } = await buildEscapeCommand(ticketId, def, resolveBodies);
 
   if (!stateNode || !stateNode.transitions?.length) {
     // Terminal or unknown state — shouldn't happen but be defensive
@@ -222,7 +294,7 @@ export function buildRePrompt(
     );
     return (
       `[Stuck-delegate detection] Ticket ${ticketId} is in state '${currentState}' but appears stuck. ` +
-      `If you believe your work is complete, run \`linear escape ${ticketId}\` to break glass.`
+      `If you believe your work is complete, run \`${escapeCmd}\` to break glass.${escapeNote}`
     );
   }
 
@@ -233,7 +305,7 @@ export function buildRePrompt(
     return `\`${cmd}\` (→ ${t.to})`;
   });
 
-  commands.push(`\`linear ${breakGlassCommand} ${ticketId}\` (break glass, legal from any state)`);
+  commands.push(`\`${escapeCmd}\` (break glass, legal from any state)${escapeNote}`);
 
   return (
     `[Stuck-delegate detection] You posted a completion comment but ticket ${ticketId} is still ` +
@@ -450,7 +522,7 @@ export class StuckDelegateDetector {
         }
 
         // Build re-prompt
-        const rePrompt = buildRePrompt(ticketId, candidate.currentState, def);
+        const rePrompt = await buildRePrompt(ticketId, candidate.currentState, def);
 
         // Send wake signal
         try {

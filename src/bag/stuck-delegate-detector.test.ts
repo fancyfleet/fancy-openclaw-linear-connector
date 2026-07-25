@@ -22,6 +22,7 @@ import {
   StuckDelegateDetector,
   PromptCounter,
   buildRePrompt,
+  buildEscapeCommand,
   type StuckCandidate,
 } from "./stuck-delegate-detector.js";
 import type { WorkflowDef } from "../workflow-gate.js";
@@ -135,20 +136,28 @@ describe("StuckDelegateDetector", () => {
   // ── buildRePrompt ──────────────────────────────────────────────────────
 
   describe("buildRePrompt", () => {
-    test("builds re-prompt with legal commands for implementation state", () => {
-      const prompt = buildRePrompt("AI-1451", "implementation", TEST_WORKFLOW_DEF);
+    // TEST_WORKFLOW_DEF's break_glass.to is the terminal `escape` state (no
+    // owner_role), so buildEscapeCommand falls back to break_glass.owner_role
+    // ("steward"). Inject a stub resolver so these tests don't read the real
+    // capability policy — single-body "steward" → concrete `--target astrid`.
+    const singleBodyResolver = async (_role: string) => ["astrid"];
+
+    test("builds re-prompt with legal commands for implementation state", async () => {
+      const prompt = await buildRePrompt("AI-1451", "implementation", TEST_WORKFLOW_DEF, singleBodyResolver);
 
       expect(prompt).toContain("AI-1451");
       expect(prompt).toContain("state:implementation");
       expect(prompt).toContain("`linear submit AI-1451`");
       expect(prompt).toContain("→ code-review");
-      expect(prompt).toContain("`linear escape AI-1451`");
+      // INF-555: escape now carries a concrete --target naming an intake-owner body.
+      expect(prompt).toContain("`linear escape AI-1451 --target astrid`");
+      expect(prompt).not.toContain("`linear escape AI-1451`"); // no bare escape
       expect(prompt).toContain("A comment is NOT a transition");
       expect(prompt).toContain("Do NOT reply HEARTBEAT_OK");
     });
 
-    test("builds re-prompt with legal commands for code-review state", () => {
-      const prompt = buildRePrompt("AI-1438", "code-review", TEST_WORKFLOW_DEF);
+    test("builds re-prompt with legal commands for code-review state", async () => {
+      const prompt = await buildRePrompt("AI-1438", "code-review", TEST_WORKFLOW_DEF, singleBodyResolver);
 
       expect(prompt).toContain("state:code-review");
       expect(prompt).toContain("`linear approve AI-1438`");
@@ -157,19 +166,117 @@ describe("StuckDelegateDetector", () => {
       expect(prompt).toContain("→ implementation");
     });
 
-    test("handles terminal state gracefully", () => {
-      const prompt = buildRePrompt("AI-999", "done", TEST_WORKFLOW_DEF);
+    test("handles terminal state gracefully", async () => {
+      const prompt = await buildRePrompt("AI-999", "done", TEST_WORKFLOW_DEF, singleBodyResolver);
 
       expect(prompt).toContain("AI-999");
       expect(prompt).toContain("done");
-      expect(prompt).toContain("escape");
+      // INF-555: fallback branch also emits the concrete --target escape command.
+      expect(prompt).toContain("`linear escape AI-999 --target astrid`");
     });
 
-    test("handles unknown state gracefully", () => {
-      const prompt = buildRePrompt("AI-999", "unknown-state", TEST_WORKFLOW_DEF);
+    test("handles unknown state gracefully", async () => {
+      const prompt = await buildRePrompt("AI-999", "unknown-state", TEST_WORKFLOW_DEF, singleBodyResolver);
 
       expect(prompt).toContain("AI-999");
       expect(prompt).toContain("unknown-state");
+    });
+  });
+
+  // ── buildEscapeCommand (INF-555) ────────────────────────────────────────
+
+  describe("buildEscapeCommand", () => {
+    // A def whose break_glass.to state DOES declare an owner_role, so the
+    // intake-owner resolves from the destination state (the production shape:
+    // task.yaml's break_glass.to=intake, intake.owner_role=requester).
+    const REENTRY_DEF: WorkflowDef = {
+      id: "task",
+      version: 2,
+      archetype: "single-task",
+      entry_state: "intake",
+      break_glass: { command: "escape", to: "intake", owner_role: "steward" },
+      states: [
+        {
+          id: "intake",
+          owner_role: "requester",
+          kind: "normal",
+          transitions: [{ command: "request", to: "routing" }],
+        },
+        { id: "routing", owner_role: "department-head", kind: "normal", transitions: [{ command: "assign", to: "doing" }] },
+        { id: "done", kind: "terminal" },
+      ],
+    };
+
+    test("single-body intake role → concrete --target, no note", async () => {
+      const { command, note } = await buildEscapeCommand("INF-1", REENTRY_DEF, async () => ["ai"]);
+      expect(command).toBe("linear escape INF-1 --target ai");
+      expect(note).toBe("");
+    });
+
+    test("multi-body intake role → default --target first body + names alternatives", async () => {
+      const { command, note } = await buildEscapeCommand("INF-2", REENTRY_DEF, async () => ["ai", "matt"]);
+      // The bug case (INF-545): bare escape would fail-close; we default to a
+      // valid body so the command is copy-pastable and works.
+      expect(command).toBe("linear escape INF-2 --target ai");
+      // Alternatives named so the agent can route elsewhere.
+      expect(note).toContain("requester");
+      expect(note).toContain("matt");
+      expect(note).not.toContain("ai,"); // ai is the default, not listed as an alternative
+    });
+
+    test("resolves the owner from break_glass.to state, not break_glass.owner_role", async () => {
+      // REENTRY_DEF: break_glass.owner_role='steward' but intake.owner_role='requester'.
+      // The escape delegate is resolved from the destination state's owner_role,
+      // so the resolver MUST be asked about 'requester', not 'steward'.
+      const rolesAsked: string[] = [];
+      await buildEscapeCommand("INF-3", REENTRY_DEF, async (role) => {
+        rolesAsked.push(role);
+        return ["ai"];
+      });
+      expect(rolesAsked).toEqual(["requester"]);
+    });
+
+    test("falls back to break_glass.owner_role when break_glass.to state has no owner_role", async () => {
+      // TEST_WORKFLOW_DEF's break_glass.to='escape' is terminal (no owner_role).
+      const rolesAsked: string[] = [];
+      await buildEscapeCommand("INF-4", TEST_WORKFLOW_DEF, async (role) => {
+        rolesAsked.push(role);
+        return ["astrid"];
+      });
+      expect(rolesAsked).toEqual(["steward"]);
+    });
+
+    test("unresolvable role (no bodies) → bare escape, no --target", async () => {
+      const { command, note } = await buildEscapeCommand("INF-5", REENTRY_DEF, async () => []);
+      expect(command).toBe("linear escape INF-5");
+      expect(note).toBe("");
+    });
+
+    test("resolver throws → bare escape (fail-safe, never a broken --target)", async () => {
+      const { command, note } = await buildEscapeCommand("INF-6", REENTRY_DEF, async () => {
+        throw new Error("policy read failed");
+      });
+      expect(command).toBe("linear escape INF-6");
+      expect(note).toBe("");
+    });
+
+    test("no intake owner role at all → bare escape", async () => {
+      const noOwnerDef: WorkflowDef = {
+        id: "x",
+        break_glass: { command: "escape", to: "gone" },
+        states: [{ id: "gone", kind: "terminal" }],
+      };
+      const { command } = await buildEscapeCommand("INF-7", noOwnerDef, async () => ["ai"]);
+      expect(command).toBe("linear escape INF-7");
+    });
+
+    test("honors a custom break_glass.command verb", async () => {
+      const customVerbDef: WorkflowDef = {
+        ...REENTRY_DEF,
+        break_glass: { command: "bail", to: "intake", owner_role: "steward" },
+      };
+      const { command } = await buildEscapeCommand("INF-8", customVerbDef, async () => ["ai"]);
+      expect(command).toBe("linear bail INF-8 --target ai");
     });
   });
 
