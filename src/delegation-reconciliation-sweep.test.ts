@@ -876,7 +876,7 @@ describe("AC3: each heal emits operational event + alert-bus notify; failures al
     expect(result.scanned).toBe(1);
     expect(wakeDispatches).toEqual(["AI-660-PLAIN"]);
     expect(adhocQuery).toContain("AdhocDelegationReconciliation");
-    expect(adhocQuery).toContain("delegate: { isMe: false }");
+    expect(adhocQuery).toContain("delegate: { isMe: { eq: false } }");
     expect(adhocQuery).not.toContain("labels: { none:");
     eventStore.close();
   });
