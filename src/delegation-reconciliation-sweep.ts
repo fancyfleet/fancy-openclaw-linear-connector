@@ -31,6 +31,7 @@ import {
   setStateAtomic,
   type SetStateAtomicResult,
 } from "./workflow-gate.js";
+import { getAgentIdForLinearUserId, getOpenclawAgentName } from "./agents.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { registerCron, markCronRun, formatIntervalMs } from "./cron/registry.js";
 import { OperationalEventStore, type OperationalEventStore as OperationalEventStoreType } from "./store/operational-event-store.js";
@@ -122,6 +123,7 @@ type LinearIssueNode = {
 };
 
 type IssuesPageResp = {
+  errors?: Array<{ message: string }>;
   data?: {
     issues?: {
       nodes: LinearIssueNode[];
@@ -203,6 +205,19 @@ async function queryGovernedTickets(
     });
 
     const data = (await res.json()) as IssuesPageResp;
+
+    // INF-585: fail loud on a non-2xx response or a 200-with-errors GraphQL
+    // validation failure. Previously the governed query read `nodes ?? []`
+    // with no guard, so a bad response (e.g. HTTP 400 GRAPHQL_VALIDATION_FAILED,
+    // or Linear's 200-with-`errors` for an invalid filter) was swallowed as an
+    // empty page → the sweep reported `scanned:0` and woke nobody. Throwing
+    // surfaces the failure via runDelegationReconciliationSweep's catch, which
+    // records it in result.errors and fires an alert-bus notify.
+    if (!res.ok || (data.errors && data.errors.length > 0)) {
+      const detail = data.errors?.[0]?.message ?? `HTTP ${res.status}`;
+      throw new Error(`GovernedTickets query failed: ${detail}`);
+    }
+
     nodes.push(...(data.data?.issues?.nodes ?? []));
 
     const pageInfo = data.data?.issues?.pageInfo;
@@ -277,7 +292,29 @@ async function queryAdhocDelegatedTickets(
     });
 
     const data = (await res.json()) as IssuesPageResp;
-    nodes.push(...(data.data?.issues?.nodes ?? []));
+
+    // INF-334: Linear returns 200 with "errors" for invalid filters.
+    // INF-585: fail loud instead of returning []. The old behavior logged and
+    // returned an empty page, so an invalid filter (or an HTTP 400) reported
+    // `scanned:0` with no alert — indistinguishable from "no ad-hoc tickets to
+    // reconcile," which is exactly how the original broken filter went
+    // unnoticed. Throwing surfaces the failure via
+    // runDelegationReconciliationSweep's catch (result.errors + alert-bus).
+    if (!res.ok || (data.errors && data.errors.length > 0)) {
+      const detail = data.errors?.[0]?.message ?? `HTTP ${res.status}`;
+      throw new Error(`AdhocDelegationReconciliation query failed: ${detail}`);
+    }
+
+    const pageNodes = data.data?.issues?.nodes ?? [];
+
+    // INF-334: The schema-legal query returns BOTH governed and ad-hoc tickets.
+    // We must filter out governed tickets
+    // (those with wf:* labels) client-side to satisfy "adhoc" semantics.
+    const adhocNodes = pageNodes.filter(n => {
+      return !n.labels.nodes.some(l => l.name.startsWith("wf:"));
+    });
+
+    nodes.push(...adhocNodes);
 
     const pageInfo = data.data?.issues?.pageInfo;
     hasNextPage = pageInfo?.hasNextPage === true;
@@ -786,6 +823,27 @@ export async function runDelegationReconciliationSweep(
 
     // ── AC1: Enrolled ticket with delegate but no dispatch record ───────
     if (ticket.delegateId && ticket.delegateName) {
+      // INF-589: wake by the OpenClaw agent id, not the Linear display name.
+      // ticket.delegateName is the Linear display label (e.g.
+      // "Felix (Unity Dev)"), which delivery cannot resolve — getOpenclawAgentName
+      // matches on the lowercase id and returns the display name unchanged, so the
+      // gateway routes an unresolvable `openclaw/Felix (Unity Dev)` and the wake
+      // dies in delivered-pending-ack while the sweep still reports healed. Resolve
+      // the stable delegateId (Linear user id) to the OpenClaw id up front and key
+      // everything — idempotency, lease, wake, ledger — on it, mirroring the
+      // bootstrap path's resolved delegateAgentName. Fall back to the legacy
+      // display-name path only for an unrecognized delegate (no better answer).
+      const resolvedAgentId = getAgentIdForLinearUserId(ticket.delegateId);
+      const delegateAgentName =
+        resolvedAgentId ?? getOpenclawAgentName(ticket.delegateName);
+      if (resolvedAgentId === undefined) {
+        log.warn(
+          `delegation-reconciliation: could not resolve delegate id ` +
+          `${ticket.delegateId} ("${ticket.delegateName}") to an OpenClaw agent ` +
+          `for ${ticket.identifier}; waking by display name may not route (INF-589)`,
+        );
+      }
+
       // Check idempotency (AC4): has this delegate been dispatched since
       // they were set? Use the real delegate-set timestamp from Linear
       // history, NOT ticket.updatedAt (which changes on any mutation).
@@ -860,7 +918,7 @@ export async function runDelegationReconciliationSweep(
       if (
         hasDispatchSinceDelegation(
           operationalEventStore,
-          ticket.delegateName,
+          delegateAgentName,
           ticket.identifier,
           delegationTimestamp,
         )
@@ -877,14 +935,14 @@ export async function runDelegationReconciliationSweep(
       const leaseKey = `linear-${ticket.identifier}`;
       if (opts.dispatchLeaseStore) {
         const lease = opts.dispatchLeaseStore.acquire(
-          ticket.delegateName,
+          delegateAgentName,
           leaseKey,
           { updatedAt: ticket.updatedAt },
         );
         if (lease.refused) {
           log.info(
             `delegation-reconciliation: lease refused for ${ticket.identifier} → ` +
-            `active lease exists for ${ticket.delegateName}, skipping wake`,
+            `active lease exists for ${delegateAgentName}, skipping wake`,
           );
           result.skippedIdempotent++;
           continue;
@@ -893,17 +951,17 @@ export async function runDelegationReconciliationSweep(
 
       // Heal: re-dispatch the delegation wake through the normal delivery path
       try {
-        await wakeFn(ticket.delegateName, ticket.identifier);
+        await wakeFn(delegateAgentName, ticket.identifier);
 
         result.healed++;
         log.info(
-          `delegation-reconciliation: healed ${ticket.identifier} → wake dispatched to ${ticket.delegateName}`,
+          `delegation-reconciliation: healed ${ticket.identifier} → wake dispatched to ${delegateAgentName}`,
         );
 
         // Emit operational event
         operationalEventStore.append({
           outcome: "dispatch-accepted",
-          agent: ticket.delegateName,
+          agent: delegateAgentName,
           key: `linear-${ticket.identifier}`,
           detail: {
             mode: "delegation-reconciliation",
@@ -914,12 +972,12 @@ export async function runDelegationReconciliationSweep(
         // Also emit a delegation-reconciled event for AC3 observability
         operationalEventStore.append({
           outcome: "delegation-reconciled",
-          agent: ticket.delegateName,
+          agent: delegateAgentName,
           key: `linear-${ticket.identifier}`,
           detail: {
             mode: "delegation-wake",
             ticket: ticket.identifier,
-            delegate: ticket.delegateName,
+            delegate: delegateAgentName,
           },
         });
 
@@ -952,7 +1010,7 @@ export async function runDelegationReconciliationSweep(
 
         operationalEventStore.append({
           outcome: "delegation-reconciliation-failed",
-          agent: ticket.delegateName,
+          agent: delegateAgentName,
           key: `linear-${ticket.identifier}`,
           errorSummary: msg,
           detail: {
