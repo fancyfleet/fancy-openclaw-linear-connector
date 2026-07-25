@@ -261,6 +261,8 @@ describe("INF-508: silent wake-failure diagnostics", () => {
   it("AC2b — a second sweep does not re-alert (dedup on exhausted ladder)", async () => {
     const diagnostic = classifyWakeFailure({ agentId: "igor", gateway: "dev", errorSummary: OVERFLOW_SIGNAL });
     const alerts: UnreachableAlert[] = [];
+    const nowMs = Date.parse("2026-07-24T17:38:00.000Z");
+    const deliveredAtMs = nowMs - 60 * 60_000;
     const opts: FirstActionWatchdogOptions = {
       listTickets: async () => [
         {
@@ -270,19 +272,19 @@ describe("INF-508: silent wake-failure diagnostics", () => {
           delegate: "igor",
           humanAssigned: false,
           labels: [],
-          dispatchDeliveredAtMs: Date.now() - 60 * 60_000,
+          dispatchDeliveredAtMs: deliveredAtMs,
           dispatchUpdatedAt: "2026-07-24T16:38:00.000Z",
           firstOwnerActionAtMs: null,
           rungsFired: 0,
           stallReason: {
             reason: StallReasonCode.WAKE_TURN_FAILED,
             detail: diagnostic.summary,
-            resolvedAt: Date.now(),
+            resolvedAt: nowMs,
             diagnostic,
           },
         },
       ],
-      now: () => Date.now(),
+      now: () => nowMs,
       maxRungs: 3,
       defaultDeadlineMs: 45 * 60_000,
       redispatch: async () => ({ admitted: true }),
