@@ -320,6 +320,10 @@ describe("proxy — AI-1762 transition write verification + bounded retry", () =
 
   const atomicCalls = (calls: Array<{ query: string }>) =>
     calls.filter((c) => c.query.includes("ApplyAtomicTransition"));
+  const forwardAtomicCalls = (calls: Array<{ query: string; variables: Record<string, unknown> }>) =>
+    atomicCalls(calls).filter((c) => Array.isArray(c.variables.labelIds) && c.variables.labelIds.includes("impl-lbl"));
+  const rollbackAtomicCalls = (calls: Array<{ query: string; variables: Record<string, unknown> }>) =>
+    atomicCalls(calls).filter((c) => Array.isArray(c.variables.labelIds) && c.variables.labelIds.includes("acv-lbl"));
   const verifyCalls = (calls: Array<{ query: string }>) =>
     calls.filter((c) => c.query.includes("VerifyTransitionWrite"));
 
@@ -358,8 +362,8 @@ describe("proxy — AI-1762 transition write verification + bounded retry", () =
     // One retry: two atomic writes, two verification reads.
     expect(atomicCalls(calls).length).toBe(2);
     expect(verifyCalls(calls).length).toBe(2);
-    // Every attempt carried the full bundled tuple including the delegate.
-    for (const call of atomicCalls(calls)) {
+    // Every forward attempt carried the full bundled tuple including the delegate.
+    for (const call of forwardAtomicCalls(calls)) {
       expect((call as { variables: Record<string, unknown> }).variables.delegateId).toBe("u-igor");
     }
   });
@@ -379,9 +383,10 @@ describe("proxy — AI-1762 transition write verification + bounded retry", () =
     expect(res.body._workflowTransition.status).toBe("failed");
     expect(res.body._workflowTransition.code).toBe("transition-write-unverified");
     expect(res.body._workflowTransition.detail).toMatch(/delegate/);
-    // Bounded retry: default policy is 3 attempts, then stop.
-    expect(atomicCalls(calls).length).toBe(3);
-    expect(verifyCalls(calls).length).toBe(3);
+    // Bounded retry: default policy is 3 forward attempts, then one rollback write.
+    expect(forwardAtomicCalls(calls).length).toBe(3);
+    expect(rollbackAtomicCalls(calls).length).toBe(1);
+    expect(verifyCalls(calls).length).toBe(4);
   });
 
   it("AC2: exhausted retries append a transition-write-failed operational event", async () => {

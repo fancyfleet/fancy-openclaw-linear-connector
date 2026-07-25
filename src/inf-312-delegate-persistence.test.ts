@@ -285,6 +285,20 @@ interface MutableFetch {
 function makeMutableFetch(initial: { state: string; delegate: string | null }): MutableFetch {
   let currentContext = contextFor(initial.state, initial.delegate);
   let withIdsState = initial.state;
+  const stateByLabelId = new Map(
+    [
+      "intake",
+      "capture_ac",
+      "design",
+      "write-tests",
+      "implementation",
+      "code-review",
+      "merge",
+      "deploy",
+      "ac-validate",
+      "done",
+    ].map((state) => [`${state}-lbl`, state] as const),
+  );
   const calls: Array<{ query: string; variables: Record<string, unknown> }> = [];
   let lastWrittenDelegateId: string | null | undefined = undefined;
   let lastMutationIncludedAssigneeId = false;
@@ -345,6 +359,21 @@ function makeMutableFetch(initial: { state: string; delegate: string | null }): 
         delegateId: lastWrittenDelegateId,
         assigneeIdIncluded: lastMutationIncludedAssigneeId,
       });
+      const labelIds = Array.isArray(vars.labelIds) ? vars.labelIds : [];
+      const nextState = labelIds
+        .map((id) => (typeof id === "string" ? stateByLabelId.get(id) : undefined))
+        .find((state): state is string => Boolean(state));
+      if (nextState || lastWrittenDelegateId !== undefined) {
+        const ctx = currentContext as { data: { issue: { delegate: { id: string } | null } } };
+        const currentDelegate = ctx.data.issue.delegate?.id ?? null;
+        currentContext = contextFor(
+          nextState ?? withIdsState,
+          lastWrittenDelegateId !== undefined ? lastWrittenDelegateId : currentDelegate,
+        );
+        if (nextState) {
+          withIdsState = nextState;
+        }
+      }
       return json({ data: { issueUpdate: { success: true } } });
     }
     // Any forwarded mutation (commentCreate / issueUpdate) succeeds.
