@@ -284,6 +284,10 @@ describe("AI-1994 — executeFanout incremental dedup (mocked Linear API)", () =
     } as never);
 
     expect(result.created).toBe(0);
+    expect(result.specEntryCount).toBe(2);
+    expect(result.attempted).toBe(0);
+    expect(result.specMatchedChildren).toEqual(["AI-3001", "AI-3002"]);
+    expect(result.specMatchedTerminalChildren).toEqual([]);
     const createCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
     expect(createCalls).toHaveLength(0);
   });
@@ -329,12 +333,36 @@ describe("AI-1994 — executeFanout incremental dedup (mocked Linear API)", () =
     // Both entries already have children (Done + Doing): re-entry spawns nothing.
     // (Also fails against no-dedup impl, so this is not a vacuous invariant.)
     expect(result.created).toBe(0);
+    expect(result.specEntryCount).toBe(2);
+    expect(result.attempted).toBe(0);
+    expect(result.specMatchedChildren).toEqual(["AI-3001", "AI-3002"]);
+    expect(result.specMatchedTerminalChildren).toEqual(["AI-3001"]);
 
     // …and no update/cancel/delete/archive mutation may touch an existing child.
     const mutating = fetchCalls.filter((c) =>
       /issueUpdate|issueArchive|issueDelete|archiveIssue/i.test(String(c.body.query ?? "")),
     );
     expect(mutating).toHaveLength(0);
+  });
+
+  it("INF-620: dedup-zero against only terminal existing children is visible to the outcome recorder", async () => {
+    const findings = extractSpecFindings(specFrom(["Alpha"]), "findings");
+    const existingChildren = [
+      { identifier: "AI-3001", specEntryId: findings[0].id as string, state: "Done" },
+    ];
+
+    globalThis.fetch = makeFetch();
+    const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, {
+      skipPreview: true,
+      findingsOverride: findings,
+      existingChildren,
+    } as never);
+
+    expect(result.specEntryCount).toBe(1);
+    expect(result.created).toBe(0);
+    expect(result.attempted).toBe(0);
+    expect(result.specMatchedChildren).toEqual(["AI-3001"]);
+    expect(result.specMatchedTerminalChildren).toEqual(["AI-3001"]);
   });
 
   it("AC2/AC3: a removed entry is NOT cancelled — an unmatched-child note is posted", async () => {

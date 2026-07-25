@@ -176,6 +176,8 @@ export interface FanoutResult {
    * failed, not that the spec was empty or waived.
    */
   attempted: number;
+  /** Number of parseable spec entries extracted for this fan-out. */
+  specEntryCount: number;
   /**
    * INF-28: identifiers of all children that match the current spec (newly minted ∪
    * existing children whose specEntryId is in the current spec). Unlike
@@ -184,6 +186,8 @@ export interface FanoutResult {
    * accumulated history.
    */
   specMatchedChildren: string[];
+  /** Spec-matched children that were already terminal at fan-out time. */
+  specMatchedTerminalChildren: string[];
 }
 
 
@@ -1344,7 +1348,9 @@ export async function executeFanout(
     pendingApproval: false,
     unmatchedChildren: [],
     attempted: 0,
+    specEntryCount: 0,
     specMatchedChildren: [],
+    specMatchedTerminalChildren: [],
   };
 
   // AI-1992 AC7 (spawn time): the child workflow type is config-driven and MUST
@@ -1374,6 +1380,7 @@ export async function executeFanout(
   //    title fallback). A pre-flight validated caller may pass findingsOverride.
   const findings = (options?.findingsOverride ?? extractSpecFindings(parentCtx.description, config.spec_source))
     .map(withFindingMetadata);
+  result.specEntryCount = findings.length;
   log.info(`fanout: extracted ${findings.length} finding(s) from parent ${parentIssueId} (spec_source=${config.spec_source})`);
 
   if (findings.length === 0) {
@@ -1425,6 +1432,12 @@ export async function executeFanout(
     (c) => specFindingIds.has(c.specEntryId),
   );
   result.specMatchedChildren = matchedExisting.map((c) => c.identifier);
+  result.specMatchedTerminalChildren = matchedExisting
+    .filter((c) => {
+      const state = c.state?.toLowerCase();
+      return state === "done" || state === "escape";
+    })
+    .map((c) => c.identifier);
 
   if (legacyIdOnlyMatches.length > 0) {
     // INF-32 AC1: a workflow-less child suppressed a spawn on an id-only match.

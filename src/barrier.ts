@@ -504,9 +504,10 @@ export async function evaluateBarrier(
   if (children !== null && expectedChildren && expectedChildren.length > 0) {
     const filtered = children.filter((c) => expectedChildren.includes(c.identifier));
     if (filtered.length === 0) {
-      // No expected children found — treat as zero, which means
-      // all-terminal (vacuous satisfaction for the expected set).
-      return { allTerminal: true, totalChildren: 0, terminalCount: 0, orphanedCount: 0, children: [] };
+      // Expected children were recorded but none are currently linked/readable
+      // under the parent. This is not the same as an unscoped zero-child
+      // barrier: do not let stale/missing scoped children satisfy vacuously.
+      return { allTerminal: false, totalChildren: 0, terminalCount: 0, orphanedCount: 0, children: [] };
     }
     const terminalCount = filtered.filter((c) => c.isTerminal).length;
     const orphanedCount = filtered.filter((c) => c.isOrphaned).length;

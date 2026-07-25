@@ -45,7 +45,7 @@ import type { ObservationStore } from "./store/observation-store.js";
 import { recordObservation } from "./store/observation-write-path.js";
 import { isBodyKnown } from "./escalation-gate.js";
 import { getAgent, getAgents } from "./agents.js";
-import { executeFanout, shouldTriggerFanout, validateFanoutSpec, extractSpecFindings, autoDeriveArmFindings, deriveSpecFromPriorChildren, deriveStructuredFromChildren, upsertDerivedSpecSection, updateIssueDescription, type Finding } from "./fanout.js";
+import { executeFanout, shouldTriggerFanout, validateFanoutSpec, extractSpecFindings, autoDeriveArmFindings, deriveSpecFromPriorChildren, deriveStructuredFromChildren, upsertDerivedSpecSection, updateIssueDescription, type FanoutResult, type Finding } from "./fanout.js";
 import { recordFanoutOutcome } from "./fanout-outcome-store.js";
 import { onChildTerminal, onManagingEntry, isTerminalState } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
@@ -4216,6 +4216,37 @@ export interface ApplyStateTransitionOptions {
   delegateOverride?: string | null;
 }
 
+export function deriveFanoutBarrierOutcome(result: FanoutResult): {
+  outcome: "refused" | "pending-approval" | "waived" | "failed" | "awaiting";
+  childIdentifiers?: string[];
+} {
+  if (result.refused) return { outcome: "refused" };
+  if (result.pendingApproval) return { outcome: "pending-approval" };
+  if (result.spawnIfResult && !result.spawnIfResult.shouldSpawn) {
+    return result.spawnIfResult.outcome === "failed"
+      ? { outcome: "failed" }
+      : { outcome: "waived" };
+  }
+  if (result.created === 0 && result.errors.length > 0) return { outcome: "failed" };
+  if (result.attempted > 0 && result.created === 0) return { outcome: "failed" };
+  if (
+    result.specEntryCount > 0 &&
+    result.attempted === 0 &&
+    result.created === 0 &&
+    result.specMatchedChildren.length > 0 &&
+    result.specMatchedTerminalChildren.length === result.specMatchedChildren.length
+  ) {
+    return { outcome: "failed" };
+  }
+  if (result.specMatchedChildren.length > 0) {
+    return { outcome: "awaiting", childIdentifiers: result.specMatchedChildren };
+  }
+  if (result.created > 0) {
+    return { outcome: "awaiting", childIdentifiers: result.childIdentifiers };
+  }
+  return { outcome: "waived" };
+}
+
 /**
  * AI-1809: machine-readable outcome of applyStateTransition.
  *
@@ -5497,38 +5528,12 @@ export async function applyStateTransition(
       // to wait on, or whether to block+alarm.
       if (!spawnIfEvaluationFailed) {
         const now = new Date().toISOString();
-        let outcomeType: string;
-        let childIds: string[] | undefined;
-
-        if (fanoutResult.refused) {
-          outcomeType = "refused";
-        } else if (fanoutResult.pendingApproval) {
-          outcomeType = "pending-approval";
-        } else if (fanoutResult.spawnIfResult && !fanoutResult.spawnIfResult.shouldSpawn) {
-          // Verified waive (spawnIfResult.outcome === "waived")
-          outcomeType = "waived";
-        } else if (fanoutResult.created === 0 && fanoutResult.errors.length > 0) {
-          outcomeType = "failed";
-        } else if (fanoutResult.attempted > 0 && fanoutResult.created === 0) {
-          // Attempted N, minted 0 — rare but distinct from waived
-          outcomeType = "failed";
-        } else if (fanoutResult.specMatchedChildren.length > 0) {
-          outcomeType = "awaiting";
-          childIds = fanoutResult.specMatchedChildren;
-        } else if (fanoutResult.created > 0) {
-          // Created children without spec-matched set (fallback — should not happen
-          // with the FanoutResult extension, but be defensive)
-          outcomeType = "awaiting";
-          childIds = fanoutResult.childIdentifiers;
-        } else {
-          // Zero children created, no errors, no refusal — effectively waived
-          outcomeType = "waived";
-        }
+        const outcome = deriveFanoutBarrierOutcome(fanoutResult);
 
         try {
           await recordFanoutOutcome(issueId, {
-            outcome: outcomeType as "refused" | "pending-approval" | "waived" | "failed" | "awaiting",
-            childIdentifiers: childIds,
+            outcome: outcome.outcome,
+            childIdentifiers: outcome.childIdentifiers,
             recordedAt: now,
           });
         } catch (err) {
