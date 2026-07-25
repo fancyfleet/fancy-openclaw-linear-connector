@@ -17,7 +17,7 @@ import path from "node:path";
 import { componentLogger, createLogger } from "./logger.js";
 import { loadWorkflowRegistry, type WorkflowDef } from "./workflow-gate.js";
 import { resolveBodiesForRole } from "./escalation-gate.js";
-import { findOrCreateLabel } from "./linear-helpers.js";
+import { findOrCreateLabel, postComment } from "./linear-helpers.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import type { LinearEvent, LinearIssueCreatedEvent, LinearIssueUpdatedEvent } from "./webhook/schema.js";
 import { getAgents, getAccessToken } from "./agents.js";
@@ -29,7 +29,7 @@ const LINEAR_API_URL = "https://api.linear.app/graphql";
 // ── Public result type ────────────────────────────────────────────────────────
 
 export interface BootstrapResult {
-  action: "bootstrapped" | "demoted";
+  action: "bootstrapped" | "demoted" | "rejected";
   workflowId?: string;
   entryState?: string;
   /** OpenClaw agent name of the newly-set delegate (bootstrapped only). */
@@ -38,6 +38,8 @@ export interface BootstrapResult {
   ticketIdentifier?: string;
   /** Ticket title for wake delivery (bootstrapped only). */
   ticketTitle?: string;
+  /** Human-readable reason (rejected only). */
+  rejectionReason?: string;
 }
 
 // ── Agents loader ─────────────────────────────────────────────────────────────
@@ -62,6 +64,12 @@ export interface IssueContext {
   identifier: string;
   title: string;
   labels: Array<{ id: string; name: string }>;
+  /**
+   * INF-552: Linear user ID of the issue creator ("requester"). Used to bounce
+   * an unregistered-workflow authoring attempt back to whoever filed it. Absent
+   * when the creator could not be resolved from the API.
+   */
+  creatorId?: string;
 }
 
 /** Re-export so callers (sweep) can import from a single module. */
@@ -83,6 +91,7 @@ export async function fetchIssueContext(issueId: string, authToken: string): Pro
         team { id }
         labels { nodes { id name } }
         delegate { id }
+        creator { id }
       }
     }
   `;
@@ -101,6 +110,7 @@ export async function fetchIssueContext(issueId: string, authToken: string): Pro
           team: { id: string };
           labels: { nodes: Array<{ id: string; name: string }> };
           delegate: { id: string } | null;
+          creator: { id: string } | null;
         } | null;
       };
     };
@@ -113,6 +123,7 @@ export async function fetchIssueContext(issueId: string, authToken: string): Pro
       identifier: issue.identifier,
       title: issue.title,
       labels: issue.labels.nodes,
+      creatorId: issue.creator?.id,
     };
   } catch {
     return null;
@@ -129,13 +140,23 @@ export async function issueUpdateAtomic(
   labelIds: string[],
   authToken: string,
   delegateId?: string | null,
+  assigneeId?: string | null,
 ): Promise<boolean> {
   const hasDelegate = delegateId !== undefined;
+  const hasAssignee = assigneeId !== undefined;
   const inputParts: string[] = ["labelIds: $labelIds"];
   if (hasDelegate) inputParts.push("delegateId: $delegateId");
+  if (hasAssignee) inputParts.push("assigneeId: $assigneeId");
+
+  const varDecls = [
+    "$issueId: String!",
+    "$labelIds: [String!]!",
+    ...(hasDelegate ? ["$delegateId: String"] : []),
+    ...(hasAssignee ? ["$assigneeId: String"] : []),
+  ];
 
   const mutation = `
-    mutation ApplyAtomicTransition($issueId: String!, $labelIds: [String!]!${hasDelegate ? ", $delegateId: String" : ""}) {
+    mutation ApplyAtomicTransition(${varDecls.join(", ")}) {
       issueUpdate(id: $issueId, input: { ${inputParts.join(", ")} }) {
         success
       }
@@ -143,6 +164,7 @@ export async function issueUpdateAtomic(
   `;
   const variables: Record<string, unknown> = { issueId: internalId, labelIds };
   if (hasDelegate) variables.delegateId = delegateId;
+  if (hasAssignee) variables.assigneeId = assigneeId;
 
   try {
     const res = await fetch(LINEAR_API_URL, {
@@ -313,8 +335,19 @@ export async function applyBootstrapToIssue(
   }
 
   const def = registry.get(workflowId);
-  if (!def?.entry_state) {
-    log.warn(`workflow-bootstrap: no def (or no entry_state) for workflow '${workflowId}' — skipping bootstrap`);
+  // INF-552: an unregistered workflow id is a loud rejection, not a silent
+  // strand. Previously this returned null, leaving the ticket with a wf:* label
+  // and no state:* — invisible limbo (fails canon 8). Now we bounce it back to
+  // the requester with a named reason so a human/sweep actually sees it. This is
+  // the "reject unregistered ids loudly" half of the engine primitive; the
+  // entry-state instantiation below is the already-general registered half.
+  if (!def) {
+    return rejectUnregisteredWorkflow(issue, workflowId, authToken);
+  }
+  // A registered-but-malformed def (no entry_state) still fails safe as a skip —
+  // that is a registry authoring defect, not an unregistered-id authoring attempt.
+  if (!def.entry_state) {
+    log.warn(`workflow-bootstrap: def for '${workflowId}' has no entry_state — skipping bootstrap`);
     return null;
   }
 
@@ -397,5 +430,55 @@ export async function applyBootstrapToIssue(
     delegateAgentName,
     ticketIdentifier: issue.identifier,
     ticketTitle: issue.title,
+  };
+}
+
+/**
+ * INF-552: loud rejection of an authoring attempt that named an unregistered
+ * workflow id.
+ *
+ * The registry is the single source of truth for what workflows exist, so the
+ * engine — not the CLI — decides whether a `wf:<id>` label resolves. When it
+ * does not, this replaces the old silent strand (wf:* present, no state:* ever
+ * stamped) with a rejection that leaves an auditable trail:
+ *   - strip the wf:* / state:* limbo labels so the ticket is plain ad-hoc again,
+ *   - bounce it to the requester (assignee = creator, delegate cleared) so a
+ *     human's queue surfaces it,
+ *   - post a named-reason comment.
+ *
+ * Never throws — mutation/comment failures are absorbed by the underlying
+ * helpers and logged; the caller still gets a "rejected" result.
+ */
+async function rejectUnregisteredWorkflow(
+  issue: IssueContext,
+  workflowId: string,
+  authToken: string,
+): Promise<BootstrapResult> {
+  const reason = `unknown workflow '${workflowId}' — not registered`;
+
+  // Drop every wf:* and state:* label — the authoring attempt leaves no managed
+  // limbo behind; what remains is a plain, ad-hoc ticket.
+  const strippedLabelIds = issue.labels
+    .filter((l) => !l.name.startsWith("wf:") && !l.name.startsWith("state:"))
+    .map((l) => l.id);
+
+  // assigneeId = creator returns the ticket to whoever filed it (assignee means
+  // "a human must act"); delegateId: null clears any agent-ownership limbo. Only
+  // set assignee when the creator was resolvable — otherwise leave it untouched.
+  const assigneeId = issue.creatorId ?? undefined;
+  await issueUpdateAtomic(issue.id, strippedLabelIds, authToken, null, assigneeId);
+  await postComment(issue.id, reason, authToken);
+
+  log.warn(
+    `workflow-bootstrap: rejected ${issue.identifier ?? issue.id} — ${reason}; ` +
+      `bounced to requester (${issue.creatorId ?? "unknown"})`,
+  );
+
+  return {
+    action: "rejected",
+    workflowId,
+    ticketIdentifier: issue.identifier,
+    ticketTitle: issue.title,
+    rejectionReason: reason,
   };
 }
