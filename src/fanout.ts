@@ -1186,6 +1186,10 @@ async function fetchIssueTeamAndParent(
 /**
  * Returns the child's human-readable identifier (e.g. "AI-1443") on success.
  */
+type CreateChildIssueResult =
+  | { ok: true; child: { internalId: string; identifier: string } }
+  | { ok: false; error: string };
+
 async function createChildIssue(
   teamId: string,
   title: string,
@@ -1194,7 +1198,7 @@ async function createChildIssue(
   labelIds: string[],
   authToken: string,
   delegateId?: string | null,
-): Promise<{ internalId: string; identifier: string } | null> {
+): Promise<CreateChildIssueResult> {
   const mutation = `
     mutation CreateChild($input: IssueCreateInput!) {
       issueCreate(input: $input) {
@@ -1225,17 +1229,21 @@ async function createChildIssue(
           issue?: { id: string; identifier: string } | null;
         };
       };
+      errors?: Array<{ message?: string }>;
     };
     const data = (await res.json()) as Resp;
     const result = data.data?.issueCreate;
     if (result?.success && result.issue) {
-      return { internalId: result.issue.id, identifier: result.issue.identifier };
+      return { ok: true, child: { internalId: result.issue.id, identifier: result.issue.identifier } };
     }
-    log.warn(`fanout: issueCreate returned non-success for '${title}': ${JSON.stringify(result)}`);
-    return null;
+    const errorDetail = data.errors?.map((e) => e.message ?? JSON.stringify(e)).join("; ")
+      ?? `issueCreate returned non-success: ${JSON.stringify(result)}`;
+    log.warn(`fanout: issueCreate returned non-success for '${title}': ${errorDetail}`);
+    return { ok: false, error: errorDetail };
   } catch (err) {
-    log.error(`fanout: issueCreate failed for '${title}': ${err instanceof Error ? err.message : String(err)}`);
-    return null;
+    const error = err instanceof Error ? err.message : String(err);
+    log.error(`fanout: issueCreate failed for '${title}': ${error}`);
+    return { ok: false, error };
   }
 }
 
@@ -1676,18 +1684,18 @@ export async function executeFanout(
       delegateId,
     );
 
-    if (child) {
+    if (child.ok) {
       result.created++;
-      result.childIdentifiers.push(child.identifier);
-      createdInternalIds.push(child.internalId);
-      createdComponents.push({ ...child, finding });
-      log.info(`fanout: created child ${child.identifier} — "${childTitle}" (finding ${i + 1}/${toSpawn.length})`);
+      result.childIdentifiers.push(child.child.identifier);
+      createdInternalIds.push(child.child.internalId);
+      createdComponents.push({ ...child.child, finding });
+      log.info(`fanout: created child ${child.child.identifier} — "${childTitle}" (finding ${i + 1}/${toSpawn.length})`);
     } else {
       result.errors.push({
         findingIndex: i,
-        message: `Failed to create child for finding: "${childTitle}"`,
+        message: `Failed to create child for finding "${childTitle}": ${child.error}`,
       });
-      log.warn(`fanout: failed to create child for finding ${i + 1}/${toSpawn.length}: "${childTitle}"`);
+      log.warn(`fanout: failed to create child for finding ${i + 1}/${toSpawn.length}: "${childTitle}" — ${child.error}`);
     }
   }
 
@@ -1754,21 +1762,21 @@ export async function executeFanout(
           authToken,
           configDelegateId,
         );
-        if (!verifyChild) {
+        if (!verifyChild.ok) {
           result.errors.push({
             findingIndex: -1,
-            message: `Failed to create integration verification child for capability '${capability}'`,
+            message: `Failed to create integration verification child for capability '${capability}': ${verifyChild.error}`,
           });
           continue;
         }
         result.created++;
-        result.childIdentifiers.push(verifyChild.identifier);
-        result.specMatchedChildren.push(verifyChild.identifier);
+        result.childIdentifiers.push(verifyChild.child.identifier);
+        result.specMatchedChildren.push(verifyChild.child.identifier);
         for (const component of components) {
-          await createBlockingRelation(component.internalId, verifyChild.internalId, authToken);
+          await createBlockingRelation(component.internalId, verifyChild.child.internalId, authToken);
         }
         log.info(
-          `fanout: created integration verification child ${verifyChild.identifier} for capability '${capability}' ` +
+          `fanout: created integration verification child ${verifyChild.child.identifier} for capability '${capability}' ` +
           `blocked by ${components.map((c) => c.identifier).join(", ")}`,
         );
       }
