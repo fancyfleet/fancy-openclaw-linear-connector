@@ -172,7 +172,7 @@ function allTransitionCommands(def: Record<string, unknown>): string[] {
   return getStates(def).flatMap((s) => (s.transitions ?? []).map((t) => t.command));
 }
 
-function makeLabelFetch(labelNames: string[]): typeof globalThis.fetch {
+function makeLabelFetch(labelNames: string[], opts: { mergedPrEvidence?: boolean } = {}): typeof globalThis.fetch {
   return async (_url, init) => {
     const body = typeof init?.body === "string" ? init.body : "";
     if (body.includes("TeamStates")) {
@@ -190,6 +190,37 @@ function makeLabelFetch(labelNames: string[]): typeof globalThis.fetch {
             },
           },
         }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (body.includes("IssueBranchAndPR")) {
+      const attachments = opts.mergedPrEvidence
+        ? {
+            nodes: [
+              {
+                url: "https://github.com/fancymatt/fancy-openclaw-linear-connector/pull/1872",
+                sourceType: "github",
+                metadata: { status: "merged", mergeCommitSha: "abc123def456" },
+              },
+            ],
+          }
+        : { nodes: [] };
+      return new Response(
+        JSON.stringify({
+          data: {
+            issue: {
+              description: "",
+              comments: { nodes: [] },
+              attachments,
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (body.includes("IssueRepoAttachments")) {
+      return new Response(
+        JSON.stringify({ data: { issue: { attachments: { nodes: [] } } } }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
@@ -384,13 +415,13 @@ describe("AC5: state:deployment + state:host-deploy no longer exist; gate reject
   });
 
   it("checkWorkflowRules allows continue-workflow from state:merge for hanzo", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"]);
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"], { mergedPrEvidence: true });
     const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
     expect(result).toBeNull();
   });
 
   it("checkWorkflowRules allows continue-workflow from state:deploy for the deployer", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deploy"]);
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deploy"], { mergedPrEvidence: true });
     // grover is the default deployer for the connector fleet
     const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "grover");
     expect(result).toBeNull();

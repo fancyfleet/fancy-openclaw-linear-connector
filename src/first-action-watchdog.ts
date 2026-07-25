@@ -480,6 +480,17 @@ export async function runFirstActionWatchdogSweep(
         if (unreachable) {
           // Ladder already exhausted for this dispatch — the rung-2 alert
           // fired once; stay silent instead of re-alerting every sweep.
+          upsertFirstActionLadder({
+            ticket: t.ticket,
+            state: t.state,
+            delegate: t.delegate,
+            armedAt: new Date(armedAtMs).toISOString(),
+            deliveredAtMs: rawDeliveredAtMs,
+            deadlineAt: new Date(deadlineAtMs).toISOString(),
+            rungsFired,
+            unreachable,
+            history,
+          });
           continue;
         }
 
