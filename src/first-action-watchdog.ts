@@ -126,7 +126,7 @@ export interface ReroutePayload {
 }
 
 export interface FirstActionWatchdogOptions {
-  authToken?: string;
+  authToken?: string | (() => string);
   /** File OR directory of workflow def YAML; per-state first_action_deadline. */
   workflowDefPath?: string;
   listTickets: () => Promise<WatchdogTicket[]>;

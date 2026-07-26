@@ -57,7 +57,7 @@ const LINEAR_ISSUES_PAGE_SIZE = 50;
 // ── Types ────────────────────────────────────────────────────────────────────
 
 export interface DelegationReconciliationOptions {
-  authToken: string;
+  authToken: string | (() => string);
   operationalEventStore: OperationalEventStoreType;
   alertBus: AlertBus;
   wakeFn: (agentName: string, ticketIdentifier: string) => Promise<void>;
@@ -515,6 +515,11 @@ async function reconcileOutOfBandTerminal(
   const mirror = opts.enrolledTicketsStore;
   const setStateFn = opts.setStateFn ?? setStateAtomic;
 
+  // INF-683: resolve the token at call time (getter) so the ~5s boot / ~20h
+  // rotation can't strand a dead copy captured at boot.
+  const authToken =
+    typeof opts.authToken === "function" ? opts.authToken() : opts.authToken;
+
   const labelActive = hasStateLabel(ticket.labels) && !isTerminal(ticket.labels);
   const delegatePinned = !!ticket.delegateId;
   const enrolledRow = mirror?.getByTicketId(ticket.identifier) ?? null;
@@ -541,7 +546,7 @@ async function reconcileOutOfBandTerminal(
     if (ticket.nativeStateType === "completed") {
       let res: SetStateAtomicResult;
       try {
-        res = await setStateFn(ticket.identifier, "done", null, opts.authToken, {
+        res = await setStateFn(ticket.identifier, "done", null, authToken, {
           force: true,
           enrolledTicketsStore: mirror,
           operationalEventStore: opts.operationalEventStore,
@@ -615,7 +620,9 @@ async function reconcileOutOfBandTerminal(
 export async function runDelegationReconciliationSweep(
   opts: DelegationReconciliationOptions,
 ): Promise<DelegationReconciliationResult> {
-  const authToken = opts.authToken;
+  // INF-683: resolve the token at pass time (getter) so the boot/~20h token
+  // refresh can't strand a value captured at registration.
+  const authToken = typeof opts.authToken === "function" ? opts.authToken() : opts.authToken;
   const fetchFn = opts.fetchFn ?? globalThis.fetch;
   const alertBus = opts.alertBus;
   const operationalEventStore = opts.operationalEventStore;
@@ -1046,7 +1053,7 @@ export async function runDelegationReconciliationSweep(
  * Returns the NodeJS.Timeout so the caller can clear it on shutdown.
  */
 export function registerDelegationReconciliationCron(opts: {
-  authToken: string;
+  authToken: string | (() => string);
   intervalMs?: number;
   operationalEventStore?: OperationalEventStoreType;
   alertBus?: AlertBus;

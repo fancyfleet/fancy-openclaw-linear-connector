@@ -53,8 +53,8 @@ interface OperationalEventSink {
 }
 
 export interface DefStateMigrationSweepOptions {
-  /** Linear auth token (Bearer ...). */
-  authToken: string;
+  /** Linear auth token (Bearer ...), or a lazy getter resolved per pass (INF-683). */
+  authToken: string | (() => string);
   /** Workflow registry: map of wf-id → WorkflowDef. */
   workflowRegistry: Map<string, WorkflowDef>;
   /** Operational event store (optional; one event per migrated ticket). */
@@ -219,6 +219,12 @@ function emitEvent(store: OperationalEventSink | undefined, event: OperationalEv
 
 // ── AC1: the sweep ────────────────────────────────────────────────────────────
 
+/** INF-683: resolve a captured-or-lazy auth token at the moment of use, so the
+ *  token-refresh rotation (boot + ~20h) can't strand a value captured at boot. */
+function resolveAuthToken(authToken: string | (() => string)): string {
+  return typeof authToken === "function" ? authToken() : authToken;
+}
+
 /**
  * Enumerate governed (wf:*) tickets and migrate each ticket stranded at a
  * removed state that carries a `migrations` mapping in its def: atomically swap
@@ -232,7 +238,8 @@ function emitEvent(store: OperationalEventSink | undefined, event: OperationalEv
 export async function runDefStateMigrationSweep(
   options: DefStateMigrationSweepOptions,
 ): Promise<DefStateMigrationSweepResult> {
-  const { authToken, workflowRegistry, operationalEventStore, wakeFn } = options;
+  const { workflowRegistry, operationalEventStore, wakeFn } = options;
+  const authToken = resolveAuthToken(options.authToken);
   const migrated: DefStateMigrationSweepResult["migrated"] = [];
   const errors: string[] = [];
 
@@ -371,7 +378,7 @@ export function resetDefStateMigrationLiveness(): void {
 }
 
 export interface DefStateMigrationRunnerOptions {
-  authToken: string;
+  authToken: string | (() => string);
   /** Lazily resolve the workflow registry (async load happens off the boot path). */
   loadRegistry: () => Promise<Map<string, WorkflowDef>>;
   operationalEventStore?: OperationalEventSink;
@@ -393,7 +400,8 @@ export function registerDefStateMigrationRunner(options: DefStateMigrationRunner
   // gate). This keeps the runner from triggering a config-health-recording
   // registry load on every createApp() in the test suite, which would otherwise
   // race into unrelated tests. Liveness still reports ranOnLoad with a 0 count.
-  if (!options.authToken || options.authToken.trim() === "") {
+  const gateToken = resolveAuthToken(options.authToken);
+  if (!gateToken || gateToken.trim() === "") {
     _liveness = { ranOnLoad: true, migratedCount: 0, scanned: 0, lastRunAt: null, errors: ["skipped: no Linear auth token"] };
     log.info("def-state migration runner registered but skipped — no Linear auth token available");
     return;

@@ -56,7 +56,7 @@ const DEFAULT_INTERVAL_MS = 5 * 60 * 1000; // 5 min
 // ── Types ────────────────────────────────────────────────────────────────────
 
 export interface ReconciliationSweepOptions {
-  authToken: string;
+  authToken: string | (() => string);
   /** Optional workflow registry override. If absent, the core loads from file. */
   workflowRegistry?: Map<string, WorkflowDef>;
   /** Grace window in ms. Tickets younger than this are skipped. Default 2 min. */
@@ -467,7 +467,9 @@ async function queryUnenrolledTickets(
 export async function runBootstrapReconciliationSweep(
   opts: ReconciliationSweepOptions,
 ): Promise<ReconciliationSweepResult> {
-  const authToken = opts.authToken;
+  // INF-683: resolve the token at pass time (getter) so the boot/~20h token
+  // refresh can't strand a value captured at registration.
+  const authToken = typeof opts.authToken === "function" ? opts.authToken() : opts.authToken;
   const graceWindowMs = opts.graceWindowMs ?? DEFAULT_GRACE_WINDOW_MS;
   const nowMs = opts.nowMs ?? Date.now();
   const fetchFn = opts.fetchFn ?? globalThis.fetch;
@@ -784,7 +786,7 @@ export async function runBootstrapReconciliationSweep(
  */
 export function registerBootstrapReconciliationCron(
   opts: {
-    authToken: string;
+    authToken: string | (() => string);
     intervalMs?: number;
     /** Alert bus for heal/failure notifications. Defaults to the global singleton. */
     alertBus?: AlertBus;

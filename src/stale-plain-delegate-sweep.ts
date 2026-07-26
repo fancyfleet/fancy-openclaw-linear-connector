@@ -53,7 +53,7 @@ const DEFAULT_RECENT_DISPATCH_WINDOW_MS = 15 * 60 * 1000; // 15 min
 const NULL_DELEGATE_STALE_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2h
 
 export interface StalePlainDelegateOptions {
-  authToken: string;
+  authToken: string | (() => string);
   operationalEventStore: OperationalEventStore;
   alertBus: AlertBus;
   ackTracker?: DispatchAckTracker;
@@ -390,7 +390,11 @@ async function moveTicketToTodo(
 export async function runNullDelegateRecoverySweep(
   opts: StalePlainDelegateOptions,
 ): Promise<{ detected: number; recovered: number; failed: number; errors: string[] }> {
-  const { authToken, operationalEventStore, alertBus, postLinearComment } = opts;
+  const { operationalEventStore, alertBus, postLinearComment } = opts;
+  // INF-683: resolve the token at pass time (getter) so the ~5s boot / ~20h
+  // rotation can't strand a dead copy captured at boot.
+  const authToken =
+    typeof opts.authToken === "function" ? opts.authToken() : opts.authToken;
   const fetchFn = opts.fetchFn ?? globalThis.fetch;
   const staleTimeoutMs = opts.staleTimeoutMs ?? NULL_DELEGATE_STALE_TIMEOUT_MS;
 
@@ -484,7 +488,6 @@ export async function runStalePlainDelegateSweep(
   opts: StalePlainDelegateOptions,
 ): Promise<StalePlainDelegateResult> {
   const {
-    authToken,
     operationalEventStore,
     alertBus,
     ackTracker,
@@ -492,6 +495,9 @@ export async function runStalePlainDelegateSweep(
     postLinearComment,
   } = opts;
 
+  // INF-683: resolve the token at pass time (getter) so the boot/~20h token
+  // refresh can't strand a value captured at registration.
+  const authToken = typeof opts.authToken === "function" ? opts.authToken() : opts.authToken;
   const fetchFn = opts.fetchFn ?? globalThis.fetch;
   const staleTimeoutMs = opts.staleTimeoutMs ?? DEFAULT_STALE_TIMEOUT_MS;
 
@@ -667,7 +673,7 @@ export async function runStalePlainDelegateSweep(
 }
 
 export function registerStalePlainDelegateCron(opts: {
-  authToken: string;
+  authToken: string | (() => string);
   intervalMs?: number;
   staleTimeoutMs?: number;
   operationalEventStore?: OperationalEventStore;
