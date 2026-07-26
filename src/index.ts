@@ -2172,7 +2172,12 @@ if (isEntryPoint) {
   // output and routes findings through the AlertBus with stable dedup keys
   // (git-remote-liveness PUSH-DEAD keyed on AI-2189 root-cause ticket).
   registerConfigSanityAlertCron();
-  registerTokenWatchdogCron();
+  // INF-711 backport adaptation: registerTokenWatchdogCron() is a dangling call
+  // on release-1.4 — the function is never defined here (INF-381 landed it broken
+  // on main and it was neutralized forward by 0bde76a3 / INF-446, which is not on
+  // release-1.4). Mirror that neutralization rather than pull in the unrelated
+  // watchdog-registration scaffolding.
+  // registerTokenWatchdogCron();
 
   // INF-192: Matrix approval gate — register at bootstrap so the component
   // is armed (observable via /health.matrixApprovalGate). Derives config from
