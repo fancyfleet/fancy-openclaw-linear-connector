@@ -226,6 +226,9 @@ export interface WorkflowState {
   id: string;
   owner_role?: string;
   kind?: string;
+  commitment_gate?: {
+    exits?: Record<string, { to?: string }>;
+  };
   /** AI-1992: declarative fan-out config. When present, the state's forward
    *  (non-break-glass) transition mints N children per {@link FanoutConfig}. */
   fanout?: FanoutConfig;
@@ -312,6 +315,133 @@ export interface WorkflowDef {
 
 let _registryCache: Map<string, WorkflowDef> | null = null;
 
+const REQUIRED_COMMITMENT_EXITS = ["accept", "reject", "not-ready"] as const;
+const COMMITMENT_EXIT_OUTCOME = "commitment-exit-recorded" as const;
+
+let _commitmentActivityObserverRegistered = false;
+let _lastCommitmentAutoAccept: {
+  ticket: string;
+  exit: "accept";
+  to: string;
+  occurredAt: string;
+} | null = null;
+
+export function markCommitmentActivityObserverRegistered(): void {
+  _commitmentActivityObserverRegistered = true;
+}
+
+export function getCommitmentGateLiveness(): {
+  registered: boolean;
+  activityObserverRegistered: boolean;
+  lastAutoAccept: typeof _lastCommitmentAutoAccept;
+} {
+  return {
+    registered: _commitmentActivityObserverRegistered,
+    activityObserverRegistered: _commitmentActivityObserverRegistered,
+    lastAutoAccept: _lastCommitmentAutoAccept,
+  };
+}
+
+function validateCommitmentGate(def: WorkflowDef): string[] {
+  const errors: string[] = [];
+  for (const state of def.states ?? []) {
+    const gate = state.commitment_gate;
+    if (!gate) {
+      if (state.id === "investigation") {
+        errors.push(
+          `commitment gate on workflow '${def.id}' state '${state.id}' must declare exactly one exit each for accept, reject, and not-ready`,
+        );
+      }
+      continue;
+    }
+    const exits = gate.exits ?? {};
+    const actual = Object.keys(exits).sort();
+    const expected = [...REQUIRED_COMMITMENT_EXITS].sort();
+    if (actual.length !== expected.length || actual.some((exit, index) => exit !== expected[index])) {
+      errors.push(
+        `commitment gate on workflow '${def.id}' state '${state.id}' must declare exactly one exit each for accept, reject, and not-ready`,
+      );
+      continue;
+    }
+    for (const exit of REQUIRED_COMMITMENT_EXITS) {
+      const target = exits[exit]?.to;
+      if (!target) {
+        errors.push(`commitment gate on workflow '${def.id}' state '${state.id}' exit '${exit}' has no target`);
+      }
+      const matchingTransition = state.transitions?.find((t) => t.command === exit && t.to === target);
+      if (!matchingTransition) {
+        errors.push(
+          `commitment gate on workflow '${def.id}' state '${state.id}' exit '${exit}' must match a transition to '${target ?? "(missing)"}'`,
+        );
+      }
+    }
+  }
+  return errors;
+}
+
+function getCommitmentGateState(def: WorkflowDef): WorkflowState | undefined {
+  return def.states.find((s) => !!s.commitment_gate);
+}
+
+function commitmentExitFor(state: WorkflowState | undefined, intent: string): { exit: string; to: string } | null {
+  const target = state?.commitment_gate?.exits?.[intent]?.to;
+  return target ? { exit: intent, to: target } : null;
+}
+
+function hasRecordedCommitmentExit(store: OperationalEventStore | undefined, identifier: string): boolean {
+  if (!store) return false;
+  return store.query({ key: identifier, outcome: COMMITMENT_EXIT_OUTCOME }).length > 0;
+}
+
+function recordCommitmentExitIfMissing(params: {
+  store?: OperationalEventStore;
+  identifier: string;
+  workflow: string;
+  from: string;
+  exit: string;
+  to: string;
+  agent?: string | null;
+  auto?: boolean;
+}): void {
+  const { store, identifier, workflow, from, exit, to, agent, auto } = params;
+  if (!store || hasRecordedCommitmentExit(store, identifier)) return;
+  store.append({
+    outcome: COMMITMENT_EXIT_OUTCOME,
+    agent: agent ?? null,
+    key: identifier,
+    sessionKey: normalizeLinearTicketKey(identifier),
+    detail: { workflow, from, exit, to, auto: auto === true },
+  });
+}
+
+function recordDoingNeverSet(params: {
+  store?: OperationalEventStore;
+  identifier: string;
+  workflow: string;
+  state: string;
+  agent?: string | null;
+}): void {
+  const { store, identifier, workflow, state, agent } = params;
+  if (!store) return;
+  store.append({
+    outcome: "failure-taxonomy",
+    agent: agent ?? null,
+    key: identifier,
+    sessionKey: normalizeLinearTicketKey(identifier),
+    errorSummary: "INF-508 doing-never-set",
+    detail: {
+      taxonomy: "INF-508",
+      reason: "doing-never-set",
+      workflow,
+      state,
+    },
+  });
+}
+
+function normalizeLinearTicketKey(identifier: string): string {
+  return identifier.startsWith("linear-") ? identifier : `linear-${identifier}`;
+}
+
 /**
  * Read, parse, and validate a single workflow def file. Throws on read/parse
  * failure or if native_state validation fails (AI-1490 / AI-1498 fail-closed
@@ -326,6 +456,10 @@ async function loadDefFromFile(file: string): Promise<WorkflowDef> {
   }
   if (def.break_glass && !def.break_glass.command) {
     log.warn(`workflow-gate: break_glass block in ${file} has no 'command' field — falling back to hardcoded "escape". Canonicalize the YAML to add command: escape.`);
+  }
+  const commitmentGateErrors = validateCommitmentGate(def);
+  if (commitmentGateErrors.length > 0) {
+    throw new Error(commitmentGateErrors.join("; "));
   }
   const warnings = validateNativeStateMappings(def);
   for (const w of warnings) {
@@ -3371,10 +3505,20 @@ export async function checkWorkflowRules(
   // supplied. Fall back to issueId only when the fetch gave us nothing (it may itself
   // already be an identifier on the CLI path).
   const appliedStateKey = fetchedIdentifier ?? issueId;
+  const liveCurrentState = getCurrentState(labels, def);
+  const liveStateNode = liveCurrentState ? def.states.find((s) => s.id === liveCurrentState) : undefined;
+  const liveCommitmentExit = commitmentExitFor(liveStateNode, intent);
+  if (liveStateNode?.commitment_gate && !liveCommitmentExit) {
+    return (
+      `[Proxy] '${intent}' blocked: missing commitment exit for ${issueId}. ` +
+      `Before downstream transitions from '${liveCurrentState}', record exactly one commitment exit: ` +
+      `accept, reject, or not-ready.`
+    );
+  }
   const currentState =
     typeof snapshotState === "string" && snapshotState.length > 0
       ? snapshotState
-      : getAppliedState(appliedStateKey) ?? getCurrentState(labels, def); // AI-2357: applied-state store wins over stale label; AI-2094: def-aware fallback
+      : getAppliedState(appliedStateKey) ?? liveCurrentState; // AI-2357: applied-state store wins over stale label; AI-2094: def-aware fallback
   if (!currentState) {
     // AI-1402: For needs-human, fail-closed even without a state label.
     // We cannot determine if there is a forward path, so treat the ticket as actionable.
@@ -3415,6 +3559,15 @@ export async function checkWorkflowRules(
       `[Proxy] '${intent}' blocked: ticket is in state '${currentState}' which is not defined in workflow '${workflowId}'. ` +
       `This state was likely removed in a workflow def update. ` +
       `Use break-glass ('escape') to re-enter the workflow at intake, or contact a steward to migrate the ticket.`
+    );
+  }
+
+  const commitmentExit = commitmentExitFor(stateNode, intent);
+  if (stateNode.commitment_gate && !commitmentExit) {
+    return (
+      `[Proxy] '${intent}' blocked: missing commitment exit for ${issueId}. ` +
+      `Before downstream transitions from '${currentState}', record exactly one commitment exit: ` +
+      `accept, reject, or not-ready.`
     );
   }
 
@@ -4621,6 +4774,8 @@ export interface ApplyStateTransitionOptions {
     workflowState: string;
     source: "transition";
   }) => void | Promise<void>;
+  /** INF-695: marks an activity-observer accept so /health can expose liveness. */
+  commitmentAutoAccept?: boolean;
 }
 
 function deriveFanoutBarrierOutcome(result: FanoutResult): {
@@ -4886,6 +5041,47 @@ export async function applyStateTransition(
   const currentStateName = options?.sourceStateOverride ?? actualStateName;
 
   const breakGlassCommand = def.break_glass?.command ?? "escape";
+  const commitmentGateState = getCommitmentGateState(def);
+  const currentCommitmentExit = commitmentExitFor(
+    currentStateName ? def.states.find((s) => s.id === currentStateName) : undefined,
+    intent,
+  );
+  const acceptTarget = commitmentGateState?.commitment_gate?.exits?.accept?.to;
+  if (
+    currentStateName &&
+    acceptTarget &&
+    currentStateName === acceptTarget &&
+    !hasRecordedCommitmentExit(options?.operationalEventStore, issue.identifier)
+  ) {
+    recordDoingNeverSet({
+      store: options?.operationalEventStore,
+      identifier: issue.identifier,
+      workflow: workflowId,
+      state: currentStateName,
+      agent: options?.bodyId ?? null,
+    });
+    return {
+      status: "failed",
+      code: "doing-never-set",
+      detail: `workflow '${workflowId}' is in working state '${currentStateName}' without a recorded commitment exit`,
+      from: currentStateName,
+      to: currentStateName,
+    };
+  }
+  if (
+    currentCommitmentExit &&
+    hasRecordedCommitmentExit(options?.operationalEventStore, issue.identifier)
+  ) {
+    log.info(
+      `workflow-gate: commitment gate: ${issue.identifier} already has a recorded exit — skipping duplicate '${intent}'`,
+    );
+    return {
+      status: "noop",
+      code: "commitment-exit-already-recorded",
+      from: currentStateName,
+      to: currentCommitmentExit.to,
+    };
+  }
 
   // AI-2035: terminal re-entry guard (reciprocal of the setStateAtomic terminal
   // guard at §"AI-1954 AC3"). A reviewer's semantic command can emit >1 mutation
@@ -6018,6 +6214,27 @@ export async function applyStateTransition(
       (resolvedDelegateId != null ? ` delegate=${resolvedDelegateId}` : resolvedDelegateId === null ? ` delegate=cleared` : ``) +
       (resolvedNativeStateId ? ` native=${destNativeState}(${resolvedNativeStateId})` : ``),
     );
+
+    if (currentCommitmentExit) {
+      recordCommitmentExitIfMissing({
+        store: options?.operationalEventStore,
+        identifier: issue.identifier,
+        workflow: workflowId,
+        from: currentStateName ?? "",
+        exit: currentCommitmentExit.exit,
+        to: currentCommitmentExit.to,
+        agent: options?.bodyId ?? null,
+        auto: options?.commitmentAutoAccept === true,
+      });
+      if (options?.commitmentAutoAccept === true && currentCommitmentExit.exit === "accept") {
+        _lastCommitmentAutoAccept = {
+          ticket: issue.identifier,
+          exit: "accept",
+          to: currentCommitmentExit.to,
+          occurredAt: new Date().toISOString(),
+        };
+      }
+    }
 
     if (!isTerminal && resolvedDelegateId && options?.onTransitionWake) {
       const delegateAgent = getAgents().find((a) => a.linearUserId === resolvedDelegateId);
