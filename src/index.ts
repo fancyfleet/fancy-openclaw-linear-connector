@@ -333,7 +333,19 @@ export function createApp(options?: CreateAppOptions) {
     },
     fanoutWakeFn: async (agentName, ticketIdentifier) => {
       const sessionKey = normalizeSessionKey(ticketIdentifier);
+      const livenessRecord = livenessDispatchStore.recordDispatch({
+        agentId: agentName,
+        ticketId: ticketIdentifier,
+        sessionKey,
+        delegateAtDispatch: agentName,
+      });
       if (sessionTracker.isActiveForTicket(agentName, sessionKey)) {
+        livenessDispatchStore.recordAck(livenessRecord.dispatchId, {
+          delivered: true,
+          target_identity: agentName,
+          status: "accepted",
+          target_session_key: sessionKey,
+        });
         log.info(`fanout dispatch skipped for ${agentName} [${sessionKey}]: session already active`);
         return;
       }
@@ -350,7 +362,7 @@ export function createApp(options?: CreateAppOptions) {
       };
       const actionText = `You were delegated ${ticketIdentifier}`;
       const message = (await buildWorkflowAwareDeliveryMessage(ticketIdentifier, authToken, actionText)) ?? actionText;
-      await reconciliationWakeWithLeaseCheck({
+      const wakeResult = await reconciliationWakeWithLeaseCheck({
         agentId: agentName,
         ticketId: ticketIdentifier,
         leaseStore: dispatchLeaseStore,
@@ -360,8 +372,18 @@ export function createApp(options?: CreateAppOptions) {
           return await deliverMessageToAgent(agId, sessionKey, msg, cfg);
         },
       });
+      if (!wakeResult.dispatched && !wakeResult.suppressed) {
+        throw new Error(wakeResult.reason ?? "fanout wake delivery failed");
+      }
+      livenessDispatchStore.recordAck(livenessRecord.dispatchId, {
+        delivered: wakeResult.dispatched,
+        target_identity: agentName,
+        status: "queued",
+        target_session_key: sessionKey,
+      });
     },
     getDispatchAckTracker: () => ackTracker,
+    postFanoutDispatchStore: livenessDispatchStore,
   }));
 
   // Upload proxy — AI-1767. Agents can't fetch uploads.linear.app directly

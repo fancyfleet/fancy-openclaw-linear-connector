@@ -30,6 +30,7 @@ import { findLabel, findOrCreateLabel } from "./linear-helpers.js";
 import { generateSpawnPreview, checkCaps, formatPreviewComment, formatCapRefusalComment, parseSpawnCaps, type SpawnPreview, type CapCheckResult, type SpawnCaps, type FindingInput } from "./spawn-preview.js";
 import type { FanoutConfig, SpawnIfConfig, WorkflowDef } from "./workflow-gate.js";
 import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
+import type { FanoutChildForVerification } from "./post-fanout-child-verification.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "fanout");
 
@@ -249,6 +250,8 @@ export interface FanoutResult {
    * accumulated history.
    */
   specMatchedChildren: string[];
+  /** INF-696: created child delegate facts used by post-fanout dispatch verification. */
+  createdChildDelegates: FanoutChildForVerification[];
 }
 
 
@@ -1445,6 +1448,7 @@ export async function executeFanout(
     unmatchedChildren: [],
     attempted: 0,
     specMatchedChildren: [],
+    createdChildDelegates: [],
   };
 
   // AI-1992 AC7 (spawn time): the child workflow type is config-driven and MUST
@@ -1881,14 +1885,18 @@ export async function executeFanout(
       delegateId,
     );
 
+    const delegateAgentName = finding.delegate ?? config.initial_delegate;
     if (child.ok) {
       result.created++;
       result.childIdentifiers.push(child.child.identifier);
+      result.createdChildDelegates.push({
+        identifier: child.child.identifier,
+        delegateAgentId: delegateAgentName && delegateId ? delegateAgentName : null,
+      });
       createdInternalIds.push(child.child.internalId);
       createdComponents.push({ ...child.child, finding });
       log.info(`fanout: created child ${child.child.identifier} — "${childTitle}" (finding ${i + 1}/${toSpawn.length})`);
 
-      const delegateAgentName = finding.delegate ?? config.initial_delegate;
       if (
         delegateAgentName &&
         delegateId &&
@@ -1985,6 +1993,10 @@ export async function executeFanout(
         }
         result.created++;
         result.childIdentifiers.push(verifyChild.child.identifier);
+        result.createdChildDelegates.push({
+          identifier: verifyChild.child.identifier,
+          delegateAgentId: config.initial_delegate && configDelegateId ? config.initial_delegate : null,
+        });
         result.specMatchedChildren.push(verifyChild.child.identifier);
         for (const component of components) {
           await createBlockingRelation(component.internalId, verifyChild.child.internalId, authToken);
