@@ -45,7 +45,7 @@ const DEFAULT_MAX_REDISPATCH = 2;
 const DEFAULT_RECENT_DISPATCH_WINDOW_MS = 15 * 60 * 1000; // 15 min
 
 export interface StalePlainDelegateOptions {
-  authToken: string;
+  authToken: string | (() => string);
   operationalEventStore: OperationalEventStore;
   alertBus: AlertBus;
   ackTracker?: DispatchAckTracker;
@@ -197,7 +197,6 @@ export async function runStalePlainDelegateSweep(
   opts: StalePlainDelegateOptions,
 ): Promise<StalePlainDelegateResult> {
   const {
-    authToken,
     operationalEventStore,
     alertBus,
     ackTracker,
@@ -205,6 +204,9 @@ export async function runStalePlainDelegateSweep(
     postLinearComment,
   } = opts;
 
+  // INF-683: resolve the token at pass time (getter) so the boot/~20h token
+  // refresh can't strand a value captured at registration.
+  const authToken = typeof opts.authToken === "function" ? opts.authToken() : opts.authToken;
   const fetchFn = opts.fetchFn ?? globalThis.fetch;
   const staleTimeoutMs = opts.staleTimeoutMs ?? DEFAULT_STALE_TIMEOUT_MS;
 
@@ -361,7 +363,7 @@ export async function runStalePlainDelegateSweep(
 }
 
 export function registerStalePlainDelegateCron(opts: {
-  authToken: string;
+  authToken: string | (() => string);
   intervalMs?: number;
   staleTimeoutMs?: number;
   operationalEventStore?: OperationalEventStore;
