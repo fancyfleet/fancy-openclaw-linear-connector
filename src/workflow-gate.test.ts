@@ -915,11 +915,11 @@ describe("checkWorkflowRules — canonical vault schema (src/__fixtures__/canoni
 
   afterEach(() => { globalThis.fetch = originalFetch; });
 
-  it("parses the canonical YAML without error (passes for a legal command)", async () => {
+  it("parses the canonical YAML and blocks submit before a commitment exit", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
-    // 'submit' is legal in implementation; auto-assigns to singleton reviewer; null means pass-through
-    // AI-1731: submit now has requires_comment — pass hasComment=true to test legality, not the comment gate
-    expect(await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles", null, undefined, null, false, false, true)).toBeNull();
+    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles", null, undefined, null, false, false, true);
+    expect(result).toMatch(/missing commitment exit/i);
+    expect(result).toMatch(/accept, reject, or not-ready/i);
   });
 
   it("canonical: escape is legal from every state (§4.4)", async () => {
@@ -1887,12 +1887,11 @@ describe("checkWorkflowRules — AI-2476: merged-PR release gate (branch/PR veri
     expect(result).toBeNull();
   });
 
-  it("gate does NOT fire for 'submit' from non-merge/deploy states (implementation → code-review)", async () => {
+  it("merged-PR gate does NOT mask the commitment gate for 'submit' from implementation", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"], { hasBranch: false, hasPR: false });
-    // 'submit' is the forward command from implementation; it should not trigger
-    // the done gate (which only fires from merge/deploy states).
     const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles", null, null, null, false, false, true);
-    expect(result).toBeNull();
+    expect(result).toMatch(/missing commitment exit/i);
+    expect(result).not.toMatch(/branch evidence|merged PR|pull request/i);
   });
 
   // AI-1492 regression: branch auto-deleted after squash merge — merged PR must still pass.

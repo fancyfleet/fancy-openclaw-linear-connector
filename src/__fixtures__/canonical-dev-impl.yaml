@@ -52,9 +52,15 @@
 #   recovery_actor: ai added (AI-1579). Version bumped to match deployed (15).
 #   Stakes keys confirmed as stakes:* (canonical; deployed risk:* migrated).
 #   State spine unchanged from v10+ (merge/deploy).
+#
+# v17 (2026-07-25, INF-695): commitment/acceptance gate. Implementation now has
+#   an explicit investigation-exit fork (`accept` → `doing`, `reject` →
+#   `rejected`, `not-ready` → `needs-info`). Downstream `submit` is present on
+#   implementation so the proxy can refuse it with the specific missing
+#   commitment-exit error until exactly one exit is recorded.
 
 id: dev-impl
-version: 16
+version: 17
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
 
@@ -129,7 +135,23 @@ states:
     # entered from write-tests/tests-ready, code-review/request-changes,
     # merge/reject, deploy/reject, ac-validate/ac-fail — one dev work-phase,
     # no awaiting-vs-doing split. Dev makes the failing tests pass.
+    commitment_gate:
+      exits:
+        accept:
+          to: doing
+        reject:
+          to: rejected
+        not-ready:
+          to: needs-info
     transitions:
+      - command: accept
+        to: doing
+      - command: reject
+        to: rejected
+        requires_comment: true
+      - command: not-ready
+        to: needs-info
+        requires_comment: true
       - command: submit
         to: code-review
         generic: continue
@@ -145,6 +167,38 @@ states:
         to: implementation
         assign:
           mode: required          # caller must specify the delegate target
+
+  - id: doing
+    owner_role: dev
+    kind: normal
+    native_state: doing          # commitment accepted; active implementation work has begun
+    sla: 72h
+    transitions:
+      - command: submit
+        to: code-review
+        generic: continue
+        requires_comment: true
+        assign:
+          mode: required
+          constraint: not-implementer
+      - command: handoff
+        to: doing
+        assign:
+          mode: required
+
+  - id: needs-info
+    owner_role: dev
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: handoff
+        to: needs-info
+        assign:
+          mode: required
+
+  - id: rejected
+    kind: terminal
+    native_state: invalid
 
   - id: code-review
     owner_role: code-review

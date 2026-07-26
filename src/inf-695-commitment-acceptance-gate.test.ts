@@ -31,6 +31,7 @@ const ISSUE_UUID = "issue-inf-695";
 const ISSUE_IDENTIFIER = "INF-695";
 const TEAM_ID = "team-ai";
 const IGOR_LINEAR_ID = "user-igor";
+const REGISTERED_DEFS_DIR = path.resolve(process.cwd(), "src/registered-defs");
 
 const POLICY_YAML = `
 capabilities:
@@ -305,6 +306,7 @@ describe("INF-695 S2 — Commitment / acceptance gate", () => {
     delete process.env.AGENTS_FILE;
     delete process.env.CAPABILITY_POLICY_PATH;
     delete process.env.WORKFLOW_DEF_PATH;
+    delete process.env.WORKFLOW_DEFS_DIR;
     delete process.env.LINEAR_WEBHOOK_SECRET;
     resetPolicyCache();
     resetWorkflowCache();
@@ -317,6 +319,27 @@ describe("INF-695 S2 — Commitment / acceptance gate", () => {
     setupConfig(dir, INVALID_DEFAULT_EXIT_WORKFLOW_YAML);
 
     await expect(loadWorkflowRegistry()).rejects.toThrow(/commitment.*exit.*accept.*reject.*not-ready/i);
+  });
+
+  it("AC2.1 + AC2.2: registered dev-impl production definition declares the commitment gate before submit", async () => {
+    delete process.env.WORKFLOW_DEF_PATH;
+    process.env.WORKFLOW_DEFS_DIR = REGISTERED_DEFS_DIR;
+    resetWorkflowCache();
+
+    const registry = await loadWorkflowRegistry();
+    const def = registry.get("dev-impl");
+    expect(def).toBeDefined();
+
+    const implementation = def?.states.find((s) => s.id === "implementation");
+    expect(implementation?.commitment_gate?.exits).toEqual({
+      accept: { to: "doing" },
+      reject: { to: "rejected" },
+      "not-ready": { to: "needs-info" },
+    });
+    expect(implementation?.transitions?.map((t) => t.command)).toEqual(
+      expect.arrayContaining(["accept", "reject", "not-ready", "submit"]),
+    );
+    expect(def?.states.find((s) => s.id === "doing")?.transitions?.some((t) => t.command === "submit" && t.to === "code-review")).toBe(true);
   });
 
   it("AC2.1: accept out of investigation records exactly one commitment exit", async () => {
