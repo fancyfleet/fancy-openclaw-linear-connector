@@ -53,7 +53,7 @@ const LINEAR_ISSUES_PAGE_SIZE = 50;
 // ── Types ────────────────────────────────────────────────────────────────────
 
 export interface DelegationReconciliationOptions {
-  authToken: string;
+  authToken: string | (() => string);
   operationalEventStore: OperationalEventStoreType;
   alertBus: AlertBus;
   wakeFn: (agentName: string, ticketIdentifier: string) => Promise<void>;
@@ -464,7 +464,9 @@ function hasDispatchSinceDelegation(
 export async function runDelegationReconciliationSweep(
   opts: DelegationReconciliationOptions,
 ): Promise<DelegationReconciliationResult> {
-  const authToken = opts.authToken;
+  // INF-683: resolve the token at pass time (getter) so the boot/~20h token
+  // refresh can't strand a value captured at registration.
+  const authToken = typeof opts.authToken === "function" ? opts.authToken() : opts.authToken;
   const fetchFn = opts.fetchFn ?? globalThis.fetch;
   const alertBus = opts.alertBus;
   const operationalEventStore = opts.operationalEventStore;
@@ -890,7 +892,7 @@ export async function runDelegationReconciliationSweep(
  * Returns the NodeJS.Timeout so the caller can clear it on shutdown.
  */
 export function registerDelegationReconciliationCron(opts: {
-  authToken: string;
+  authToken: string | (() => string);
   intervalMs?: number;
   operationalEventStore?: OperationalEventStoreType;
   alertBus?: AlertBus;

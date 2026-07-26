@@ -1593,7 +1593,11 @@ export function createApp(options?: CreateAppOptions) {
   // reachable from the production entry point (createApp), with load-time
   // liveness surfaced at /health.workflowMigrations. Fetches nothing unless a
   // registered def actually declares a migration map.
-  const migrationAuthToken =
+  // INF-683: lazy per-use getter — resolved at each use-site so the ~5s post-boot
+  // and ~20h token-refresh rotations can't strand a value captured at boot (the
+  // captured-const 401 that blinded fleet-wide reconciliation). Mirrors the
+  // already-correct resolveCronAuthToken/resolveValidationAuthToken siblings.
+  const resolveMigrationAuthToken = () =>
     getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
   const migrationWakeFn = async (agentName: string, ticketIdentifier: string) => {
     const sessionKey = normalizeSessionKey(ticketIdentifier);
@@ -1617,12 +1621,12 @@ export function createApp(options?: CreateAppOptions) {
     };
     const actionText = `${ticketIdentifier} was migrated to a new workflow state (its previous state was removed by a def change)`;
     const message =
-      (await buildWorkflowAwareDeliveryMessage(ticketIdentifier, migrationAuthToken, actionText)) ??
+      (await buildWorkflowAwareDeliveryMessage(ticketIdentifier, resolveMigrationAuthToken(), actionText)) ??
       actionText;
     await deliverMessageToAgent(agentName, sessionKey, message, deliveryConfig);
   };
   registerDefStateMigrationRunner({
-    authToken: migrationAuthToken,
+    authToken: resolveMigrationAuthToken,
     loadRegistry: () => loadWorkflowRegistry(),
     operationalEventStore,
     wakeFn: migrationWakeFn,
@@ -1774,7 +1778,11 @@ if (isEntryPoint) {
   // same delivery primitive the webhook bootstrap path uses (buildWorkflowAware
   // DeliveryMessage + deliverMessageToAgent), so a healed ticket is not just
   // labeled-and-delegated but actually surfaced to its owner.
-  const reconciliationAuthToken =
+  // INF-683: lazy per-use getter — resolved at each use-site so the ~5s post-boot
+  // and ~20h token-refresh rotations can't strand a value captured at boot. This
+  // is the captured-const that 401'd every 5-min delegation-reconciliation cycle
+  // and every build-message title/label fetch, blinding fleet-wide reconciliation.
+  const resolveReconciliationAuthToken = () =>
     getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
   const reconciliationWakeFn = async (agentName: string, ticketIdentifier: string) => {
     const sessionKey = normalizeSessionKey(ticketIdentifier);
@@ -1796,7 +1804,7 @@ if (isEntryPoint) {
     };
     const actionText = `You were delegated ${ticketIdentifier}`;
     const message =
-      (await buildWorkflowAwareDeliveryMessage(ticketIdentifier, reconciliationAuthToken, actionText)) ??
+      (await buildWorkflowAwareDeliveryMessage(ticketIdentifier, resolveReconciliationAuthToken(), actionText)) ??
       actionText;
 
     // INF-282: Wire DispatchLeaseStore check into reconciliation wake path.
@@ -1815,7 +1823,7 @@ if (isEntryPoint) {
   };
 
   registerBootstrapReconciliationCron({
-    authToken: reconciliationAuthToken,
+    authToken: resolveReconciliationAuthToken,
     wakeFn: reconciliationWakeFn,
     dispatchAckTracker: ackTracker,
   });
@@ -1824,7 +1832,7 @@ if (isEntryPoint) {
   // delegation wakes caused by webhook-ingress gaps. Complements AI-1775
   // (bootstrap sweep) and the rescue/stuck-delegate/no-activity detectors.
   registerDelegationReconciliationCron({
-    authToken: reconciliationAuthToken,
+    authToken: resolveReconciliationAuthToken,
     operationalEventStore,
     wakeFn: reconciliationWakeFn,
     dispatchLeaseStore,
@@ -1835,7 +1843,7 @@ if (isEntryPoint) {
   // (non-wf) tickets with a delegate set that have been sitting in Thinking/
   // Doing/To Do with zero progress beyond the staleness threshold.
   registerStalePlainDelegateCron({
-    authToken: reconciliationAuthToken,
+    authToken: resolveReconciliationAuthToken,
     operationalEventStore,
     alertBus: getAlertBus(),
     wakeFn: reconciliationWakeFn,
@@ -1858,7 +1866,7 @@ if (isEntryPoint) {
     .catch(() => undefined);
   const firstActionAgentNames = new Set(getAgents().map((a) => a.name.toLowerCase()));
   registerFirstActionWatchdogCron({
-    authToken: reconciliationAuthToken,
+    authToken: resolveReconciliationAuthToken,
     workflowDefPath: process.env.WORKFLOW_DEFS_DIR ?? process.env.WORKFLOW_DEF_DIR,
     capabilityPolicy: firstActionCapabilityPolicy,
     listTickets: async () => {
@@ -1956,7 +1964,7 @@ if (isEntryPoint) {
       try {
         const res = await fetch(LINEAR_API_URL, {
           method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: reconciliationAuthToken },
+          headers: { "Content-Type": "application/json", Authorization: resolveReconciliationAuthToken() },
           body: JSON.stringify({ query, variables: { id: t.ticket } }),
         });
         const data = (await res.json()) as { data?: { issue?: CrossCheckIssue | null } };
@@ -2043,7 +2051,7 @@ if (isEntryPoint) {
 
     try {
       const result = await runDelegationReconciliationSweep({
-        authToken: reconciliationAuthToken,
+        authToken: resolveReconciliationAuthToken,
         operationalEventStore,
         alertBus: getAlertBus(),
         wakeFn: reconciliationWakeFn,
@@ -2178,10 +2186,15 @@ if (isEntryPoint) {
   }
 
   // AI-2554: label-sync audit cron — periodic check for proxy-store vs Linear state divergence.
-  const labelSyncAuthToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+  // INF-683: lazy per-use getter — resolved per audit pass so the boot/~20h token
+  // refresh can't strand a value captured at boot. The eager resolve here is a
+  // registration gate only (skip when no token is available at boot).
+  const resolveLabelSyncAuthToken = () =>
+    getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  const labelSyncAuthToken = resolveLabelSyncAuthToken();
   if (labelSyncAuthToken) {
     registerLabelSyncAuditCron({
-      authToken: labelSyncAuthToken,
+      authToken: resolveLabelSyncAuthToken,
       enrolledTicketsStore,
     });
     log.info("AI-2554: label-sync audit cron registered (interval=15m)");
