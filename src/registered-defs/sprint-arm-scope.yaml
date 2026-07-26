@@ -20,6 +20,9 @@ version: 1
 archetype: single-task
 entry_state: doing
 
+migrations:
+  escape: doing
+
 break_glass:
   command: escape
   to: doing

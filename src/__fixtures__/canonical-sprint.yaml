@@ -7,6 +7,9 @@ version: 1
 archetype: feature-initiative
 entry_state: intake
 
+migrations:
+  escape: validating
+
 break_glass:
   command: escape               # x-openclaw-linear-intent value that triggers break-glass (§4.4)
   to: validating                # INF-311: break-glass targets a RECOVERABLE state, not a terminal
