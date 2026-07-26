@@ -4,15 +4,23 @@ This repo follows a maintenance-branch model: `main` tracks the next major versi
 
 ## Current state
 
-| Branch / tag   | Purpose                              | Deploys to              |
-|----------------|--------------------------------------|-------------------------|
-| `main`         | Next major (v1.5 in development)     | fancymatt (after v1.5)  |
-| `release-1.4`  | v1.4 maintenance                     | fancymatt               |
-| tag `v1.4.0`   | Frozen v1.4 release point            | —                       |
-| `release-1.3`  | v1.3 maintenance (superseded)        | —                       |
-| tag `v1.3.0`   | Frozen v1.3 release point            | —                       |
-| `release-1.0`  | v1.0 maintenance                     | ILL                     |
-| tag `v1.0.0`   | Frozen v1.0 release point            | —                       |
+| Branch / tag   | Purpose                                   | Deploys to                |
+|----------------|-------------------------------------------|---------------------------|
+| `main`         | Next major (v1.5 in development)          | **fancymatt (live)**      |
+| `release-1.4`  | v1.4 maintenance / fancymatt rollback     | — (rollback target)       |
+| tag `v1.4.0`   | Frozen v1.4 release point                 | —                         |
+| `release-1.3`  | v1.3 maintenance (superseded)             | —                         |
+| tag `v1.3.0`   | Frozen v1.3 release point                 | —                         |
+| `release-1.0`  | v1.0 maintenance                          | ILL                       |
+| tag `v1.0.0`   | Frozen v1.0 release point                 | —                         |
+
+> **fancymatt deploys from `main`, not `release-1.4`** (AI-2305). The
+> `linear-webhook-fancymatt` deploy worktree tracks `origin/main` (git-pull-then-build;
+> live `/health` @ `e7650e97`). `release-1.4` is kept current as the **rollback target**
+> for fancymatt, so backport hygiene still matters — but a fix on `main` ahead of
+> `release-1.4` is *not* a production gap for fancymatt (prod already carries it). ILL
+> continues to run `release-1.0`. (Corrected on INF-712; the earlier "fancymatt (after
+> v1.5)" / "release-1.4 → fancymatt" rows predated the AI-2305 main-deployed switch.)
 
 ## Branching workflow
 
