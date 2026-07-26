@@ -44,6 +44,7 @@ import { isTerminalState } from "./barrier.js";
 import { getAgent, getAgentByProxyToken } from "./agents.js";
 import type { NoActivityDetector } from "./bag/no-activity-detector.js";
 import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
+import type { DispatchRecordStore } from "./liveness-channel/dispatch-record-store.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
 import { IssueCreateDedupCache, extractIssueCreateInput, fingerprintIssueCreate, isSuccessfulIssueCreate, DEFAULT_DEDUP_TTL_MS, type Claim } from "./issue-create-dedup.js";
 import { checkArtifactDisclosure } from "./artifact-disclosure.js";
@@ -541,6 +542,8 @@ export interface ProxyDeps {
   fanoutWakeFn?: (agentName: string, ticketIdentifier: string) => Promise<void>;
   /** INF-570: ack tracker for actionable fan-out child dispatches. */
   getDispatchAckTracker?: () => DispatchAckTracker | undefined;
+  /** INF-696: liveness dispatch store for post-fanout child dispatch verification. */
+  postFanoutDispatchStore?: DispatchRecordStore;
 }
 
 export async function handleProxyRequest(req: Request, res: Response, deps?: ProxyDeps): Promise<void> {
@@ -1422,6 +1425,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             delegateOverride,
             fanoutWakeFn: deps?.fanoutWakeFn,
             getDispatchAckTracker: deps?.getDispatchAckTracker,
+            postFanoutDispatchStore: deps?.postFanoutDispatchStore,
           });
 
           // ── AI-2554: Structured transition audit record ──────────────

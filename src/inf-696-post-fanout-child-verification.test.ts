@@ -13,11 +13,9 @@
  *   identifiers produce N result rows, and a created-then-lost child is surfaced
  *   as a missing result.
  *
- * AC3.4 is conditional in INF-696. This test suite does not assert a production
- * entry-point registration because the current codebase has no post-fanout
- * verification component/consumer to wire yet; if implementation introduces one
- * at the fan-out-completion boundary, it must add a production createApp/health
- * liveness test alongside these contract tests.
+ * - AC3.4: production fan-out completion wiring passes the liveness dispatch
+ *   store from createApp through proxy into workflow-gate, and workflow-gate
+ *   verifies before recording an awaiting fan-out outcome.
  */
 
 import fs from "node:fs";
@@ -223,5 +221,31 @@ describe("INF-696 AC3.3: verification is exhaustive over every created child", (
       }),
     );
     expect(result.allVerified).toBe(false);
+  });
+});
+
+describe("INF-696 AC3.4: production fan-out completion path is wired to the verifier", () => {
+  it("passes the liveness store from createApp through proxy into workflow-gate", () => {
+    const indexTs = fs.readFileSync(path.join(process.cwd(), "src/index.ts"), "utf8");
+    const proxyTs = fs.readFileSync(path.join(process.cwd(), "src/proxy.ts"), "utf8");
+
+    expect(indexTs).toContain("postFanoutDispatchStore: livenessDispatchStore");
+    expect(indexTs).toContain("livenessDispatchStore.recordDispatch({");
+    expect(indexTs).toContain("livenessDispatchStore.recordAck(livenessRecord.dispatchId");
+    expect(proxyTs).toContain("postFanoutDispatchStore?: DispatchRecordStore");
+    expect(proxyTs).toContain("postFanoutDispatchStore: deps?.postFanoutDispatchStore");
+  });
+
+  it("runs steward fan-out delegate verification before recording a clean awaiting outcome", () => {
+    const workflowGateTs = fs.readFileSync(path.join(process.cwd(), "src/workflow-gate.ts"), "utf8");
+    const verifierCall = workflowGateTs.indexOf("verifyStewardFanoutDelegates({");
+    const refusedOutcome = workflowGateTs.indexOf('outcome: "failed" as const', verifierCall);
+    const deriveOutcome = workflowGateTs.indexOf("deriveFanoutBarrierOutcome(fanoutResult)", verifierCall);
+    const recordOutcome = workflowGateTs.indexOf("recordFanoutOutcome(issueId", verifierCall);
+
+    expect(verifierCall).toBeGreaterThanOrEqual(0);
+    expect(refusedOutcome).toBeGreaterThan(verifierCall);
+    expect(deriveOutcome).toBeGreaterThan(refusedOutcome);
+    expect(recordOutcome).toBeGreaterThan(deriveOutcome);
   });
 });

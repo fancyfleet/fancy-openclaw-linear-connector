@@ -47,6 +47,8 @@ import { recordObservation } from "./store/observation-write-path.js";
 import { getAgent, getAgents } from "./agents.js";
 import { executeFanout, shouldTriggerFanout, validateFanoutSpec, extractSpecFindings, autoDeriveArmFindings, deriveSpecFromPriorChildren, deriveStructuredFromChildren, upsertDerivedSpecSection, updateIssueDescription, type FanoutResult, type Finding } from "./fanout.js";
 import { recordFanoutOutcome } from "./fanout-outcome-store.js";
+import type { DispatchRecordStore } from "./liveness-channel/dispatch-record-store.js";
+import { verifyStewardFanoutDelegates } from "./post-fanout-child-verification.js";
 import { onChildTerminal, onManagingEntry, isTerminalState, evaluateBarrier } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
 import { fetchLastCommentByUser } from "./linear-helpers.js";
@@ -4767,6 +4769,8 @@ export interface ApplyStateTransitionOptions {
   fanoutWakeFn?: (agentName: string, ticketIdentifier: string) => Promise<void>;
   /** INF-570: ack tracker for actionable fan-out child dispatches. */
   getDispatchAckTracker?: () => import("./bag/dispatch-ack-tracker.js").DispatchAckTracker | undefined;
+  /** INF-696: liveness dispatch store for post-fanout child dispatch verification. */
+  postFanoutDispatchStore?: DispatchRecordStore;
   /** INF-92: transition-stamped delegate wake hook. */
   onTransitionWake?: (dispatch: {
     agentName: string;
@@ -6369,6 +6373,24 @@ export async function applyStateTransition(
       // executeFanout, which would double-mint children.
       const fanoutResult = preTransitionFanoutResult;
       spawnIfEvaluationFailed = fanoutResult.spawnIfResult?.outcome === "failed";
+      const postFanoutVerification = options?.postFanoutDispatchStore && fanoutResult.childIdentifiers.length > 0
+        ? verifyStewardFanoutDelegates({
+            parentIdentifier: issue.identifier ?? issueId,
+            expectedChildIdentifiers: fanoutResult.childIdentifiers,
+            openChildren: fanoutResult.createdChildDelegates,
+            dispatchStore: options.postFanoutDispatchStore,
+          })
+        : null;
+      if (postFanoutVerification?.refused) {
+        fanoutResult.errors.push({
+          findingIndex: -1,
+          message: `Post-fanout child dispatch verification failed: ${postFanoutVerification.notVerifiedIdentifiers.join(", ")}`,
+        });
+        log.warn(
+          `workflow-gate: INF-696: post-fanout dispatch verification refused for ${issueId}: ` +
+          `${postFanoutVerification.summary}`,
+        );
+      }
       if (fanoutResult.created > 0) {
         log.info(
           `workflow-gate: B-2 fan-out: ${fanoutResult.created} child(ren) created for ${issueId}: ${fanoutResult.childIdentifiers.join(", ")}`,
@@ -6387,7 +6409,9 @@ export async function applyStateTransition(
       // to wait on, or whether to block+alarm.
       if (!spawnIfEvaluationFailed) {
         const now = new Date().toISOString();
-        const outcome = deriveFanoutBarrierOutcome(fanoutResult);
+        const outcome = postFanoutVerification?.refused
+          ? { outcome: "failed" as const }
+          : deriveFanoutBarrierOutcome(fanoutResult);
 
         try {
           await recordFanoutOutcome(issueId, {

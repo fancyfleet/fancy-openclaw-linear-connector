@@ -15,6 +15,8 @@ import { extractFindings, executeFanout, shouldTriggerFanout, type Finding } fro
 import { applyStateTransition, resetWorkflowCache, type WorkflowDef, type FanoutConfig } from "./workflow-gate.js";
 import { reloadAgents } from "./agents.js";
 import { resetPolicyCache } from "./escalation-gate.js";
+import { DispatchRecordStore } from "./liveness-channel/dispatch-record-store.js";
+import { getFanoutOutcome } from "./fanout-outcome-store.js";
 
 const CANONICAL_UX_AUDIT_FIXTURE = path.resolve(process.cwd(), "src/__fixtures__/canonical-ux-audit.yaml");
 
@@ -1088,6 +1090,40 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     expect(failureComment).toContain("proposed 1 child issue(s), but child creation created 0");
     expect(failureComment).toContain("parent remains in `spawning`");
     expect(failureComment).toContain(validatorReason);
+  });
+
+  it("INF-696: post-fanout verification records a failed outcome when spawned children lack delegate dispatch acks", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-696-fanout-integration-"));
+    const originalFanoutOutcomePath = process.env.FANOUT_OUTCOME_PATH;
+    process.env.FANOUT_OUTCOME_PATH = path.join(dir, "fanout-outcomes.json");
+    const dispatchStore = new DispatchRecordStore(path.join(dir, "liveness-dispatches.db"));
+
+    try {
+      globalThis.fetch = makeIntegrationFetch({
+        teamLabels: [
+          { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+          { id: "existing-state-todo", name: "state:todo" },
+        ],
+      });
+
+      await expect(
+        applyStateTransition("spawn", "AI-1439", "Bearer tok", {
+          postFanoutDispatchStore: dispatchStore,
+        }),
+      ).resolves.toMatchObject({ status: "applied" });
+
+      await expect(getFanoutOutcome("AI-1439")).resolves.toMatchObject({ outcome: "failed" });
+      const barrierFetch = fetchCalls.find((c) => (c.body.query ?? "").includes("ParentChildren"));
+      expect(barrierFetch).toBeUndefined();
+    } finally {
+      dispatchStore.close();
+      if (originalFanoutOutcomePath !== undefined) {
+        process.env.FANOUT_OUTCOME_PATH = originalFanoutOutcomePath;
+      } else {
+        delete process.env.FANOUT_OUTCOME_PATH;
+      }
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("does NOT trigger fan-out for non-ux-audit workflows", async () => {
