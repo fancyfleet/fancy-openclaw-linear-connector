@@ -1341,6 +1341,7 @@ async function createChildIssue(
   labelIds: string[],
   authToken: string,
   delegateId?: string | null,
+  stateId?: string | null,
 ): Promise<CreateChildIssueResult> {
   const mutation = `
     mutation CreateChild($input: IssueCreateInput!) {
@@ -1358,6 +1359,13 @@ async function createChildIssue(
     parentId: parentIssueId,
   };
   if (delegateId) input.delegateId = delegateId;
+  // INF-748: pin the child's native Linear state at mint so it is born in the
+  // column its state:* label declares (e.g. Doing/To Do), not the team-default
+  // Backlog. Without stateId the issueCreate lands the child in Backlog, where
+  // consider-work/begin-work are refused and the delegate cannot pick it up.
+  // Fail-open: when the caller could not resolve a stateId, omit it and let
+  // Linear apply the team default (legacy behavior) rather than aborting the mint.
+  if (stateId) input.stateId = stateId;
 
   try {
     const res = await fetch(LINEAR_API_URL, {
@@ -1484,6 +1492,19 @@ export async function executeFanout(
      * auto-migrate children to escape (terminal).
      */
     lookupEntryState?: (workflowLabel: string) => Promise<string | undefined>;
+    /**
+     * INF-748: resolve a child workflow's entry-state native Linear stateId for
+     * the given team. Given a wf:* label and the team id, returns the Linear
+     * workflow state UUID that matches the entry state's `native_state`, so the
+     * child is minted directly into that column instead of the team-default
+     * Backlog. When omitted (or when it returns null/undefined), createChildIssue
+     * omits stateId and the child lands in the team default — the pre-INF-748
+     * behavior, preserved for backward compat and as a fail-open path.
+     */
+    lookupEntryStateId?: (
+      workflowLabel: string,
+      teamId: string,
+    ) => Promise<string | null | undefined>;
     /**
      * INF-570: workflow registry and dispatch seams used to route children born
      * directly into an actionable entry state through the canonical wake/ack
@@ -1777,6 +1798,11 @@ export async function executeFanout(
   //    Cache resolved label ids by state name to avoid redundant API calls
   //    when multiple children share the same workflow entry_state.
   const stateLabelCache = new Map<string, string>();
+  // INF-748: cache resolved native Linear stateIds by child workflow label so
+  // sibling children sharing a workflow reuse one team-states lookup. A resolved
+  // miss is cached as null so we don't re-probe a workflow that has no mappable
+  // entry native_state.
+  const stateIdCache = new Map<string, string | null>();
 
   // AI-1992: optional initial delegate from config (used as default when
   // per-entry delegate is not set). Resolve once for reuse.
@@ -1915,6 +1941,26 @@ export async function executeFanout(
     }
     const labelIds = [wfLabelId, entryStateLabelId];
 
+    // INF-748: resolve the child's native Linear stateId so it is minted into
+    // the column its state:* label declares, not the team-default Backlog. Cache
+    // per workflow (incl. resolved misses) to avoid redundant team-states probes.
+    // Fail-open: a null result mints the child at the team default, as before.
+    let entryStateId: string | null | undefined;
+    if (options?.lookupEntryStateId) {
+      if (stateIdCache.has(findingWorkflow)) {
+        entryStateId = stateIdCache.get(findingWorkflow);
+      } else {
+        entryStateId = await options.lookupEntryStateId(findingWorkflow, parentCtx.teamId);
+        stateIdCache.set(findingWorkflow, entryStateId ?? null);
+        if (!entryStateId) {
+          log.warn(
+            `fanout: could not resolve native stateId for '${findingWorkflow}' (${stateLabelName}) ` +
+            `in finding "${childTitle}" — child will be minted at the team default state`,
+          );
+        }
+      }
+    }
+
     // AI-2199: per-entry delegate override. Falls back to config default.
     const delegateId = finding.delegate
       ? await resolveInitialDelegate(finding.delegate)
@@ -1939,6 +1985,7 @@ export async function executeFanout(
       labelIds,
       authToken,
       delegateId,
+      entryStateId,
     );
 
     const delegateAgentName = finding.delegate ?? config.initial_delegate;
@@ -2024,6 +2071,24 @@ export async function executeFanout(
           continue;
         }
 
+        // INF-748: mint the integration-verify child into its entry native
+        // state as well, on the same fail-open contract as the finding children.
+        let verifyStateId: string | null | undefined;
+        if (options?.lookupEntryStateId) {
+          if (stateIdCache.has(verifyWorkflow)) {
+            verifyStateId = stateIdCache.get(verifyWorkflow);
+          } else {
+            verifyStateId = await options.lookupEntryStateId(verifyWorkflow, parentCtx.teamId);
+            stateIdCache.set(verifyWorkflow, verifyStateId ?? null);
+            if (!verifyStateId) {
+              log.warn(
+                `fanout: could not resolve native stateId for integration verification workflow ` +
+                `'${verifyWorkflow}' (${stateLabelName}) — child will be minted at the team default state`,
+              );
+            }
+          }
+        }
+
         const verifyDescription = [
           `Parent: ${parentIssueId}`,
           `Capability: ${capability}`,
@@ -2039,6 +2104,7 @@ export async function executeFanout(
           [verifyWfLabelId, entryStateLabelId],
           authToken,
           configDelegateId,
+          verifyStateId,
         );
         if (!verifyChild.ok) {
           result.errors.push({

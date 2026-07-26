@@ -6247,6 +6247,21 @@ export async function applyStateTransition(
           if (def) fanoutWorkflowRegistry.set(defId, def);
           return def?.entry_state ? `state:${def.entry_state}` : undefined;
         },
+        // INF-748: resolve the child's entry-state native Linear stateId so the
+        // mint pins native state == state:* label. The entry state's semantic
+        // native_state comes from the registered def; resolveNativeStateId maps
+        // it to the team's actual Linear state UUID (same resolver the governed
+        // B2 transition path uses). Returns undefined on any miss so the mint
+        // fails open to the team default rather than aborting.
+        lookupEntryStateId: async (wfLabel: string, teamId: string) => {
+          const defId = wfLabel.startsWith("wf:") ? wfLabel.slice(3) : wfLabel;
+          const def = await loadWorkflowDefById(defId);
+          if (def) fanoutWorkflowRegistry.set(defId, def);
+          if (!def?.entry_state) return undefined;
+          const entryStateNode = def.states.find((s) => s.id === def.entry_state);
+          if (!entryStateNode?.native_state) return undefined;
+          return await resolveNativeStateId(teamId, entryStateNode.native_state, authToken);
+        },
         // Carried onto the INF-624 preflight so the child wake / dispatch-ack
         // behavior that lands children as actionable is preserved now that the
         // fan-out runs before the parent advance and is not re-executed after.
