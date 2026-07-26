@@ -18,6 +18,7 @@ import { resetConfigHealth } from "./config-health.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { createApp } from "./index.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
+import { _resetAppliedStateStore, recordAppliedState } from "./store/applied-state-store.js";
 import {
   _setTransitionWritePolicyForTests,
   applyStateTransition,
@@ -297,11 +298,13 @@ describe("INF-695 S2 — Commitment / acceptance gate", () => {
   beforeEach(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-695-"));
     originalFetch = globalThis.fetch;
+    _resetAppliedStateStore();
     setupConfig(dir);
   });
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    _resetAppliedStateStore();
     _setTransitionWritePolicyForTests();
     delete process.env.AGENTS_FILE;
     delete process.env.CAPABILITY_POLICY_PATH;
@@ -384,6 +387,36 @@ describe("INF-695 S2 — Commitment / acceptance gate", () => {
     expect(proxyError).toMatch(/missing commitment exit/i);
     expect(proxyError).toMatch(/accept.*reject.*not-ready/i);
     expect(proxyError).not.toMatch(/not a legal command|Legal moves:/i);
+  });
+
+  it("AC2.2 (regression, Charles code-review): after accept, submit passes on the authoritative applied state even when the live label is still the stale gated state", async () => {
+    // AI-2357 stale-label scenario, now that the gated state carries a commitment_gate:
+    // the engine has recorded the authoritative state as `doing` (post-accept), but the
+    // Linear label projection still shows the gated `state:investigation`. A legitimate
+    // downstream `submit` must resolve through the applied-state store as the
+    // `doing -> ac-validate` transition — NOT be refused as a missing commitment exit
+    // off the stale label. This guards against re-introducing a live-label-based gate.
+    const { fetch } = makeLinearFetch("investigation");
+    globalThis.fetch = fetch;
+
+    // Authoritative engine state after `accept`; live labels (above) still gated.
+    recordAppliedState(ISSUE_IDENTIFIER, "doing");
+
+    const error = await checkWorkflowRules(
+      "submit",
+      ISSUE_UUID,
+      "Bearer tok-igor",
+      "igor",
+      null,
+      IGOR_LINEAR_ID,
+      null,
+      false,
+      false,
+      true,
+    );
+
+    // Legal transition -> no proxy error, and specifically not the missing-commitment-exit refusal.
+    expect(error).toBeNull();
   });
 
   it("AC2.3 + AC2.5: production webhook activity auto-fires accept once, sets doing once, and exposes liveness at /health", async () => {

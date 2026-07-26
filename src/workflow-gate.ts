@@ -3506,15 +3506,15 @@ export async function checkWorkflowRules(
   // already be an identifier on the CLI path).
   const appliedStateKey = fetchedIdentifier ?? issueId;
   const liveCurrentState = getCurrentState(labels, def);
-  const liveStateNode = liveCurrentState ? def.states.find((s) => s.id === liveCurrentState) : undefined;
-  const liveCommitmentExit = commitmentExitFor(liveStateNode, intent);
-  if (liveStateNode?.commitment_gate && !liveCommitmentExit) {
-    return (
-      `[Proxy] '${intent}' blocked: missing commitment exit for ${issueId}. ` +
-      `Before downstream transitions from '${liveCurrentState}', record exactly one commitment exit: ` +
-      `accept, reject, or not-ready.`
-    );
-  }
+  // INF-695 revision (Charles code-review): the commitment-gate refusal must be
+  // evaluated against the AUTHORITATIVE current state, not the live state:* label.
+  // The gate is enforced below off `stateNode`/`currentState` — the same AI-2357
+  // applied-state resolution the rest of checkWorkflowRules uses. Checking it here,
+  // before `currentState` is resolved, blocked legitimate post-accept downstream
+  // commands: after `accept` records the engine state as `doing`, a stale
+  // `state:implementation` label projection would otherwise make `submit` (a valid
+  // `doing -> code-review` transition) fail as "missing commitment exit" before the
+  // applied-state store could win. Do NOT reinstate a label-based gate here.
   const currentState =
     typeof snapshotState === "string" && snapshotState.length > 0
       ? snapshotState
