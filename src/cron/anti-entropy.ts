@@ -35,6 +35,9 @@ const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "anti
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 
+/** INF-719: page size for the paginated wf:* sweep (Linear caps unpaginated issues() at 50). */
+const LINEAR_ISSUES_PAGE_SIZE = 50;
+
 // ── Public types ───────────────────────────────────────────────────────────
 
 export interface AntiEntropyOptions {
@@ -214,36 +217,60 @@ async function resolveSemanticToNativeId(
 }
 
 async function fetchWorkflowIssues(authToken: string): Promise<IssueNode[]> {
-  const query = `
-    query AntiEntropyIssues {
-      issues(filter: { labels: { name: { startsWith: "wf:" } } }) {
-        nodes {
-          id
-          identifier
-          team { id }
-          state { id name }
-          labels { nodes { id name } }
-          children {
-            nodes {
-              identifier
-              labels { nodes { name } }
+  // INF-719: page through the full wf:* set. An unpaginated issues() query is
+  // hard-capped at 50 nodes by Linear, so this anti-entropy sweep only ever
+  // reconciled the first page of a 250+ ticket board. Mirror the cursor loop in
+  // delegation-reconciliation-sweep.ts.
+  type Resp = {
+    data?: {
+      issues?: {
+        nodes?: IssueNode[];
+        pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+      };
+    };
+    errors?: unknown[];
+  };
+  const nodes: IssueNode[] = [];
+  let cursor: string | null = null;
+  let hasNextPage = true;
+  while (hasNextPage) {
+    const afterArg = cursor ? `, after: ${JSON.stringify(cursor)}` : "";
+    const query = `
+      query AntiEntropyIssues {
+        issues(first: ${LINEAR_ISSUES_PAGE_SIZE}${afterArg}, filter: { labels: { name: { startsWith: "wf:" } } }) {
+          nodes {
+            id
+            identifier
+            team { id }
+            state { id name }
+            labels { nodes { id name } }
+            children {
+              nodes {
+                identifier
+                labels { nodes { name } }
+              }
             }
           }
+          pageInfo { hasNextPage endCursor }
         }
       }
+    `;
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query }),
+    });
+    const data = (await res.json()) as Resp;
+    if (Array.isArray(data.errors) && data.errors.length > 0) {
+      throw new Error(`Linear GraphQL errors: ${formatGraphQlErrors(data.errors)}`);
     }
-  `;
-  const res = await fetch(LINEAR_API_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: authToken },
-    body: JSON.stringify({ query }),
-  });
-  type Resp = { data?: { issues?: { nodes?: IssueNode[] } }; errors?: unknown[] };
-  const data = (await res.json()) as Resp;
-  if (Array.isArray(data.errors) && data.errors.length > 0) {
-    throw new Error(`Linear GraphQL errors: ${formatGraphQlErrors(data.errors)}`);
+    nodes.push(...(data.data?.issues?.nodes ?? []));
+    const pageInfo = data.data?.issues?.pageInfo;
+    hasNextPage = pageInfo?.hasNextPage === true;
+    cursor = pageInfo?.endCursor ?? null;
+    if (hasNextPage && !cursor) break;
   }
-  return data.data?.issues?.nodes ?? [];
+  return nodes;
 }
 
 async function issueUpdateState(

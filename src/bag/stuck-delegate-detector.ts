@@ -566,11 +566,14 @@ export async function defaultFetchStuckCandidates(
 
   const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
 
-  // Query all issues delegated to this agent that have state:* labels
+  // Query all issues delegated to this agent that have state:* labels.
+  // INF-719: `$after` threads the cursor so a delegate holding more than 50
+  // tickets is fully scanned; `first: 50` alone silently truncated the set.
   const query = `
-    query DelegatedIssues($delegateId: ID!) {
+    query DelegatedIssues($delegateId: ID!, $after: String) {
       issues(
         first: 50,
+        after: $after,
         filter: { delegate: { id: { eq: $delegateId } } }
       ) {
         nodes {
@@ -609,44 +612,32 @@ export async function defaultFetchStuckCandidates(
             }
           }
         }
+        pageInfo { hasNextPage endCursor }
       }
     }
   `;
 
   try {
-    const res = await fetchImpl("https://api.linear.app/graphql", {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: authHeader },
-      body: JSON.stringify({ query, variables: { delegateId: agent.linearUserId } }),
-    });
-
-    if (!res.ok) {
-      throw new Error(`Linear API returned ${res.status} for agent ${agent.name}`);
-    }
-
-    const body = (await res.json()) as {
-      data?: {
-        issues?: {
-          nodes?: Array<{
-            identifier: string;
-            labels: { nodes: Array<{ name: string }> };
-            delegate: { id: string } | null;
-            updatedAt: string;
-            state: { name: string; type: string } | null;
-            children?: {
-              nodes?: Array<{
-                identifier: string;
-                state?: { type: string } | null;
-                labels?: { nodes?: Array<{ name: string }> };
-              }>;
-            };
-            comments: {
-              nodes: Array<{
-                id: string;
-                createdAt: string;
-                body: string;
-                user: { id: string; name: string } | null;
-              }>;
+    type StuckIssueNode = {
+      identifier: string;
+      labels: { nodes: Array<{ name: string }> };
+      delegate: { id: string } | null;
+      updatedAt: string;
+      state: { name: string; type: string } | null;
+      children?: {
+        nodes?: Array<{
+          identifier: string;
+          state?: { type: string } | null;
+          labels?: { nodes?: Array<{ name: string }> };
+        }>;
+      };
+      comments: {
+        nodes: Array<{
+          id: string;
+          createdAt: string;
+          body: string;
+          user: { id: string; name: string } | null;
+        }>;
             };
             history: {
               nodes: Array<{
@@ -659,17 +650,44 @@ export async function defaultFetchStuckCandidates(
                 toState?: { name: string } | null;
               }>;
             };
-          }>;
+    };
+    type StuckResp = {
+      data?: {
+        issues?: {
+          nodes?: StuckIssueNode[];
+          pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
         };
       };
       errors?: Array<{ message: string }>;
     };
 
-    if (body.errors?.length) {
-      throw new Error(`Linear API errors: ${body.errors.map((e) => e.message).join("; ")}`);
+    // INF-719: page through the full delegated set — a delegate holding more
+    // than one page of tickets was silently truncated at 50.
+    const issues: StuckIssueNode[] = [];
+    let cursor: string | null = null;
+    let hasNextPage = true;
+    while (hasNextPage) {
+      const res = await fetchImpl("https://api.linear.app/graphql", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: authHeader },
+        body: JSON.stringify({ query, variables: { delegateId: agent.linearUserId, after: cursor } }),
+      });
+
+      if (!res.ok) {
+        throw new Error(`Linear API returned ${res.status} for agent ${agent.name}`);
+      }
+
+      const body = (await res.json()) as StuckResp;
+      if (body.errors?.length) {
+        throw new Error(`Linear API errors: ${body.errors.map((e) => e.message).join("; ")}`);
+      }
+      issues.push(...(body.data?.issues?.nodes ?? []));
+      const pageInfo = body.data?.issues?.pageInfo;
+      hasNextPage = pageInfo?.hasNextPage === true;
+      cursor = pageInfo?.endCursor ?? null;
+      if (hasNextPage && !cursor) break;
     }
 
-    const issues = body.data?.issues?.nodes ?? [];
     const candidates: StuckCandidate[] = [];
 
     for (const issue of issues) {

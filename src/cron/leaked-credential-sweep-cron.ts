@@ -67,35 +67,52 @@ export function createSweepLinearApi(linearToken?: string): LinearSweepApi {
       const since = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000).toISOString();
       // Closed = state.type in {completed, canceled}. `canceled` covers both
       // Canceled and Invalid (they share the canceled type in Linear).
-      const data = await graphQL<{
+      type LeakedNode = {
+        id: string;
+        identifier: string;
+        comments?: { nodes: Array<{ body: string }> };
+      };
+      type LeakedResp = {
         issues: {
-          nodes: Array<{
-            id: string;
-            identifier: string;
-            comments?: { nodes: Array<{ body: string }> };
-          }>;
+          nodes: LeakedNode[];
+          pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
         };
-      }>(
-        `query ClosedLeakedCred($since: DateTime!, $label: String!) {
-          issues(
-            filter: {
-              labels: { name: { eq: $label } }
-              state: { type: { in: ["completed", "canceled"] } }
-              updatedAt: { gte: $since }
+      };
+      // INF-719: page through the full result set. `first: 100` alone silently
+      // dropped closed tickets beyond the first 100 in the lookback window.
+      const nodes: LeakedNode[] = [];
+      let cursor: string | null = null;
+      let hasNextPage = true;
+      while (hasNextPage) {
+        const data: LeakedResp = await graphQL<LeakedResp>(
+          `query ClosedLeakedCred($since: DateTime!, $label: String!, $after: String) {
+            issues(
+              filter: {
+                labels: { name: { eq: $label } }
+                state: { type: { in: ["completed", "canceled"] } }
+                updatedAt: { gte: $since }
+              }
+              first: 100
+              after: $after
+              orderBy: updatedAt
+            ) {
+              nodes {
+                id
+                identifier
+                comments(first: 50) { nodes { body } }
+              }
+              pageInfo { hasNextPage endCursor }
             }
-            first: 100
-            orderBy: updatedAt
-          ) {
-            nodes {
-              id
-              identifier
-              comments(first: 50) { nodes { body } }
-            }
-          }
-        }`,
-        { since, label: SEC_LEAKED_CREDENTIAL_LABEL },
-      );
-      return (data.issues?.nodes ?? []).map((n) => ({
+          }`,
+          { since, label: SEC_LEAKED_CREDENTIAL_LABEL, after: cursor },
+        );
+        nodes.push(...(data.issues?.nodes ?? []));
+        const pageInfo = data.issues?.pageInfo;
+        hasNextPage = pageInfo?.hasNextPage === true;
+        cursor = pageInfo?.endCursor ?? null;
+        if (hasNextPage && !cursor) break;
+      }
+      return nodes.map((n) => ({
         id: n.id,
         identifier: n.identifier,
         comments: n.comments?.nodes?.map((c) => c.body ?? "") ?? [],

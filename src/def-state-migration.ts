@@ -31,6 +31,9 @@ const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "def-
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 
+/** INF-719: page size for the paginated wf:* enumeration (Linear caps unpaginated issues() at 50). */
+const LINEAR_ISSUES_PAGE_SIZE = 50;
+
 // ── Types ───────────────────────────────────────────────────────────────────
 
 export interface DefStateMigrationPlan {
@@ -141,33 +144,55 @@ export function validateDefStateRemovals(
 // ── Linear helpers ────────────────────────────────────────────────────────────
 
 async function fetchGovernedTickets(authToken: string): Promise<FetchedTicket[]> {
-  const query = `
-    query WorkflowIssues {
-      issues(filter: { labels: { some: { name: { startsWith: "wf:" } } } }) {
-        nodes {
-          id
-          identifier
-          state { name }
-          labels { nodes { id name } }
-          team { id }
-        }
-      }
-    }
-  `;
-  const res = await fetch(LINEAR_API_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: authToken },
-    body: JSON.stringify({ query }),
-  });
   type IssueNode = {
     id: string;
     identifier: string;
     labels: { nodes: Array<{ id: string; name: string }> };
     team: { id: string } | null;
   };
-  type Resp = { data?: { issues?: { nodes: IssueNode[] } } };
-  const data = (await res.json()) as Resp;
-  return (data.data?.issues?.nodes ?? []).map((n) => ({
+  type Resp = {
+    data?: {
+      issues?: {
+        nodes: IssueNode[];
+        pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+      };
+    };
+  };
+  // INF-719: page through the full wf:* set. An unpaginated issues() query is
+  // hard-capped at 50 nodes by Linear, so this migration would silently skip
+  // any in-flight ticket beyond the first page. Mirror the cursor loop.
+  const nodes: IssueNode[] = [];
+  let cursor: string | null = null;
+  let hasNextPage = true;
+  while (hasNextPage) {
+    const afterArg = cursor ? `, after: ${JSON.stringify(cursor)}` : "";
+    const query = `
+      query WorkflowIssues {
+        issues(first: ${LINEAR_ISSUES_PAGE_SIZE}${afterArg}, filter: { labels: { some: { name: { startsWith: "wf:" } } } }) {
+          nodes {
+            id
+            identifier
+            state { name }
+            labels { nodes { id name } }
+            team { id }
+          }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+    `;
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query }),
+    });
+    const data = (await res.json()) as Resp;
+    nodes.push(...(data.data?.issues?.nodes ?? []));
+    const pageInfo = data.data?.issues?.pageInfo;
+    hasNextPage = pageInfo?.hasNextPage === true;
+    cursor = pageInfo?.endCursor ?? null;
+    if (hasNextPage && !cursor) break;
+  }
+  return nodes.map((n) => ({
     id: n.id,
     identifier: n.identifier,
     labels: n.labels.nodes.map((l) => l.name),

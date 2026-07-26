@@ -46,6 +46,14 @@ const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "boot
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 
+/**
+ * INF-719: page size for the paginated wf:* sweep. Linear caps an unpaginated
+ * `issues()` query at 50 nodes, which blinded this sweep to ~80% of the board
+ * once 250+ wf:*-enrolled tickets went live. Mirrors the proven cursor loop in
+ * delegation-reconciliation-sweep.ts (LINEAR_ISSUES_PAGE_SIZE = 50).
+ */
+const LINEAR_ISSUES_PAGE_SIZE = 50;
+
 /** Default grace window: a ticket younger than this is given time for the
  *  Issue-update webhook to arrive naturally. */
 const DEFAULT_GRACE_WINDOW_MS = 2 * 60 * 1000; // 2 min
@@ -404,46 +412,78 @@ async function queryUnenrolledTickets(
   authToken: string,
   fetchFn: typeof fetch,
 ): Promise<ReconciliationCandidate[]> {
-  const query = `
-    query BootstrapReconciliation {
-      issues(filter: { labels: { some: { name: { startsWith: "wf:" } } } }) {
-        nodes {
-          id
-          identifier
-          updatedAt
-          labels { nodes { id name } }
-          delegate { id }
-          team { id }
-          state { name type }
-          title
-        }
-      }
-    }
-  `;
-
-  const res = await fetchFn(LINEAR_API_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: authToken },
-    body: JSON.stringify({ query }),
-  });
-
+  type IssueNode = {
+    id: string;
+    identifier: string;
+    updatedAt: string;
+    labels: { nodes: Array<{ id: string; name: string }> };
+    delegate: { id: string } | null;
+    team: { id: string };
+    state: { name: string; type: string } | null;
+  };
   type Resp = {
+    errors?: Array<{ message: string }>;
     data?: {
       issues?: {
-        nodes: Array<{
-          id: string;
-          identifier: string;
-          updatedAt: string;
-          labels: { nodes: Array<{ id: string; name: string }> };
-          delegate: { id: string } | null;
-          team: { id: string };
-          state: { name: string; type: string } | null;
-        }>;
+        nodes: IssueNode[];
+        pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
       };
     };
   };
-  const data = (await res.json()) as Resp;
-  const nodes = data.data?.issues?.nodes ?? [];
+
+  // INF-719: page through the full result set. An unpaginated issues() query is
+  // hard-capped at 50 nodes by Linear, so any wf:* ticket beyond the first page
+  // was never scanned and any desync on it was never healed (INF-717 / LSO-20).
+  const nodes: IssueNode[] = [];
+  let cursor: string | null = null;
+  let hasNextPage = true;
+
+  while (hasNextPage) {
+    const afterArg = cursor ? `, after: ${JSON.stringify(cursor)}` : "";
+    const query = `
+      query BootstrapReconciliation {
+        issues(first: ${LINEAR_ISSUES_PAGE_SIZE}${afterArg}, filter: { labels: { some: { name: { startsWith: "wf:" } } } }) {
+          nodes {
+            id
+            identifier
+            updatedAt
+            labels { nodes { id name } }
+            delegate { id }
+            team { id }
+            state { name type }
+            title
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+      }
+    `;
+
+    const res = await fetchFn(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query }),
+    });
+
+    const data = (await res.json()) as Resp;
+
+    // INF-719/INF-585: fail loud on a non-2xx or a 200-with-errors response so
+    // the caller's catch surfaces it — a swallowed error here would report
+    // scanned:0 and silently heal nobody, the exact blindness this ticket fights.
+    if (!res.ok || (data.errors && data.errors.length > 0)) {
+      const detail = data.errors?.[0]?.message ?? `HTTP ${res.status}`;
+      throw new Error(`BootstrapReconciliation query failed: ${detail}`);
+    }
+
+    nodes.push(...(data.data?.issues?.nodes ?? []));
+
+    const pageInfo = data.data?.issues?.pageInfo;
+    hasNextPage = pageInfo?.hasNextPage === true;
+    cursor = pageInfo?.endCursor ?? null;
+    if (hasNextPage && !cursor) break;
+  }
 
   return nodes.map((n) => ({
     id: n.id,
