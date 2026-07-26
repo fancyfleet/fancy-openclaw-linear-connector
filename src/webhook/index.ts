@@ -28,7 +28,7 @@ import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgent
 import { checkAgentLiveness, type LivenessConfig } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
 import { checkRoleGuardAndBlock, type LinearUserIdResolver } from "../routing-guard.js";
-import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, autoEnrollPlainDelegation, markAutoEnrollRegistered } from "../workflow-gate.js";
+import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, autoEnrollPlainDelegation, markAutoEnrollRegistered, markCommitmentActivityObserverRegistered, applyStateTransition } from "../workflow-gate.js";
 import { checkLabelSyncForTicket, emitLabelSyncWarning } from "../transition-audit.js";
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/index.js";
@@ -186,6 +186,53 @@ function acknowledgeAgentAuthoredActivity(
   log.info(`Agent-authored Linear activity acknowledged: ${agentId} [${ticketId}]`);
 }
 
+const commitmentAutoAcceptClaims = new Set<string>();
+
+async function autoAcceptCommitmentOnActivity(
+  event: LinearEvent,
+  operationalEventStore?: OperationalEventStore,
+): Promise<void> {
+  if (event.type !== "Comment" && event.type !== "AgentSessionEvent") return;
+  const actorId = event.actor?.id;
+  if (!actorId) return;
+  const agentName = buildAgentMap()[actorId];
+  if (!agentName) return;
+  const bodyId = getOpenclawAgentName(agentName);
+  const data = (event as { data?: Record<string, unknown> }).data;
+  const issue = data?.issue as Record<string, unknown> | undefined;
+  const sessionIssue = ((data?.agentSession as Record<string, unknown> | undefined)?.issue ?? {}) as Record<string, unknown>;
+  const issueId =
+    (issue?.id as string | undefined) ??
+    (data?.issueId as string | undefined) ??
+    (sessionIssue.id as string | undefined) ??
+    issueIdentifierFromEvent(event);
+  if (!issueId) return;
+  const claimKey = issueIdentifierFromEvent(event) ?? issueId;
+  if (commitmentAutoAcceptClaims.has(claimKey)) return;
+  commitmentAutoAcceptClaims.add(claimKey);
+  const token = getAccessToken(bodyId) ?? getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+  if (!token) {
+    commitmentAutoAcceptClaims.delete(claimKey);
+    return;
+  }
+  try {
+    const result = await applyStateTransition("accept", issueId, token, {
+      bodyId,
+      operationalEventStore,
+      commitmentAutoAccept: true,
+    });
+    if (result.status === "applied") {
+      log.info(`Commitment gate auto-accepted ${issueIdentifierFromEvent(event) ?? issueId} on ${event.type} activity`);
+    }
+    if (result.status !== "applied" && result.code !== "commitment-exit-already-recorded") {
+      commitmentAutoAcceptClaims.delete(claimKey);
+    }
+  } catch (err) {
+    commitmentAutoAcceptClaims.delete(claimKey);
+    log.warn(`Commitment gate auto-accept failed (fail-open): ${errorSummary(err)}`);
+  }
+}
+
 /** Wrap deliverToAgent with the global concurrent-dispatch semaphore. */
 async function deliverWithSlot(
   route: RouteResult,
@@ -236,6 +283,7 @@ export function createWebhookRouter(
     "primary webhook dispatch path (dispatchRoute → assertDispatchTargetFetchable)",
   );
   markAutoEnrollRegistered();
+  markCommitmentActivityObserverRegistered();
   markDispatchIntegrityGateActive(
     "deliveryTimeRecipientResolution",
     "primary webhook dispatch path (dispatchRoute → roster-based recipient validation, AI-2192)",
@@ -397,6 +445,7 @@ export function createWebhookRouter(
       }
 
       acknowledgeAgentAuthoredActivity(event, onAgentActivity);
+      await autoAcceptCommitmentOnActivity(event, operationalEventStore);
 
       // AI-2350: Renew dispatch lease on agent activity (comment posted,
       // agent session event). This extends the lease TTL so long-running

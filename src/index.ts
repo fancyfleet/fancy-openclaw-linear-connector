@@ -21,7 +21,7 @@ import { buildWorkflowAwareDeliveryMessage } from "./delivery/build-message.js";
 import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, StuckDelegateDetector, HoldRetryTracker, resignalPendingTickets, replayPendingBag, ManagingPoller } from "./bag/index.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 import { reconciliationWakeFn as reconciliationWakeWithLeaseCheck } from "./bag/reconciliation-wake.js";
-import { getAutoEnrollLiveness, getTicketNoActivityTimeoutMs, getWorkflowRegistryLiveness, loadWorkflowRegistry } from "./workflow-gate.js";
+import { getAutoEnrollLiveness, getCommitmentGateLiveness, getTicketNoActivityTimeoutMs, getWorkflowRegistryLiveness, loadWorkflowRegistry } from "./workflow-gate.js";
 import { getFanoutPreviewCreateLiveness, registerFanoutPreviewCreate } from "./fanout.js";
 import { getDefStateMigrationLiveness, registerDefStateMigrationRunner } from "./def-state-migration.js";
 import { getFixtureDriftLiveness, runFixtureDriftCheck } from "./fixture-drift-detector.js";
@@ -537,6 +537,9 @@ export function createApp(options?: CreateAppOptions) {
       matrixApprovalGate: getMatrixApprovalGateLiveness(),
       // AI-2542: auto-enroll liveness and demote/escape suppression counters.
       autoEnroll: getAutoEnrollLiveness(),
+      // INF-695 AC2.5: commitment activity observer liveness. registered=true
+      // only when createWebhookRouter wires the production webhook consumer.
+      commitmentGate: getCommitmentGateLiveness(),
       // AI-2624 AC7: ManagingPoller liveness — reports running state and
       // effective cycle/interval at /health without waiting for a wake.
       // Uses a forward ref because the poller is constructed later in
