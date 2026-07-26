@@ -109,6 +109,14 @@ const CALLER_LUID = "grover-uuid";
 const PR_URL = "https://github.com/fancyfleet/fancy-openclaw-linear-connector/pull/542";
 const MERGE_COMMENT = `Break-glass: PR #542 merge complete and verified (SHA 77e50121 on main): ${PR_URL}`;
 
+// Mixed multi-URL case (INF-714 review): the ticket references a superseded PR
+// that is authoritatively open (#540, reachable 200 merged:false) AND the real
+// merged PR (#542) whose private-repo read is UNREACHABLE. "Any 2xx ⇒ verified"
+// would treat the reachable-open URL as authoritative and block — reopening the
+// INF-695 trap. The gate must decline to block when any URL is unreachable.
+const PR_URL_OPEN = "https://github.com/fancyfleet/fancy-openclaw-linear-connector/pull/540";
+const MIXED_COMMENT = `Superseded ${PR_URL_OPEN}; real merge landed as PR #542 (SHA 77e50121 on main): ${PR_URL}`;
+
 const DEPLOY_LABELS = [
   { id: "lbl-wf", name: "wf:dev-impl" },
   { id: "lbl-state", name: "state:deploy" },
@@ -119,27 +127,34 @@ const DEPLOY_LABELS = [
 type GitHubMode = "merged" | "notmerged" | "unreachable";
 
 interface MockOpts {
-  /** GitHub API behavior for GET /pulls/{n}. */
+  /** Default GitHub API behavior for GET /pulls/{n}. */
   github: GitHubMode;
+  /** Per-PR-number override, e.g. { "540": "notmerged", "542": "unreachable" }. */
+  githubByPr?: Record<string, GitHubMode>;
+  /** Override the comment body carrying the PR URL(s). */
+  commentBody?: string;
   issueLabels?: Array<{ id: string; name: string }>;
 }
 
 function makeMockFetch(opts: MockOpts): typeof globalThis.fetch {
   const issueLabels = opts.issueLabels ?? DEPLOY_LABELS;
+  const commentBody = opts.commentBody ?? MERGE_COMMENT;
 
   return (async (url, init) => {
     const urlStr = typeof url === "string" ? url : (url as URL).href;
 
     // ── GitHub REST API: GET /repos/{owner}/{repo}/pulls/{n} ──
     if (urlStr.includes("api.github.com")) {
-      if (opts.github === "unreachable") {
+      const prNum = urlStr.match(/\/pulls\/(\d+)/)?.[1];
+      const mode: GitHubMode = (prNum && opts.githubByPr?.[prNum]) ?? opts.github;
+      if (mode === "unreachable") {
         // Private repo the token cannot read (INF-695), or network/rate-limit.
         return new Response(JSON.stringify({ message: "Not Found" }), {
           status: 404,
           headers: { "Content-Type": "application/json" },
         });
       }
-      const merged = opts.github === "merged";
+      const merged = mode === "merged";
       return new Response(
         JSON.stringify({
           merged,
@@ -179,7 +194,7 @@ function makeMockFetch(opts: MockOpts): typeof globalThis.fetch {
           data: {
             issue: {
               description: null,
-              comments: { nodes: [{ body: MERGE_COMMENT }] },
+              comments: { nodes: [{ body: commentBody }] },
               attachments: { nodes: [] },
             },
           },
@@ -308,6 +323,25 @@ describe("INF-714: checkWorkflowRules — merge verification across GitHub reach
     expect(result).toContain("blocked");
   });
 
+  it("AC3 mixed multi-URL: authoritative-open URL + unreachable merged URL (token set) → does NOT block, loud alert", async () => {
+    process.env.GH_TOKEN = "mock-token";
+    // #540 authoritatively open (reachable 200 merged:false), #542 unreachable (the merged one).
+    globalThis.fetch = makeMockFetch({
+      github: "unreachable",
+      githubByPr: { "540": "notmerged", "542": "unreachable" },
+      commentBody: MIXED_COMMENT,
+    });
+    const result = await checkWorkflowRules("continue", ISSUE_ID, AUTH_TOKEN, BODY_ID, null, CALLER_LUID);
+
+    // A single reachable-open URL must NOT make the unknowable merged URL look
+    // verified — the ticket must not be stranded.
+    expect(result).toBeNull();
+
+    const alert = alertStore.query({ source: "done-gate" }).find((a) => a.dedupKey === `done-gate|inf-714-unverifiable|${ISSUE_ID}`);
+    expect(alert).toBeDefined();
+    expect(alert?.severity).toBe("warning");
+  });
+
   it("No token configured + comment PR URL → accepted as sufficient (INF-522 preserved, no false alert)", async () => {
     // GH_TOKEN unset (afterEach deletes it). checkPRMergedFromGitHub returns null
     // because no token — the no-token defense-in-depth path, not the unreachable path.
@@ -329,6 +363,25 @@ describe("INF-714: applyStateTransition — release gate across GitHub reachabil
     const result = await applyStateTransition("continue", ISSUE_ID, AUTH_TOKEN, { bodyId: BODY_ID });
 
     // The evidence gate must not be the thing that blocks (release-gate).
+    expect(result.code).not.toBe("release-gate");
+
+    const alert = alertStore.query({ source: "done-gate" }).find((a) => a.dedupKey === `done-gate|inf-714-unverifiable|${ISSUE_ID}`);
+    expect(alert).toBeDefined();
+    expect(alert?.severity).toBe("warning");
+  });
+
+  it("AC3 mixed multi-URL: authoritative-open URL + unreachable merged URL (token set) → does NOT block, loud alert", async () => {
+    process.env.GH_TOKEN = "mock-token";
+    globalThis.fetch = makeMockFetch({
+      github: "unreachable",
+      githubByPr: { "540": "notmerged", "542": "unreachable" },
+      commentBody: MIXED_COMMENT,
+    });
+    const result = await applyStateTransition("continue", ISSUE_ID, AUTH_TOKEN, { bodyId: BODY_ID });
+
+    // Enforcement gate must agree with the advisory gate: any-unreachable ⇒ do
+    // not block. Before the fix, the reachable-open #540 set reachable=true and
+    // the else-arm blocked — the AC3 trap.
     expect(result.code).not.toBe("release-gate");
 
     const alert = alertStore.query({ source: "done-gate" }).find((a) => a.dedupKey === `done-gate|inf-714-unverifiable|${ISSUE_ID}`);

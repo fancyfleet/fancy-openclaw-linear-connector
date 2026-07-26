@@ -2092,15 +2092,24 @@ interface BranchAndPRStatus {
   /** Merge SHA of the pull request, if known (INF-452). */
   mergeSha: string | null;
   /**
-   * True when PR URL evidence exists and is NOT confirmed merged, AND every
+   * True when PR URL evidence exists, is NOT confirmed merged, AND at least one
    * GitHub-API verification attempt was unreachable — non-2xx (401/403/404 for
    * a private repo the connector's token cannot read, 5xx, rate-limit) or a
-   * network error — so GitHub could neither confirm nor deny the merge (INF-714).
+   * network error — so GitHub could neither confirm nor deny that URL's merge
+   * (INF-714).
+   *
+   * "At least one" (not "every") is deliberate: in the mixed case — one PR URL
+   * reachable-open, another the genuinely-merged PR but unreachable — the merged
+   * URL's state is unknowable, so the ticket must not be blocked. Keying off the
+   * all-unreachable `!reachable` instead reopened the INF-695 trap on the
+   * enforcement gate (any single 2xx made it look verifiable). This mirrors the
+   * advisory gate's per-URL `unreachable` so the two agree by construction.
    *
    * This is distinct from an authoritative "not merged": a reachable 200 that
-   * reports `merged:false`. The done gate must treat "cannot verify" differently
-   * from "verified not merged" — the former must NOT fail-closed and strand a
-   * merged+approved ticket (the INF-695 deadlock), the latter is a genuine block.
+   * reports `merged:false` with no unreachable ambiguity. The done gate must
+   * treat "cannot verify" differently from "verified not merged" — the former
+   * must NOT fail-closed and strand a merged+approved ticket (the INF-695
+   * deadlock), the latter is a genuine block.
    */
   githubVerifyUnreachable: boolean;
 }
@@ -2257,19 +2266,26 @@ async function fetchBranchAndPRStatus(
     // minutes or longer. The GitHub API is the source of truth. Check both
     // attachment-based and description-scanned URLs for full coverage.
     //
-    // INF-714: track whether GitHub was *reachable*. When PR evidence exists
-    // but the GitHub API could not be reached (private repo the connector's
-    // token cannot read, network error, rate-limit), we must not silently
-    // conclude "not merged" — that fail-closed a merged+approved ticket in the
-    // INF-695 deadlock. `githubVerifyUnreachable` carries that ambiguity to the
-    // done gate so it can accept-loudly instead of stranding the ticket.
+    // INF-714: track whether GitHub verification was *unreachable*. When PR
+    // evidence exists but the GitHub API could not be reached for a URL (private
+    // repo the connector's token cannot read, network error, rate-limit), we
+    // must not silently conclude "not merged" — that fail-closed a merged+approved
+    // ticket in the INF-695 deadlock. `githubVerifyUnreachable` carries that
+    // ambiguity to the done gate so it can accept-loudly instead of stranding.
+    //
+    // Keyed off `anyUnreachable` (at least one URL unreachable), NOT the
+    // all-unreachable `!reachable`: in the mixed case (a reachable-open URL plus
+    // an unreachable merged URL) the merged URL's status is unknowable, so the
+    // ticket must not be blocked. This makes the enforcement gate agree with the
+    // advisory gate (`checkWorkflowRules`, `unreachable = any null`) by
+    // construction (INF-714 review, Astrid).
     let githubVerifyUnreachable = false;
     if (allPrUrls.length > 0) {
       const res = await verifyPrMergeStateViaGitHub(allPrUrls);
       if (res.merged) {
         hasMergedPR = true;
         mergeSha = res.mergeSha;
-      } else if (!res.reachable) {
+      } else if (res.anyUnreachable) {
         githubVerifyUnreachable = true;
       }
     }
@@ -2295,7 +2311,7 @@ async function fetchBranchAndPRStatus(
           hasMergedPR = true;
           mergeSha = res.mergeSha;
           githubVerifyUnreachable = false;
-        } else if (!res.reachable) {
+        } else if (res.anyUnreachable) {
           githubVerifyUnreachable = true;
         }
       }
@@ -2559,21 +2575,27 @@ async function searchGitHubPRsByPerRepoScan(identifier: string): Promise<string[
  * GitHub. Returns `merged: false` when all PRs are open/closed-without-merge,
  * or when GitHub could not be reached.
  *
- * INF-714: also returns `reachable` — true when AT LEAST ONE PR URL returned an
- * authoritative 2xx response (whether merged or not). It is false when every
- * attempt failed to reach an authoritative answer: non-2xx (401/403/404 for a
- * private repo the token cannot read, 5xx, rate-limit) or a thrown network
- * error. The done gate uses this to distinguish "GitHub says not merged"
- * (reachable=true, block is legitimate) from "GitHub could not be reached"
- * (reachable=false, must NOT fail-closed and strand a merged+approved ticket —
- * the INF-695 deadlock). A `merged:true` result always implies `reachable:true`.
+ * INF-714: also returns two independent reachability signals so the enforcement
+ * gate can mirror the advisory gate's per-URL semantics exactly:
+ *   - `reachable` — true when AT LEAST ONE PR URL returned an authoritative 2xx
+ *     response (whether merged or not).
+ *   - `anyUnreachable` — true when AT LEAST ONE PR URL failed to reach an
+ *     authoritative answer: non-2xx (401/403/404 for a private repo the token
+ *     cannot read, 5xx, rate-limit) or a thrown network error.
+ * These are NOT complements — in the mixed case (one URL 2xx-open, another
+ * unreachable) BOTH are true. The done gate keys off `anyUnreachable` (not the
+ * all-unreachable `!reachable`) so that a merged-but-unverifiable PR alongside a
+ * reachable-open one still declines to block — the exact INF-695 deadlock the
+ * enforcement gate reopened when it collapsed to "any 2xx ⇒ verified" (INF-714
+ * review, Astrid). A `merged:true` result always implies `reachable:true`.
  *
  * Supports optional GITHUB_TOKEN / GH_TOKEN env var for authenticated requests
  * (higher rate limit, private repo access). Falls back to unauthenticated
  * requests when no token is available.
  */
-async function verifyPrMergeStateViaGitHub(prUrls: string[]): Promise<{ merged: boolean; mergeSha: string | null; reachable: boolean }> {
+async function verifyPrMergeStateViaGitHub(prUrls: string[]): Promise<{ merged: boolean; mergeSha: string | null; reachable: boolean; anyUnreachable: boolean }> {
   let reachable = false;
+  let anyUnreachable = false;
   for (const prUrl of prUrls) {
     const parsed = parseGitHubPrUrl(prUrl);
     if (!parsed) continue;
@@ -2590,8 +2612,10 @@ async function verifyPrMergeStateViaGitHub(prUrls: string[]): Promise<{ merged: 
       // Response includes `merged` (boolean) and `merge_commit_sha` (string).
       const res = await fetch(`${GITHUB_API_BASE}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${number}`, { headers });
       if (!res.ok) {
-        // INF-714: non-2xx is NOT an authoritative answer — leave `reachable`
-        // untouched so this URL cannot be read as "verified not merged".
+        // INF-714: non-2xx is NOT an authoritative answer — mark this URL
+        // unreachable (so it cannot be read as "verified not merged") and leave
+        // `reachable` untouched.
+        anyUnreachable = true;
         log.warn(`INF-132: GitHub API returned ${res.status} for ${owner}/${repo}#${number} — skipping GitHub verification (falling back to Linear metadata)`);
         continue;
       }
@@ -2601,15 +2625,17 @@ async function verifyPrMergeStateViaGitHub(prUrls: string[]): Promise<{ merged: 
       const prData = (await res.json()) as GitHubPrResponse;
       if (prData.merged === true) {
         log.info(`INF-132: GitHub API confirmed PR ${owner}/${repo}#${number} is merged, overriding stale Linear metadata`);
-        return { merged: true, mergeSha: prData.merge_commit_sha ?? null, reachable: true };
+        return { merged: true, mergeSha: prData.merge_commit_sha ?? null, reachable: true, anyUnreachable };
       }
     } catch (err) {
+      // INF-714: a thrown network error is unreachable, not "verified not merged".
+      anyUnreachable = true;
       const msg = err instanceof Error ? err.message : String(err);
       log.warn(`INF-132: GitHub API fetch failed for ${owner}/${repo}#${number}: ${msg} — skipping GitHub verification (falling back to Linear metadata)`);
       continue;
     }
   }
-  return { merged: false, mergeSha: null, reachable };
+  return { merged: false, mergeSha: null, reachable, anyUnreachable };
 }
 
 /**
