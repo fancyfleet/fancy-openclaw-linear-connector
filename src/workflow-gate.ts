@@ -41,6 +41,7 @@ import { componentLogger, createLogger, type Logger } from "./logger.js";
 import { defaultWorkflowDefPath } from "./instance-config.js";
 import { bodyHasCapability, resolveBodiesForRole, resolveBodiesWithCapability, isBodyKnown, isRoleDeclared, isSyntheticNoBodyRole } from "./escalation-gate.js";
 import { probeDeployOutcome } from "./deploy-probe.js";
+import { parseDemoWalkMarker, verifyDemoWalkEvidence } from "./demo-walk-evidence.js";
 import { isTerminalIssueState } from "./linear-actionable.js";
 import type { ObservationStore } from "./store/observation-store.js";
 import { recordObservation } from "./store/observation-write-path.js";
@@ -122,6 +123,13 @@ export interface WorkflowTransition {
   requires_capability_statement?: boolean;
   /** INF-359: validation approval gate; ticket description must carry passed demonstration-walk evidence. */
   requires_demonstration_walk?: boolean;
+  /** LIF-263: live demonstration-walk gate. Unlike requires_demonstration_walk
+   *  (a self-attested description marker), this requires a real, passing, recent
+   *  demonstration-walk *artifact* attached to the ticket by the deploy role's
+   *  run_demo_walk wrapper (LIF-264) — the live evidence ac-validate's
+   *  container-isolated validator cannot produce. Per-ticket opt-in via the
+   *  `Demo-walk-script:` / `Demo-walk-required:` markers. */
+  requires_demonstration_walk_artifact?: boolean;
   /** Matt directive 2026-07-12: opt-in designated-approver semantics. When true
    *  (and requires_capability is set), a caller holding that capability may fire
    *  THIS transition without being the ticket's delegate — how a def nominates a
@@ -3714,6 +3722,50 @@ export async function checkWorkflowRules(
                `(Running: ${probe.runningCommit ?? 'unknown'}, Expected: ${expectedCommit})`;
       }
       log.info(`workflow-gate: deploy-probe SUCCEEDED for ${issueId}`);
+    }
+  }
+
+  // LIF-263: Live demonstration-walk gate.
+  // The dev-impl `deploy → ac-validate` edge may require a real, passing,
+  // recent demonstration-walk artifact — the live evidence ac-validate's
+  // container-isolated validator structurally cannot produce against the
+  // loopback-only LifeOS app. The deploy role runs the walk on the host
+  // (run_demo_walk, LIF-264) and attaches the bundle; this gate CHECKS that
+  // finished evidence — it never generates it.
+  //
+  // Per-ticket opt-in: only tickets whose ACs need a live walk carry a
+  // `Demo-walk-script:` marker (or `Demo-walk-required: true`). Absent a marker,
+  // the ticket needs no live walk and the gate fails open (library bumps,
+  // pure-logic fixes). `Demo-walk-required: true` with no script named fails
+  // loudly — never a silent pass.
+  if (match.requires_demonstration_walk_artifact && !breakGlassOverride) {
+    const { description, fetchFailed } = await fetchIssueDescription(issueId, authToken);
+    if (fetchFailed) {
+      log.warn(`workflow-gate: demo-walk-artifact gate: ${intent} on ${issueId} could not fetch description`);
+      return (
+        `[Proxy] '${intent}' blocked: unable to fetch the ticket description to check for a required demonstration walk. ` +
+        `Retry once Linear is readable, or use break-glass if a steward intentionally needs to override.`
+      );
+    }
+    const marker = parseDemoWalkMarker(description);
+    if (!marker.required) {
+      log.info(`workflow-gate: demo-walk-artifact gate: ${intent} on ${issueId} — no Demo-walk-script marker; ticket needs no live walk, passing`);
+    } else if (marker.explicitRequire && !marker.scriptPath) {
+      log.warn(`workflow-gate: demo-walk-artifact gate: ${intent} on ${issueId} — Demo-walk-required:true but no Demo-walk-script: named`);
+      return (
+        `[Proxy] '${intent}' blocked: this ticket declares 'Demo-walk-required: true' but names no walk script. ` +
+        `Add a 'Demo-walk-script: <repo-relative-path>' line so the deploy role can run it, then re-run the walk.`
+      );
+    } else {
+      const evidence = await verifyDemoWalkEvidence({ issueId, authToken });
+      if (!evidence.ok) {
+        log.warn(`workflow-gate: demo-walk-artifact gate FAILED for ${issueId}: ${evidence.reason}`);
+        return (
+          `[Proxy] '${intent}' blocked: demonstration-walk evidence check failed. ${evidence.reason}. ` +
+          `(script: ${marker.scriptPath ?? "unspecified"})`
+        );
+      }
+      log.info(`workflow-gate: demo-walk-artifact gate SUCCEEDED for ${issueId} (exit=${evidence.exitCode}, sha=${evidence.sha}, attached=${evidence.attachedAt})`);
     }
   }
 

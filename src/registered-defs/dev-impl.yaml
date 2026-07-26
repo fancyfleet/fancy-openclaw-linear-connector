@@ -221,6 +221,13 @@ states:
         generic: continue
         requires_capability: infra:ssh
         requires_deploy_probe: true
+        # LIF-263: after the image is rolled + /health confirmed (deploy-probe),
+        # a ticket whose ACs need a live walk (carries a `Demo-walk-script:`
+        # marker) must have a passing, recent demonstration-walk artifact
+        # attached by the deploy role's run_demo_walk wrapper (LIF-264) before
+        # advancing to ac-validate. Fails open for tickets with no marker; fails
+        # loudly for a marked ticket with missing/failed/stale evidence.
+        requires_demonstration_walk_artifact: true
         requires_human_signoff_above_stakes: true   # H-7 (AI-1482): high-stakes release needs human sign-off
         assign: { mode: auto }     # ac-validate steward is singleton (Astrid) — auto-assign
       - command: reject
