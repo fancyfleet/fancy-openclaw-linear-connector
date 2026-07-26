@@ -154,6 +154,16 @@ export interface WorkflowTransition {
    *  dev-sprint `converge` → done edge: a governed completion move that cannot
    *  fire while any tracked work is still in flight. Read-failure fails closed. */
   requires_children_terminal?: boolean;
+  /** INF-758: if true, this transition is only legal when at least one child of
+   *  the ticket is a COMPLETED implementation child — a child carrying an
+   *  implementation workflow label (`wf:dev-impl` or `wf:task`) in a terminal
+   *  state. Closes the LIF-291 false-Done hole: a dev-sprint `converge` → done
+   *  fired from `ac-definition` (or any converge edge) whose only terminal
+   *  children were scoping/design arms (`wf:sprint-arm-*`) satisfies
+   *  `requires_children_terminal` vacuously — every arm is Done, but nothing was
+   *  ever implemented. This gate makes convergence structurally impossible
+   *  without shipped, completed implementation. Read-failure fails closed. */
+  requires_implementation_child?: boolean;
   /** Generic transition role: 'continue' maps to `linear continue-workflow`, 'revision' maps to `linear request-revision`. */
   generic?: 'continue' | 'revision';
 }
@@ -319,6 +329,17 @@ let _registryCache: Map<string, WorkflowDef> | null = null;
 
 const REQUIRED_COMMITMENT_EXITS = ["accept", "reject", "not-ready"] as const;
 const COMMITMENT_EXIT_OUTCOME = "commitment-exit-recorded" as const;
+
+/**
+ * INF-758: workflow labels that mark a child as an IMPLEMENTATION arm of a
+ * dev-sprint — a child that actually ships code, as opposed to a scoping/design
+ * arm (`wf:sprint-arm-*`) or an integration-verify child. A dev-sprint's
+ * `converge` → done edge requires at least one COMPLETED child from this set
+ * (see `requires_implementation_child`). Sourced from dev-sprint.yaml's
+ * `spawn-impl` fanout (`child_workflow: wf:dev-impl`) and the ac-definition
+ * spec, which enumerates impl tickets as "wf:dev-impl or wf:task".
+ */
+const IMPLEMENTATION_CHILD_WORKFLOW_LABELS = new Set(["wf:dev-impl", "wf:task"]);
 
 let _commitmentActivityObserverRegistered = false;
 let _lastCommitmentAutoAccept: {
@@ -3821,39 +3842,74 @@ export async function checkWorkflowRules(
     }
   }
 
-  // INF-504: children-terminal gate for the dev-sprint `converge` → done edge.
-  // A governed completion move that is only legal when the acceptance walk is
-  // already satisfied — every child terminal, and at least one child exists so
-  // an empty sprint cannot silently converge. This is what makes `converge` a
-  // real terminal edge (unlike cancel/abandon → cancelled): it proves the
-  // tracked work shipped rather than asserting it. Break-glass bypasses (a
+  // INF-504 / INF-758: children-terminal + implementation-child gates for the
+  // dev-sprint `converge` → done edge. Both read the same child set, so the
+  // barrier is evaluated ONCE and both gates share it — a second read could see
+  // a different set and let the two gates disagree. Break-glass bypasses both (a
   // steward may force it). Read-failure fails closed — an unreadable child set
   // is NOT "no children" (INF-34), so we hold rather than complete on a guess.
-  if (match.requires_children_terminal && !breakGlassOverride) {
+  if (
+    (match.requires_children_terminal || match.requires_implementation_child) &&
+    !breakGlassOverride
+  ) {
     const barrier = await evaluateBarrier(issueId, authToken);
     if (barrier.readFailed) {
-      log.warn(`workflow-gate: children-terminal gate: ${intent} on ${issueId} — child set unreadable, failing closed`);
+      log.warn(`workflow-gate: converge gate: ${intent} on ${issueId} — child set unreadable, failing closed`);
       return (
         `[Proxy] '${intent}' blocked: unable to read the ticket's children to confirm the acceptance walk is complete. ` +
         `Retry once Linear is readable, or use break-glass if a steward intentionally needs to override.`
       );
     }
-    if (barrier.totalChildren === 0) {
-      log.warn(`workflow-gate: children-terminal gate: ${intent} on ${issueId} — zero children, refusing vacuous convergence`);
-      return (
-        `[Proxy] '${intent}' blocked: this ticket has no children, so there is no completed work to converge on. ` +
-        `A terminal completion edge requires at least one delivered child. Use a normal forward transition, or cancel if the sprint is being abandoned.`
-      );
+
+    // INF-504: children-terminal gate. A governed completion move that is only
+    // legal when the acceptance walk is already satisfied — every child terminal,
+    // and at least one child exists so an empty sprint cannot silently converge.
+    // This is what makes `converge` a real terminal edge (unlike cancel/abandon →
+    // cancelled): it proves the tracked work shipped rather than asserting it.
+    if (match.requires_children_terminal) {
+      if (barrier.totalChildren === 0) {
+        log.warn(`workflow-gate: children-terminal gate: ${intent} on ${issueId} — zero children, refusing vacuous convergence`);
+        return (
+          `[Proxy] '${intent}' blocked: this ticket has no children, so there is no completed work to converge on. ` +
+          `A terminal completion edge requires at least one delivered child. Use a normal forward transition, or cancel if the sprint is being abandoned.`
+        );
+      }
+      if (!barrier.allTerminal) {
+        const inFlight = barrier.totalChildren - barrier.terminalCount;
+        log.warn(`workflow-gate: children-terminal gate: ${intent} on ${issueId} — ${inFlight}/${barrier.totalChildren} children not terminal (orphaned=${barrier.orphanedCount})`);
+        return (
+          `[Proxy] '${intent}' blocked: ${barrier.terminalCount}/${barrier.totalChildren} children are terminal ` +
+          `(${inFlight} still in flight, ${barrier.orphanedCount} orphaned). ` +
+          `The acceptance walk is not yet satisfied — '${intent}' completes the sprint only when every child is Done. ` +
+          `Finish or resolve the outstanding children first.`
+        );
+      }
     }
-    if (!barrier.allTerminal) {
-      const inFlight = barrier.totalChildren - barrier.terminalCount;
-      log.warn(`workflow-gate: children-terminal gate: ${intent} on ${issueId} — ${inFlight}/${barrier.totalChildren} children not terminal (orphaned=${barrier.orphanedCount})`);
-      return (
-        `[Proxy] '${intent}' blocked: ${barrier.terminalCount}/${barrier.totalChildren} children are terminal ` +
-        `(${inFlight} still in flight, ${barrier.orphanedCount} orphaned). ` +
-        `The acceptance walk is not yet satisfied — '${intent}' completes the sprint only when every child is Done. ` +
-        `Finish or resolve the outstanding children first.`
+
+    // INF-758: implementation-child gate. `requires_children_terminal` alone is
+    // satisfied VACUOUSLY when the only terminal children are scoping/design arms
+    // (`wf:sprint-arm-*`) — every arm Done, but nothing implemented. That is
+    // exactly how LIF-291 reached `done` from `ac-definition`: its three scope
+    // arms were terminal, so converge passed and skipped implementation +
+    // validation entirely. Require at least one COMPLETED implementation child
+    // (`wf:dev-impl`/`wf:task` in a terminal state) so convergence is impossible
+    // without shipped code that ran its own AC/validation gate to `done`.
+    if (match.requires_implementation_child) {
+      const completedImplChildren = barrier.children.filter(
+        (c) =>
+          c.isTerminal &&
+          c.labels.some((l) => IMPLEMENTATION_CHILD_WORKFLOW_LABELS.has(l)),
       );
+      if (completedImplChildren.length === 0) {
+        const implLabels = [...IMPLEMENTATION_CHILD_WORKFLOW_LABELS].join(", ");
+        log.warn(`workflow-gate: implementation-child gate: ${intent} on ${issueId} — no completed implementation child among ${barrier.totalChildren} children, refusing false-Done`);
+        return (
+          `[Proxy] '${intent}' blocked: a dev-sprint cannot converge to done without a completed implementation child. ` +
+          `None of this ticket's ${barrier.totalChildren} children is a terminal implementation ticket (${implLabels}) — ` +
+          `the terminal children look like scoping/design arms, so no code was implemented or validated. ` +
+          `Spawn the implementation arm and let it reach done first, or use break-glass if a steward intentionally needs to override.`
+        );
+      }
     }
   }
 

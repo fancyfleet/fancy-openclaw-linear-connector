@@ -1,6 +1,6 @@
-# dev-sprint — Sprint Execution Workflow (v11)
+# dev-sprint — Sprint Execution Workflow (v12)
 # owner: steward (Astrid), engine (spawn-arms, spawn-impl)
-# last-updated: 2026-07-22
+# last-updated: 2026-07-26
 # status: v8 deployed to production (INF-359 sprint coherence)
 #
 # v5 (2026-07-21): added `cancelled` terminal state — explicit sprint
@@ -35,6 +35,16 @@
 #   break-glass `escape` (loops to intake, re-spawning arms), so `converge → done`
 #   was never reachable. Same children-terminal + attestation gate. Live victim:
 #   LSO-1 (impl children LSO-5/6/7 all Done, wedged at spawn-impl for 2 days).
+# v12 (2026-07-26): added `requires_implementation_child: true` to all three
+#   `converge` → done edges (ac-definition, spawn-impl, managing-impl) — INF-758.
+#   `requires_children_terminal` alone is satisfied VACUOUSLY when the only
+#   terminal children are scoping/design arms (`wf:sprint-arm-*`): every arm Done,
+#   nothing implemented. That is how LIF-291 reached `done` from `ac-definition`
+#   (3 scope arms terminal → converge passed) skipping implementation + validation,
+#   and auto-advanced parent LIF-45 `managing → releasing` on an empty increment.
+#   The new gate requires >=1 COMPLETED implementation child (`wf:dev-impl`/`wf:task`
+#   in a terminal state) so convergence is structurally impossible without shipped
+#   code that ran its own AC/validation gate to done. Break-glass still bypasses.
 #
 # Registered-def copy for CI conformance validation (INF-42). The canonical
 # source is the vault markdown spec at:
@@ -50,7 +60,7 @@
 #   → 5. ac-definition → 6. spawn-impl → 7. managing-impl → 8. validation → done
 
 id: dev-sprint
-version: 11
+version: 12
 archetype: orchestrator
 entry_state: intake
 
@@ -157,6 +167,10 @@ states:
       - command: converge
         to: done
         requires_children_terminal: true
+        # INF-758: converge is a false-Done hole unless a real impl child shipped.
+        # requires_children_terminal is satisfied vacuously by scope/design arms
+        # (wf:sprint-arm-*) — the LIF-291 defect. Require >=1 COMPLETED impl child.
+        requires_implementation_child: true
         requires_comment: true
 
   - id: spawn-impl
@@ -196,6 +210,10 @@ states:
       - command: converge
         to: done
         requires_children_terminal: true
+        # INF-758: converge is a false-Done hole unless a real impl child shipped.
+        # requires_children_terminal is satisfied vacuously by scope/design arms
+        # (wf:sprint-arm-*) — the LIF-291 defect. Require >=1 COMPLETED impl child.
+        requires_implementation_child: true
         requires_comment: true
 
   - id: managing-impl
@@ -216,6 +234,10 @@ states:
       - command: converge
         to: done
         requires_children_terminal: true
+        # INF-758: converge is a false-Done hole unless a real impl child shipped.
+        # requires_children_terminal is satisfied vacuously by scope/design arms
+        # (wf:sprint-arm-*) — the LIF-291 defect. Require >=1 COMPLETED impl child.
+        requires_implementation_child: true
         requires_comment: true
 
   - id: validation
