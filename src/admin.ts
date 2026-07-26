@@ -29,6 +29,7 @@ import { recaptureAc } from "./ac-record-store.js";
 import type { MutationAuditStore } from "./store/mutation-audit-store.js";
 import { getStatus as getConfigHealthStatus } from "./config-health.js";
 import { getRegistryPolicyStatus } from "./registry-policy.js";
+import { runFixtureDriftCheck } from "./fixture-drift-detector.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 import { runDelegationReconciliationSweep } from "./delegation-reconciliation-sweep.js";
 import { getAlertBus } from "./alerts/alert-bus.js";
@@ -530,7 +531,18 @@ export function createAdminRouter(deps: AdminDeps): Router {
         res.status(422).json({ ok: false, diagnostics: result.diagnostics });
         return;
       }
-      res.json({ ok: true, registry: result.registry });
+      const fixtureDrift = await runFixtureDriftCheck();
+      if (!fixtureDrift.healthy || !fixtureDrift.gate.healthy) {
+        deps.operationalEventStore?.append({
+          outcome: "fixture-drift-non-green",
+          type: "workflow-defs-reload",
+          key: "fixtureDrift",
+          errorSummary: `fixtureDrift non-green: ${fixtureDrift.drifted}/${fixtureDrift.total} workflow def(s) refused`,
+          detail: { fixtureDrift },
+          plane: "connector",
+        });
+      }
+      res.json({ ok: true, registry: result.registry, fixtureDrift });
     } catch (err) {
       res.status(502).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
     }

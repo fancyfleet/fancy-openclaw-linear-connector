@@ -180,18 +180,39 @@ fi
   echo "        health check (http://127.0.0.1:3100/health)…"
   for i in $(seq 1 15); do
     sleep 2
-    if curl -sf --max-time 3 http://127.0.0.1:3100/health >/dev/null 2>&1; then
+    HEALTH_JSON=$(curl -sf --max-time 3 http://127.0.0.1:3100/health 2>/dev/null) || HEALTH_JSON=
+    if [ -n "$HEALTH_JSON" ]; then
       SHARED_WT=$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null)@$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)
+      # INF-775: release verification treats fixtureDrift.healthy and
+      # fixtureDrift.gate.healthy as non-green DRIFT/GATE blockers before OK.
       # AI-2357: a 200 from /health only proves *something* is listening — it was
       # possible for a deploy to report OK while the live process ran different
       # code (stale stamp, failed swap). Assert the running process reports the
       # commit we just shipped, so RESULT: OK is a verified claim, not a hope.
-      LIVE_COMMIT=$(curl -sf --max-time 3 http://127.0.0.1:3100/health 2>/dev/null \
-        | sed -n 's/.*"commit":"\([^"]*\)".*/\1/p')
+      LIVE_COMMIT=$(printf '%s' "$HEALTH_JSON" | sed -n 's/.*"commit":"\([^"]*\)".*/\1/p')
       case "$LIVE_COMMIT" in
         "$DEPLOY_COMMIT"*)
+          if ! printf '%s' "$HEALTH_JSON" | node -e '
+            let body = "";
+            process.stdin.on("data", (chunk) => { body += chunk; });
+            process.stdin.on("end", () => {
+              try {
+                const health = JSON.parse(body);
+                const fixtureDrift = health.fixtureDrift;
+                process.exit(fixtureDrift?.healthy === true && fixtureDrift?.gate?.healthy === true ? 0 : 1);
+              } catch {
+                process.exit(1);
+              }
+            });
+          '; then
+            echo "RESULT: FIXTURE_DRIFT_NON_GREEN — /health.fixtureDrift or fixtureDrift.gate is not healthy."
+            echo "        The service restarted, but release verification refuses green until fixture drift is clean."
+            echo "        Check /health.fixtureDrift and connector fixture sync before treating this deploy as complete."
+            exit 4
+          fi
           echo "RESULT: OK — deployed $DEPLOY_REF @ $DEPLOY_COMMIT, healthy after $((i*2))s ($(date -Is))"
           echo "        verified: /health reports commit $LIVE_COMMIT"
+          echo "        verified: /health.fixtureDrift.healthy and /health.fixtureDrift.gate.healthy are true"
           echo "        shared working tree UNTOUCHED: $SHARED_WT"
           exit 0
           ;;
