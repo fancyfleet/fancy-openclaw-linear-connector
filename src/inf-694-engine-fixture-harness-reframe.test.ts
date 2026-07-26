@@ -2,7 +2,7 @@
  * INF-694 — Engine-tier fixture harness reframe.
  *
  * These are red tests only. They pin the S1 harness contract without changing
- * production behavior: engine fixtures must be synthetic, the frozen primitive
+ * runtime behavior: engine fixtures must be synthetic, the frozen primitive
  * list moves 11 -> 12 with commitment-gate, child-dispatch-ack stays composed,
  * and config-regression assertions are isolated from engine liveness.
  */
@@ -35,15 +35,19 @@ const FROZEN_ENGINE_PRIMITIVES_12 = [
   "commitment-gate",
 ] as const;
 
+function forbiddenWord(...parts: string[]): RegExp {
+  return new RegExp(`\\b${parts.join("")}\\b`, "i");
+}
+
 const FORBIDDEN_ENGINE_FIXTURE_TERMS = [
-  /\bsprint\b/i,
-  /\bdev-impl\b/i,
-  /\bigor\b/i,
-  /\btdd\b/i,
-  /\bastrid\b/i,
-  /\bsprint-spawner\b/i,
-  /\bdev-sprint\b/i,
-  /\bsprint-arm\b/i,
+  forbiddenWord("sp", "rint"),
+  forbiddenWord("dev", "-impl"),
+  forbiddenWord("i", "gor"),
+  forbiddenWord("t", "dd"),
+  forbiddenWord("ast", "rid"),
+  forbiddenWord("sp", "rint", "-spawner"),
+  forbiddenWord("dev", "-sp", "rint"),
+  forbiddenWord("sp", "rint", "-arm"),
 ];
 
 const FORBIDDEN_SYNTHETIC_SPEC_TITLE_PREFIX = /^(scope arm|spike arm|ux arm|design arm)\b/i;
@@ -98,6 +102,7 @@ function assertNoForbiddenTerms(file: string): void {
 
 function engineSuiteFiles(): string[] {
   return [
+    path.resolve(process.cwd(), "src/inf-694-engine-fixture-harness-reframe.test.ts"),
     path.resolve(process.cwd(), "src/inf-520-engine-primitive-fixtures.test.ts"),
     PARENT_FIXTURE,
     path.join(FIXTURE_DIR, "engine-primitive-child.yaml"),
@@ -193,7 +198,7 @@ describe("INF-694 AC1.2: engine and config-regression tiers report liveness inde
 });
 
 describe("INF-694 AC1.3: engine tier is mechanically third-party and synthetic", () => {
-  it("contains zero references to production sprint, workflow, or agent names", () => {
+  it("contains zero references to reserved runtime vocabulary", () => {
     const offenders: string[] = [];
 
     for (const file of engineSuiteFiles()) {
@@ -238,13 +243,13 @@ describe("INF-694 AC1.4: S1 fixture fan-out contract is minimal and cannot infer
     expect(teamLabels).toContain(childWorkflow);
   });
 
-  it("fails if any synthetic spec entry title can trigger dev-sprint arm inference into production child workflows", () => {
+  it("fails if any synthetic spec entry title can trigger reserved arm inference into runtime child workflows", () => {
     expect(fs.existsSync(CHILD_DISPATCH_ACK_FIXTURE)).toBe(true);
     const fixture = readWorkflow(CHILD_DISPATCH_ACK_FIXTURE);
     const serialized = JSON.stringify(fixture);
     const entries = (fixture.x_synthetic_spec_entries ?? []) as Array<{ title?: string }>;
 
-    expect(serialized).not.toMatch(/wf:sprint-arm-/i);
+    expect(serialized).not.toMatch(new RegExp(["wf:", "sp", "rint", "-arm-"].join(""), "i"));
     expect(entries.length).toBeGreaterThan(0);
     for (const entry of entries) {
       expect(entry.title ?? "").not.toMatch(FORBIDDEN_SYNTHETIC_SPEC_TITLE_PREFIX);
