@@ -77,6 +77,7 @@ RUN VERSION=$(node -p "require('./package.json').dependencies['better-sqlite3'].
 RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --from=builder /app/dist/ dist/
+COPY --from=builder /app/src/registered-defs/ dist/registered-defs/
 COPY --from=web-builder /app/web/dist/ web/dist/
 
 # Create non-root user and ensure data dir exists

@@ -90,6 +90,7 @@ import { DispatchRecordStore } from "./liveness-channel/dispatch-record-store.js
 import { LivenessChannelEndpoint } from "./liveness-channel/index.js";
 import { SessionHealthProbe } from "./liveness-channel/session-health.js";
 import { TurnLivenessProbe } from "./liveness-channel/turn-liveness.js";
+import { reconcileBootWorkflowRegistry } from "./boot-workflow-registry-reconcile.js";
 import type { StaleSessionDetail } from "./bag/session-tracker.js";
 import crypto from "crypto";
 import path from "path";
@@ -1750,6 +1751,21 @@ if (isEntryPoint) {
   }
 
   log.info(`Starting connector [${DEPLOYMENT_NAME}] with ${agents.length} agent(s): ${agents.map((a) => a.name).join(", ")}`);
+
+  try {
+    await reconcileBootWorkflowRegistry();
+  } catch (err) {
+    const msg = `Fatal: boot workflow registry reconcile failed: ${err instanceof Error ? err.message : String(err)}`;
+    log.error(msg);
+    notify({
+      severity: "critical",
+      source: "workflow-def",
+      title: "Connector refusing to start — workflow registry reconcile failed",
+      detail: msg,
+      dedupKey: "workflow-def|boot-reconcile-failed",
+    });
+    process.exit(1);
+  }
 
   // AI-1848 (Pillar 2 D1): load the universal policy canon at bootstrap so
   // /health can report liveness immediately (fail-open: missing file is a
