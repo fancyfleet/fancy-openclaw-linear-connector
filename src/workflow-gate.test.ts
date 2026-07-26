@@ -1227,6 +1227,99 @@ describe("applyStateTransition — AI-1490: idempotency re-stamp when label is m
   });
 });
 
+describe("applyStateTransition — INF-728: handoff self-loop delegate write (runtime intent 'handoff')", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  // Regression guard for INF-728. Commit a45f435d (INF-570) narrowed the second
+  // INF-124 handoff self-loop guard in applyStateTransition from
+  //   `intent === "handoff"`  to  `intent === "handoff-work"`.
+  // But the runtime intent for the CLI `handoff-work` / `consider-work` verbs is
+  // "handoff", not "handoff-work" (see the toStateName self-loop branch at
+  // workflow-gate.ts, `else if (intent === "handoff")`, and the sibling
+  // checkWorkflowRules guard which still matches both). So the narrowed guard went
+  // dead: a handoff on a ticket already in its current workflow state — the NORMAL
+  // case, since handoff is a delegate-only self-loop — fell into the idempotency
+  // `already-in-state → noop` branch and the requested delegate was silently never
+  // written. That broke consider-work / handoff-work delegate routing fleet-wide
+  // (INF-697 reroute to Igor, a regular agent; LSO-25 self-delegate to Astrid, an
+  // app-user; both read back null).
+  //
+  // The fix re-enables the fall-through for the "handoff" runtime intent, but GATES
+  // it on a delegate actually being supplied (proxy delegateOverride or an explicit
+  // --target / cliTarget), so a bare handoff that names no delegate still no-ops
+  // cleanly (preserving the AI-2115 idempotency contract) and never nulls the
+  // existing delegate with an unresolved write. The prior INF-124 coverage keyed on
+  // "handoff-work" and so never caught the value mismatch — these tests pin the real
+  // runtime intent "handoff".
+  it("writes the delegate on a handoff self-loop when the ticket is already in its current state", async () => {
+    process.env.WORKFLOW_DEFS_DIR = path.resolve(process.cwd(), "src/__fixtures__");
+    resetWorkflowCache();
+    try {
+      const { fetch: mock, calls } = makeTransitionFetch({
+        issueLabels: [
+          { id: "wf-lbl", name: "wf:task" },
+          { id: "state-lbl", name: "state:doing" },
+          { id: "other-lbl", name: "priority:high" },
+        ],
+        teamLabels: [{ id: "doing-lbl", name: "state:doing" }],
+      });
+      globalThis.fetch = mock;
+
+      // delegateOverride mirrors the proxy pre-resolving the handoff target before
+      // forwarding — the value that must land as the new delegate.
+      const result = await applyStateTransition("handoff", "issue-uuid", "Bearer tok", {
+        delegateOverride: "new-delegate-uuid",
+      });
+
+      // The a45f435d regression short-circuits here with an idempotent no-op.
+      expect(result).not.toMatchObject({ status: "noop", code: "already-in-state" });
+
+      // The delegate write must actually fire, carrying the requested delegate.
+      const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+      expect(updateCall).toBeDefined();
+      const vars = updateCall!.body.variables as { delegateId?: string; labelIds: string[] };
+      expect(vars.delegateId).toBe("new-delegate-uuid");
+      // Self-loop: the workflow state stays 'doing'.
+      expect(result.to).toBe("doing");
+    } finally {
+      delete process.env.WORKFLOW_DEFS_DIR;
+      resetWorkflowCache();
+    }
+  });
+
+  // Pins the delegate gate: a "handoff" runtime intent with NO delegate supplied
+  // (no delegateOverride, no cliTarget) must still no-op — the fix must not
+  // over-broaden into an unconditional fall-through, which would issue a
+  // delegate-less atomic write on every idempotent handoff and risk nulling the
+  // live delegate (the "nulled the existing delegate as a side effect" symptom in
+  // the INF-728 report). Mirrors the AI-2115 "still no-ops cleanly" contract.
+  it("still no-ops a handoff self-loop when no delegate is supplied (no override, no target)", async () => {
+    process.env.WORKFLOW_DEFS_DIR = path.resolve(process.cwd(), "src/__fixtures__");
+    resetWorkflowCache();
+    try {
+      const { fetch: mock, calls } = makeTransitionFetch({
+        issueLabels: [
+          { id: "wf-lbl", name: "wf:task" },
+          { id: "state-lbl", name: "state:doing" },
+        ],
+        teamLabels: [{ id: "doing-lbl", name: "state:doing" }],
+      });
+      globalThis.fetch = mock;
+
+      const result = await applyStateTransition("handoff", "issue-uuid", "Bearer tok");
+
+      expect(result).toMatchObject({ status: "noop", code: "already-in-state" });
+      const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+      expect(updateCall).toBeUndefined();
+    } finally {
+      delete process.env.WORKFLOW_DEFS_DIR;
+      resetWorkflowCache();
+    }
+  });
+});
+
 describe("applyStateTransition — normal state advance", () => {
   let originalFetch: typeof globalThis.fetch;
   beforeEach(() => { originalFetch = globalThis.fetch; });

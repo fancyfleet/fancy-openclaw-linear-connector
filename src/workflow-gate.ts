@@ -5667,8 +5667,31 @@ export async function applyStateTransition(
   // existing entry already holds this same state, and its absence is harmless.
   // INF-124: for handoff self-loop, don't short-circuit — the delegate
   // write (via delegateOverride or the target field in the forwarded mutation
-  // body) must still fire. Skip the idempotency check entirely.
-  if (intent === "handoff-work") {
+  // body) must still fire. Skip the idempotency check entirely: taking this
+  // branch bypasses the whole `else if (currentStateName === toStateName)` block
+  // (idempotency no-op AND re-stamp) and continues to the delegate resolution +
+  // atomic write below, which is the ONLY path that writes the delegate. The
+  // atomic write also strips and re-adds the state:* labels, so any stale label
+  // is cleaned up there too.
+  //
+  // INF-728: the runtime intent for the CLI handoff-work/consider-work verbs is
+  // "handoff" (proven at the toStateName self-loop branch above — `else if (intent
+  // === "handoff")` — and in live proxy logs), NOT "handoff-work". a45f435d
+  // narrowed this guard to the literal "handoff-work" only, so the real "handoff"
+  // intent fell into the idempotency block below and no-op'd — silently dropping
+  // the requested delegate (INF-697 reroute to Igor; LSO-25 self-delegate to
+  // Astrid). Match "handoff" here too, but GATE it on a delegate actually being
+  // supplied (the proxy's pre-resolved delegateOverride or an explicit --target /
+  // cliTarget, which handoff-work/consider-work always carry). A bare "handoff"
+  // with no delegate must NOT take this branch — it has to fall into the block
+  // below so the AI-2115 stale-label purge stays reachable and a genuinely empty
+  // self-loop still no-ops cleanly instead of issuing an unresolved delegate write
+  // that could null the live delegate. The literal "handoff-work" verb stays
+  // unconditional: its delegate comes from prior-implementer resolution (no
+  // cliTarget/override), so it must reach the write regardless (AI-2595 AC2).
+  const handoffHasDelegate =
+    options?.delegateOverride !== undefined || Boolean(options?.cliTarget);
+  if (intent === "handoff-work" || (intent === "handoff" && handoffHasDelegate)) {
     log.info(`workflow-gate: B2 apply: ${issueId} handoff self-loop at state '${toStateName}' — continuing to delegate write`);
   } else if (currentStateName === toStateName) {
     const targetLabelName = `state:${toStateName}`;
@@ -5702,8 +5725,15 @@ export async function applyStateTransition(
         );
         return { status: "applied", code: "stale-label-purged", from: currentStateName, to: toStateName };
       }
-      // INF-124: for handoff self-loop, don't short-circuit — the delegate
-      // must be written even though the state label doesn't change.
+      // INF-124 / INF-728: a handoff self-loop that carries a delegate is handled
+      // by the FIRST guard above (it skips this whole block and reaches the
+      // delegate write — "falling through" from HERE would hit the re-stamp path
+      // below, which writes labels only and never the delegate). The only handoff
+      // that reaches this point is one with NO delegate to write, so it must
+      // no-op cleanly (AI-2115 "still no-ops cleanly when the target label is the
+      // only state:* label"). Keep the literal-"handoff-work" branch as a defensive
+      // fall-through — that verb is normally caught by the first guard, but if it
+      // ever reaches here it should still not short-circuit a delegate write.
       if (intent === "handoff-work") {
         log.info(
           `workflow-gate: B2 apply: ${issueId} handoff self-loop at state '${toStateName}' — continuing to delegate write`,
