@@ -96,11 +96,21 @@ describe("AI-2095: wf:task completion path + recoverable break-glass", () => {
   });
 
   it.each([
+    ["intake", "request-changes"],
     ["review", "request-changes"],
     ["sign-off", "reject"],
   ])("request-revision from '%s' resolves to '%s'", async (state, expected) => {
     const result = await resolveMetaIntent("request-revision", ISSUE_ID, TOKEN, state);
     expect(result).toEqual({ resolved: expected });
+  });
+
+  it("intake request-revision is an explicit worker-target recovery edge", async () => {
+    const def = (await loadWorkflowRegistry()).get("task") as WorkflowDef;
+    const intake = def.states.find((s) => s.id === "intake");
+    const revision = intake?.transitions?.find((t) => t.command === "request-changes");
+    expect(revision?.generic).toBe("revision");
+    expect(revision?.to).toBe("doing");
+    expect(revision?.assign?.mode).toBe("required");
   });
 
   it("every non-terminal state has a generic:continue forward edge (no dead ends)", async () => {
