@@ -120,6 +120,13 @@ export interface ReconciliationSweepResult {
 interface EnrolledTicketNativeState {
   state: { id: string; name: string; type: string } | null;
   delegate: { id: string } | null;
+  /**
+   * INF-753: the ticket's live labels, read in the SAME query as delegate+state
+   * so a write-time seat guard can re-check the terminal `state:*` label. Optional
+   * so existing test mocks (which return only state+delegate) are unaffected — a
+   * missing value simply means the label guard has nothing to assert on.
+   */
+  labels?: Array<{ name: string }> | null;
 }
 
 type ReconciliationCandidate = {
@@ -185,6 +192,7 @@ async function queryEnrolledTicketState(
         id
         state { id name type }
         delegate { id }
+        labels { nodes { name } }
       }
     }
   `;
@@ -199,6 +207,7 @@ async function queryEnrolledTicketState(
         issue?: {
           state: { id: string; name: string; type: string } | null;
           delegate: { id: string } | null;
+          labels?: { nodes: Array<{ name: string }> } | null;
         } | null;
       };
     };
@@ -208,6 +217,7 @@ async function queryEnrolledTicketState(
     return {
       state: issue.state,
       delegate: issue.delegate,
+      labels: issue.labels?.nodes ?? null,
     };
   } catch {
     return null;
@@ -458,6 +468,41 @@ async function reconcileTerminalNativeState(
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({ query: mutation, variables: { issueId, stateId: completedStateId } }),
+    });
+    type MResp = { data?: { issueUpdate?: { success: boolean } } };
+    const data = (await res.json()) as MResp;
+    return data.data?.issueUpdate?.success ?? false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * INF-753 (Mode 2 mis-seat heal): clear a stray delegate that was mis-seated onto
+ * a terminal-labeled ticket whose native state is ALREADY terminal. Writes only
+ * `delegateId: null` — it does NOT touch the native state (already completed) or
+ * labels. This is the second half of the mis-seat repair: `reconcileTerminalNativeState`
+ * clears the delegate as a side effect of the native→Done write when the native is
+ * still active, but a mis-seat on an already-Done terminal ticket has no native write
+ * to piggyback on, so the stray owner would otherwise be woken forever.
+ */
+async function clearStrayDelegate(
+  issueId: string,
+  authToken: string,
+  fetchFn: typeof fetch,
+): Promise<boolean> {
+  const mutation = `
+    mutation ClearStrayDelegate($issueId: String!) {
+      issueUpdate(id: $issueId, input: { delegateId: null }) {
+        success
+      }
+    }
+  `;
+  try {
+    const res = await fetchFn(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: mutation, variables: { issueId } }),
     });
     type MResp = { data?: { issueUpdate?: { success: boolean } } };
     const data = (await res.json()) as MResp;
@@ -827,10 +872,43 @@ export async function runBootstrapReconciliationSweep(
     try {
       const stateData = await queryEnrolledTicketState(ticket.id, authToken, fetchFn);
       if (!stateData || !stateData.state) continue;
-      // Already terminal (completed/canceled) → nothing to reconcile. A native-Done
-      // ticket with live labels is Pass 3's job; a canceled ticket must not be
-      // force-completed.
-      if (stateData.state.type === "completed" || stateData.state.type === "canceled") continue;
+
+      // INF-753 (Mode 2 mis-seat heal): a terminal-labeled ticket whose native
+      // state is ALREADY terminal but which still carries a delegate is a
+      // mis-seat (the LSO-20 shape after a partial native heal). There is no
+      // native write to piggyback the delegate-clear on, so clear the stray
+      // delegate directly — otherwise the mis-seated owner is woken forever on
+      // a finished ticket. A canceled/completed native state is NOT force-moved.
+      if (stateData.state.type === "completed" || stateData.state.type === "canceled") {
+        if (stateData.delegate?.id) {
+          const cleared = await clearStrayDelegate(ticket.id, authToken, fetchFn);
+          if (cleared) {
+            result.healed++;
+            log.info(
+              `bootstrap-reconciliation: cleared stray delegate on terminal-native ticket ${ticket.identifier}` +
+              ` (native ${stateData.state.name}, label state:done; delegate ${stateData.delegate.id} → null)`,
+            );
+            alertBus.notify({
+              severity: "warning",
+              source: "bootstrap-reconciled",
+              title: `Bootstrap reconciliation cleared stray delegate on terminal ticket ${ticket.identifier}`,
+              detail: {
+                mode: "mode-2-misseat-clear",
+                ticket: ticket.identifier,
+                issueId: ticket.id,
+                nativeState: stateData.state.name,
+                clearedDelegate: stateData.delegate.id,
+              },
+              ticket: ticket.identifier,
+            });
+          } else {
+            result.errors.push(`stray-delegate clear mutation failed for ${ticket.identifier}`);
+            log.warn(`bootstrap-reconciliation: stray-delegate clear returned false for ${ticket.identifier}`);
+          }
+        }
+        // Native already terminal — nothing more to reconcile (Pass 3 owns label close).
+        continue;
+      }
 
       const completedStateId = await queryTeamCompletedStateId(ticket.teamId, authToken, fetchFn);
       if (!completedStateId) {
@@ -839,22 +917,30 @@ export async function runBootstrapReconciliationSweep(
         continue;
       }
 
+      // INF-753: `reconcileTerminalNativeState` writes `stateId + delegateId: null`
+      // in one mutation, so this ALSO clears a delegate mis-seated onto a
+      // native-active terminal-labeled ticket (the exact INF-739 wedge shape:
+      // `state:done` label + native `To Do` + delegate Felix → native Done +
+      // delegate null). Mode 2 heals the mis-seat, it does not merely tolerate it.
       const reconciled = await reconcileTerminalNativeState(ticket.id, completedStateId, authToken, fetchFn);
       if (reconciled) {
         result.healed++;
         log.info(
           `bootstrap-reconciliation: reconciled terminal-label ticket ${ticket.identifier}` +
-          ` (native ${stateData.state.name} → completed; label state:done unchanged)`,
+          ` (native ${stateData.state.name} → completed; label state:done unchanged` +
+          (stateData.delegate?.id ? `; mis-seated delegate ${stateData.delegate.id} → null` : "") + `)`,
         );
         alertBus.notify({
           severity: "warning",
           source: "bootstrap-reconciled",
           title: `Bootstrap reconciliation reconciled terminal-label ticket ${ticket.identifier}`,
           detail: {
+            mode: stateData.delegate?.id ? "mode-2-misseat-heal" : "mode-2-native-reconcile",
             ticket: ticket.identifier,
             issueId: ticket.id,
             fromNativeState: stateData.state.name,
             toStateId: completedStateId,
+            clearedDelegate: stateData.delegate?.id ?? null,
           },
           ticket: ticket.identifier,
         });
@@ -911,12 +997,27 @@ export async function runBootstrapReconciliationSweep(
     if (!ownerRole) continue;
 
     try {
-      // Idempotency / race-safety: re-fetch live delegate+state right before the
-      // write. A delegate-change webhook (or a prior sweep) may have seated an
-      // owner between the batch query and now — if so, this pass is a no-op.
+      // Idempotency / race-safety: re-fetch live delegate+state+labels right
+      // before the write. A delegate-change webhook (or a prior sweep) may have
+      // seated an owner between the batch query and now — if so, this pass is a
+      // no-op.
       const live = await queryEnrolledTicketState(ticket.id, authToken, fetchFn);
       if (live?.delegate?.id) continue;
       if (live?.state && (live.state.type === "completed" || live.state.type === "canceled")) continue;
+      // INF-753 (the LSO-20 re-regression): the snapshot `isTerminalStateLabel`
+      // guard above reads the BATCH-QUERY labels, which go stale. The exact live
+      // repro on INF-739: the sweep snapshotted the pre-sign-off shape (active
+      // `state:*`, null delegate), then a governed sign-off flipped the label to
+      // `state:done` before this write landed — and the seat proceeded because the
+      // idempotency re-fetch checked delegate + native state but NOT the label.
+      // Re-check the LIVE terminal label here so a terminal ticket is never seated.
+      if (live?.labels && isTerminalStateLabel(live.labels)) {
+        log.info(
+          `bootstrap-reconciliation: Mode 1 skipping ${ticket.identifier} — live re-fetch shows a terminal ` +
+          `state:* label (raced a sign-off/close since the batch snapshot); no seat on a terminal ticket`,
+        );
+        continue;
+      }
 
       const bodies = await resolveOwnerBodies(ownerRole);
       if (bodies.length === 0) {

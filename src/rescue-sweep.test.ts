@@ -124,6 +124,13 @@ function makeLinearMock(opts: {
     delegateName?: string | null;
     nativeStateName?: string; // deliberately included to verify it is NOT consulted
     updatedAt?: string;
+    /** INF-753: live labels the pre-seat guard re-fetch returns (defaults to snapshot
+     *  `labels` when omitted). Set this DIFFERENT from `labels` to simulate the ticket
+     *  racing to a terminal label between the batch snapshot and the seat write. */
+    liveLabels?: string[];
+    /** INF-753: live delegate the pre-seat guard re-fetch returns (defaults to snapshot
+     *  `delegateId`). Set to simulate another sweep/webhook winning the seat race. */
+    liveDelegateId?: string | null;
   }>;
   updateDelegate?: { success: boolean };
   updateLabels?: { success: boolean };
@@ -157,6 +164,30 @@ function makeLinearMock(opts: {
       }));
       return new Response(
         JSON.stringify({ data: { issues: { nodes } } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    // INF-753: live pre-seat guard re-fetch. Defaults to the snapshot labels/delegate
+    // so existing seat tests pass through unchanged; per-issue live* overrides let a
+    // test simulate the ticket racing to a terminal label (or gaining a delegate)
+    // between the batch snapshot and the seat write.
+    if (query.includes("RescueSeatGuard")) {
+      const vars = (parsed.variables as Record<string, unknown>) ?? {};
+      const id = (vars["id"] as string) ?? "";
+      const iss = (opts.issues ?? []).find((i) => i.id === id);
+      const liveLabels = iss?.liveLabels ?? iss?.labels ?? [];
+      const liveDelegateId =
+        iss?.liveDelegateId !== undefined ? iss.liveDelegateId : (iss?.delegateId ?? null);
+      const issue = iss
+        ? {
+            id: iss.id,
+            delegate: liveDelegateId ? { id: liveDelegateId } : null,
+            labels: { nodes: liveLabels.map((name) => ({ name })) },
+          }
+        : null;
+      return new Response(
+        JSON.stringify({ data: { issue } }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
@@ -517,6 +548,93 @@ describe("AC7 — scenario: dormant ticket gets re-delegated", () => {
     expect(action.identifier).toBe("AI-401");
     expect(action.classification).toBe("dormant");
     expect(action.action).toMatch(/delegat/i);
+  });
+});
+
+describe("INF-753 — live pre-seat guard blocks the stale-snapshot terminal race", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("dormant classification from a stale snapshot: NO seat when the live label raced to state:done", async () => {
+    // The exact INF-739 mechanism: the batch snapshot shows the pre-sign-off
+    // shape (active state:*, null delegate → classified `dormant`), but by the
+    // time the seat write runs the governed sign-off has flipped the label to
+    // state:done. The live pre-seat guard must block the seat.
+    const { fetch: mock, delegateUpdateCalls } = makeLinearMock({
+      issues: [
+        {
+          id: "uuid-race",
+          identifier: "INF-739",
+          labels: ["wf:dev-impl", "state:write-tests"], // snapshot: dormant
+          delegateId: null,
+          liveLabels: ["wf:dev-impl", "state:done"], // live: raced to terminal
+        },
+      ],
+    });
+    globalThis.fetch = mock;
+
+    const result = await runRescueSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: new Map([["dev-impl", { ...TEST_WORKFLOW_DEF }]]),
+      capabilityPolicyPath: writeCapabilityPolicy(),
+    });
+
+    // No delegate mutation — the seat was blocked at the live re-check.
+    expect(delegateUpdateCalls).not.toContain("uuid-race");
+    expect(result.rescued).toBe(0);
+    expect(result.rescues[0]?.outcome).toBe("ambiguous");
+    expect(result.rescues[0]?.action).toMatch(/skipped/i);
+  });
+
+  it("dormant classification, live delegate raced in: NO double-seat", async () => {
+    const { fetch: mock, delegateUpdateCalls } = makeLinearMock({
+      issues: [
+        {
+          id: "uuid-raced-delegate",
+          identifier: "AI-402",
+          labels: ["wf:dev-impl", "state:write-tests"],
+          delegateId: null,
+          liveDelegateId: "someone-else-uuid", // another sweep/webhook won the seat
+        },
+      ],
+    });
+    globalThis.fetch = mock;
+
+    const result = await runRescueSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: new Map([["dev-impl", { ...TEST_WORKFLOW_DEF }]]),
+      capabilityPolicyPath: writeCapabilityPolicy(),
+    });
+
+    expect(delegateUpdateCalls).not.toContain("uuid-raced-delegate");
+    expect(result.rescued).toBe(0);
+    expect(result.rescues[0]?.outcome).toBe("ambiguous");
+  });
+
+  it("still seats when the live label matches the (non-terminal) snapshot — guard is not over-broad", async () => {
+    const { fetch: mock, delegateUpdateCalls } = makeLinearMock({
+      issues: [
+        {
+          id: "uuid-ok",
+          identifier: "AI-403",
+          labels: ["wf:dev-impl", "state:write-tests"],
+          delegateId: null,
+          // no live overrides → live == snapshot (non-terminal, null delegate)
+        },
+      ],
+    });
+    globalThis.fetch = mock;
+
+    const result = await runRescueSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: new Map([["dev-impl", { ...TEST_WORKFLOW_DEF }]]),
+      capabilityPolicyPath: writeCapabilityPolicy(),
+    });
+
+    expect(delegateUpdateCalls).toContain("uuid-ok");
+    expect(result.rescued).toBe(1);
+    expect(result.rescues[0]?.outcome).toBe("rescued");
   });
 });
 

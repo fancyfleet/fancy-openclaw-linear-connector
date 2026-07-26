@@ -350,6 +350,68 @@ async function setDelegate(ticketId: string, delegateId: string, authToken: stri
   }
 }
 
+/** Terminal workflow-label prefixes — a ticket carrying one is lifecycle-finished
+ *  and must NEVER have a delegate seated on it (INF-717 fix A / LSO-20). Mirrors
+ *  the canonical set in classifyTicket and delegation-reconciliation-sweep.ts. */
+const TERMINAL_STATE_LABEL_PREFIXES = ["state:done", "state:escape", "state:canceled"];
+
+/**
+ * INF-753: live pre-seat guard. `classifyTicket` reads the BATCH-QUERY snapshot,
+ * which goes stale — the exact live repro on INF-739: this sweep snapshotted the
+ * pre-sign-off shape (active `state:*`, null delegate → classified `dormant`),
+ * then a governed sign-off flipped the label to `state:done` and cleared the
+ * delegate before the seat write landed, and `rescueDormant` seated a delegate
+ * onto a now-terminal ticket (the LSO-20 re-regression this ticket fixes).
+ *
+ * Re-fetch the LIVE labels + delegate immediately before any role-seat write and
+ * report whether seating is still safe. Blocks the seat when the ticket has since
+ * become terminal-labeled OR already acquired a delegate (another sweep/webhook
+ * won the race). Fails OPEN (allows the seat) only when the ticket cannot be read
+ * back — the snapshot classification is the best evidence we have and refusing
+ * every seat on a transient read error would defeat the sweep's purpose.
+ */
+async function liveSeatBlocked(
+  ticketId: string,
+  authToken: string,
+): Promise<{ blocked: boolean; reason?: string }> {
+  const query = `
+    query RescueSeatGuard($id: String!) {
+      issue(id: $id) {
+        id
+        delegate { id }
+        labels { nodes { name } }
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: ticketId } }),
+    });
+    type Resp = {
+      data?: {
+        issue?: {
+          delegate?: { id: string } | null;
+          labels?: { nodes: Array<{ name: string }> } | null;
+        } | null;
+      };
+    };
+    const data = (await res.json()) as Resp;
+    const issue = data.data?.issue;
+    if (!issue) return { blocked: false }; // unreadable → fail open (snapshot is best evidence)
+    if (issue.delegate?.id) return { blocked: true, reason: "already-delegated" };
+    const labelNames = (issue.labels?.nodes ?? []).map((l) => l.name);
+    const terminal = labelNames.some((n) =>
+      TERMINAL_STATE_LABEL_PREFIXES.some((t) => n.startsWith(t)),
+    );
+    if (terminal) return { blocked: true, reason: "terminal-label" };
+    return { blocked: false };
+  } catch {
+    return { blocked: false }; // read error → fail open
+  }
+}
+
 async function applyLabelIds(ticketId: string, labelIds: string[], authToken: string): Promise<boolean> {
   const mutation = `
     mutation UpdateLabels($id: String!, $labelIds: [String!]!) {
@@ -552,6 +614,20 @@ async function rescueMalformed(
     };
   }
 
+  // INF-753: re-check live state immediately before writing the entry-state label
+  // + seat. A ticket that raced to a terminal label since the batch snapshot must
+  // not be re-bootstrapped into an active state and re-seated (the LSO-20 shape).
+  const guard = await liveSeatBlocked(ticket.id, authToken);
+  if (guard.blocked) {
+    return {
+      ticketId: ticket.id,
+      identifier: ticket.identifier,
+      classification: "malformed",
+      action: `bootstrap skipped — live re-fetch shows ${guard.reason} (raced the batch snapshot); not re-enrolling`,
+      outcome: "ambiguous",
+    };
+  }
+
   const existingIds = ticket.labelNodes.map((n) => n.id);
   const labelOk = await applyLabelIds(ticket.id, [...existingIds, stateLabelUuid], authToken);
 
@@ -593,6 +669,17 @@ async function rescueDormant(
   const candidates = ownerRole ? roleBodiesForRole(ownerRole) : [];
 
   if (candidates.length === 1) {
+    // INF-753: re-check live terminal label / delegate immediately before the seat.
+    const guard = await liveSeatBlocked(ticket.id, authToken);
+    if (guard.blocked) {
+      return {
+        ticketId: ticket.id,
+        identifier: ticket.identifier,
+        classification: "dormant",
+        action: `seat skipped — live re-fetch shows ${guard.reason} (raced the batch snapshot); not seating ${candidates[0]}`,
+        outcome: "ambiguous",
+      };
+    }
     const ok = await setDelegate(ticket.id, candidates[0], authToken);
     return {
       ticketId: ticket.id,
@@ -632,6 +719,19 @@ async function rescueDrifted(
   const candidates = ownerRole ? roleBodiesForRole(ownerRole) : [];
 
   if (candidates.length === 1) {
+    // INF-753: re-check live terminal label immediately before the re-seat. (A
+    // drifted ticket already has a delegate, so `already-delegated` is expected
+    // and must NOT block the correction — only a terminal label blocks here.)
+    const guard = await liveSeatBlocked(ticket.id, authToken);
+    if (guard.blocked && guard.reason === "terminal-label") {
+      return {
+        ticketId: ticket.id,
+        identifier: ticket.identifier,
+        classification: "drifted",
+        action: `re-seat skipped — live re-fetch shows a terminal label (raced the batch snapshot); not seating ${candidates[0]}`,
+        outcome: "ambiguous",
+      };
+    }
     const ok = await setDelegate(ticket.id, candidates[0], authToken);
     return {
       ticketId: ticket.id,
