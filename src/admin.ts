@@ -17,6 +17,7 @@ import type { ObservationStore, ReasonCode, MetricSummary } from "./store/observ
 import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forensics.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
 import { setStateAtomic, loadWorkflowRegistry, resetWorkflowCache, reloadWorkflowDefs } from "./workflow-gate.js";
+import { runFixtureDriftCheck } from "./fixture-drift-detector.js";
 import { instanceConfigRoot } from "./instance-config.js";
 import { retryApply } from "./proposal/apply-pipeline.js";
 import type { ProposalStore } from "./store/proposal-store.js";
@@ -530,7 +531,17 @@ export function createAdminRouter(deps: AdminDeps): Router {
         res.status(422).json({ ok: false, diagnostics: result.diagnostics });
         return;
       }
-      res.json({ ok: true, registry: result.registry });
+      // INF-723: refresh the fixture-drift snapshot after a hot-reload. Without
+      // this, runFixtureDriftCheck() ran only at bootstrap (src/index.ts), so an
+      // operator who hot-reloaded the registry could not re-verify drift without
+      // a full restart — /health.fixtureDrift stayed pinned to the pre-reload
+      // state. Awaited so the response reflects the post-reload drift status.
+      const drift = await runFixtureDriftCheck();
+      res.json({
+        ok: true,
+        registry: result.registry,
+        fixtureDrift: { healthy: drift.healthy, drifted: drift.drifted, total: drift.total },
+      });
     } catch (err) {
       res.status(502).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
     }
