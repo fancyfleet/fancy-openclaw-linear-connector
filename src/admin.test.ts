@@ -1,4 +1,5 @@
 import request from "supertest";
+import { jest } from "@jest/globals";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -41,6 +42,7 @@ describe("admin console", () => {
   let dir: string;
   let webDist: string;
   let appState: ReturnType<typeof createApp>;
+  let restartProcess: jest.Mock;
 
   beforeEach(() => {
     dir = tempDir();
@@ -50,15 +52,18 @@ describe("admin console", () => {
     process.env.AGENTS_FILE = writeAgents(dir);
     process.env.ADMIN_SECRET = ADMIN_SECRET;
     process.env.ADMIN_WEB_DIST = webDist;
+    restartProcess = jest.fn();
     reloadAgents();
     appState = createApp({
       bagDbPath: path.join(dir, "pending-bag.db"),
       agentQueueDbPath: path.join(dir, "agent-queue.db"),
       operationalEventsDbPath: path.join(dir, "operational-events.db"),
+      restartProcess,
     });
   });
 
   afterEach(() => {
+    jest.useRealTimers();
     appState.bag.close();
     appState.sessionTracker.close();
     appState.agentQueue.close();
@@ -89,6 +94,21 @@ describe("admin console", () => {
     expect(viaBearer.status).toBe(200);
     const viaBasic = await adminBasicGet(appState.app, "/admin/api/dashboard");
     expect(viaBasic.status).toBe(200);
+  });
+
+  test("restart endpoint is authenticated and schedules a process restart", async () => {
+    jest.useFakeTimers();
+
+    const unauthorized = await request(appState.app).post("/admin/api/restart");
+    expect(unauthorized.status).toBe(401);
+
+    const res = await request(appState.app).post("/admin/api/restart").set("x-admin-secret", ADMIN_SECRET);
+    expect(res.status).toBe(202);
+    expect(res.body).toMatchObject({ ok: true, service: "fancy-openclaw-linear-connector" });
+    expect(restartProcess).not.toHaveBeenCalled();
+
+    jest.advanceTimersByTime(100);
+    expect(restartProcess).toHaveBeenCalledTimes(1);
   });
 
   test("serves the SPA shell for console routes without auth", async () => {

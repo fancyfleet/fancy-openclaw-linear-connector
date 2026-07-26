@@ -65,6 +65,8 @@ interface AdminDeps {
   mutationAuditStore?: MutationAuditStore;
   /** AI-2039: learning-loop proposal queue + apply-outcome store (C4/C5 console). */
   proposalStore?: ProposalStore;
+  /** Test hook for the scoped admin restart endpoint. Defaults to process.exit(0). */
+  restartProcess?: () => void;
 }
 
 type Severity = "green" | "yellow" | "red" | "gray";
@@ -483,6 +485,18 @@ export function createAdminRouter(deps: AdminDeps): Router {
   // ── Authenticated API ────────────────────────────────────────────────────
   router.use("/api", adminAuth);
   mountStreamRoute(router);
+
+  router.post("/api/restart", (_req: Request, res: Response) => {
+    const scheduledAt = new Date().toISOString();
+    res.status(202).json({
+      ok: true,
+      scheduledAt,
+      service: "fancy-openclaw-linear-connector",
+      message: "Connector restart scheduled; supervisor is expected to restore service.",
+    });
+    const restart = deps.restartProcess ?? (() => process.exit(0));
+    setTimeout(restart, 100).unref();
+  });
 
   router.get("/api/dashboard", (_req: Request, res: Response) => {
     res.json(buildDashboard(deps));

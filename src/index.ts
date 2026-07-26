@@ -241,6 +241,8 @@ export interface CreateAppOptions {
    * live hooks URL. Also used as isTicketActionable bypass when provided.
    */
   sendWakeUp?: (agentId: string, ticketIds: string[]) => Promise<void>;
+  /** Test hook for the admin restart endpoint. Defaults to process.exit(0). */
+  restartProcess?: () => void;
   /** Override DeadLetterQueueStore database path (for testing). */
   deadLetterQueueDbPath?: string;
 }
@@ -1343,7 +1345,7 @@ export function createApp(options?: CreateAppOptions) {
   });
 
   // Management console (Phase 3): React SPA + JSON API, session or secret auth.
-  app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, ackTracker, deploymentName: DEPLOYMENT_NAME, enrolledTicketsStore, forensicsDiagnosticsDir: options?.forensicsDiagnosticsDir, mutationAuditStore, wakeConfigForAgent, proposalStore }));
+  app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, ackTracker, deploymentName: DEPLOYMENT_NAME, enrolledTicketsStore, forensicsDiagnosticsDir: options?.forensicsDiagnosticsDir, mutationAuditStore, wakeConfigForAgent, proposalStore, restartProcess: options?.restartProcess }));
 
   // INF-193 AC3: cache-flush endpoint for emergency invalidation. ADMIN_SECRET-gated.
   app.post("/admin/api/cache/flush", (req: express.Request, res: express.Response) => {
