@@ -1,80 +1,26 @@
-# dev-impl — Archetype A workflow definition
-# design.md §13, §16.1
-# owner: steward (Astrid)
-# version history: bump `version` on any state/edge change; in-flight tickets
-#   use the version stamped at their creation time (design.md §12).
-#
-# This fixture is kept in sync with the deployed workflow definition so CI
-# can exercise the canonical schema without depending on the vault being
-# present. The canonical source is the deployed def under WORKFLOW_DEFS_DIR;
-# fixture drift is detected at /health.fixtureDrift. Keep in sync.
-#
-# Shape principle (design decision 2026-06-06): a STATE is a work-phase — one
-#   kind of work, one owner role; "awaiting X" and "doing X" are the same state.
-#   A TRANSITION is a decision/event (may carry payload) — never a resting place.
-#   Decision-results (`approved`, `merged`) are transitions, not states.
-#   Hanzo's container is the DEPLOYMENT container: merging is one operation it
-#   authorizes (`deploy:execute`), not its definition.
-#
-# Native state projection (AI-1490): each state declares the semantic native
-#   Linear state the CLI should project to when entering that state. v7 (AI-1510)
-#   made native status a pure engagement overlay — every active work-phase rests
-#   at `todo`; the connector cycles To Do → Thinking → Doing off the delegate's
-#   session lifecycle. Terminal states keep semantic value (done→done).
-#
-# v8 (2026-06-10, Matt directive): test-driven + deploy-real + AC-gate shape.
-#   New states: write-tests (TestDrivenDevelopmentAgent writes failing tests
-#   before implementation), host-deploy (Grover, host-side, the bare-metal half
-#   of deployment Hanzo's container can't reach), ac-validate (the intake steward
-#   re-verifies the deployed artifact against the captured AC before done).
-#   Also reconciled H-7 (AI-1482, Done) stakes/capture_ac/human-signoff config —
-#   it was implemented in code + tests but missing from the production def.
-#
-# v9 (2026-06-27, AI-1710): escape re-enters at intake instead of terminating.
-#   break_glass.to changed from escape → intake; escape state removed entirely.
-#   done remains the only terminal state. unescape verb retired (no escape state to exit).
-#
-# v10 (2026-07-06, AI-1872 — Matt directive): split deployment into merge + deploy
-#   states; generic verbs only. The old `deployment` state conflated two distinct
-#   operations (merging the PR vs deploying the artifact) behind state-specific
-#   custom verbs. Replaced with two explicit states using generic `continue`:
-#     - `merge` (owner: deployment/Hanzo): merges the PR → continue → deploy
-#     - `deploy` (owner: host-deploy/Grover for the connector fleet): deploys the
-#       artifact, or decides "no deploy needed" → continue → ac-validate
-#   Custom verbs `deploy`, `handoff-host-deploy`, `host-deployed` removed entirely;
-#   the full spine is now:
-#     write-tests → implementation → code-review → merge → deploy → ac-validate
-#   In-flight tickets at the old `state:deployment` / `state:host-deploy` labels
-#   are migrated via escape → re-intake (the state labels no longer exist in the
-#   def, so the gate rejects any command from them — operators must escape).
-#
-# v15 (INF-98 reconciliation, 2026-07-18): reconciled with deployed def.
-#   recovery_actor: ai added (AI-1579). Version bumped to match deployed (15).
-#   Stakes keys confirmed as stakes:* (canonical; deployed risk:* migrated).
-#   State spine unchanged from v10+ (merge/deploy).
-#
-# v17 (2026-07-25, INF-695): commitment/acceptance gate. Implementation now has
-#   an explicit investigation-exit fork (`accept` → `doing`, `reject` →
-#   `rejected`, `not-ready` → `needs-info`). Downstream `submit` is present on
-#   implementation so the proxy can refuse it with the specific missing
-#   commitment-exit error until exactly one exit is recorded.
+# GENERATED from src/registered-defs/dev-impl.yaml — do not hand-edit.
+# Regenerate: node scripts/check-workflow-def-sync.mjs --write dev-impl
+# The canonical fixture is a mirror of the registered-def (INF-723 single-source rule).
 
 id: dev-impl
 version: 17
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
 
-# AI-1579 (2026-06-13): recovery actor. `ai` (the orchestrator, fills no workflow
-# role) may re-establish a delegate on a ticket whose delegate is currently EMPTY
-# (orphaned) at ANY state — the authorization counterpart to the stale-session
-# recovery machinery. Scoped to the empty-delegate path only.
+# AI-1579: recovery actor. `ai` (the orchestrator, fills no workflow role) may
+# re-establish a delegate on a ticket whose delegate is currently EMPTY (orphaned)
+# at ANY state — the authorization counterpart to the stale-session recovery
+# machinery. Scoped to the empty-delegate path only. Reconciled into the deploy
+# source by INF-745: the fixture carried this since INF-98 (matching the deployed
+# def, AI-1579) but registered-defs never had it — recovery_actor is a live engine
+# field (workflow-gate.ts def.recovery_actor), so the fixture held the truth.
 recovery_actor: ai
 
 # Phase 6.5 / H-7 (AI-1482): Stakes-threshold sign-off configuration.
 # When a ticket's stakes level meets or exceeds the threshold, the release
 # transition requires a human sign-off (Matt), not an AI agent.
 # Stakes levels: 0 = low (internal only), 1 = medium, 2 = high (external/irreversible).
-# Labels on the ticket: stakes:low, stakes:medium, stakes:high (canonical namespace).
+# Labels on the ticket: stakes:low, stakes:medium, stakes:high.
 stakes:
   threshold: 2                # release from stakes ≥ this level requires human sign-off
   levels:                     # label name → numeric level mapping
@@ -205,7 +151,7 @@ states:
     kind: normal
     native_state: todo           # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
     sla: 24h                    # time-in-state; breach → stall escalation (design.md §5.5)
-    # Review contract (v8): Hanzo runs the FULL test suite. Any red ⇒
+    # Review contract (v8): reviewer runs the FULL test suite. Any red ⇒
     # request-changes with the failing tests named in feedback. `approve` is
     # legal only when the suite is green AND code quality satisfies the reviewer.
     # AI-1872: approve now routes to `merge` (not the old `deployment`).
