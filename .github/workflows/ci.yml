@@ -31,6 +31,9 @@ jobs:
       - name: Check package.json integrity
         run: npm run check:json-keys
 
+      - name: Check workflow-def sync (registered-defs ⇄ fixtures, INF-723)
+        run: npm run check:workflow-sync
+
       - name: Build (tsc)
         run: npm run build
 
