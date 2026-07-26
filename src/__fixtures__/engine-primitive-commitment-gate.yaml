@@ -1,0 +1,23 @@
+id: synthetic-commitment-gate
+version: 1
+archetype: engine-primitive-contract
+entry_state: offered
+
+x_engine_primitives:
+  - commitment-gate
+
+states:
+  - id: offered
+    owner_role: role-a
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: accept-offer
+        to: committed
+        assign:
+          mode: required
+          default: agent-1
+
+  - id: committed
+    kind: terminal
+    native_state: done

@@ -61,6 +61,7 @@ const FROZEN_ENGINE_PRIMITIVES = [
   "parenting-reparenting",
   "role-delegate-resolution",
   "escape-break-glass",
+  "commitment-gate",
 ] as const;
 
 interface CapabilityPolicyBody {

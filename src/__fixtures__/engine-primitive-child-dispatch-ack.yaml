@@ -1,0 +1,48 @@
+id: synthetic-child-dispatch-ack
+version: 1
+archetype: engine-composed-contract
+entry_state: queued
+
+description: |
+  ## synthetic entries
+  - title: child acknowledgement one
+    body: dispatch wakes child one
+  - title: child acknowledgement two
+    body: dispatch wakes child two
+
+x_engine_primitives:
+  - fan-out
+  - dispatch-wake
+
+x_synthetic_team_labels:
+  - wf:synthetic-child
+
+x_synthetic_spec_entries:
+  - title: child acknowledgement one
+  - title: child acknowledgement two
+
+states:
+  - id: queued
+    owner_role: synthetic-steward
+    kind: normal
+    native_state: todo
+    fanout:
+      spec_source: synthetic entries
+      child_workflow: wf:synthetic-child
+    transitions:
+      - command: dispatch-children
+        to: awaiting-acks
+
+  - id: awaiting-acks
+    owner_role: synthetic-steward
+    kind: normal
+    native_state: managing
+    barrier: true
+    description: per-child dispatch acknowledgement is composed from fan-out and dispatch-wake
+    transitions:
+      - command: acknowledge
+        to: complete
+
+  - id: complete
+    kind: terminal
+    native_state: done

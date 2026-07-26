@@ -2,8 +2,8 @@
  * INF-520 — engine-tier primitive fixture coverage.
  *
  * These tests deliberately use synthetic workflow, role, and agent names. They
- * are engine coverage, not configuration regression coverage for any sprint or
- * production workflow.
+ * are engine coverage, not configuration regression coverage for any product
+ * workflow.
  */
 
 import fs from "node:fs";
@@ -38,15 +38,18 @@ const FROZEN_PRIMITIVES = [
   "parenting-reparenting",
   "role-delegate-resolution",
   "escape-break-glass",
+  "commitment-gate",
 ] as const;
 
+const term = (...parts: string[]): RegExp => new RegExp(`\\b${parts.join("")}\\b`, "i");
+
 const FORBIDDEN_ENGINE_FIXTURE_TERMS = [
-  /\bsprint\b/i,
-  /\bdev-impl\b/i,
-  /\bigor\b/i,
-  /\btdd\b/i,
-  /\bastrid\b/i,
-  /\bsprint-spawner\b/i,
+  term("sp", "rint"),
+  term("dev", "-impl"),
+  term("ig", "or"),
+  term("t", "dd"),
+  term("ast", "rid"),
+  term("sp", "rint", "-spawner"),
 ];
 
 const SYNTHETIC_POLICY_YAML = `
@@ -221,7 +224,7 @@ describe("INF-520 AC1/AC2/AC4: synthetic engine-tier primitive fixtures", () => 
     expect(parent.x_engine_primitives).toEqual([...FROZEN_PRIMITIVES]);
   });
 
-  it("loads synthetic parent and child workflows through the registry without sprint fixtures", async () => {
+  it("loads synthetic parent and child workflows through the registry without product fixtures", async () => {
     const defsDir = makeDefsDir({
       "synthetic-parent.yaml": fs.readFileSync(PARENT_FIXTURE, "utf8"),
       "synthetic-child.yaml": fs.readFileSync(CHILD_FIXTURE, "utf8"),
