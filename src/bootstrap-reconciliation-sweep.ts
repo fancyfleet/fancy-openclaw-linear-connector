@@ -39,7 +39,8 @@ import { loadWorkflowRegistry, type WorkflowDef } from "./workflow-gate.js";
 import { isTerminalIssueState } from "./linear-actionable.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { registerCron, markCronRun, formatIntervalMs } from "./cron/registry.js";
-import { buildAgentMap } from "./agents.js";
+import { buildAgentMap, getLinearUserIdForAgent, getOpenclawAgentName } from "./agents.js";
+import { resolveBodiesForRole } from "./escalation-gate.js";
 import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "bootstrap-reconciliation");
@@ -79,6 +80,22 @@ export interface ReconciliationSweepOptions {
   dispatchAckTracker?: DispatchAckTracker;
   /** Injectable fetch (tests). Defaults to global fetch. */
   fetchFn?: typeof fetch;
+  /**
+   * INF-739 Mode 1: resolve the body ids that fill a workflow role. Defaults to
+   * the capability-policy-backed `resolveBodiesForRole`. Injectable so the
+   * Mode-1 auto-seat pass is testable without a live capability policy.
+   */
+  resolveBodiesForRole?: (roleId: string) => Promise<string[]>;
+  /**
+   * INF-739 Mode 1: resolve a body id → its Linear user id (the value written to
+   * `delegateId`). Defaults to `getLinearUserIdForAgent`.
+   */
+  linearUserIdForBody?: (bodyId: string) => string | undefined;
+  /**
+   * INF-739 Mode 1: resolve a body id → the OpenClaw agent name used to route a
+   * wake to the newly-seated owner. Defaults to `getOpenclawAgentName`.
+   */
+  openclawNameForBody?: (bodyId: string) => string;
 }
 
 export interface ReconciliationSweepResult {
@@ -88,6 +105,12 @@ export interface ReconciliationSweepResult {
   healed: number;
   /** Tickets within the grace window (skipped, not healed). */
   withinGrace: number;
+  /**
+   * INF-739 Mode 1: actionable null-delegate tickets on which the sweep
+   * auto-seated the current state's role owner. Distinct from `healed`
+   * (native-state reconciliation) so the two correction modes stay countable.
+   */
+  seated: number;
   /** Non-fatal errors encountered during the sweep. */
   errors: string[];
 }
@@ -363,6 +386,52 @@ async function queryTeamCompletedStateId(
   }
 }
 
+/** Terminal workflow-label prefixes: a ticket carrying one of these is
+ *  lifecycle-finished and must NEVER have a delegate re-seated on it (the LSO-20
+ *  bug — INF-717 fix A). Mode 1's auto-seat pass excludes them explicitly. */
+const TERMINAL_STATE_LABEL_PREFIXES = ["state:done", "state:escape", "state:canceled"];
+
+function isTerminalStateLabel(labels: Array<{ name: string }>): boolean {
+  return labels.some((l) =>
+    TERMINAL_STATE_LABEL_PREFIXES.some((t) => l.name.startsWith(t)),
+  );
+}
+
+/**
+ * INF-739 Mode 1: seat a delegate on an actionable, ownerless enrolled ticket.
+ *
+ * Writes only `delegateId` — it does NOT touch labels or native state (the
+ * ticket is already correctly enrolled and actionable; the only defect is the
+ * missing owner). Mirrors the raw `issueUpdate` delegate write the webhook
+ * bootstrap path uses (INF-728 confirmed this path persists app-user delegates).
+ */
+async function seatRoleOwnerDelegate(
+  issueId: string,
+  delegateLinearUserId: string,
+  authToken: string,
+  fetchFn: typeof fetch,
+): Promise<boolean> {
+  const mutation = `
+    mutation SeatRoleOwnerDelegate($issueId: String!, $delegateId: String!) {
+      issueUpdate(id: $issueId, input: { delegateId: $delegateId }) {
+        success
+      }
+    }
+  `;
+  try {
+    const res = await fetchFn(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: mutation, variables: { issueId, delegateId: delegateLinearUserId } }),
+    });
+    type MResp = { data?: { issueUpdate?: { success: boolean } } };
+    const data = (await res.json()) as MResp;
+    return data.data?.issueUpdate?.success ?? false;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Reconcile an enrolled ticket whose workflow label is terminal-done but whose
  * native Linear state is still active (INF-497 / the INF-496 shape).
@@ -524,8 +593,16 @@ export async function runBootstrapReconciliationSweep(
     scanned: 0,
     healed: 0,
     withinGrace: 0,
+    seated: 0,
     errors: [],
   };
+
+  // INF-739 Mode 1: injectable role/body resolvers (default to the real
+  // capability-policy + agents-config backed functions) so the auto-seat pass
+  // is testable without a live policy/agents.json.
+  const resolveOwnerBodies = opts.resolveBodiesForRole ?? resolveBodiesForRole;
+  const linearUserIdForBody = opts.linearUserIdForBody ?? getLinearUserIdForAgent;
+  const openclawNameForBody = opts.openclawNameForBody ?? getOpenclawAgentName;
 
   // ── Query ──────────────────────────────────────────────────────────────
   let candidates: Awaited<ReturnType<typeof queryUnenrolledTickets>>;
@@ -793,6 +870,131 @@ export async function runBootstrapReconciliationSweep(
         severity: "warning",
         source: "bootstrap-reconciled",
         title: `Bootstrap reconciliation terminal-state error for ${ticket.identifier}`,
+        detail: { error: msg },
+        ticket: ticket.identifier,
+      });
+    }
+  }
+
+  // ── Pass 5: Actionable null-delegate tickets → auto-seat role owner (INF-739 Mode 1) ─
+  // The INF-735 shape: `wf:*` + a non-terminal `state:*` label, native state
+  // still active, but NO delegate. The workflow record is correctly enrolled and
+  // actionable — the only defect is that no agent owns the next move, so it stalls
+  // until a human hand-seats the role owner. This pass seats the current state's
+  // role owner (`resolveBodiesForRole`) automatically.
+  //
+  // HARD EXCLUSION (INF-717 fix A / the LSO-20 bug): a terminal-labeled ticket
+  // (`state:done` / `state:escape` / `state:canceled`) correctly has a null
+  // delegate — reconciling its native state is Pass 4's job, and re-seating a
+  // delegate here would re-open a finished ticket. Mode 1 must never touch them.
+  for (const ticket of candidates) {
+    // Native terminality wins over stale labels (symmetric to Pass 1/2 guards).
+    if (isTerminalIssueState(ticket.nativeState)) continue;
+
+    // Only enrolled, ownerless tickets.
+    if (ticket.delegateId) continue;
+    const workflowLabel = ticket.labels.find((l) => l.name.startsWith("wf:"))?.name;
+    const stateLabel = ticket.labels.find((l) => l.name.startsWith("state:"))?.name;
+    if (!workflowLabel || !stateLabel) continue;
+
+    // Never re-seat on a terminal-labeled ticket — that is Mode 2's shape and
+    // re-seating it is the LSO-20 defect this pass is explicitly forbidden to repeat.
+    if (isTerminalStateLabel(ticket.labels)) continue;
+
+    // Must be an actionable state that declares an owner_role (excludes terminal
+    // states via `kind !== "terminal"`; a null registry → skip, cannot resolve).
+    if (!isActionableWorkflowLabelState(workflowRegistry, workflowLabel, stateLabel)) continue;
+
+    const stateDef = workflowDefForLabel(workflowRegistry, workflowLabel)
+      ?.states.find((s) => s.id === stateLabel.replace(/^state:/, ""));
+    const ownerRole = stateDef?.owner_role;
+    if (!ownerRole) continue;
+
+    try {
+      // Idempotency / race-safety: re-fetch live delegate+state right before the
+      // write. A delegate-change webhook (or a prior sweep) may have seated an
+      // owner between the batch query and now — if so, this pass is a no-op.
+      const live = await queryEnrolledTicketState(ticket.id, authToken, fetchFn);
+      if (live?.delegate?.id) continue;
+      if (live?.state && (live.state.type === "completed" || live.state.type === "canceled")) continue;
+
+      const bodies = await resolveOwnerBodies(ownerRole);
+      if (bodies.length === 0) {
+        result.errors.push(
+          `mode-1 auto-seat: role '${ownerRole}' has no body to seat on ${ticket.identifier}`,
+        );
+        log.warn(
+          `bootstrap-reconciliation: Mode 1 could not seat ${ticket.identifier} — role '${ownerRole}' resolves to zero bodies`,
+        );
+        continue;
+      }
+      // single → concrete; multi → first candidate (mirrors resolveBodiesForRole
+      // usage across the gate; a multi-body role seats its first filler).
+      const bodyId = bodies[0];
+      const delegateLinearUserId = linearUserIdForBody(bodyId);
+      if (!delegateLinearUserId) {
+        result.errors.push(
+          `mode-1 auto-seat: body '${bodyId}' (role '${ownerRole}') has no linearUserId for ${ticket.identifier}`,
+        );
+        log.warn(
+          `bootstrap-reconciliation: Mode 1 could not seat ${ticket.identifier} — body '${bodyId}' has no linearUserId`,
+        );
+        continue;
+      }
+
+      const seated = await seatRoleOwnerDelegate(ticket.id, delegateLinearUserId, authToken, fetchFn);
+      if (!seated) {
+        result.errors.push(`mode-1 auto-seat mutation failed for ${ticket.identifier}`);
+        log.warn(`bootstrap-reconciliation: Mode 1 seat mutation returned false for ${ticket.identifier}`);
+        continue;
+      }
+
+      result.seated++;
+      log.info(
+        `bootstrap-reconciliation: Mode 1 seated role '${ownerRole}' owner '${bodyId}' on ${ticket.identifier}` +
+        ` (state ${stateLabel}, native ${ticket.nativeState?.name ?? "active"})`,
+      );
+
+      // Audit trail (AC): one alert-bus record per auto-heal.
+      alertBus.notify({
+        severity: "warning",
+        source: "bootstrap-reconciled",
+        title: `Bootstrap reconciliation seated role owner on ${ticket.identifier}`,
+        detail: {
+          mode: "mode-1-auto-seat",
+          ticket: ticket.identifier,
+          issueId: ticket.id,
+          workflowLabel,
+          stateLabel,
+          ownerRole,
+          seatedBody: bodyId,
+          delegateLinearUserId,
+        },
+        ticket: ticket.identifier,
+      });
+
+      // Wake the newly-seated owner — otherwise it is seated but dark, the exact
+      // stall this sweep fights. Record the dispatch so the watchdog does not
+      // double-fire. Wake is best-effort: seating already succeeded.
+      if (wakeFn) {
+        const wakeTarget = openclawNameForBody(bodyId);
+        try {
+          await wakeFn(wakeTarget, ticket.identifier);
+          opts.dispatchAckTracker?.recordDispatch(wakeTarget, ticket.identifier);
+        } catch (wakeErr) {
+          const wakeMsg = wakeErr instanceof Error ? wakeErr.message : String(wakeErr);
+          result.errors.push(`mode-1 wake failed for ${ticket.identifier}: ${wakeMsg}`);
+          log.warn(`bootstrap-reconciliation: Mode 1 wake failed for ${ticket.identifier}: ${wakeMsg}`);
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      result.errors.push(`mode-1 auto-seat failed for ${ticket.identifier}: ${msg}`);
+      log.error(`bootstrap-reconciliation: Mode 1 auto-seat error for ${ticket.identifier}: ${msg}`);
+      alertBus.notify({
+        severity: "warning",
+        source: "bootstrap-reconciled",
+        title: `Bootstrap reconciliation Mode 1 auto-seat error for ${ticket.identifier}`,
         detail: { error: msg },
         ticket: ticket.identifier,
       });
