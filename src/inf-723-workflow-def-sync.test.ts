@@ -76,11 +76,14 @@ describe("INF-723 workflow-def sync gate", () => {
   });
 
   it("AC3: an allowlisted def that is back in sync fail-closes (ratchet only tightens)", () => {
+    // The real KNOWN_DRIFT allowlist is empty after INF-745, so inject a synthetic
+    // allowlist to exercise the ratchet-tightening branch. Pick any clean def (its
+    // registered-def and fixture are in sync) and pretend it is still allowlisted:
+    // the gate must fail-close and tell you to remove it from KNOWN_DRIFT.
     const root = makeTempRoot();
-    const id = [...KNOWN_DRIFT][0];
-    // Regenerate the fixture from the registered-def → now in sync while still allowlisted.
-    writeFixtures(root, [id]);
-    const res = checkWorkflowDefSync(root);
+    const id = cleanDefId(root);
+    const syntheticAllowlist = new Set([id]);
+    const res = checkWorkflowDefSync(root, syntheticAllowlist);
     expect(res.ok).toBe(false);
     expect(res.violations.some((v: string) => v.includes(id) && v.includes("KNOWN_DRIFT"))).toBe(true);
   });
@@ -105,10 +108,15 @@ describe("INF-723 workflow-def sync gate", () => {
 
   it("AC5: --write regenerates a fixture as a structural mirror of its registered-def", () => {
     const root = makeTempRoot();
-    const id = [...KNOWN_DRIFT][0];
+    const id = cleanDefId(root);
     const rdPath = path.join(root, "src", "registered-defs", `${id}.yaml`);
     const fxPath = path.join(root, "src", "__fixtures__", `canonical-${id}.yaml`);
-    // Before: drifted (it's on the allowlist for exactly this reason).
+    // Inject drift into the registered-def so it no longer mirrors its fixture
+    // (the real allowlist is empty post-INF-745, so no def ships pre-drifted).
+    const def = yaml.load(fs.readFileSync(rdPath, "utf8")) as Record<string, unknown>;
+    def.__inf723_injected_drift = true;
+    fs.writeFileSync(rdPath, yaml.dump(def));
+    // Before: drifted.
     expect(structurallyEqual(fs.readFileSync(rdPath, "utf8"), fs.readFileSync(fxPath, "utf8"))).toBe(false);
 
     writeFixtures(root, [id]);

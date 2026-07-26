@@ -1,19 +1,6 @@
-# sprint-arm-scope — dev-sprint shaping-arm archetype (scope)
-# spec of record: life-os/project-management/dev-sprint-workflow-spec.md (vault,
-#   approved by Matt 2026-07-08). AI-1993.
-# owner: sprint-owner (Astrid) does the scoping; charles reviews the scope artifact.
-#
-# One of the four shaping arms fanned out by dev-sprint at spawn-arms. Every arm
-# is a uniform doing → review → done shape whose `done` terminal carries
-# satisfies_parent_barrier: true, so the parent managing-arms barrier
-# auto-advances only when all four arms terminate cleanly (AI-1992 engine).
-#
-# Authority (spec table): the scope artifact is REVIEWED by charles (the code-review
-# functionary) — review.owner_role: code-review resolves to charles.
-#
-# native_state (AI-1498): work-phases project to `doing`/`todo`; done → done,
-# escape → invalid (Canceled column). Terminal states still carry native_state
-# or the registry loader fails the def closed.
+# GENERATED from src/registered-defs/sprint-arm-scope.yaml — do not hand-edit.
+# Regenerate: node scripts/check-workflow-def-sync.mjs --write sprint-arm-scope
+# The canonical fixture is a mirror of the registered-def (INF-723 single-source rule).
 
 id: sprint-arm-scope
 version: 1
@@ -22,7 +9,7 @@ entry_state: doing
 
 break_glass:
   command: escape
-  to: escape
+  to: doing
   owner_role: steward
 
 states:
@@ -65,7 +52,3 @@ states:
     kind: terminal
     native_state: done
     satisfies_parent_barrier: true   # signals the parent managing-arms barrier
-
-  - id: escape
-    kind: terminal
-    native_state: invalid            # abnormal termination → Canceled column

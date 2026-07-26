@@ -59,6 +59,15 @@ version: 17
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
 
+# AI-1579: recovery actor. `ai` (the orchestrator, fills no workflow role) may
+# re-establish a delegate on a ticket whose delegate is currently EMPTY (orphaned)
+# at ANY state — the authorization counterpart to the stale-session recovery
+# machinery. Scoped to the empty-delegate path only. Reconciled into the deploy
+# source by INF-745: the fixture carried this since INF-98 (matching the deployed
+# def, AI-1579) but registered-defs never had it — recovery_actor is a live engine
+# field (workflow-gate.ts def.recovery_actor), so the fixture held the truth.
+recovery_actor: ai
+
 # Phase 6.5 / H-7 (AI-1482): Stakes-threshold sign-off configuration.
 # When a ticket's stakes level meets or exceeds the threshold, the release
 # transition requires a human sign-off (Matt), not an AI agent.

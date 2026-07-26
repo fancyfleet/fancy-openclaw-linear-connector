@@ -51,11 +51,12 @@ import yaml from "js-yaml";
  * The gate fail-closes on drift for every def NOT listed here.
  */
 export const KNOWN_DRIFT = new Set([
-  "dev-impl",        // fixture carries a top-level `recovery_actor` absent from registered-defs
-  "dev-sprint",      // fixture stale at v8; registered-defs at v11
-  "sprint",          // break_glass + states diverge at the same version (v1)
-  "sprint-arm-scope", // break_glass + states diverge at the same version (v1)
-  "task",            // states diverge at the same version (v2); live is v3 (backport pending)
+  // Empty: all 5 originally-drifted defs were reconciled in INF-745. The ratchet
+  // is now fully armed — any registered-defs ⇄ fixture divergence fail-closes CI.
+  // (dev-impl recovery_actor, task selection_criteria: fixture held the deployed
+  //  truth → added to registered-defs. sprint / sprint-arm-scope break_glass+escape
+  //  terminal: reverted the INF-570 #505 collateral regression. dev-sprint: fixture
+  //  regenerated from the current v11 registered-def.)
 ]);
 
 /**
@@ -114,8 +115,12 @@ export function structurallyEqual(rdContent, fxContent) {
  * Evaluate the ratchet over a repo root. Pure (no I/O side effects beyond reads,
  * no process.exit) so the jest test can assert on the structured result.
  * Returns { ok, violations: string[], notices: string[] }.
+ *
+ * `knownDrift` defaults to the module-level KNOWN_DRIFT allowlist; tests inject a
+ * synthetic Set so the ratchet branches (allowlisted-drift notice, allowlisted-but-
+ * back-in-sync violation) stay exercisable even when the real allowlist is empty.
  */
-export function checkWorkflowDefSync(root) {
+export function checkWorkflowDefSync(root, knownDrift = KNOWN_DRIFT) {
   const violations = [];
   const notices = [];
 
@@ -133,7 +138,7 @@ export function checkWorkflowDefSync(root) {
     const inSync = structurallyEqual(rdContent, fxContent);
 
     if (inSync) {
-      if (KNOWN_DRIFT.has(id)) {
+      if (knownDrift.has(id)) {
         violations.push(
           `${id}: now IN SYNC but still on the KNOWN_DRIFT allowlist — reconciled; ` +
             `remove "${id}" from KNOWN_DRIFT in scripts/check-workflow-def-sync.mjs to tighten the ratchet.`,
@@ -143,7 +148,7 @@ export function checkWorkflowDefSync(root) {
     }
 
     // drifted
-    if (KNOWN_DRIFT.has(id)) {
+    if (knownDrift.has(id)) {
       notices.push(`${id}: known in-repo drift (tracked, INF-723 item 4) — registered-defs ⇄ fixture differ`);
     } else {
       violations.push(

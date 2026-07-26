@@ -429,14 +429,21 @@ describe("AC3: fixture-drift detector is imported and registered in index.ts", (
 // ── Tests: AC4 — version-bump discipline documented in def headers ─────────
 
 describe("AC4: version-bump discipline documented in def headers", () => {
+  // A fixture header satisfies this either by documenting version-bump discipline
+  // directly (hand-maintained header) OR — post-INF-723 — by being a generated
+  // mirror whose registered-def source carries that discipline; the generated
+  // header points back at that single source (INF-745).
+  const documentsVersionDiscipline = (content: string) =>
+    /version.*bump|version.*history|bump.*version/i.test(content) ||
+    /GENERATED from src\/registered-defs\/.*\.yaml|mirror of the registered-def/is.test(content);
+
   it("canonical-dev-impl.yaml header documents version-bump discipline", async () => {
     const content = await fsp.readFile(fixturePathFor("dev-impl"), "utf8");
-    // Must mention how/when to bump the version number
-    expect(content).toMatch(/version.*bump|version.*history|bump.*version/i);
+    expect(documentsVersionDiscipline(content)).toBe(true);
   });
 
   it("canonical-task.yaml header documents version-bump discipline", async () => {
     const content = await fsp.readFile(fixturePathFor("task"), "utf8");
-    expect(content).toMatch(/version.*bump|version.*history|bump.*version/i);
+    expect(documentsVersionDiscipline(content)).toBe(true);
   });
 });

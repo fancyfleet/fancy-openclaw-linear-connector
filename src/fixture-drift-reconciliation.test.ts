@@ -501,31 +501,34 @@ describe("AC3: fixture-drift warning is clean — zero drift after reconciliatio
 // ══════════════════════════════════════════════════════════════════════════════
 
 describe("AC4: Documentation — fixture header explains canonical source & regeneration", () => {
-  it("canonical-dev-impl.yaml header references deployed def source location", () => {
-    const raw = fs.readFileSync(CANONICAL_DEV_IMPL, "utf8");
-    expect(raw).toMatch(/WORKFLOW_DEFS_DIR/i);
-    expect(raw).toMatch(/fixture/i);
-    expect(raw).toMatch(/keep in sync/i);
+  // A fixture header must identify its canonical source and how to keep it current.
+  // Two regimes are valid: a hand-maintained header naming the deployed def
+  // (WORKFLOW_DEFS_DIR / the canonical vault file, "keep in sync"), or — post-INF-723
+  // — a generated-mirror header naming the registered-def source plus the exact
+  // regeneration command (INF-745). Either satisfies the documentation contract.
+  const explainsSourceAndRegen = (raw: string) => {
+    const identifiesSource =
+      /WORKFLOW_DEFS_DIR|canonical vault file|GENERATED from src\/registered-defs/i.test(raw);
+    const explainsRegen = /keep\s*in\s*sync|Regenerate:|--write/i.test(raw);
+    return identifiesSource && explainsRegen;
+  };
+
+  it("canonical-dev-impl.yaml header references its canonical source & regeneration", () => {
+    expect(explainsSourceAndRegen(fs.readFileSync(CANONICAL_DEV_IMPL, "utf8"))).toBe(true);
   });
 
-  it("canonical-ux-audit.yaml header references deployed def source location", () => {
-    const raw = fs.readFileSync(CANONICAL_UX_AUDIT, "utf8");
-    expect(raw).toMatch(/WORKFLOW_DEFS_DIR/i);
-    expect(raw).toMatch(/fixture/i);
-    expect(raw).toMatch(/keep in sync/i);
+  it("canonical-ux-audit.yaml header references its canonical source & regeneration", () => {
+    expect(explainsSourceAndRegen(fs.readFileSync(CANONICAL_UX_AUDIT, "utf8"))).toBe(true);
   });
 
-  it("canonical-sprint.yaml header references deployed def source location", () => {
-    const raw = fs.readFileSync(CANONICAL_SPRINT, "utf8");
-    expect(raw).toMatch(/WORKFLOW_DEFS_DIR/i);
-    expect(raw).toMatch(/fixture/i);
-    expect(raw).toMatch(/keep in sync/i);
+  it("canonical-sprint.yaml header references its canonical source & regeneration", () => {
+    expect(explainsSourceAndRegen(fs.readFileSync(CANONICAL_SPRINT, "utf8"))).toBe(true);
   });
 
   it("README or docs mention how fixtures are regenerated from the vault", () => {
     const readmePath = path.resolve(process.cwd(), "README.md");
     const fixtureHeader = fs.readFileSync(CANONICAL_DEV_IMPL, "utf8");
-    const fixtureMentionsSync = /keep\s*in\s*sync/i.test(fixtureHeader);
+    const fixtureMentionsSync = /keep\s*in\s*sync|Regenerate:|GENERATED from src\/registered-defs/i.test(fixtureHeader);
 
     if (fs.existsSync(readmePath)) {
       const readme = fs.readFileSync(readmePath, "utf8").toLowerCase();
