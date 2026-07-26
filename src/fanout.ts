@@ -357,6 +357,70 @@ function isWorkflowStateActionable(def: WorkflowDef | undefined, stateLabel: str
 // ── Finding extraction ────────────────────────────────────────────────────
 
 /**
+ * INF-730: Split a spec/findings section body into one raw entry per TOP-LEVEL
+ * list bullet.
+ *
+ * A top-level bullet starts at column 0 (no leading whitespace) with `-`, `*`,
+ * or `N.`. Indented list items, continuation paragraphs, and blank lines belong
+ * to the *current* entry's description — they are never promoted to their own
+ * entry. A top-level non-bullet prose line is dropped (matching the pre-INF-730
+ * behavior of ignoring non-marker lines) so trailing section prose never leaks
+ * into the last finding.
+ *
+ * This is the defense against a rich multi-paragraph bullet over-fanning into N
+ * children. LIF-45 Cycle 9's single `## structured` bullet minted 9 scoping
+ * children (LIF-279..287) because the old flat line-regex matched every indented
+ * `1.`/`2.` sub-item — and each interstitial bold sub-line — as its own finding.
+ *
+ * Returns raw `{ title, description }`; callers apply their own post-processing
+ * (per-entry `[wf:...]` markers, trailing-colon strip, stable ids).
+ */
+function parseSpecEntries(sectionBody: string): { title: string; description?: string }[] {
+  const boldBullet = /^[-*]\s+\*\*(.+?)\*\*(?:[:\s-]+(.*))?$/;
+  const plainBullet = /^[-*]\s+(.+?)\s*$/;
+  const numberedBullet = /^\d+\.\s+(.+?)\s*$/;
+
+  const entries: { title: string; descLines: string[] }[] = [];
+  let current: { title: string; descLines: string[] } | null = null;
+
+  for (const line of sectionBody.split("\n")) {
+    // Top-level bullets carry no leading whitespace; anything indented (or a
+    // blank line) is a continuation of the current entry, never a new one.
+    const isTopLevel = line.length > 0 && !/^\s/.test(line);
+    let title: string | undefined;
+    let inlineDesc: string | undefined;
+
+    if (isTopLevel) {
+      const bold = boldBullet.exec(line);
+      if (bold) {
+        title = bold[1].trim();
+        inlineDesc = (bold[2] ?? "").trim() || undefined;
+      } else {
+        const plain = plainBullet.exec(line);
+        if (plain) {
+          title = plain[1].trim();
+        } else {
+          const numbered = numberedBullet.exec(line);
+          if (numbered) title = numbered[1].trim();
+        }
+      }
+    }
+
+    if (title !== undefined && title !== "") {
+      current = { title, descLines: inlineDesc ? [inlineDesc] : [] };
+      entries.push(current);
+    } else if (current && (line.trim() === "" || /^\s/.test(line))) {
+      current.descLines.push(line);
+    }
+  }
+
+  return entries.map((e) => ({
+    title: e.title,
+    description: e.descLines.join("\n").trim() || undefined,
+  }));
+}
+
+/**
  * Parse findings from the ticket description.
  *
  * The researcher submits the findings list as part of the `complete-audit`
@@ -394,16 +458,10 @@ export function extractFindings(description: string | null | undefined, fallback
   const sectionMatch = findingsSectionRegex.exec(description);
 
   if (sectionMatch) {
-    const sectionBody = sectionMatch[1];
-    // Parse bullet points or numbered lists
-    const lineRegex = /[-*]\s+\*\*(.+?)\*\*(?:[:\s-]+(.*))?|[-*]\s+(.+?)(?:\n|$)|\d+\.\s+(.+?)(?:\n|$)/g;
-    let match: RegExpExecArray | null;
-    while ((match = lineRegex.exec(sectionBody)) !== null) {
-      const title = (match[1] ?? match[3] ?? match[4] ?? "").trim();
-      const desc = (match[2] ?? "").trim();
-      if (title) {
-        findings.push({ title, description: desc || undefined });
-      }
+    // INF-730: one finding per TOP-LEVEL bullet; indented sub-items and
+    // continuation prose fold into the current entry rather than over-fanning.
+    for (const entry of parseSpecEntries(sectionMatch[1])) {
+      findings.push({ title: entry.title, description: entry.description });
     }
   }
 
@@ -487,27 +545,25 @@ export function extractSpecFindings(
   const PER_ENTRY_MARKER_RE = /^\\?\[wf:([^\s\\\]]+)(?:\s*[→>-]\s*([^\s\\\]]+))?\\?\]\s*/;
 
   if (sectionMatch) {
-    const sectionBody = sectionMatch[1];
-    const lineRegex = /[-*]\s+\*\*(.+?)\*\*(?:[:\s-]+(.*))?|[-*]\s+(.+?)(?:\n|$)|\d+\.\s+(.+?)(?:\n|$)/g;
-    let match: RegExpExecArray | null;
-    while ((match = lineRegex.exec(sectionBody)) !== null) {
-      let title = (match[1] ?? match[3] ?? match[4] ?? "").trim().replace(/:\s*$/, "");
-      const desc = (match[2] ?? "").trim();
-      if (title) {
-        // AI-2199: check for per-entry child workflow marker
-        const markerMatch = PER_ENTRY_MARKER_RE.exec(title);
-        const finding: Finding = {
-          title: markerMatch ? title.slice(markerMatch[0].length) : title,
-          description: desc || undefined,
-        };
-        if (markerMatch) {
-          finding.child_workflow = `wf:${markerMatch[1]}`;
-          if (markerMatch[2]) {
-            finding.delegate = markerMatch[2];
-          }
+    // INF-730: one entry per TOP-LEVEL bullet — a multi-paragraph structured
+    // bullet (nested IN/OUT numbered lists, prose, refs line) mints exactly one
+    // scoping child instead of over-fanning into N (LIF-45 → LIF-279..287).
+    for (const entry of parseSpecEntries(sectionMatch[1])) {
+      const title = entry.title.replace(/:\s*$/, "");
+      if (!title) continue;
+      // AI-2199: check for per-entry child workflow marker
+      const markerMatch = PER_ENTRY_MARKER_RE.exec(title);
+      const finding: Finding = {
+        title: markerMatch ? title.slice(markerMatch[0].length) : title,
+        description: entry.description,
+      };
+      if (markerMatch) {
+        finding.child_workflow = `wf:${markerMatch[1]}`;
+        if (markerMatch[2]) {
+          finding.delegate = markerMatch[2];
         }
-        findings.push(finding);
       }
+      findings.push(finding);
     }
   }
 
