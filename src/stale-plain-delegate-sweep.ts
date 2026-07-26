@@ -77,8 +77,11 @@ async function queryStalePlainTickets(
 }>> {
   const cutoff = new Date(Date.now() - staleTimeoutMs).toISOString();
 
+  // INF-719: `$after` threads the cursor so the sweep pages through the full
+  // candidate set. `first: 100` alone silently drops stale tickets beyond the
+  // first 100. Mirrors delegation-reconciliation-sweep.ts.
   const query = `
-    query StalePlainDelegates($cutoff: DateTime!) {
+    query StalePlainDelegates($cutoff: DateTime!, $after: String) {
       issues(
         filter: {
           updatedAt: { lte: $cutoff }
@@ -86,6 +89,7 @@ async function queryStalePlainTickets(
           delegate: { id: { neq: null } }
         }
         first: 100
+        after: $after
         orderBy: updatedAt
       ) {
         nodes {
@@ -96,35 +100,48 @@ async function queryStalePlainTickets(
           labels { nodes { name } }
           delegate { id name }
         }
+        pageInfo { hasNextPage endCursor }
       }
     }
   `;
 
-  const res = await fetchFn(LINEAR_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: authToken,
-    },
-    body: JSON.stringify({ query, variables: { cutoff } }),
-  });
-
-  const body = (await res.json()) as {
+  type StaleNode = {
+    id: string;
+    identifier: string;
+    updatedAt: string;
+    state: { name: string } | null;
+    labels: { nodes: Array<{ name: string }> };
+    delegate: { id: string; name: string } | null;
+  };
+  type Body = {
     data?: {
       issues?: {
-        nodes: Array<{
-          id: string;
-          identifier: string;
-          updatedAt: string;
-          state: { name: string } | null;
-          labels: { nodes: Array<{ name: string }> };
-          delegate: { id: string; name: string } | null;
-        }>;
+        nodes: StaleNode[];
+        pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
       };
     };
   };
 
-  const nodes = body.data?.issues?.nodes ?? [];
+  const nodes: StaleNode[] = [];
+  let cursor: string | null = null;
+  let hasNextPage = true;
+  while (hasNextPage) {
+    const res = await fetchFn(LINEAR_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: authToken,
+      },
+      body: JSON.stringify({ query, variables: { cutoff, after: cursor } }),
+    });
+
+    const body = (await res.json()) as Body;
+    nodes.push(...(body.data?.issues?.nodes ?? []));
+    const pageInfo = body.data?.issues?.pageInfo;
+    hasNextPage = pageInfo?.hasNextPage === true;
+    cursor = pageInfo?.endCursor ?? null;
+    if (hasNextPage && !cursor) break;
+  }
 
   // Filter OUT any wf:* tickets — they belong to DelegationReconciliationSweep
   return nodes

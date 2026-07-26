@@ -171,9 +171,12 @@ class ValidationNudgeStore {
  * filter client-side for the specific validation states. This matches the
  * SLA sweep pattern and avoids adding a new query shape.
  */
+// INF-719: `$after` threads the cursor so the watchdog pages through the full
+// wf:* set. Without it, `first: 100` silently drops every governed ticket beyond
+// the first 100 on a 250+ ticket board. Mirrors delegation-reconciliation-sweep.ts.
 const GOVERNED_TICKETS_QUERY = `
-  query ValidationWatchdogGoverned {
-    issues(filter: { labels: { name: { startsWith: "wf:" } } }, first: 100) {
+  query ValidationWatchdogGoverned($after: String) {
+    issues(filter: { labels: { name: { startsWith: "wf:" } } }, first: 100, after: $after) {
       nodes {
         id
         identifier
@@ -181,6 +184,7 @@ const GOVERNED_TICKETS_QUERY = `
         delegate { id name }
         history(first: 1, orderBy: createdAt) { nodes { createdAt } }
       }
+      pageInfo { hasNextPage endCursor }
     }
   }
 `;
@@ -268,36 +272,50 @@ export async function runValidationWatchdog(
   const store = new ValidationNudgeStore(nudgeStorePath);
 
   try {
-    // ── 1. Batch fetch all governed tickets ──
-    const res = await fetchFn(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({ query: GOVERNED_TICKETS_QUERY }),
-    });
-
+    // ── 1. Batch fetch all governed tickets (INF-719: paginate the full set) ──
+    type ValNode = {
+      id: string;
+      identifier: string;
+      labels: { nodes: Array<{ name: string }> };
+      delegate: { id: string; name: string } | null;
+      history: { nodes: Array<{ createdAt: string }> };
+    };
     type ValResp = {
       data?: {
         issues?: {
-          nodes?: Array<{
-            id: string;
-            identifier: string;
-            labels: { nodes: Array<{ name: string }> };
-            delegate: { id: string; name: string } | null;
-            history: { nodes: Array<{ createdAt: string }> };
-          }>;
+          nodes?: ValNode[];
+          pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
         };
       };
       errors?: Array<{ message: string }>;
     };
 
-    const json = (await res.json()) as ValResp;
-    if (json.errors?.length) {
-      throw new Error(
-        `Linear API errors: ${json.errors.map((e) => e.message).join("; ")}`,
-      );
-    }
+    const nodes: ValNode[] = [];
+    let cursor: string | null = null;
+    let hasNextPage = true;
+    while (hasNextPage) {
+      const res = await fetchFn(LINEAR_API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authToken },
+        body: JSON.stringify({
+          query: GOVERNED_TICKETS_QUERY,
+          variables: { after: cursor },
+        }),
+      });
 
-    const nodes = json.data?.issues?.nodes ?? [];
+      const json = (await res.json()) as ValResp;
+      if (json.errors?.length) {
+        throw new Error(
+          `Linear API errors: ${json.errors.map((e) => e.message).join("; ")}`,
+        );
+      }
+
+      nodes.push(...(json.data?.issues?.nodes ?? []));
+      const pageInfo = json.data?.issues?.pageInfo;
+      hasNextPage = pageInfo?.hasNextPage === true;
+      cursor = pageInfo?.endCursor ?? null;
+      if (hasNextPage && !cursor) break;
+    }
     result.scanned = nodes.length;
 
     // ── 2. Filter for watched validation states with validator delegate ──

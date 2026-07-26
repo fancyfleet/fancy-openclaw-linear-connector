@@ -7,7 +7,7 @@
  * so it survives the Bug B native-status breakage.
  *
  * Classification rules (mutually exclusive, evaluated in order):
- *   terminal  — state:done or state:escape (ignored)
+ *   terminal  — state:done, state:escape, or state:canceled (ignored)
  *   malformed — has wf:* but no state:* label
  *   dormant   — non-terminal, has state:*, but delegate is null/absent
  *   drifted   — non-terminal, has state:*, but delegate body does not fill the
@@ -27,6 +27,13 @@ import type { OperationalEventInput } from "./store/operational-event-store.js";
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "rescue-sweep");
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
+
+/**
+ * INF-719: page size for the paginated wf:* enumeration. Unpaginated issues()
+ * is hard-capped at 50 nodes by Linear, so this safety-net sweep saw only the
+ * first 50 of 250+ governed tickets. Mirrors delegation-reconciliation-sweep.ts.
+ */
+const LINEAR_ISSUES_PAGE_SIZE = 50;
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -148,8 +155,14 @@ export function classifyTicket(
   const stateLabel = labels.find((l) => l.startsWith("state:"));
   const stateId = stateLabel?.slice("state:".length);
 
-  // Terminal: done or escape — checked first, regardless of delegate
-  if (stateId === "done" || stateId === "escape") return "terminal";
+  // Terminal: done, escape, or canceled — checked first, regardless of delegate.
+  // INF-719 guard (A): `canceled` was previously omitted, so a canceled ticket
+  // with a null delegate classified as `dormant` and the sweep re-seated a
+  // delegate onto a retired ticket. Terminal tickets must never be re-seated.
+  // Matches the canonical terminal set in delegation-reconciliation-sweep.ts.
+  if (stateId === "done" || stateId === "escape" || stateId === "canceled") {
+    return "terminal";
+  }
 
   // Malformed: has wf:* but no state:* label
   if (!stateLabel) return "malformed";
@@ -216,38 +229,60 @@ function buildRoleResolver(
 // ── Linear API helpers ─────────────────────────────────────────────────────
 
 async function fetchWfTickets(authToken: string): Promise<FetchedTicket[]> {
-  const query = `
-    query WorkflowIssues {
-      issues(filter: { labels: { some: { name: { startsWith: "wf:" } } } }) {
-        nodes {
-          id
-          identifier
-          updatedAt
-          state { name }
-          labels { nodes { id name } }
-          delegate { id name }
-          team { id }
-        }
-      }
-    }
-  `;
-  try {
-    const res = await fetch(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({ query }),
-    });
-    type IssueNode = {
-      id: string;
-      identifier: string;
-      updatedAt?: string;
-      labels: { nodes: Array<{ id: string; name: string }> };
-      delegate: { id: string; name: string } | null;
-      team: { id: string } | null;
+  type IssueNode = {
+    id: string;
+    identifier: string;
+    updatedAt?: string;
+    labels: { nodes: Array<{ id: string; name: string }> };
+    delegate: { id: string; name: string } | null;
+    team: { id: string } | null;
+  };
+  type Resp = {
+    data?: {
+      issues?: {
+        nodes: IssueNode[];
+        pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+      };
     };
-    type Resp = { data?: { issues?: { nodes: IssueNode[] } } };
-    const data = (await res.json()) as Resp;
-    return (data.data?.issues?.nodes ?? []).map((n) => ({
+  };
+  try {
+    // INF-719: page through the full wf:* set — an unpaginated issues() query
+    // silently truncates to Linear's 50-node default, so this rescue sweep only
+    // ever saw the first page of a 250+ ticket board.
+    const nodes: IssueNode[] = [];
+    let cursor: string | null = null;
+    let hasNextPage = true;
+    while (hasNextPage) {
+      const afterArg = cursor ? `, after: ${JSON.stringify(cursor)}` : "";
+      const query = `
+        query WorkflowIssues {
+          issues(first: ${LINEAR_ISSUES_PAGE_SIZE}${afterArg}, filter: { labels: { some: { name: { startsWith: "wf:" } } } }) {
+            nodes {
+              id
+              identifier
+              updatedAt
+              state { name }
+              labels { nodes { id name } }
+              delegate { id name }
+              team { id }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      `;
+      const res = await fetch(LINEAR_API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authToken },
+        body: JSON.stringify({ query }),
+      });
+      const data = (await res.json()) as Resp;
+      nodes.push(...(data.data?.issues?.nodes ?? []));
+      const pageInfo = data.data?.issues?.pageInfo;
+      hasNextPage = pageInfo?.hasNextPage === true;
+      cursor = pageInfo?.endCursor ?? null;
+      if (hasNextPage && !cursor) break;
+    }
+    return nodes.map((n) => ({
       id: n.id,
       identifier: n.identifier,
       updatedAt: n.updatedAt,
