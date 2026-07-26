@@ -78,6 +78,8 @@ RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --from=builder /app/dist/ dist/
 COPY --from=web-builder /app/web/dist/ web/dist/
+COPY src/registered-defs/ src/registered-defs/
+COPY src/__fixtures__/ src/__fixtures__/
 
 # Create non-root user and ensure data dir exists
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup \
