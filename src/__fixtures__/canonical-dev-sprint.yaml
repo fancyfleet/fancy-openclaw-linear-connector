@@ -3,7 +3,7 @@
 # The canonical fixture is a mirror of the registered-def (INF-723 single-source rule).
 
 id: dev-sprint
-version: 11
+version: 12
 archetype: orchestrator
 entry_state: intake
 
@@ -110,6 +110,10 @@ states:
       - command: converge
         to: done
         requires_children_terminal: true
+        # INF-758: converge is a false-Done hole unless a real impl child shipped.
+        # requires_children_terminal is satisfied vacuously by scope/design arms
+        # (wf:sprint-arm-*) — the LIF-291 defect. Require >=1 COMPLETED impl child.
+        requires_implementation_child: true
         requires_comment: true
 
   - id: spawn-impl
@@ -149,6 +153,10 @@ states:
       - command: converge
         to: done
         requires_children_terminal: true
+        # INF-758: converge is a false-Done hole unless a real impl child shipped.
+        # requires_children_terminal is satisfied vacuously by scope/design arms
+        # (wf:sprint-arm-*) — the LIF-291 defect. Require >=1 COMPLETED impl child.
+        requires_implementation_child: true
         requires_comment: true
 
   - id: managing-impl
@@ -169,6 +177,10 @@ states:
       - command: converge
         to: done
         requires_children_terminal: true
+        # INF-758: converge is a false-Done hole unless a real impl child shipped.
+        # requires_children_terminal is satisfied vacuously by scope/design arms
+        # (wf:sprint-arm-*) — the LIF-291 defect. Require >=1 COMPLETED impl child.
+        requires_implementation_child: true
         requires_comment: true
 
   - id: validation
