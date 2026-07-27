@@ -3,7 +3,7 @@
 # The canonical fixture is a mirror of the registered-def (INF-723 single-source rule).
 
 id: dev-impl
-version: 17
+version: 18
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
 
@@ -48,6 +48,13 @@ states:
         capture_ac: true
       - command: demote
         to: __ad_hoc__          # ticket leaves the workflow entirely (design.md §4.5)
+      # INF-867: recover a known-good merged ticket that escaped back to intake
+      # after branch-correlation failure. This is intentionally NOT generic:
+      # normal continue-workflow/accept still starts at write-tests.
+      - command: force-deploy
+        to: deploy
+        requires_comment: true
+        assign: { mode: auto }     # deploy is singleton (Grover for connector fleet) — auto-assign
       # INF-150: handoff self-loop — re-attach delegate without changing state
       - command: handoff
         to: intake

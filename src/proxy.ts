@@ -958,7 +958,8 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // the X-Openclaw-Comment-Satisfied-By header — the CLI points at the
       // existing comment that already carries the feedback, and the proxy
       // verifies it (issue match, recency, authorship) before honoring it.
-      let requestHasComment = extractCommentBody(body) !== null;
+      const requestCommentBody = extractCommentBody(body);
+      let requestHasComment = requestCommentBody !== null;
       const satisfiedByHeader = (req.headers["x-openclaw-comment-satisfied-by"] as string | undefined) ?? null;
       if (!requestHasComment && satisfiedByHeader && issueId) {
         requestHasComment = await verifyCommentSatisfiedBy(issueId, satisfiedByHeader, authorization, callerLinearUserId);
@@ -975,7 +976,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       if (requestHasComment) {
         recordTransitionCarriedComment();
       }
-      const p3rejection = await checkWorkflowRules(effectiveIntent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride, intent !== effectiveIntent, requestHasComment, snapshotDelegateId, snapshotState);
+      const p3rejection = await checkWorkflowRules(effectiveIntent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride, intent !== effectiveIntent, requestHasComment, snapshotDelegateId, snapshotState, requestCommentBody);
       if (p3rejection) {
         log.warn(`workflow-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${p3rejection}`);
 
