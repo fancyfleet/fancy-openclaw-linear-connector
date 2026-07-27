@@ -7613,6 +7613,28 @@ export async function autoEnrollPlainDelegation(
   const workflowId = "task";
   const entryState = "doing";
 
+  if (delegateAgentName) {
+    try {
+      const workerBodies = await resolveBodiesForRole("worker");
+      const isWorkerDelegate = workerBodies
+        .map((body) => body.toLowerCase())
+        .includes(delegateAgentName.toLowerCase());
+      if (!isWorkerDelegate) {
+        log.info(
+          `workflow-gate: autoEnrollPlainDelegation: skipping ${issueId} because ` +
+            `delegate '${delegateAgentName}' is not a worker body for task:doing`,
+        );
+        return { enrolled: false };
+      }
+    } catch (err) {
+      log.warn(
+        `workflow-gate: autoEnrollPlainDelegation: worker role resolution failed for ${issueId} — ` +
+          `skipping task:doing promotion: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return { enrolled: false };
+    }
+  }
+
   const issue = await fetchIssueWithLabels(issueId, authToken);
   if (!issue) {
     log.warn(`workflow-gate: autoEnrollPlainDelegation: failed to fetch labels for ${issueId} — skipping`);
