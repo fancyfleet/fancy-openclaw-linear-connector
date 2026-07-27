@@ -95,5 +95,19 @@ process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = "";
 // DEFAULT_AGENTS_PATH, which is process.cwd() + '/agents.json' — the LIVE
 // production encrypted agents file — causing every reloadAgents() that runs
 // without AGENTS_FILE set to hit the encryption key path and fail.
-const JEST_AGENTS_FILE = path.join(os.tmpdir(), "connector-jest-no-agents.json");
+//
+// INF-844: this was a FIXED, shared os.tmpdir()/connector-jest-no-agents.json —
+// the same shared-fixed-path class as IMPLEMENTER_STORE_PATH above. It is safe
+// today only because nothing writes to the sentinel, but that invariant is
+// unenforced: any test that writes agents while AGENTS_FILE still points here
+// would create the file for EVERY worker, so every other file relying on the
+// "non-existent sentinel → empty agents" contract would instead read those
+// agents — a cross-worker race jest's per-file isolation does not cover.
+// Rooting it in the per-worker JEST_STATE_DIR (a real, isolated temp dir; the
+// sentinel FILE inside it still does not exist → reloadAgents() returns [])
+// closes that. Exported as JEST_NO_AGENTS_FILE so the few tests that restore or
+// point AGENTS_FILE at the sentinel reference this per-worker path instead of
+// recomputing the shared literal.
+const JEST_AGENTS_FILE = path.join(JEST_STATE_DIR, "connector-jest-no-agents.json");
 process.env.AGENTS_FILE = JEST_AGENTS_FILE;
+process.env.JEST_NO_AGENTS_FILE = JEST_AGENTS_FILE;
