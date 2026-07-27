@@ -5215,6 +5215,7 @@ export async function applyStateTransition(
   const acceptTarget = commitmentGateState?.commitment_gate?.exits?.accept?.to;
   if (
     currentStateName &&
+    intent !== breakGlassCommand &&
     acceptTarget &&
     currentStateName === acceptTarget &&
     !hasRecordedCommitmentExit(options?.operationalEventStore, issue.identifier)
@@ -5238,15 +5239,22 @@ export async function applyStateTransition(
     currentCommitmentExit &&
     hasRecordedCommitmentExit(options?.operationalEventStore, issue.identifier)
   ) {
-    log.info(
-      `workflow-gate: commitment gate: ${issue.identifier} already has a recorded exit — skipping duplicate '${intent}'`,
-    );
-    return {
-      status: "noop",
-      code: "commitment-exit-already-recorded",
-      from: currentStateName,
-      to: currentCommitmentExit.to,
-    };
+    if (currentStateName !== currentCommitmentExit.to) {
+      log.warn(
+        `workflow-gate: commitment gate: ${issue.identifier} already has a recorded exit but ` +
+        `is still projected at '${currentStateName}' - repairing via duplicate '${intent}' to '${currentCommitmentExit.to}'`,
+      );
+    } else {
+      log.info(
+        `workflow-gate: commitment gate: ${issue.identifier} already has a recorded exit — skipping duplicate '${intent}'`,
+      );
+      return {
+        status: "noop",
+        code: "commitment-exit-already-recorded",
+        from: currentStateName,
+        to: currentCommitmentExit.to,
+      };
+    }
   }
 
   // AI-2035: terminal re-entry guard (reciprocal of the setStateAtomic terminal
