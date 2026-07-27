@@ -517,6 +517,18 @@ function childIsInBarrierScope(child: ChildState, barrierScope?: string): boolea
   return true;
 }
 
+function buildBarrierEvaluationOptions(
+  expectedChildren?: ExpectedChildrenFilter,
+  stateDef?: WorkflowState | null,
+): ExpectedChildrenFilter | BarrierEvaluationOptions {
+  const barrierScope = stateDef?.barrier_scope;
+  if (!barrierScope) return expectedChildren;
+  return {
+    expectedChildren,
+    barrierScope,
+  };
+}
+
 export async function evaluateBarrier(
   parentIdentifier: string,
   authToken: string,
@@ -692,6 +704,7 @@ export async function attemptBarrierTransition(
   workflowDef?: WorkflowDef,
   prefetchedParentState?: { labels: string[]; internalId: string; teamId: string } | null,
   expectedChildren?: ExpectedChildrenFilter,
+  prefetchedCurrentState?: string | null,
 ): Promise<BarrierTransitionResult> {
   const result: BarrierTransitionResult = {
     transitioned: false,
@@ -740,8 +753,52 @@ export async function attemptBarrierTransition(
     return result;
   }
 
+  // 1. Verify parent is in a barrier state before evaluating children. The
+  // current state's definition may also carry a barrier_scope that constrains
+  // which child classes participate in this barrier.
+  const parentState = prefetchedParentState ?? await fetchParentState(parentIdentifier, authToken);
+  if (!parentState) {
+    result.error = "Failed to fetch parent state";
+    return result;
+  }
+
+  const workflowId = getWorkflowId(parentState.labels);
+  if (!workflowId) {
+    result.error = "No workflow ID found on parent labels";
+    return result;
+  }
+
+  const currentState = prefetchedCurrentState ?? getCurrentState(parentState.labels);
+  if (!currentState) {
+    result.error = "No state:* label found on parent";
+    return result;
+  }
+
+  // AI-1992: barrier-ness is config-driven. Load the parent's workflow def and
+  // confirm its CURRENT state declares `barrier: true`. No hardcoded workflow-id
+  // allowlist and no hardcoded "managing" state name — a def may have multiple
+  // barrier states (two-phase) under any workflow id.
+  let wfDef: WorkflowDef | null = workflowDef ?? null;
+  if (!wfDef) {
+    try {
+      wfDef = await loadWorkflowDefById(workflowId);
+    } catch {
+      wfDef = null;
+    }
+  }
+  const currentStateDef = wfDef?.states.find((s) => s.id === currentState);
+  if (!isBarrierState(currentStateDef)) {
+    log.info(`barrier: parent ${parentIdentifier} state '${currentState}' (wf:${workflowId}) is not a barrier state — skipping`);
+    result.error = `Parent state '${currentState}' on wf:${workflowId} is not a barrier state`;
+    return result;
+  }
+
   // 1. Evaluate barrier
-  const barrier = await evaluateBarrier(parentIdentifier, authToken, childFilter);
+  const barrier = await evaluateBarrier(
+    parentIdentifier,
+    authToken,
+    buildBarrierEvaluationOptions(childFilter, currentStateDef),
+  );
   result.terminalCount = barrier.terminalCount;
   result.totalChildren = barrier.totalChildren;
 
@@ -771,45 +828,6 @@ export async function attemptBarrierTransition(
       `${barrier.terminalCount}/${barrier.totalChildren} done`,
     );
     return result; // Not an error — just not ready yet
-  }
-
-  // 2. Verify parent is in a barrier state
-  //    Use pre-fetched state if provided (avoids redundant API call)
-  const parentState = prefetchedParentState ?? await fetchParentState(parentIdentifier, authToken);
-  if (!parentState) {
-    result.error = "Failed to fetch parent state";
-    return result;
-  }
-
-  const workflowId = getWorkflowId(parentState.labels);
-  if (!workflowId) {
-    result.error = "No workflow ID found on parent labels";
-    return result;
-  }
-
-  const currentState = getCurrentState(parentState.labels);
-  if (!currentState) {
-    result.error = "No state:* label found on parent";
-    return result;
-  }
-
-  // AI-1992: barrier-ness is config-driven. Load the parent's workflow def and
-  // confirm its CURRENT state declares `barrier: true`. No hardcoded workflow-id
-  // allowlist and no hardcoded "managing" state name — a def may have multiple
-  // barrier states (two-phase) under any workflow id.
-  let wfDef: WorkflowDef | null = workflowDef ?? null;
-  if (!wfDef) {
-    try {
-      wfDef = await loadWorkflowDefById(workflowId);
-    } catch {
-      wfDef = null;
-    }
-  }
-  const currentStateDef = wfDef?.states.find((s) => s.id === currentState);
-  if (!isBarrierState(currentStateDef)) {
-    log.info(`barrier: parent ${parentIdentifier} state '${currentState}' (wf:${workflowId}) is not a barrier state — skipping`);
-    result.error = `Parent state '${currentState}' on wf:${workflowId} is not a barrier state`;
-    return result;
   }
 
   // Barrier target: advance along THIS barrier state's forward transition —
@@ -937,6 +955,27 @@ export async function onManagingEntry(
   parentIdentifier: string,
   authToken: string,
 ): Promise<BarrierTransitionResult | null> {
+  const parentState = await fetchParentState(parentIdentifier, authToken);
+  const appliedState = getAppliedState(parentIdentifier);
+  const liveState = parentState ? getCurrentState(parentState.labels) : null;
+  const currentState = appliedState ?? liveState;
+  let wfDef: WorkflowDef | null = null;
+  let currentStateDef: WorkflowState | undefined;
+  if (parentState && currentState) {
+    const workflowId = getWorkflowId(parentState.labels);
+    if (workflowId) {
+      try {
+        const loadedDef = await loadWorkflowDefById(workflowId);
+        if (loadedDef) {
+          wfDef = loadedDef;
+          currentStateDef = loadedDef.states.find((s) => s.id === currentState);
+        }
+      } catch {
+        wfDef = null;
+      }
+    }
+  }
+
   // INF-28: Read the recorded fan-out outcome, if any.
   const outcome = await getFanoutOutcome(parentIdentifier);
 
@@ -991,7 +1030,11 @@ export async function onManagingEntry(
             `evaluating barrier against ${outcome.childIdentifiers.length} recorded child(ren) ` +
             `(${outcome.childIdentifiers.join(", ")})`,
           );
-          const barrier = await evaluateBarrier(parentIdentifier, authToken, outcome.childIdentifiers);
+          const barrier = await evaluateBarrier(
+            parentIdentifier,
+            authToken,
+            buildBarrierEvaluationOptions(outcome.childIdentifiers, currentStateDef),
+          );
 
           if (barrier.readFailed) {
             await alarmUnreadableChildren(parentIdentifier, authToken);
@@ -1012,7 +1055,14 @@ export async function onManagingEntry(
             `barrier: INF-28 onManagingEntry: awaiting set all-terminal for ${parentIdentifier} ` +
             `(${barrier.terminalCount}/${barrier.totalChildren}) — attempting transition`,
           );
-          return attemptBarrierTransition(parentIdentifier, authToken);
+          return attemptBarrierTransition(
+            parentIdentifier,
+            authToken,
+            wfDef ?? undefined,
+            parentState,
+            outcome.childIdentifiers,
+            currentState,
+          );
         }
         // fall through: empty awaiting set → treat as claimed (no children to wait on)
         break;
@@ -1029,7 +1079,11 @@ export async function onManagingEntry(
   }
 
   // 1. Evaluate the barrier (current behavior for absent / not-declared / waived)
-  const barrier = await evaluateBarrier(parentIdentifier, authToken);
+  const barrier = await evaluateBarrier(
+    parentIdentifier,
+    authToken,
+    buildBarrierEvaluationOptions(undefined, currentStateDef),
+  );
 
   // INF-34: an unreadable child set is not "children still active" — returning
   // null here would be logged by the caller as normal flow, which is how the
@@ -1071,7 +1125,14 @@ export async function onManagingEntry(
     `barrier: AI-1730 onManagingEntry: barrier satisfied for ${parentIdentifier} ` +
     `(${barrier.terminalCount}/${barrier.totalChildren} terminal) — attempting transition`,
   );
-  return attemptBarrierTransition(parentIdentifier, authToken);
+  return attemptBarrierTransition(
+    parentIdentifier,
+    authToken,
+    wfDef ?? undefined,
+    parentState,
+    undefined,
+    currentState,
+  );
 }
 
 /**
@@ -1134,7 +1195,7 @@ export async function onChildTerminal(
 
   // 3. Attempt the barrier transition, passing pre-fetched parent state + def
   log.info(`barrier: child ${childIdentifier} terminal, checking barrier for parent ${parentIdentifier}`);
-  return attemptBarrierTransition(parentIdentifier, authToken, wfDef ?? undefined, parentState);
+  return attemptBarrierTransition(parentIdentifier, authToken, wfDef ?? undefined, parentState, undefined, currentState);
 }
 
 // ── Label fetch with IDs ──────────────────────────────────────────────────

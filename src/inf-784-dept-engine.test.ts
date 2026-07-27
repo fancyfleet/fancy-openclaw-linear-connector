@@ -18,15 +18,16 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { load as loadYaml } from "js-yaml";
 import { afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals";
-import { evaluateBarrier } from "./barrier.js";
+import { evaluateBarrier, onManagingEntry } from "./barrier.js";
+import { isDeptOwnedInfraTerminal, planDeptEngineOutputs } from "./dept-engine.js";
 import { resolveBodiesForRole, resetPolicyCache } from "./escalation-gate.js";
+import { clearFanoutOutcomeStore, recordFanoutOutcome } from "./fanout-outcome-store.js";
 import { loadWorkflowRegistry, resetWorkflowCache } from "./workflow-gate.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
 const REGISTERED_DEF_PATH = path.join(REPO_ROOT, "src/registered-defs/dept-engine.yaml");
 const CANONICAL_FIXTURE_PATH = path.join(REPO_ROOT, "src/__fixtures__/canonical-dept-engine.yaml");
-const RUNTIME_MODULE = path.join(REPO_ROOT, "src/dept-engine.ts");
 const DIST_ENTRY = path.join(REPO_ROOT, "dist/index.js");
 
 type LooseRecord = Record<string, any>;
@@ -51,10 +52,6 @@ function transition(from: LooseRecord, command: string, to: string): LooseRecord
 
 function stable(value: unknown): unknown {
   return JSON.parse(JSON.stringify(value));
-}
-
-function pathToFileUrl(file: string): string {
-  return `file://${file.replace(/\\/g, "/").replace(/\.ts$/, ".js")}`;
 }
 
 async function pollHealth(url: string, timeoutMs: number): Promise<LooseRecord> {
@@ -86,12 +83,6 @@ async function stopChild(child: ChildProcess | undefined): Promise<void> {
       resolve();
     });
   });
-}
-
-async function loadDeptEngineRuntime(): Promise<LooseRecord> {
-  expect(fs.existsSync(RUNTIME_MODULE)).toBe(true);
-  const dynamicImport = new Function("specifier", "return import(specifier)") as (specifier: string) => Promise<unknown>;
-  return dynamicImport(pathToFileUrl(RUNTIME_MODULE)) as Promise<LooseRecord>;
 }
 
 async function readBoundPort(portFile: string, timeoutMs: number): Promise<number> {
@@ -352,9 +343,14 @@ bodies:
 
 describe("INF-784 AC3: managing barrier scope is owned-infra only", () => {
   const oldFetch = global.fetch;
+  const oldFanoutOutcomePath = process.env.FANOUT_OUTCOME_PATH;
 
   afterEach(() => {
     global.fetch = oldFetch;
+    clearFanoutOutcomeStore();
+    if (oldFanoutOutcomePath !== undefined) process.env.FANOUT_OUTCOME_PATH = oldFanoutOutcomePath;
+    else delete process.env.FANOUT_OUTCOME_PATH;
+    resetWorkflowCache();
   });
 
   it("excludes product handoff/proposal children from managing barrier evaluation", async () => {
@@ -411,6 +407,119 @@ describe("INF-784 AC3: managing barrier scope is owned-infra only", () => {
     expect(result.children.map((child) => child.identifier)).toEqual(["ENG-101"]);
     expect(result.totalChildren).toBe(1);
   });
+
+  it("onManagingEntry advances dept-engine managing when owned-infra is done and out-of-barrier proposals remain active", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-784-fanout-"));
+    process.env.FANOUT_OUTCOME_PATH = path.join(tmpDir, "fanout-outcomes.json");
+    clearFanoutOutcomeStore();
+    await recordFanoutOutcome("ENG-DEPT-1", {
+      outcome: "awaiting",
+      childIdentifiers: ["ENG-101", "PROD-44", "PROD-45"],
+      recordedAt: new Date().toISOString(),
+    });
+
+    const fetchCalls: Array<{ query: string; variables?: LooseRecord }> = [];
+    global.fetch = jest.fn(async (_url, init) => {
+      const parsed = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as { query?: string; variables?: LooseRecord };
+      const query = parsed.query ?? "";
+      fetchCalls.push({ query, variables: parsed.variables });
+
+      if (query.includes("ParentChildren")) {
+        return new Response(JSON.stringify({
+          data: {
+            issue: {
+              children: {
+                nodes: [
+                  {
+                    identifier: "ENG-101",
+                    labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:done" }, { name: "dept-output:owned-infra" }] },
+                  },
+                  {
+                    identifier: "PROD-44",
+                    labels: { nodes: [{ name: "wf:task" }, { name: "state:implementation" }, { name: "dept-output:product-backlog-proposal" }] },
+                  },
+                  {
+                    identifier: "PROD-45",
+                    labels: { nodes: [{ name: "wf:task" }, { name: "state:implementation" }, { name: "dept-output:standards-proposal" }] },
+                  },
+                ],
+              },
+            },
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      if (query.includes("ParentState") || query.includes("ParentLabels") || query.includes("IssueLabels")) {
+        return new Response(JSON.stringify({
+          data: {
+            issue: {
+              id: "parent-internal-id",
+              team: { id: "team-eng" },
+              labels: {
+                nodes: [
+                  { id: "wf-lbl", name: "wf:dept-engine" },
+                  { id: "state-lbl", name: "state:managing" },
+                ],
+              },
+            },
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      if (query.includes("TeamStates")) {
+        return new Response(JSON.stringify({
+          data: {
+            team: {
+              states: {
+                nodes: [
+                  { id: "native-thinking", name: "Thinking", type: "started" },
+                  { id: "native-managing", name: "Managing", type: "started" },
+                ],
+              },
+            },
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      if (query.includes("TeamLabels")) {
+        return new Response(JSON.stringify({
+          data: { team: { labels: { nodes: [{ id: "state-validation-lbl", name: "state:validation" }] } } },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      if (query.includes("ApplyBarrierTransition") || query.includes("UpdateLabels")) {
+        return new Response(JSON.stringify({ data: { issueUpdate: { success: true } } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      if (query.includes("commentCreate")) {
+        return new Response(JSON.stringify({ data: { commentCreate: { success: true, comment: { id: "comment-id" } } } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      throw new Error(`unexpected query: ${query.slice(0, 120)}`);
+    }) as typeof fetch;
+
+    const result = await onManagingEntry("ENG-DEPT-1", "token");
+
+    expect(result).not.toBeNull();
+    expect(result?.transitioned).toBe(true);
+    expect(result?.terminalCount).toBe(1);
+    expect(result?.totalChildren).toBe(1);
+    const transitionCall = fetchCalls.find((call) => call.query.includes("ApplyBarrierTransition"));
+    expect(transitionCall?.variables).toMatchObject({
+      issueId: "parent-internal-id",
+      input: {
+        labelIds: ["wf-lbl", "state-validation-lbl"],
+        stateId: "native-thinking",
+      },
+    });
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
 });
 
 describe("INF-784 AC4/AC6: output routing, provenance, and foundation-first gate", () => {
@@ -426,10 +535,9 @@ describe("INF-784 AC4/AC6: output routing, provenance, and foundation-first gate
   });
 
   it("routes proposed product outputs with provenance while refusing cross-team priority/sprint/state writes", async () => {
-    const runtime = await loadDeptEngineRuntime();
-    expect(typeof runtime.planDeptEngineOutputs).toBe("function");
+    expect(typeof planDeptEngineOutputs).toBe("function");
 
-    const result = runtime.planDeptEngineOutputs({
+    const result = planDeptEngineOutputs({
       department: "ENG",
       cycle: 3,
       foundation: { milestone: "runtime-dispatch-hardened", met: true },
@@ -470,11 +578,10 @@ describe("INF-784 AC4/AC6: output routing, provenance, and foundation-first gate
   });
 
   it("keeps product backlog and standards proposals locked until the named foundation milestone is met", async () => {
-    const runtime = await loadDeptEngineRuntime();
-    expect(typeof runtime.planDeptEngineOutputs).toBe("function");
+    expect(typeof planDeptEngineOutputs).toBe("function");
 
     expect(() =>
-      runtime.planDeptEngineOutputs({
+      planDeptEngineOutputs({
         department: "ENG",
         cycle: 1,
         foundation: { milestone: "runtime-dispatch-hardened", met: false },
@@ -490,22 +597,21 @@ describe("INF-784 AC4/AC6: output routing, provenance, and foundation-first gate
 
 describe("INF-784 AC5: per-department terminal predicates", () => {
   it("requires ENG owned-infra PR work to be tests-green plus merged", async () => {
-    const runtime = await loadDeptEngineRuntime();
-    expect(typeof runtime.isDeptOwnedInfraTerminal).toBe("function");
+    expect(typeof isDeptOwnedInfraTerminal).toBe("function");
 
-    expect(runtime.isDeptOwnedInfraTerminal({
+    expect(isDeptOwnedInfraTerminal({
       department: "ENG",
       artifactType: "pull-request",
       checks: { tests: "green" },
       pullRequest: { merged: true },
     })).toBe(true);
-    expect(runtime.isDeptOwnedInfraTerminal({
+    expect(isDeptOwnedInfraTerminal({
       department: "ENG",
       artifactType: "pull-request",
       checks: { tests: "green" },
       pullRequest: { merged: false },
     })).toBe(false);
-    expect(runtime.isDeptOwnedInfraTerminal({
+    expect(isDeptOwnedInfraTerminal({
       department: "ENG",
       artifactType: "pull-request",
       checks: { tests: "red" },
@@ -514,15 +620,14 @@ describe("INF-784 AC5: per-department terminal predicates", () => {
   });
 
   it("supports a non-PR owned-infra artifact whose terminal signal is department-head approval", async () => {
-    const runtime = await loadDeptEngineRuntime();
-    expect(typeof runtime.isDeptOwnedInfraTerminal).toBe("function");
+    expect(typeof isDeptOwnedInfraTerminal).toBe("function");
 
-    expect(runtime.isDeptOwnedInfraTerminal({
+    expect(isDeptOwnedInfraTerminal({
       department: "DSN",
       artifactType: "standards-document",
       headReview: { reviewer: "laren", approved: true, authoredByDepartmentHead: true },
     })).toBe(true);
-    expect(runtime.isDeptOwnedInfraTerminal({
+    expect(isDeptOwnedInfraTerminal({
       department: "DSN",
       artifactType: "standards-document",
       headReview: { reviewer: "astrid", approved: true, authoredByDepartmentHead: false },
