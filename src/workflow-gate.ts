@@ -39,7 +39,7 @@ import path from "node:path";
 import yaml from "js-yaml";
 import { componentLogger, createLogger, type Logger } from "./logger.js";
 import { defaultWorkflowDefPath } from "./instance-config.js";
-import { bodyHasCapability, resolveBodiesForRole, resolveBodiesWithCapability, isBodyKnown, isRoleDeclared, isSyntheticNoBodyRole } from "./escalation-gate.js";
+import { bodyHasCapability, resolveBodiesForRole, resolveBodiesWithCapability, isBodyKnown, isRoleDeclared, isSyntheticNoBodyRole, type RoleResolutionScope } from "./escalation-gate.js";
 import { probeDeployOutcome } from "./deploy-probe.js";
 import { isTerminalIssueState } from "./linear-actionable.js";
 import type { ObservationStore } from "./store/observation-store.js";
@@ -286,6 +286,8 @@ export interface WorkflowDef {
   version?: number;
   archetype?: string;
   entry_state?: string;
+  department_scope?: RoleResolutionScope;
+  instantiation?: Record<string, unknown>;
   /** §4.4: break_glass.command is the x-openclaw-linear-intent value for escape. */
   break_glass?: { command: string; to?: string; owner_role?: string };
   /**
@@ -321,6 +323,29 @@ export interface WorkflowDef {
    * not per-state. */
   invariant_skip?: string[];
   states: WorkflowState[];
+}
+
+function concreteScopeValue(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function departmentHeadScopeForDef(def: WorkflowDef): RoleResolutionScope | undefined {
+  const declared = def.department_scope ?? {};
+  const instantiated = def.instantiation ?? {};
+  const scope: RoleResolutionScope = {
+    department: concreteScopeValue(declared.department ?? instantiated.department),
+    team: concreteScopeValue(declared.team ?? instantiated.team),
+  };
+  return scope.department || scope.team ? scope : undefined;
+}
+
+async function resolveBodiesForOwnerRole(ownerRole: string, def: WorkflowDef): Promise<string[]> {
+  return resolveBodiesForRole(
+    ownerRole,
+    ownerRole === "department-head" ? departmentHeadScopeForDef(def) : undefined,
+  );
 }
 
 // ── Workflow def cache & registry ──────────────────────────────────────────
@@ -905,7 +930,7 @@ export async function reloadWorkflowDefs(): Promise<
 
       let bodies: string[];
       try {
-        bodies = await resolveBodiesForRole(role);
+        bodies = await resolveBodiesForOwnerRole(role, def);
       } catch {
         bodies = []; // treat resolution failure as an unreachable role — fail loud below.
       }
@@ -1853,7 +1878,7 @@ export async function resolveTransitionTargets(
   if (!ownerRole || destState?.kind === 'terminal') {
     return { bodies: [], mode: 'none' };
   }
-  const bodies = await resolveBodiesForRole(ownerRole);
+  const bodies = await resolveBodiesForOwnerRole(ownerRole, def);
   if (bodies.length === 0) return { bodies: [], mode: 'none' };
   if (bodies.length === 1) return { bodies, mode: 'auto' };
   return { bodies, mode: 'required' };
@@ -1913,7 +1938,7 @@ export async function resolveTransitionDelegate(
 
   // (3) Role-based resolution (singleton only).
   try {
-    const roleBodies = await resolveBodiesForRole(destOwnerRole);
+    const roleBodies = await resolveBodiesForOwnerRole(destOwnerRole, def);
     if (roleBodies.length === 1) {
       const agent = getAgent(roleBodies[0]);
       if (agent?.linearUserId) {
@@ -4313,7 +4338,7 @@ export async function checkWorkflowRules(
   if (ownerRole && destStateNode?.kind !== 'terminal') {
     let legalBodies: string[];
     try {
-      legalBodies = await resolveBodiesForRole(ownerRole);
+      legalBodies = await resolveBodiesForOwnerRole(ownerRole, def);
     } catch {
       legalBodies = []; // fail-open
     }
@@ -4688,7 +4713,7 @@ export async function checkRawMutationInterception(
     const stateNode = def.states.find((s) => s.id === stateId);
     const ownerRole = stateNode?.owner_role;
     if (!ownerRole) return null; // ownerless/terminal state — fail-open
-    const authorized = new Set<string>(await resolveBodiesForRole(ownerRole));
+    const authorized = new Set<string>(await resolveBodiesForOwnerRole(ownerRole, def));
     const stewardRole = def.break_glass?.owner_role;
     if (stewardRole) {
       for (const b of await resolveBodiesForRole(stewardRole)) authorized.add(b);
@@ -6169,7 +6194,7 @@ export async function applyStateTransition(
           typeof matchedTransition?.assign?.selection_criteria === "string" &&
           matchedTransition.assign.selection_criteria.trim().length > 0;
         if (enforcesSelectionCriteria) {
-          const legalTargets = await resolveBodiesForRole(destOwnerRole!);
+          const legalTargets = await resolveBodiesForOwnerRole(destOwnerRole!, def);
           const roleDeclared = legalTargets.length > 0 || await isRoleDeclared(destOwnerRole!);
           if ((legalTargets.length > 1 || legalTargets.length === 0 && roleDeclared) && !legalTargets.includes(explicitTarget)) {
             log.error(
@@ -6238,7 +6263,7 @@ export async function applyStateTransition(
       // Role-based resolution (singleton auto-assign, multi-body skip).
       if (resolvedDelegateId === undefined) {
         try {
-          const roleBodies = await resolveBodiesForRole(destOwnerRole!);
+          const roleBodies = await resolveBodiesForOwnerRole(destOwnerRole!, def);
           if (roleBodies.length === 1) {
             const singletonResult = resolveSingletonDelegate(roleBodies, destOwnerRole!);
             if (singletonResult.resolvedDelegateId) {
@@ -7936,7 +7961,7 @@ export async function setStateAtomic(
     const isTerminal = destNode?.kind === "terminal" || !ownerRole;
     if (!isTerminal && ownerRole) {
       try {
-        const roleBodies = await resolveBodiesForRole(ownerRole);
+        const roleBodies = await resolveBodiesForOwnerRole(ownerRole, def);
         if (roleBodies.length === 1) {
           const targetBody = roleBodies[0];
           const outcome = await dispatchWithRetry(options.sendWakeUp, targetBody, ticketIdentifier);

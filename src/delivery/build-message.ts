@@ -472,7 +472,7 @@ export async function tryBuildWorkflowMessage(
   return [
     `${actionText}: ${title}`,
     "",
-    `This is a [${def.id}] workflow ticket in state: **${currentState}**`,
+    `This is a [${def.id}] managed workflow ticket in state: **${currentState}**`,
     ...stakesBlock,
     ...lastCommentBlock,
     "",

@@ -57,6 +57,10 @@ version: 3                      # INF-804: approved PR tasks route through merge
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
 
+department_scope:
+  department: DSN
+  team: Design
+
 break_glass:
   command: escape
   to: intake                   # AI-2095: re-enter recoverably at intake, not a terminal trap

@@ -5,7 +5,8 @@ entry_state: evaluating
 
 instantiation:
   charter_ref: department-charter
-  department: department
+  department: ENG
+  team: Engineering
   foundation_milestone: runtime-dispatch-hardened
 
 output_classes:
