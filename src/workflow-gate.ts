@@ -510,6 +510,16 @@ async function loadDefFromFile(file: string): Promise<WorkflowDef> {
 }
 
 async function validateDefFixtureSync(def: WorkflowDef, raw: string): Promise<void> {
+  // Fail-closed by default (INF-773): a deployed def that drifts from its
+  // canonical fixture is refused before registry.set. The grace opt-out exists
+  // for the test suite, which installs synthetic minimal defs (with canonical
+  // ids like `dev-impl`/`sprint-spawner`) that intentionally diverge from the
+  // canonical fixtures to exercise OTHER enforcement dimensions. Mirrors the
+  // PROXY_ALLOW_MISSING_CLI_VERSION pattern in jest.setup.ts: production `.env`
+  // leaves this unset → enforcement on, which is the shipped fail-closed posture.
+  // The observer path (runFixtureDriftCheck) stays fully armed regardless — only
+  // the hard loader refusal is graced, so drift is still reported in health.
+  if (process.env.ALLOW_WORKFLOW_DEF_FIXTURE_DRIFT) return;
   const fixtureCheck = await checkDefAgainstFixture(def.id, raw);
   if (!fixtureCheck.inSync) {
     throw new Error(

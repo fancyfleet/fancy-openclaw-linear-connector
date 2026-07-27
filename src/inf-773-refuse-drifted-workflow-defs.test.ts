@@ -64,7 +64,12 @@ beforeEach(() => {
     "WORKFLOW_DEF_PATH",
     "WORKFLOW_DEF_STATE_SNAPSHOT_PATH",
     "DATA_DIR",
+    "ALLOW_WORKFLOW_DEF_FIXTURE_DRIFT",
   );
+  // jest.setup.ts sets the suite-wide grace opt-out so synthetic defs load; this
+  // dedicated test asserts the fail-closed refusal, so it opts back INTO
+  // enforcement by clearing the grace flag (restored in afterEach via restoreEnv).
+  delete process.env.ALLOW_WORKFLOW_DEF_FIXTURE_DRIFT;
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-773-"));
   defsDir = path.join(tmpDir, "defs");
   fs.mkdirSync(defsDir, { recursive: true });
