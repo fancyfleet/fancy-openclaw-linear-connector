@@ -651,6 +651,10 @@ function isCommentCreateMutation(body: GraphQLRequestBody | null): boolean {
   return !!body?.query && /\bcommentCreate\s*\(/.test(body.query);
 }
 
+function isWorkflowTransitionMutation(body: GraphQLRequestBody | null): boolean {
+  return isIssueUpdateMutation(body) || isCommentCreateMutation(body);
+}
+
 /**
  * AI-1583: True only when the request's GraphQL operation is a mutation.
  *
@@ -1469,11 +1473,18 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           }
         }
 
-        // AI-1977: Pre-resolve the delegateId and inject it into the forwarded mutation
-        // BEFORE the forward, so webhook #1 carries the correct delegate from the start.
+        // AI-1977: Pre-resolve the delegateId before the forward, so workflow
+        // commands fail closed before any upstream side effect when their
+        // destination delegate cannot be determined.
+        //
+        // For issueUpdate, also inject the delegateId into the forwarded mutation
+        // so webhook #1 carries the correct delegate from the start.
         // Previously applyStateTransition set the delegate as a separate API call after
         // the forward, meaning webhook #1 fired with the OLD delegate — the new delegate
         // was invisible until webhook #2 (which sometimes never arrived or was misrouted).
+        // INF-854: commentCreate can be the command-carrying mutation. It cannot
+        // carry delegateId itself, but it still must pre-resolve delegateOverride
+        // or block ambiguity before the comment posts.
         //
         // This block:
         //   1. Resolves the delegate using the same def-driven logic as applyStateTransition
@@ -1482,7 +1493,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         //
         // If resolution fails (multi-body, no target), we skip injection and let
         // applyStateTransition handle it the old way.
-        if (isIssueUpdateMutation(body) && issueId && effectiveIntent !== 'migrate-state') {
+        if (isWorkflowTransitionMutation(body) && issueId && effectiveIntent !== 'migrate-state') {
           try {
             const preLabels = sourceStateOverride
               ? [] // we already have pre-forward labels

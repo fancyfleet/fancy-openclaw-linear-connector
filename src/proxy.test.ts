@@ -103,6 +103,33 @@ bodies:
     fills_roles: [requester]
 `;
 
+const TEST_POLICY_WITH_STEWARD_ONLY_YAML = `
+capabilities:
+  - id: human:escalate
+  - id: workflow:break-glass
+  - id: linear:transition
+containers:
+  - id: steward
+    grants: [linear:transition, human:escalate, workflow:break-glass]
+  - id: requester
+    grants: [linear:transition]
+roles:
+  - id: steward
+    requires: [human:escalate]
+  - id: requester
+    requires: [linear:transition]
+bodies:
+  - id: charles
+    container: steward
+    fills_roles: [steward]
+  - id: astrid
+    container: requester
+    fills_roles: [requester]
+  - id: ai
+    container: requester
+    fills_roles: [requester]
+`;
+
 const TEST_WORKFLOW_YAML = `
 id: dev-impl
 version: 1
@@ -1302,6 +1329,109 @@ describe("proxy enforcement — B2 state-label transition application", () => {
     expect(vars.labelIds).toContain("intake-lbl");
     expect(vars.labelIds).not.toContain("review-lbl");
     expect(vars.delegateId).toBe("u3");
+  });
+
+  it("INF-854: commentCreate escape to multi-body requester pre-resolves caller delegate before posting", async () => {
+    process.env.CAPABILITY_POLICY_PATH = writePolicyFile(dir, TEST_POLICY_WITH_REQUESTER_YAML);
+    writeTaskEscapeWorkflowFile(dir);
+    resetPolicyCache();
+    resetWorkflowCache();
+    reloadAgents();
+
+    const { fetch: mock, calls } = makeB2Fetch({
+      b1LabelResponse: {
+        data: {
+          issue: {
+            labels: { nodes: [{ name: "wf:task" }, { name: "state:review" }] },
+            delegate: { id: "u3" },
+          },
+        },
+      },
+      b2IssueResponse: {
+        data: {
+          issue: {
+            id: "task-internal-uuid",
+            identifier: "INF-854",
+            team: { id: "team-uuid" },
+            labels: {
+              nodes: [
+                { id: "wf-task-lbl", name: "wf:task" },
+                { id: "review-lbl", name: "state:review" },
+              ],
+            },
+          },
+        },
+      },
+      b2TeamLabels: {
+        data: {
+          team: {
+            labels: {
+              nodes: [
+                { id: "intake-lbl", name: "state:intake" },
+                { id: "review-lbl", name: "state:review" },
+              ],
+            },
+          },
+        },
+      },
+    });
+    globalThis.fetch = mock;
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "astrid")
+      .set("X-Openclaw-Linear-Intent", "escape")
+      .send({
+        query: "mutation M($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } } }",
+        variables: { issueId: "issue-uuid", body: "Escaping this stuck review." },
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+    expect(calls.some((c) => c.query.includes("commentCreate"))).toBe(true);
+    const atomic = calls.find((c) => c.query.includes("ApplyAtomicTransition"));
+    expect(atomic).toBeDefined();
+    const vars = atomic!.variables as { issueId: string; labelIds: string[]; delegateId?: string };
+    expect(vars.issueId).toBe("task-internal-uuid");
+    expect(vars.labelIds).toContain("intake-lbl");
+    expect(vars.labelIds).not.toContain("review-lbl");
+    expect(vars.delegateId).toBe("u3");
+  });
+
+  it("INF-854: commentCreate escape blocks ambiguous requester routing before posting", async () => {
+    process.env.CAPABILITY_POLICY_PATH = writePolicyFile(dir, TEST_POLICY_WITH_STEWARD_ONLY_YAML);
+    writeTaskEscapeWorkflowFile(dir);
+    resetPolicyCache();
+    resetWorkflowCache();
+    reloadAgents();
+
+    const { fetch: mock, calls } = makeB2Fetch({
+      b1LabelResponse: {
+        data: {
+          issue: {
+            labels: { nodes: [{ name: "wf:task" }, { name: "state:review" }] },
+            delegate: { id: "u1" },
+          },
+        },
+      },
+    });
+    globalThis.fetch = mock;
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "escape")
+      .send({
+        query: "mutation M($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } } }",
+        variables: { issueId: "issue-uuid", body: "Escaping this stuck review." },
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors?.[0]?.message).toContain("blocked before posting a workflow comment");
+    expect(calls.some((c) => c.query.includes("commentCreate"))).toBe(false);
+    expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(false);
   });
 });
 
