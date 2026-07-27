@@ -413,7 +413,10 @@ function commitmentExitFor(state: WorkflowState | undefined, intent: string): { 
 }
 
 function hasRecordedCommitmentExit(store: OperationalEventStore | undefined, identifier: string): boolean {
-  if (!store) return false;
+  // Tolerate an append-only sink (ObservationEventSink) with no query(): this
+  // helper can now be reached on non-commitment transitions, where callers may
+  // pass a write-only store. A missing query() means "nothing recorded".
+  if (!store || typeof store.query !== "function") return false;
   return store.query({ key: identifier, outcome: COMMITMENT_EXIT_OUTCOME }).length > 0;
 }
 
@@ -421,7 +424,12 @@ function getRecordedCommitmentExit(
   store: OperationalEventStore | undefined,
   identifier: string,
 ): { workflow: string; from: string; exit: string; to: string } | null {
-  if (!store) return null;
+  // Eager lookup at the top of applyStateTransition runs on every transition,
+  // including non-commitment ones whose callers pass an append-only sink with
+  // no query(). Treat a query-less store as "nothing recorded" rather than
+  // throwing — applyStateTransition gates every workflow transition, so an
+  // unconditional throw here has engine-wide blast radius.
+  if (!store || typeof store.query !== "function") return null;
   const event = store.query({ key: identifier, outcome: COMMITMENT_EXIT_OUTCOME, limit: 1 })[0];
   if (!event || !event.detail || typeof event.detail !== "object") return null;
   const detail = event.detail as Record<string, unknown>;
