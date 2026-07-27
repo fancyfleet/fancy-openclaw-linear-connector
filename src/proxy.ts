@@ -1506,13 +1506,17 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
                     : stateNode?.transitions?.find(
                     (t) => t.command === effectiveIntent,
                   );
-                  if (matchedTransition) {
+                  const delegateDestination =
+                    matchedTransition?.to ??
+                    (effectiveIntent === breakGlassCommand ? def.break_glass?.to ?? "escape" : undefined);
+                  if (delegateDestination) {
                     const resolved = await resolveTransitionDelegate(
-                      matchedTransition.to,
+                      delegateDestination,
                       matchedTransition,
                       def,
                       issueId,
                       target ?? undefined,
+                      agentId,
                     );
                     if (resolved !== undefined) {
                       delegateOverride = resolved;
@@ -1524,6 +1528,20 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
                           `delegate-pre-resolve agent=${agentId} intent=${effectiveIntent}${ticketCtx}: injected delegateId=${resolved} into forwarded mutation`,
                         );
                       }
+                    } else if (
+                      effectiveIntent === breakGlassCommand &&
+                      def.states.some((s) => s.id === delegateDestination && !!s.owner_role && s.kind !== "terminal")
+                    ) {
+                      log.warn(`delegate-pre-resolve blocked agent=${agentId} intent=${effectiveIntent}${ticketCtx}: destination delegate requires --target`);
+                      res.status(200).json({
+                        errors: [{
+                          message:
+                            `[Proxy] '${effectiveIntent}' blocked before posting a workflow comment: ` +
+                            `break-glass target state '${delegateDestination}' has an ambiguous owner. ` +
+                            `Re-run with --target <agent>.`,
+                        }],
+                      });
+                      return;
                     }
                   }
                 }
