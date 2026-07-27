@@ -4,15 +4,15 @@
  *
  * GEN-214 (2026-07-19) looked like "review→done is unmapped": `approve`,
  * `continue-workflow` and `escape` all appeared to do nothing from `review`.
- * The workflow def was never the problem — review→sign-off→done is a real,
- * tested two-continue tail (see ai-2094-wf-task-review-signoff.test.ts AC4).
+ * The workflow def was never the problem — review→merge→sign-off→done is a
+ * real, tested tail (see ai-2094-wf-task-review-signoff.test.ts AC4).
  * The actual defect was two bugs compounding on the LIVE capability-policy,
  * where `requester` is filled by TWO bodies (astrid, ai), not one:
  *
  *   1. A transition owned by a multi-body role (`approve` → sign-off, owned by
- *      `requester`) fail-closes without an explicit `--target` — correct,
- *      documented behavior (AI-1709). Astrid's dispatch loop never supplied
- *      one, so every `approve`/`escape` attempt aborted.
+ *      `requester`) used to fail-close without an explicit `--target`. INF-804
+ *      routes approval to singleton deployment/Hanzo first, so review approval
+ *      no longer depends on requester target selection.
  *   2. The fail-close remedy comment — the ONE place the agent would have
  *      learned to re-run with `--target astrid|ai` — silently failed to post.
  *      `postComment()`'s response was discarded (fixed upstream as INF-127),
@@ -47,11 +47,14 @@ const CANONICAL_TASK_FIXTURE = path.resolve(process.cwd(), "src/__fixtures__/can
 const TASK_POLICY_YAML = `
 capabilities:
   - id: linear:transition
+  - id: deploy:execute
 containers:
   - id: steward
     grants: [linear:transition]
   - id: dev
     grants: [linear:transition]
+  - id: deployment
+    grants: [linear:transition, deploy:execute]
 roles:
   - id: requester
     requires: [linear:transition]
@@ -59,6 +62,8 @@ roles:
     requires: [linear:transition]
   - id: worker
     requires: [linear:transition]
+  - id: deployment
+    requires: [deploy:execute]
 bodies:
   - id: astrid
     container: steward
@@ -66,6 +71,9 @@ bodies:
   - id: ai
     container: steward
     fills_roles: [requester]
+  - id: hanzo
+    container: deployment
+    fills_roles: [deployment]
   - id: worker1
     container: dev
     fills_roles: [worker]
@@ -78,6 +86,7 @@ const AGENTS_JSON = {
   agents: [
     { name: "astrid", linearUserId: "user-astrid", clientId: "c", clientSecret: "s", accessToken: "t", refreshToken: "r", host: "local" as const },
     { name: "ai", linearUserId: "user-ai", clientId: "c", clientSecret: "s", accessToken: "t", refreshToken: "r", host: "local" as const },
+    { name: "hanzo", linearUserId: "user-hanzo", clientId: "c", clientSecret: "s", accessToken: "t", refreshToken: "r", host: "local" as const },
     { name: "worker1", linearUserId: "user-worker1", clientId: "c", clientSecret: "s", accessToken: "t", refreshToken: "r", host: "local" as const },
     { name: "worker2", linearUserId: "user-worker2", clientId: "c", clientSecret: "s", accessToken: "t", refreshToken: "r", host: "local" as const },
   ],
@@ -89,6 +98,7 @@ const TEAM_LABELS = [
   { id: "state-routing-id", name: "state:routing" },
   { id: "state-doing-id", name: "state:doing" },
   { id: "state-review-id", name: "state:review" },
+  { id: "state-merge-id", name: "state:merge" },
   { id: "state-signoff-id", name: "state:sign-off" },
   { id: "state-done-id", name: "state:done" },
 ];
@@ -166,7 +176,21 @@ function makeFetch(currentLabelNames: () => string[]): typeof globalThis.fetch {
     }
 
     if (query.includes("IssueBranchAndPR")) {
-      return json({ data: { issue: { attachments: { nodes: [] } } } });
+      return json({
+        data: {
+          issue: {
+            attachments: {
+              nodes: [
+                {
+                  url: "https://github.com/fancymatt/repo/pull/1",
+                  sourceType: "github",
+                  metadata: { status: "merged", mergeCommitSha: "abc123" },
+                },
+              ],
+            },
+          },
+        },
+      });
     }
 
     if (query.includes("issueUpdate") || query.includes("ApplyAtomicTransition") || query.includes("UpdateDelegate")) {
@@ -231,7 +255,7 @@ describe("INF-128 — wf:task full lifecycle (multi-body requester)", () => {
     globalThis.fetch = originalFetch;
   });
 
-  it("AC2: intake → routing → doing → review → sign-off → done, target supplied at every multi-body gate", async () => {
+  it("AC2: intake → routing → doing → review → merge → sign-off → done, target supplied at every multi-body gate", async () => {
     // intake --request--> routing (department-head is a singleton: astrid; no target needed)
     globalThis.fetch = makeFetch(() => ["wf:task", "state:intake"]);
     let result = await applyStateTransition("request", TICKET_IDENTIFIER, "Bearer tok", {
@@ -257,14 +281,23 @@ describe("INF-128 — wf:task full lifecycle (multi-body requester)", () => {
     });
     expect(result).toMatchObject({ status: "applied", from: "doing", to: "review" });
 
-    // review --approve--> sign-off (requester is multi-body: explicit target required)
+    // review --approve--> merge (deployment is singleton: Hanzo; no target needed)
     globalThis.fetch = makeFetch(() => ["wf:task", "state:review"]);
     result = await applyStateTransition("approve", TICKET_IDENTIFIER, "Bearer tok", {
       bodyId: "astrid",
       sourceStateOverride: "review",
+    });
+    expect(result).toMatchObject({ status: "applied", from: "review", to: "merge" });
+    expect(captured.comments).toEqual([]); // happy path never posts a delegate-unresolved remedy
+
+    // merge --continue--> sign-off (requester is multi-body: explicit target required)
+    globalThis.fetch = makeFetch(() => ["wf:task", "state:merge"]);
+    result = await applyStateTransition("continue", TICKET_IDENTIFIER, "Bearer tok", {
+      bodyId: "hanzo",
+      sourceStateOverride: "merge",
       cliTarget: "astrid",
     });
-    expect(result).toMatchObject({ status: "applied", from: "review", to: "sign-off" });
+    expect(result).toMatchObject({ status: "applied", from: "merge", to: "sign-off" });
     expect(captured.comments).toEqual([]); // happy path never posts a delegate-unresolved remedy
 
     // sign-off --accept--> done (requester is multi-body: explicit target required)
@@ -280,42 +313,28 @@ describe("INF-128 — wf:task full lifecycle (multi-body requester)", () => {
 
   // ── The GEN-214 regression ────────────────────────────────────────────────
   describe("GEN-214 regression: approve on review with no --target", () => {
-    it("fails closed (NOT a silent no-op, and not 'review→done unmapped') and posts the --target remedy", async () => {
+    it("advances to the singleton merge gate instead of needing requester target selection", async () => {
       globalThis.fetch = makeFetch(() => ["wf:task", "state:review"]);
 
       const result = await applyStateTransition("approve", TICKET_IDENTIFIER, "Bearer tok", {
         bodyId: "astrid",
         sourceStateOverride: "review",
-        // no cliTarget — exactly what Astrid's dispatch loop sent on GEN-214
+        // no cliTarget — approval now seats singleton deployment/Hanzo.
       });
 
-      expect(result.status).toBe("failed");
-      expect(result.code).toBe("delegate-unresolved");
-      expect(captured.writes).toEqual([]); // no half-applied label/delegate write
-
-      // The remedy comment must actually land — this is the INF-127/INF-128 fix.
-      expect(captured.comments).toHaveLength(1);
-      const comment = captured.comments[0];
-      expect(comment.body).toContain("--target");
-      expect(comment.body).toContain("astrid");
-      expect(comment.body).toContain("ai");
-
-      // INF-128: commentCreate must be called with the resolved INTERNAL uuid,
-      // never the raw human-readable identifier the proxy forwarded — Linear's
-      // commentCreate rejects/silently drops non-UUID issueId (see
-      // postLinearComment's resolve-then-mutate two-step in index.ts).
-      expect(comment.issueId).toBe(ISSUE_UUID);
-      expect(comment.issueId).not.toBe(TICKET_IDENTIFIER);
+      expect(result).toMatchObject({ status: "applied", from: "review", to: "merge" });
+      expect(captured.comments).toEqual([]);
     });
 
-    it("recovers when re-run with the target the remedy comment named", async () => {
-      globalThis.fetch = makeFetch(() => ["wf:task", "state:review"]);
-      const result = await applyStateTransition("approve", TICKET_IDENTIFIER, "Bearer tok", {
-        bodyId: "astrid",
-        sourceStateOverride: "review",
-        cliTarget: "ai",
+    it("merge continue requires an explicit requester target before sign-off", async () => {
+      globalThis.fetch = makeFetch(() => ["wf:task", "state:merge"]);
+      const result = await applyStateTransition("continue", TICKET_IDENTIFIER, "Bearer tok", {
+        bodyId: "hanzo",
+        sourceStateOverride: "merge",
       });
-      expect(result).toMatchObject({ status: "applied", from: "review", to: "sign-off" });
+      expect(result).toMatchObject({ status: "failed", code: "delegate-unresolved", from: "merge", to: "sign-off" });
+      expect(captured.comments).toHaveLength(1);
+      expect(captured.comments[0].body).toContain("--target");
     });
   });
 });

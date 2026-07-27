@@ -7,9 +7,9 @@
  *
  *   (a) `approve` "silently declines" — review, sign-off and doing all map to
  *       native_state: todo, so `approve` advances the state:* label
- *       review→sign-off but the Linear column stays To Do. It LOOKS like nothing
- *       happened; the ticket actually needs a SECOND continue (`accept`, run by
- *       the requester) to reach Done.
+ *       review→sign-off but the Linear column stays To Do. INF-804 inserts a
+ *       real merge gate there, so approval now advances review→merge before the
+ *       requester can accept.
  *   (b) `continue-workflow` "mis-routes to assign" — getCurrentState returns the
  *       FIRST /^state:/i label via .find(); a stale/duplicate `state:routing`
  *       label (never stripped) binds resolution to `routing`, whose continue
@@ -50,10 +50,13 @@ capabilities:
   - id: linear:transition
   - id: human:escalate
   - id: workflow:break-glass
+  - id: deploy:execute
 
 containers:
   - id: dev
     grants: [linear:transition]
+  - id: deployment
+    grants: [linear:transition, deploy:execute]
   - id: steward
     grants: [linear:transition, human:escalate, workflow:break-glass]
 
@@ -64,6 +67,8 @@ roles:
     requires: [linear:transition]
   - id: worker
     requires: [linear:transition]
+  - id: deployment
+    requires: [deploy:execute]
 
 bodies:
   - id: ai
@@ -72,6 +77,9 @@ bodies:
   - id: astrid
     container: steward
     fills_roles: [department-head]
+  - id: hanzo
+    container: deployment
+    fills_roles: [deployment]
   - id: worker1
     container: dev
     fills_roles: [worker]
@@ -223,7 +231,7 @@ describe("AI-2094 — wf:task review→Done edge (label hygiene + legibility)", 
 
   // ── AC1: Two-gate machine preserved (regression guard) ──────────────────
   // "NO review → done edge. Forward path stays
-  //  review --approve--> sign-off --accept--> done."
+  //  review --approve--> merge --continue--> sign-off --accept--> done."
   // Green-guard: goes RED under the rejected fix direction #1 (making review's
   // approve resolve to `done` terminal), which would delete the requester gate.
   describe("AC1 — two-gate machine (no review→done edge)", () => {
@@ -234,14 +242,16 @@ describe("AI-2094 — wf:task review→Done edge (label hygiene + legibility)", 
       def = loaded;
     });
 
-    it("review advances to sign-off on approve — never directly to done", () => {
+    it("review advances to merge on approve — never directly to done or sign-off", () => {
       const review = def.states.find((s) => s.id === "review");
       expect(review).toBeDefined();
       const approve = review!.transitions?.find((t) => t.command === "approve");
-      expect(approve?.to).toBe("sign-off");
+      expect(approve?.to).toBe("merge");
       // The load-bearing invariant: review has NO edge whose target is done.
       const toDone = (review!.transitions ?? []).filter((t) => t.to === "done");
       expect(toDone).toHaveLength(0);
+      const toSignOff = (review!.transitions ?? []).filter((t) => t.to === "sign-off");
+      expect(toSignOff).toHaveLength(0);
     });
 
     it("done is reachable ONLY through sign-off (anti-orphan, AI-1375)", () => {
@@ -295,8 +305,8 @@ describe("AI-2094 — wf:task review→Done edge (label hygiene + legibility)", 
   //  present." Even when a ticket has drifted to TWO state:* labels, applying a
   //  transition must leave exactly one (the destination).
   describe("AC2 — transition strips prior state:* labels (exactly one remains)", () => {
-    it("approve from review strips both stale state:routing and state:review, leaving only state:sign-off", async () => {
-      const stateLabelIds = new Set(["routing-lbl", "review-lbl", "signoff-lbl"]);
+    it("approve from review strips both stale state:routing and state:review, leaving only state:merge", async () => {
+      const stateLabelIds = new Set(["routing-lbl", "review-lbl", "merge-lbl"]);
       const { fetch: mock, calls } = makeTransitionFetch({
         issueLabels: [
           { id: "wf-lbl", name: "wf:task" },
@@ -304,7 +314,7 @@ describe("AI-2094 — wf:task review→Done edge (label hygiene + legibility)", 
           { id: "review-lbl", name: "state:review" },
           { id: "prio-lbl", name: "priority:high" },
         ],
-        teamLabels: [{ id: "signoff-lbl", name: "state:sign-off" }],
+        teamLabels: [{ id: "merge-lbl", name: "state:merge" }],
       });
       globalThis.fetch = mock;
 
@@ -325,7 +335,7 @@ describe("AI-2094 — wf:task review→Done edge (label hygiene + legibility)", 
       expect(labelIds).toContain("prio-lbl");
       // Exactly one state:* label — the destination — remains.
       const stateLabels = labelIds.filter((id) => stateLabelIds.has(id));
-      expect(stateLabels).toEqual(["signoff-lbl"]);
+      expect(stateLabels).toEqual(["merge-lbl"]);
       expect(labelIds).not.toContain("routing-lbl");
       expect(labelIds).not.toContain("review-lbl");
     });
@@ -333,36 +343,35 @@ describe("AI-2094 — wf:task review→Done edge (label hygiene + legibility)", 
 
   // ── AC3: same-column legibility for review --approve ────────────────────
   // The CLI / wake-brief response must explicitly state that the ticket
-  // "advanced to sign-off — requester must run `accept` (continue-workflow) to
-  // close", so a todo→todo transition is not perceived as a silent decline.
-  // RED today: buildStateTransitionReminder emits a generic "You are now in
-  // state: sign-off" with no advance/requester/close framing.
+  // advanced to the merge gate, so a todo→todo transition is not perceived as a
+  // silent decline or requester sign-off.
+  // Regression: buildStateTransitionReminder must name the actual next gate.
   describe("AC3 — same-column advance is legible (not a silent decline)", () => {
-    it("approve response names the sign-off advance and the required second accept gate", async () => {
+    it("approve response names the merge-gate advance and does not present approval as close-ready", async () => {
       globalThis.fetch = makeCtxFetch(["wf:task", "state:review"]);
       const msg = await buildStateTransitionReminder("approve", ISSUE, TOK);
       expect(msg).not.toBeNull();
       const text = msg ?? "";
-      // Frames it as a real forward move to sign-off...
-      expect(text.toLowerCase()).toContain("advanced to sign-off");
-      // ...owned by the requester...
-      expect(text.toLowerCase()).toContain("requester");
-      // ...who must run `accept` to close (the second continue gate).
-      expect(text.toLowerCase()).toContain("accept");
-      expect(text.toLowerCase()).toContain("close");
+      expect(text.toLowerCase()).toContain("advanced to merge");
+      expect(text.toLowerCase()).toContain("deployment");
+      expect(text.toLowerCase()).not.toContain("advanced to sign-off");
     });
   });
 
-  // ── AC4: regression — two-continue tail lands in Done, delegate/assignee
+  // ── AC4: regression — merge-gated tail lands in Done, delegate/assignee
   //         cleared (regression guard). "Note the tail is TWO continue steps."
   // Green-guard: encodes the happy-path contract the fix must not regress.
-  describe("AC4 — review→approve→sign-off→accept→done is a two-continue tail", () => {
-    it("both approve (at review) and accept (at sign-off) are continue-workflow steps", async () => {
-      // Continue step #1: review --approve--> sign-off.
+  describe("AC4 — review→approve→merge→continue→sign-off→accept→done", () => {
+    it("approve, merge continue, and accept are continue-workflow steps", async () => {
+      // Continue step #1: review --approve--> merge.
       globalThis.fetch = makeCtxFetch(["wf:task", "state:review"]);
       expect(await resolveMetaIntent("continue-workflow", ISSUE, TOK)).toEqual({ resolved: "approve" });
 
-      // Continue step #2: sign-off --accept--> done.
+      // Continue step #2: merge --continue--> sign-off.
+      globalThis.fetch = makeCtxFetch(["wf:task", "state:merge"]);
+      expect(await resolveMetaIntent("continue-workflow", ISSUE, TOK)).toEqual({ resolved: "continue" });
+
+      // Continue step #3: sign-off --accept--> done.
       globalThis.fetch = makeCtxFetch(["wf:task", "state:sign-off"]);
       expect(await resolveMetaIntent("continue-workflow", ISSUE, TOK)).toEqual({ resolved: "accept" });
     });
