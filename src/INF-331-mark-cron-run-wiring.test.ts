@@ -410,7 +410,81 @@ describe("INF-331: done-ticket-detector calls markCronRun", () => {
   });
 });
 
-// ── 11. AI-1808: Production bootstrap integration ─────────────────────────────
+// ── 11. INF-847: validation-watchdog + merged evidence liveness ──────────────
+
+describe("INF-847: validation-watchdog calls markCronRun", () => {
+  beforeEach(() => {
+    jest.resetModules();
+    jest.useFakeTimers();
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+  });
+
+  it("marks lastRunAt after a registered validation tick completes", async () => {
+    const { resetCronRegistryForTest, getRegisteredCrons } =
+      await import("./cron/registry.js");
+    const { registerValidationWatchdogCron } =
+      await import("./validation-sla-watchdog.js");
+
+    resetCronRegistryForTest();
+    registerValidationWatchdogCron({
+      authToken: "test-token",
+      validatorLinearUserId: "validator-user",
+      cadenceMs: 50,
+      wakeValidator: async () => {},
+      fetchFn: async () => new Response(JSON.stringify({
+        data: {
+          issues: {
+            nodes: [],
+            pageInfo: { hasNextPage: false, endCursor: null },
+          },
+        },
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    });
+
+    await jest.advanceTimersByTimeAsync(100);
+    await flushCronPromises();
+
+    expectLastRunAtStamped(getRegisteredCrons(), "validation-watchdog");
+  });
+});
+
+describe("INF-847: merged-evidence-reconciler calls markCronRun", () => {
+  beforeEach(() => {
+    jest.resetModules();
+    jest.useFakeTimers();
+    process.env.MERGED_EVIDENCE_RECONCILER_INTERVAL = "50ms";
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+    delete process.env.MERGED_EVIDENCE_RECONCILER_INTERVAL;
+  });
+
+  it("marks lastRunAt when the heartbeat cron is registered and ticks", async () => {
+    const { resetCronRegistryForTest, getRegisteredCrons } =
+      await import("./cron/registry.js");
+    const { registerMergedEvidenceReconcilerCron } =
+      await import("./cron/merged-evidence-reconciler-cron.js");
+
+    resetCronRegistryForTest();
+    registerMergedEvidenceReconcilerCron();
+
+    expectLastRunAtStamped(getRegisteredCrons(), "merged-evidence-reconciler");
+
+    await jest.advanceTimersByTimeAsync(100);
+    await flushCronPromises();
+
+    expectLastRunAtStamped(getRegisteredCrons(), "merged-evidence-reconciler");
+  });
+});
+
+// ── 12. AI-1808: Production bootstrap integration ─────────────────────────────
 //
 // This test boots the full production entry point and polls /health until the
 // expected cron drivers are registered, proving the wiring is genuinely live in

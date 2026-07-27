@@ -99,6 +99,12 @@ import { resolveStatePath } from "./state-dir.js";
 const log = componentLogger(createLogger(), "server");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3100;
 const DEPLOYMENT_NAME = process.env.DEPLOYMENT_NAME ?? "fancymatt";
+const DEFAULT_CRITICAL_STALE_CRON_MS = 24 * 60 * 60 * 1000;
+
+function parseCriticalStaleCronMs(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number(env.CRON_CRITICAL_STALE_MS);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_CRITICAL_STALE_CRON_MS;
+}
 
 // ── Startup commit (exposed via /health for deploy verification) ─────
 let startupCommit: string = "unknown";
@@ -414,7 +420,11 @@ export function createApp(options?: CreateAppOptions) {
       bootGraceMs: parseCronStartupGraceMs(process.env.CRON_STARTUP_GRACE_MS),
       log,
     });
-    const healthy = agents.length > 0 && cronReadiness.status === "ok";
+    const staleCrons = getStaleCrons({ stalenessMultiplier: getCronStalenessMultiplierFromEnv() });
+    const criticalStaleCrons = staleCrons.filter(
+      (cron) => cron.overdueByMs >= parseCriticalStaleCronMs(),
+    );
+    const healthy = agents.length > 0 && cronReadiness.status === "ok" && criticalStaleCrons.length === 0;
 
     // AI-2008 AC3: loud dispatch-undeliverable surfacing. Every dispatch that
     // exhausted its bounded retries is a first-class operational event; project
@@ -424,7 +434,7 @@ export function createApp(options?: CreateAppOptions) {
       outcome: "dispatch-undeliverable",
       limit: 100,
     });
-    const warnings = undeliverable.map((e) => {
+    const warnings: Array<Record<string, unknown>> = undeliverable.map((e) => {
       const detail = (e.detail ?? {}) as Record<string, unknown>;
       return {
         kind: "dispatch-undeliverable",
@@ -436,6 +446,13 @@ export function createApp(options?: CreateAppOptions) {
         occurredAt: e.occurredAt,
       };
     });
+    warnings.push(...criticalStaleCrons.map((cron) => ({
+      kind: "critical-stale-cron",
+      cron: cron.name,
+      schedule: cron.schedule,
+      lastRunAt: cron.lastRunAt,
+      overdueByMs: cron.overdueByMs,
+    })));
 
     res.status(healthy ? 200 : 503).json({
       status: healthy ? "ok" : "degraded",
@@ -464,7 +481,8 @@ export function createApp(options?: CreateAppOptions) {
       // missing from this list means it shipped without bootstrap wiring
       // (the AI-1773/AI-1775 dead-code-in-prod failure mode).
       crons,
-      staleCrons: getStaleCrons({ stalenessMultiplier: getCronStalenessMultiplierFromEnv() }),
+      staleCrons,
+      criticalStaleCrons,
       cronReadiness,
       // AI-2036 AC1.6: observation write-path liveness. `wired`/`subscribed` are
       // true only because bootstrap called registerObservationWritePath() — never

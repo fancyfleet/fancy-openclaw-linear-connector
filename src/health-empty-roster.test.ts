@@ -58,6 +58,7 @@ describe("health endpoint — empty-roster guard (AI-1767)", () => {
     delete process.env.AGENTS_FILE;
     delete process.env.OPENCLAW_HOOKS_URL;
     delete process.env.OPENCLAW_HOOKS_TOKEN;
+    delete process.env.CRON_CRITICAL_STALE_MS;
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -125,5 +126,41 @@ describe("health endpoint — empty-roster guard (AI-1767)", () => {
     expect(res.status).toBe(200);
     expect(res.body).toHaveProperty("staleCrons");
     expect(res.body.staleCrons).toEqual([]);
+  });
+
+  test("INF-847: /health degrades when a cron is critically stale", async () => {
+    dir = tempDir();
+    process.env.AGENTS_FILE = writeAgentsFile(dir, [sampleAgent]);
+    process.env.CRON_CRITICAL_STALE_MS = String(24 * 60 * 60 * 1000);
+    reloadAgents();
+    appState = createApp({
+      bagDbPath: path.join(dir, "pending-bag.db"),
+      agentQueueDbPath: path.join(dir, "agent-queue.db"),
+      operationalEventsDbPath: path.join(dir, "operational-events.db"),
+    });
+
+    registerCron("critical-stale-driver", "every 5m");
+    markCronRun(
+      "critical-stale-driver",
+      new Date(Date.now() - 2 * 24 * 60 * 60 * 1000),
+    );
+
+    const res = await request(appState.app).get("/health");
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe("degraded");
+    expect(res.body.criticalStaleCrons).toEqual([
+      expect.objectContaining({
+        name: "critical-stale-driver",
+        schedule: "every 5m",
+      }),
+    ]);
+    expect(res.body.warnings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "critical-stale-cron",
+          cron: "critical-stale-driver",
+        }),
+      ]),
+    );
   });
 });

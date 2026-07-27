@@ -9,7 +9,7 @@
  */
 
 import { createLogger, componentLogger } from "../logger.js";
-import { registerCron, formatIntervalMs } from "./registry.js";
+import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "merged-evidence-reconciler-cron");
 
@@ -42,12 +42,14 @@ const MAX_TIMEOUT_MS = 2_147_483_647; // setInterval's 32-bit signed int ceiling
 export function registerMergedEvidenceReconcilerCron(): void {
   const intervalMs = parseIntervalMs(process.env.MERGED_EVIDENCE_RECONCILER_INTERVAL ?? "1h");
   registerCron(CRON_NAME, `every ${formatIntervalMs(intervalMs)}`);
+  markCronRun(CRON_NAME);
 
   const timer = setInterval(() => {
     // Reconciliation logic (Linear query + git ancestry check per ticket) is
     // driven via detectMergedEvidence/resolveEvidenceTransition from
     // ../merged-pr-evidence.js, invoked per in-flight ticket by the caller
     // that owns ticket iteration.
+    markCronRun(CRON_NAME);
   }, Math.min(intervalMs, MAX_TIMEOUT_MS));
   timer.unref();
 

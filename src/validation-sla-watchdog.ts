@@ -22,7 +22,7 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 import { createLogger, componentLogger } from "./logger.js";
-import { registerCron, formatIntervalMs } from "./cron/registry.js";
+import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
 
 // ── Logging ───────────────────────────────────────────────────────────────────
@@ -440,12 +440,22 @@ export function registerValidationWatchdogCron(
     `states=${opts.watchedStates ?? DEFAULT_WATCHED_STATES}`,
   );
 
-  const timer = setInterval(() => {
-    runValidationWatchdog(opts).catch((err) => {
+  void runValidationWatchdog(opts)
+    .then(() => markCronRun("validation-watchdog"))
+    .catch((err) => {
       console.error(
-        `[validation-watchdog] sweep failed: ${err instanceof Error ? err.message : String(err)}`,
+        `[validation-watchdog] startup sweep failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     });
+
+  const timer = setInterval(() => {
+    runValidationWatchdog(opts)
+      .then(() => markCronRun("validation-watchdog"))
+      .catch((err) => {
+        console.error(
+          `[validation-watchdog] sweep failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
   }, cadenceMs);
   if (typeof timer.unref === "function") timer.unref();
   return timer;
