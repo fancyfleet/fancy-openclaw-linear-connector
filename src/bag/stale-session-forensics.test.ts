@@ -1,5 +1,5 @@
 import { jest } from "@jest/globals";
-import { classify, buildRecoveryComment, type ToolCallSummary, type LastAssistantMessage, type StaleSnapshot, STALE_CLASS_NAMES, buildSnapshot, writeSnapshot, aggregateDigest, formatDigestSummary, recoverTicket } from "./stale-session-forensics.js";
+import { classify, buildRecoveryComment, type ToolCallSummary, type LastAssistantMessage, type StaleSnapshot, STALE_CLASS_NAMES, buildSnapshot, writeSnapshot, aggregateDigest, formatDigestSummary, recoverTicket, collectSameKeySessionReplay } from "./stale-session-forensics.js";
 import { StaleRedispatchCounter } from "./stale-redispatch-counter.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -688,6 +688,59 @@ describe("INF-859 recovery routing — same-key collision and capped reviewer C4
     expect(commentBodies()).toHaveLength(0);
     const recoveryMutations = fetchCalls().filter((call) => graphqlBody(call).query?.includes("RecoverIssue"));
     expect(recoveryMutations).toHaveLength(0);
+  });
+
+  test("INF-859: production same-key replay is collected from OpenClaw session index", () => {
+    const openclawHome = fs.mkdtempSync(path.join(os.tmpdir(), "stale-replay-"));
+    const sessionsDir = path.join(openclawHome, "agents", "igor", "sessions");
+    fs.mkdirSync(sessionsDir, { recursive: true });
+
+    const liveFile = path.join(sessionsDir, "live.jsonl");
+    const huskFile = path.join(sessionsDir, "husk.jsonl");
+    fs.writeFileSync(
+      liveFile,
+      JSON.stringify({
+        type: "message",
+        timestamp: "2026-07-27T00:00:00.000Z",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", name: "exec", arguments: {} }],
+          stopReason: "tool_use",
+        },
+      }) + "\n",
+      "utf8",
+    );
+    fs.writeFileSync(
+      huskFile,
+      JSON.stringify({
+        type: "message",
+        timestamp: "2026-07-27T00:00:01.000Z",
+        message: {
+          role: "toolResult",
+          content: [{ type: "text", text: "Error: CronSessionLifecycleClaimError: lifecycle claim already held" }],
+        },
+      }) + "\n",
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(sessionsDir, "sessions.json"),
+      JSON.stringify({
+        "agent:igor:linear-INF-665": { sessionId: "live", sessionFile: liveFile, status: "working" },
+        "agent:igor:hook:linear-INF-665": { sessionId: "husk", sessionFile: huskFile, status: "claim-collision-husk" },
+        "agent:igor:linear-INF-999": { sessionId: "other", status: "working" },
+      }),
+      "utf8",
+    );
+
+    const replay = collectSameKeySessionReplay("igor", "linear-INF-665", { openclawHome });
+
+    expect(replay).toHaveLength(2);
+    expect(replay).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ sessionKey: "agent:igor:linear-INF-665", totalCalls: 1, assistantTurns: 1, claimError: null, status: "working" }),
+        expect.objectContaining({ sessionKey: "agent:igor:hook:linear-INF-665", totalCalls: 0, assistantTurns: 0, claimError: expect.stringContaining("CronSessionLifecycleClaimError"), status: "claim-collision-husk" }),
+      ]),
+    );
   });
 
   test("INF-859/INF-665: true C4 with no competing live owner still recovers as a first-stall re-poke and counts once", async () => {

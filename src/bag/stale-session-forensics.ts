@@ -296,6 +296,63 @@ function readSessionJsonl(filePath: string): JsonlEvent[] {
   }
 }
 
+function countAssistantTurns(events: JsonlEvent[]): number {
+  return events.filter((event) => event.type === "message" && event.message?.role === "assistant").length;
+}
+
+/**
+ * Build the same-key replay context from OpenClaw's live session index.
+ *
+ * This is intentionally small and deterministic: recovery only needs enough
+ * evidence to distinguish a zero-output lifecycle claim-collision husk from a
+ * real C4 where no competing same-key owner exists.
+ */
+export function collectSameKeySessionReplay(
+  agentId: string,
+  sessionKey: string,
+  config: ForensicsConfig = {},
+): SameKeySessionReplayEntry[] {
+  const openclawHome = config.openclawHome ?? path.join(os.homedir(), ".openclaw");
+  const openclawAgentName = getOpenclawAgentName(agentId);
+  const sessionsDir = path.join(openclawHome, "agents", openclawAgentName, "sessions");
+  const indexPath = path.join(sessionsDir, "sessions.json");
+
+  try {
+    if (!fs.existsSync(indexPath)) return [];
+    const raw = fs.readFileSync(indexPath, "utf8");
+    const index = JSON.parse(raw) as Record<string, Record<string, unknown>>;
+
+    return Object.entries(index)
+      .filter(([key]) => sameNormalizedSessionKey(key, sessionKey))
+      .map(([key, entry]) => {
+        const sessionId = typeof entry.sessionId === "string" ? entry.sessionId : "";
+        const sessionFile = typeof entry.sessionFile === "string"
+          ? entry.sessionFile
+          : sessionId
+            ? path.join(sessionsDir, `${sessionId}.jsonl`)
+            : null;
+        const events = sessionFile ? readSessionJsonl(sessionFile) : [];
+        const errors = extractErrors(events);
+        const claimError = errors.find((err) =>
+          /CronSessionLifecycleClaimError|lifecycle claim already held/i.test(err),
+        ) ?? null;
+        const toolCalls = extractToolCallSummary(events);
+
+        return {
+          sessionKey: typeof entry.sessionKey === "string" ? entry.sessionKey : key,
+          sessionFile,
+          totalCalls: toolCalls.totalCalls,
+          assistantTurns: countAssistantTurns(events),
+          claimError,
+          status: typeof entry.status === "string" ? entry.status : null,
+        };
+      });
+  } catch (err) {
+    log.warn(`Failed to collect same-key session replay for ${agentId} [${sessionKey}]: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
+}
+
 // ── Snapshot builder ────────────────────────────────────────────────────────
 
 /**
@@ -1013,13 +1070,23 @@ export async function recoverTicket(
     // C1/C3/C5/C6/C-UNK → assign to human owner and clear delegate (human must review).
     // C2/C4 → clear both (connector will re-dispatch normally), unless cap is breached.
     const needsHuman = NEEDS_HUMAN_CLASSES.has(snapshot.classification) || isRedispatchCapped;
+    const sprintStewardLinearId =
+      config.sprintStewardLinearId ??
+      process.env.STALE_SPRINT_STEWARD_LINEAR_ID ??
+      getLinearUserIdForAgent(process.env.STALE_SPRINT_STEWARD_AGENT ?? "astrid") ??
+      null;
+    const infraOwnerLinearId =
+      config.infraOwnerLinearId ??
+      process.env.STALE_INFRA_OWNER_LINEAR_ID ??
+      getLinearUserIdForAgent(process.env.STALE_INFRA_OWNER_AGENT ?? "grover") ??
+      null;
     const humanId = isInfraCapacityEscalation
-      ? (config.sprintStewardLinearId ?? config.infraOwnerLinearId ?? config.humanAssigneeLinearId ?? process.env.STALE_HUMAN_ASSIGNEE_LINEAR_ID ?? null)
+      ? (sprintStewardLinearId ?? infraOwnerLinearId ?? config.humanAssigneeLinearId ?? process.env.STALE_HUMAN_ASSIGNEE_LINEAR_ID ?? null)
       : (config.humanAssigneeLinearId ?? process.env.STALE_HUMAN_ASSIGNEE_LINEAR_ID ?? null);
     if (needsHuman && !humanId) {
       log.warn(
         `Recovery for ${identifier}: class=${snapshot.classification} requires human assignment ` +
-        `but STALE_HUMAN_ASSIGNEE_LINEAR_ID is not set — delegate cleared, assignee not set`,
+        `but no recovery owner is configured — delegate cleared, assignee not set`,
       );
     }
 

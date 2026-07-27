@@ -29,7 +29,7 @@ import { registerTranscriptRedaction, getTranscriptRedactionHealth } from "./tra
 import { normalizeSessionKey } from "./session-key.js";
 import { applyEngagementStatus, registerEngagementNativeStateOverlay } from "./engagement-status.js";
 import { createAdminRouter } from "./admin.js";
-import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, STALE_CLASS_NAMES, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
+import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, collectSameKeySessionReplay, STALE_CLASS_NAMES, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
 import { checkLinearIssueRouting } from "./linear-actionable.js";
 import { assertDispatchTargetFetchable } from "./delivery/index.js";
 import { markDispatchIntegrityGateActive, getDispatchIntegrityState } from "./dispatch-integrity-state.js";
@@ -725,7 +725,50 @@ export function createApp(options?: CreateAppOptions) {
     openclawHome: process.env.OPENCLAW_HOME,
     loopThreshold: process.env.STALE_LOOP_THRESHOLD ? parseInt(process.env.STALE_LOOP_THRESHOLD, 10) : undefined,
     humanAssigneeLinearId: process.env.STALE_HUMAN_ASSIGNEE_LINEAR_ID,
+    sprintStewardLinearId:
+      process.env.STALE_SPRINT_STEWARD_LINEAR_ID ??
+      getLinearUserIdForAgent(process.env.STALE_SPRINT_STEWARD_AGENT ?? "astrid"),
+    infraOwnerLinearId:
+      process.env.STALE_INFRA_OWNER_LINEAR_ID ??
+      getLinearUserIdForAgent(process.env.STALE_INFRA_OWNER_AGENT ?? "grover"),
   };
+
+  function buildSameKeySessionReplay(stale: StaleSessionDetail): NonNullable<ForensicsConfig["sameKeySessionReplay"]> {
+    const indexedReplay = collectSameKeySessionReplay(stale.agentId, stale.sessionKey, forensicsConfig);
+    const activeReplay = sessionTracker.getActiveAgents().flatMap((activeAgentId) =>
+      sessionTracker.getActiveSessionKeys(activeAgentId).map((sessionKey) => ({
+        sessionKey,
+        totalCalls: 0,
+        assistantTurns: 0,
+        claimError: null,
+        status: sessionKey === stale.sessionKey ? "working" : "active",
+      })),
+    );
+    return [...indexedReplay, ...activeReplay];
+  }
+
+  function buildRecoveryRoleContext(
+    stale: StaleSessionDetail,
+    linearState: Awaited<ReturnType<typeof fetchLinearTicketState>>,
+    snapshot: StaleSnapshot,
+  ): NonNullable<ForensicsConfig["recoveryRoleContext"]> {
+    const state = linearState?.state?.name ?? snapshot.linearTicket.stateAtTimeout ?? undefined;
+    const stateKey = (state ?? "").toLowerCase();
+    const agentKey = stale.agentId.toLowerCase();
+    const role =
+      agentKey === "charles" || stateKey.includes("review")
+        ? "reviewer"
+        : agentKey === "hanzo" || stateKey.includes("merge") || stateKey.includes("deploy")
+          ? "merge-gate"
+          : undefined;
+
+    return {
+      workflow: "dev-impl",
+      state,
+      role,
+      failure: `C4 Never started (totalCalls:${snapshot.toolCallSummary.totalCalls}, sessionFile:${snapshot.metadata.sessionFile ?? "null"})`,
+    };
+  }
 
   /**
    * Process a single stale session: capture forensics, classify, recover ticket.
@@ -775,7 +818,11 @@ export function createApp(options?: CreateAppOptions) {
     });
 
     // 6. Recover the Linear ticket
-    const recovery = await recoverTicket(snapshot, stale.agentId, forensicsConfig);
+    const recovery = await recoverTicket(snapshot, stale.agentId, {
+      ...forensicsConfig,
+      sameKeySessionReplay: buildSameKeySessionReplay(stale),
+      recoveryRoleContext: buildRecoveryRoleContext(stale, linearState, snapshot),
+    });
     if (!recovery.success) {
       log.error(`Recovery failed for ${stale.sessionKey}: ${recovery.detail}`);
     } else if (recovery.rePoke) {
