@@ -1,0 +1,757 @@
+/**
+ * INF-784 — wf:dept-engine archetype, department engine.
+ *
+ * Red-test mapping:
+ *   AC1/AC7: registered def + canonical fixture parity, continuous loop shape,
+ *     first-N human theme-confirm gate, and no embedded charter content.
+ *   AC2: department-head role resolution is scoped by department/team.
+ *   AC3: managing barrier waits only on owned-infra children.
+ *   AC4/AC6: three output classes, provenance, no cross-team prioritization,
+ *     and foundation-first product-output gate.
+ *   AC5: per-department terminal predicates, including non-PR head approval.
+ */
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawn, type ChildProcess } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { load as loadYaml } from "js-yaml";
+import { afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals";
+import { evaluateBarrier, onManagingEntry } from "./barrier.js";
+import { isDeptOwnedInfraTerminal, planDeptEngineOutputs } from "./dept-engine.js";
+import { resolveBodiesForRole, resetPolicyCache } from "./escalation-gate.js";
+import { clearFanoutOutcomeStore, recordFanoutOutcome } from "./fanout-outcome-store.js";
+import { loadWorkflowRegistry, resetWorkflowCache, resetNativeStateCache } from "./workflow-gate.js";
+import { applyEngagementStatus, registerEngagementNativeStateOverlay } from "./engagement-status.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(__dirname, "..");
+const REGISTERED_DEF_PATH = path.join(REPO_ROOT, "src/registered-defs/dept-engine.yaml");
+const CANONICAL_FIXTURE_PATH = path.join(REPO_ROOT, "src/__fixtures__/canonical-dept-engine.yaml");
+const DIST_ENTRY = path.join(REPO_ROOT, "dist/index.js");
+
+type LooseRecord = Record<string, any>;
+
+function readYaml(file: string): LooseRecord {
+  return loadYaml(fs.readFileSync(file, "utf8")) as LooseRecord;
+}
+
+function state(def: LooseRecord, id: string): LooseRecord {
+  const found = (def.states ?? []).find((candidate: LooseRecord) => candidate.id === id);
+  expect(found).toBeDefined();
+  return found;
+}
+
+function transition(from: LooseRecord, command: string, to: string): LooseRecord {
+  const found = (from.transitions ?? []).find(
+    (candidate: LooseRecord) => candidate.command === command && candidate.to === to,
+  );
+  expect(found).toBeDefined();
+  return found;
+}
+
+function stable(value: unknown): unknown {
+  return JSON.parse(JSON.stringify(value));
+}
+
+async function pollHealth(url: string, timeoutMs: number): Promise<LooseRecord> {
+  const deadline = Date.now() + timeoutMs;
+  let lastErr: unknown = new Error("never attempted");
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(url);
+      const body = (await res.json()) as LooseRecord;
+      if (body && typeof body === "object") return body;
+    } catch (err) {
+      lastErr = err;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw lastErr;
+}
+
+async function stopChild(child: ChildProcess | undefined): Promise<void> {
+  if (!child || child.killed) return;
+  child.kill("SIGTERM");
+  await new Promise<void>((resolve) => {
+    const force = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve();
+    }, 2_000);
+    child.on("exit", () => {
+      clearTimeout(force);
+      resolve();
+    });
+  });
+}
+
+async function readBoundPort(portFile: string, timeoutMs: number): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  let lastErr: unknown = new Error("port file was never written");
+  while (Date.now() < deadline) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(portFile, "utf8")) as LooseRecord;
+      if (typeof parsed.port === "number" && parsed.port > 0) return parsed.port;
+    } catch (err) {
+      lastErr = err;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw lastErr;
+}
+
+function writeListenPortProbe(tmpDir: string): { preload: string; portFile: string } {
+  const portFile = path.join(tmpDir, "bound-port.json");
+  const preload = path.join(tmpDir, "record-listen-port.mjs");
+  fs.writeFileSync(
+    preload,
+    `
+import fs from "node:fs";
+import net from "node:net";
+
+const originalListen = net.Server.prototype.listen;
+net.Server.prototype.listen = function patchedListen(...args) {
+  const result = originalListen.apply(this, args);
+  this.once("listening", () => {
+    const address = this.address();
+    if (address && typeof address === "object" && address.port > 0) {
+      fs.writeFileSync(
+        process.env.INF784_LISTEN_PORT_FILE,
+        JSON.stringify({ port: address.port }),
+        "utf8",
+      );
+    }
+  });
+  return result;
+};
+`,
+    "utf8",
+  );
+  return { preload, portFile };
+}
+
+describe("INF-784 AC1/AC7: wf:dept-engine def registration and fixture canary", () => {
+  // AC9: load through the production registry-load path (WORKFLOW_DEFS_DIR dir-mode),
+  // the same path the connector entry point uses at bootstrap after boot-reconcile
+  // populates the dir — NOT a bare no-env default. Point it at the canonical
+  // registered-defs directory (what boot-reconcile copies into the live dir).
+  const REGISTERED_DEFS_DIR = path.dirname(REGISTERED_DEF_PATH);
+  const savedDefsDir = process.env.WORKFLOW_DEFS_DIR;
+
+  beforeEach(() => {
+    process.env.WORKFLOW_DEFS_DIR = REGISTERED_DEFS_DIR;
+    resetWorkflowCache();
+  });
+
+  afterEach(() => {
+    if (savedDefsDir === undefined) delete process.env.WORKFLOW_DEFS_DIR;
+    else process.env.WORKFLOW_DEFS_DIR = savedDefsDir;
+    resetWorkflowCache();
+  });
+
+  it("registers wf:dept-engine and keeps registered def in exact parity with canonical fixture", async () => {
+    expect(fs.existsSync(REGISTERED_DEF_PATH)).toBe(true);
+    expect(fs.existsSync(CANONICAL_FIXTURE_PATH)).toBe(true);
+
+    const registered = readYaml(REGISTERED_DEF_PATH);
+    const fixture = readYaml(CANONICAL_FIXTURE_PATH);
+    expect(stable(registered)).toEqual(stable(fixture));
+
+    const registry = await loadWorkflowRegistry();
+    expect(registry.has("dept-engine")).toBe(true);
+    expect(stable(registry.get("dept-engine"))).toEqual(stable(registered));
+  });
+
+  it("authors the required continuous loop with first-N theme-confirm gate and no embedded charter", () => {
+    const def = readYaml(REGISTERED_DEF_PATH);
+
+    expect(def).toMatchObject({
+      id: "dept-engine",
+      archetype: "continuous-loop",
+      entry_state: "evaluating",
+    });
+    expect(def.charter).toBeUndefined();
+    expect(def.description ?? "").not.toMatch(/department charter|charter content/i);
+    expect(def.instantiation).toEqual(expect.objectContaining({
+      charter_ref: expect.any(String),
+      department: expect.any(String),
+      foundation_milestone: expect.any(String),
+    }));
+
+    const expectedStates = [
+      "evaluating",
+      "theme-proposal",
+      "theme-confirm",
+      "solicit",
+      "synthesize-scope",
+      "managing",
+      "validation",
+      "done",
+    ];
+    expect((def.states ?? []).map((s: LooseRecord) => s.id)).toEqual(expectedStates);
+
+    expect(transition(state(def, "evaluating"), "propose-theme", "theme-proposal").generic).toBe("continue");
+    expect(transition(state(def, "theme-proposal"), "confirm-theme", "theme-confirm")).toEqual(expect.objectContaining({
+      generic: "continue",
+      human_confirm: expect.objectContaining({ first_cycles: expect.any(Number) }),
+    }));
+    expect(transition(state(def, "theme-confirm"), "solicit", "solicit").generic).toBe("continue");
+    expect(state(def, "solicit").fanout).toEqual(expect.objectContaining({
+      spec_source: "solicitations",
+      barrier: "all-responded",
+    }));
+    expect(transition(state(def, "solicit"), "synthesize", "synthesize-scope").generic).toBe("continue");
+    expect(state(def, "synthesize-scope")).toEqual(expect.objectContaining({
+      barrier: true,
+      fanout: expect.objectContaining({
+        spec_source: "synthesized-scope",
+        child_workflow: "wf:dev-impl",
+      }),
+    }));
+    expect(transition(state(def, "synthesize-scope"), "spawn", "managing").generic).toBe("continue");
+    expect(state(def, "managing").barrier).toBe(true);
+    expect(transition(state(def, "managing"), "validate", "validation")).toBeDefined();
+    expect(transition(state(def, "validation"), "complete-cycle", "done").generic).toBe("continue");
+    expect(transition(state(def, "done"), "loop", "evaluating").generic).toBe("continue");
+  });
+
+  it("boots the production entry point and exposes wf:dept-engine in /health.workflowRegistry without launching a cycle", async () => {
+    expect(fs.existsSync(DIST_ENTRY)).toBe(true);
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-784-bootstrap-"));
+    // AC9: model the production registry-load path exactly — set WORKFLOW_DEFS_DIR
+    // (as docker-compose does) to a writable dir the entry point's boot-reconcile
+    // populates from the packaged registered-defs, then loads dir-mode. This proves
+    // dept-engine registers via the *same* path production uses at bootstrap, not a
+    // bare no-env default the production connector never runs with.
+    const workflowsDir = path.join(tmpDir, "workflows");
+    fs.mkdirSync(workflowsDir, { recursive: true });
+    const { preload, portFile } = writeListenPortProbe(tmpDir);
+    const agentsFile = path.join(tmpDir, "agents.json");
+    fs.writeFileSync(
+      agentsFile,
+      JSON.stringify({
+        agents: [
+          {
+            name: "charles",
+            linearUserId: "user-charles-inf784",
+            openclawAgent: "charles",
+            clientId: "client-id",
+            clientSecret: "client-secret",
+            accessToken: "access-token",
+            refreshToken: "refresh-token",
+            host: "local",
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    let child: ChildProcess | undefined;
+    let childStderr = "";
+    try {
+      child = spawn(process.execPath, [DIST_ENTRY], {
+        cwd: tmpDir,
+        env: {
+          ...process.env,
+          AGENTS_FILE: agentsFile,
+          WORKFLOW_DEFS_DIR: workflowsDir,
+          DATA_DIR: path.join(tmpDir, "data"),
+          PORT: "0",
+          INF784_LISTEN_PORT_FILE: portFile,
+          LOG_LEVEL: "error",
+          LINEAR_CONNECTOR_SECRET: "test-secret-inf784",
+          LINEAR_WEBHOOK_SECRET: "test-webhook-inf784",
+          LINEAR_OAUTH_TOKEN: "test-linear-oauth-token",
+          OPENCLAW_HOOKS_URL: "http://127.0.0.1:9/unused-hooks",
+          OPENCLAW_HOOKS_TOKEN: "test-hooks-token",
+          CRON_STARTUP_GRACE_MS: "60000",
+          NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import ${preload}`.trim(),
+        },
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      child.stderr?.on("data", (chunk: Buffer) => {
+        childStderr += chunk.toString("utf8");
+      });
+
+      let body: LooseRecord;
+      try {
+        const port = await readBoundPort(portFile, 30_000);
+        body = await pollHealth(`http://127.0.0.1:${port}/health`, 30_000);
+      } catch (err) {
+        throw new Error(
+          `production entry point never exposed /health: ${err instanceof Error ? err.message : String(err)}\n` +
+          `child stderr:\n${childStderr}`,
+        );
+      }
+
+      expect(body.workflowRegistry).toBeDefined();
+      expect(body.workflowRegistry["dept-engine"]).toEqual(expect.objectContaining({
+        id: "dept-engine",
+        states: expect.arrayContaining(["evaluating", "theme-proposal", "solicit", "managing", "validation", "done"]),
+      }));
+      expect(child.exitCode).toBeNull();
+    } finally {
+      await stopChild(child);
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }, 60_000);
+});
+
+describe("INF-784 AC2: department-head resolution is scoped", () => {
+  let tmpDir: string;
+  const oldPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-784-policy-"));
+    fs.writeFileSync(
+      path.join(tmpDir, "policy.yaml"),
+      `
+capabilities:
+  - id: linear:transition
+containers:
+  - id: lead
+    grants: [linear:transition]
+  - id: steward
+    grants: [linear:transition]
+roles:
+  - id: department-head
+    requires: [linear:transition]
+  - id: steward
+    requires: [linear:transition]
+bodies:
+  - id: astrid
+    container: steward
+    fills_roles: [steward]
+  - id: charles
+    container: lead
+    fills_roles: [department-head]
+    departments: [ENG]
+    teams: [Engineering]
+  - id: laren
+    container: lead
+    fills_roles: [department-head]
+    departments: [DSN]
+    teams: [Design]
+`,
+      "utf8",
+    );
+    process.env.CAPABILITY_POLICY_PATH = path.join(tmpDir, "policy.yaml");
+    resetPolicyCache();
+  });
+
+  afterEach(() => {
+    if (oldPolicyPath === undefined) delete process.env.CAPABILITY_POLICY_PATH;
+    else process.env.CAPABILITY_POLICY_PATH = oldPolicyPath;
+    resetPolicyCache();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("resolves ENG to charles and DSN to laren instead of global steward or all heads", async () => {
+    const scopedResolver = resolveBodiesForRole as unknown as (
+      roleId: string,
+      scope: { department?: string; team?: string },
+    ) => Promise<string[]>;
+
+    await expect(scopedResolver("department-head", { department: "ENG", team: "Engineering" })).resolves.toEqual(["charles"]);
+    await expect(scopedResolver("department-head", { department: "DSN", team: "Design" })).resolves.toEqual(["laren"]);
+    await expect(scopedResolver("steward", { department: "ENG", team: "Engineering" })).resolves.toEqual(["astrid"]);
+    await expect(scopedResolver("department-head", { department: "ENG", team: "Design" })).resolves.toEqual([]);
+    await expect(scopedResolver("department-head", { department: "DSN", team: "Engineering" })).resolves.toEqual([]);
+    await expect(scopedResolver("department-head", { department: "OPS", team: "Operations" })).resolves.toEqual([]);
+    await expect(scopedResolver("department-head", {})).rejects.toThrow(/department|team|scope/i);
+  });
+});
+
+describe("INF-784 AC3: managing barrier scope is owned-infra only", () => {
+  const oldFetch = global.fetch;
+  const oldFanoutOutcomePath = process.env.FANOUT_OUTCOME_PATH;
+  // onManagingEntry derives barrier_scope from the live dept-engine def, so the
+  // registry must resolve it — via the production dir-mode path (WORKFLOW_DEFS_DIR),
+  // the same path the connector runs with, not a bare no-env default.
+  const REGISTERED_DEFS_DIR = path.dirname(REGISTERED_DEF_PATH);
+  const savedDefsDir = process.env.WORKFLOW_DEFS_DIR;
+
+  beforeEach(() => {
+    process.env.WORKFLOW_DEFS_DIR = REGISTERED_DEFS_DIR;
+    resetWorkflowCache();
+  });
+
+  afterEach(() => {
+    global.fetch = oldFetch;
+    clearFanoutOutcomeStore();
+    if (oldFanoutOutcomePath !== undefined) process.env.FANOUT_OUTCOME_PATH = oldFanoutOutcomePath;
+    else delete process.env.FANOUT_OUTCOME_PATH;
+    if (savedDefsDir === undefined) delete process.env.WORKFLOW_DEFS_DIR;
+    else process.env.WORKFLOW_DEFS_DIR = savedDefsDir;
+    resetWorkflowCache();
+  });
+
+  it("excludes product handoff/proposal children from managing barrier evaluation", async () => {
+    global.fetch = jest.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        data: {
+          issue: {
+            children: {
+              nodes: [
+                {
+                  identifier: "ENG-101",
+                  labels: {
+                    nodes: [
+                      { name: "wf:dev-impl" },
+                      { name: "state:done" },
+                      { name: "dept-output:owned-infra" },
+                    ],
+                  },
+                },
+                {
+                  identifier: "PROD-44",
+                  labels: {
+                    nodes: [
+                      { name: "wf:task" },
+                      { name: "state:implementation" },
+                      { name: "dept-output:product-backlog-proposal" },
+                    ],
+                  },
+                },
+                {
+                  identifier: "PROD-45",
+                  labels: {
+                    nodes: [
+                      { name: "wf:task" },
+                      { name: "state:implementation" },
+                      { name: "dept-output:standards-proposal" },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+        },
+      }),
+    } as Response)) as typeof fetch;
+
+    const result = await evaluateBarrier("ENG-DEPT-1", "token", {
+      workflow: "dept-engine",
+      barrierScope: "owned-infra",
+    } as any);
+
+    expect(result.allTerminal).toBe(true);
+    expect(result.children.map((child) => child.identifier)).toEqual(["ENG-101"]);
+    expect(result.totalChildren).toBe(1);
+  });
+
+  it("onManagingEntry advances dept-engine managing when owned-infra is done and out-of-barrier proposals remain active", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-784-fanout-"));
+    process.env.FANOUT_OUTCOME_PATH = path.join(tmpDir, "fanout-outcomes.json");
+    clearFanoutOutcomeStore();
+    await recordFanoutOutcome("ENG-DEPT-1", {
+      outcome: "awaiting",
+      childIdentifiers: ["ENG-101", "PROD-44", "PROD-45"],
+      recordedAt: new Date().toISOString(),
+    });
+
+    const fetchCalls: Array<{ query: string; variables?: LooseRecord }> = [];
+    global.fetch = jest.fn(async (_url, init) => {
+      const parsed = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as { query?: string; variables?: LooseRecord };
+      const query = parsed.query ?? "";
+      fetchCalls.push({ query, variables: parsed.variables });
+
+      if (query.includes("ParentChildren")) {
+        return new Response(JSON.stringify({
+          data: {
+            issue: {
+              children: {
+                nodes: [
+                  {
+                    identifier: "ENG-101",
+                    labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:done" }, { name: "dept-output:owned-infra" }] },
+                  },
+                  {
+                    identifier: "PROD-44",
+                    labels: { nodes: [{ name: "wf:task" }, { name: "state:implementation" }, { name: "dept-output:product-backlog-proposal" }] },
+                  },
+                  {
+                    identifier: "PROD-45",
+                    labels: { nodes: [{ name: "wf:task" }, { name: "state:implementation" }, { name: "dept-output:standards-proposal" }] },
+                  },
+                ],
+              },
+            },
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      if (query.includes("ParentState") || query.includes("ParentLabels") || query.includes("IssueLabels")) {
+        return new Response(JSON.stringify({
+          data: {
+            issue: {
+              id: "parent-internal-id",
+              team: { id: "team-eng" },
+              labels: {
+                nodes: [
+                  { id: "wf-lbl", name: "wf:dept-engine" },
+                  { id: "state-lbl", name: "state:managing" },
+                ],
+              },
+            },
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      if (query.includes("TeamStates")) {
+        return new Response(JSON.stringify({
+          data: {
+            team: {
+              states: {
+                nodes: [
+                  { id: "native-thinking", name: "Thinking", type: "started" },
+                  { id: "native-managing", name: "Managing", type: "started" },
+                ],
+              },
+            },
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      if (query.includes("TeamLabels")) {
+        return new Response(JSON.stringify({
+          data: { team: { labels: { nodes: [{ id: "state-validation-lbl", name: "state:validation" }] } } },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      if (query.includes("ApplyBarrierTransition") || query.includes("UpdateLabels")) {
+        return new Response(JSON.stringify({ data: { issueUpdate: { success: true } } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      if (query.includes("commentCreate")) {
+        return new Response(JSON.stringify({ data: { commentCreate: { success: true, comment: { id: "comment-id" } } } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      throw new Error(`unexpected query: ${query.slice(0, 120)}`);
+    }) as typeof fetch;
+
+    const result = await onManagingEntry("ENG-DEPT-1", "token");
+
+    expect(result).not.toBeNull();
+    expect(result?.transitioned).toBe(true);
+    expect(result?.terminalCount).toBe(1);
+    expect(result?.totalChildren).toBe(1);
+    const transitionCall = fetchCalls.find((call) => call.query.includes("ApplyBarrierTransition"));
+    expect(transitionCall?.variables).toMatchObject({
+      issueId: "parent-internal-id",
+      input: {
+        labelIds: ["wf-lbl", "state-validation-lbl"],
+        stateId: "native-thinking",
+      },
+    });
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+});
+
+describe("INF-784 AC4/AC6: output routing, provenance, and foundation-first gate", () => {
+  it("declares owned-infra, product-backlog, and standards-proposal output classes with barrier membership", () => {
+    const def = readYaml(REGISTERED_DEF_PATH);
+    const outputs = def.output_classes ?? def.x_dept_output_classes;
+
+    expect(outputs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "owned-infra", barrier: true }),
+      expect.objectContaining({ id: "product-backlog-proposal", barrier: false }),
+      expect.objectContaining({ id: "standards-proposal", barrier: false, continuous_rule: true }),
+    ]));
+  });
+
+  it("routes proposed product outputs with provenance while refusing cross-team priority/sprint/state writes", async () => {
+    expect(typeof planDeptEngineOutputs).toBe("function");
+
+    const result = planDeptEngineOutputs({
+      department: "ENG",
+      cycle: 3,
+      foundation: { milestone: "runtime-dispatch-hardened", met: true },
+      proposals: [
+        { class: "owned-infra", title: "Own the dispatch circuit breaker", team: "ENG", priority: "High", state: "todo" },
+        { class: "product-backlog-proposal", title: "Expose retry status in product UI", team: "GEN", priority: "High", state: "todo" },
+        { class: "standards-proposal", title: "Adopt retry evidence in PM bar", team: "GEN", sprint: "Current" },
+      ],
+    });
+
+    expect(result.children).toEqual([
+      expect.objectContaining({
+        class: "owned-infra",
+        barrier: true,
+        team: "ENG",
+        priority: "High",
+        state: "todo",
+        labels: expect.arrayContaining(["dept-proposed: ENG, cycle 3"]),
+      }),
+      expect.objectContaining({
+        class: "product-backlog-proposal",
+        barrier: false,
+        team: "GEN",
+        labels: expect.arrayContaining(["dept-proposed: ENG, cycle 3"]),
+      }),
+      expect.objectContaining({
+        class: "standards-proposal",
+        barrier: false,
+        team: "GEN",
+        labels: expect.arrayContaining(["dept-proposed: ENG, cycle 3"]),
+      }),
+    ]);
+    for (const child of result.children.filter((c: LooseRecord) => c.team !== "ENG")) {
+      expect(child.priority).toBeUndefined();
+      expect(child.sprint).toBeUndefined();
+      expect(child.state).toBeUndefined();
+    }
+  });
+
+  it("keeps product backlog and standards proposals locked until the named foundation milestone is met", async () => {
+    expect(typeof planDeptEngineOutputs).toBe("function");
+
+    expect(() =>
+      planDeptEngineOutputs({
+        department: "ENG",
+        cycle: 1,
+        foundation: { milestone: "runtime-dispatch-hardened", met: false },
+        proposals: [
+          { class: "owned-infra", title: "Internal dispatch hardening", team: "ENG" },
+          { class: "product-backlog-proposal", title: "Product request before foundation", team: "GEN" },
+          { class: "standards-proposal", title: "Rule before foundation", team: "GEN" },
+        ],
+      }),
+    ).toThrow(/foundation.*runtime-dispatch-hardened.*product-backlog-proposal.*standards-proposal/i);
+  });
+});
+
+describe("INF-784 AC5: per-department terminal predicates", () => {
+  it("requires ENG owned-infra PR work to be tests-green plus merged", async () => {
+    expect(typeof isDeptOwnedInfraTerminal).toBe("function");
+
+    expect(isDeptOwnedInfraTerminal({
+      department: "ENG",
+      artifactType: "pull-request",
+      checks: { tests: "green" },
+      pullRequest: { merged: true },
+    })).toBe(true);
+    expect(isDeptOwnedInfraTerminal({
+      department: "ENG",
+      artifactType: "pull-request",
+      checks: { tests: "green" },
+      pullRequest: { merged: false },
+    })).toBe(false);
+    expect(isDeptOwnedInfraTerminal({
+      department: "ENG",
+      artifactType: "pull-request",
+      checks: { tests: "red" },
+      pullRequest: { merged: true },
+    })).toBe(false);
+  });
+
+  it("supports a non-PR owned-infra artifact whose terminal signal is department-head approval", async () => {
+    expect(typeof isDeptOwnedInfraTerminal).toBe("function");
+
+    expect(isDeptOwnedInfraTerminal({
+      department: "DSN",
+      artifactType: "standards-document",
+      headReview: { reviewer: "laren", approved: true, authoredByDepartmentHead: true },
+    })).toBe(true);
+    expect(isDeptOwnedInfraTerminal({
+      department: "DSN",
+      artifactType: "standards-document",
+      headReview: { reviewer: "astrid", approved: true, authoredByDepartmentHead: false },
+    })).toBe(false);
+  });
+});
+
+// ── AC9 companion guard: engagement overlay under a fully-loaded registry ─────
+//
+// Root-cause guard for the round-3 regression. When loadWorkflowRegistry resolves
+// the full packaged registry (the production dir-mode path via WORKFLOW_DEFS_DIR),
+// loadWorkflowDefById succeeds, so the AI-2568 native_state overlay inside
+// applyEngagementStatus becomes active. A prior revision changed the *no-env*
+// registry default to load the packaged dir, which silently activated that overlay
+// for consumers/tests that had previously fail-opened — regressing the AI-1560
+// engagement Doing flip. That default is now reverted; this pins the interaction so
+// it cannot regress again.
+//
+// Production always runs dir-mode (docker-compose sets WORKFLOW_DEFS_DIR), so these
+// assertions reflect real production behavior — not the no-def fail-open path the
+// sibling engagement-status-regression suite exercises.
+describe("INF-784 AC9 guard: engagement overlay under full dir-mode registry", () => {
+  const SEMANTIC_TO_UUID: Record<string, string> = {
+    "To Do": "state-todo-uuid",
+    Thinking: "state-thinking-uuid",
+    Doing: "state-doing-uuid",
+    Done: "state-done-uuid",
+    Invalid: "state-invalid-uuid",
+  };
+  const REGISTERED_DEFS_DIR = path.dirname(REGISTERED_DEF_PATH);
+  const savedDefsDir = process.env.WORKFLOW_DEFS_DIR;
+  const savedFetch = globalThis.fetch;
+  let updates: Array<{ id: string; stateId: string }>;
+
+  function installFetchMock(stateLabel: string): void {
+    updates = [];
+    globalThis.fetch = (async (_url: any, init: any) => {
+      const body = JSON.parse(typeof init?.body === "string" ? init.body : "{}");
+      const q: string = body.query ?? "";
+      const vars = body.variables ?? {};
+      if (q.includes("EngagementIssue")) {
+        return new Response(JSON.stringify({ data: { issue: {
+          id: "issue-uuid",
+          team: { id: "team-uuid" },
+          state: { id: SEMANTIC_TO_UUID.Thinking, name: "Thinking" },
+          labels: { nodes: [{ name: "wf:dev-impl" }, { name: stateLabel }] },
+        } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (q.includes("TeamStates")) {
+        return new Response(JSON.stringify({ data: { team: { states: { nodes:
+          Object.entries(SEMANTIC_TO_UUID).map(([name, id]) => ({ id, name,
+            type: name === "Done" ? "completed" : name === "Invalid" ? "canceled" : "started" })),
+        } } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (q.includes("issueUpdate")) {
+        updates.push({ id: String(vars.id), stateId: String(vars.stateId) });
+        return new Response(JSON.stringify({ data: { issueUpdate: { success: true } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ data: {} }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }) as typeof globalThis.fetch;
+  }
+
+  beforeEach(() => {
+    process.env.WORKFLOW_DEFS_DIR = REGISTERED_DEFS_DIR;
+    resetWorkflowCache();
+    resetNativeStateCache();
+    registerEngagementNativeStateOverlay();
+  });
+
+  afterEach(() => {
+    if (savedDefsDir === undefined) delete process.env.WORKFLOW_DEFS_DIR;
+    else process.env.WORKFLOW_DEFS_DIR = savedDefsDir;
+    globalThis.fetch = savedFetch;
+    resetWorkflowCache();
+    resetNativeStateCache();
+  });
+
+  it("still flips a native_state:doing state to Doing when the full registry resolves (Doing-flip not regressed)", async () => {
+    installFetchMock("state:doing");
+    await applyEngagementStatus("AI-9001", "doing", "test-token");
+    expect(updates.some((u) => u.stateId === SEMANTIC_TO_UUID.Doing)).toBe(true);
+    expect(updates.some((u) => u.stateId === SEMANTIC_TO_UUID["To Do"])).toBe(false);
+  });
+
+  it("resolves a native_state:todo state to its resting To Do under the loaded registry (AI-2568 overlay active — production dir-mode behavior)", async () => {
+    installFetchMock("state:write-tests");
+    await applyEngagementStatus("AI-9002", "doing", "test-token");
+    expect(updates.some((u) => u.stateId === SEMANTIC_TO_UUID["To Do"])).toBe(true);
+    expect(updates.some((u) => u.stateId === SEMANTIC_TO_UUID.Doing)).toBe(false);
+  });
+});

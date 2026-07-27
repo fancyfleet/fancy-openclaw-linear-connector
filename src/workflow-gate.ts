@@ -250,6 +250,8 @@ export interface WorkflowState {
    *  linked child reaches a terminal state. Replaces the hardcoded
    *  BARRIER_WORKFLOWS set; barrier-ness is now per-state, any workflow id. */
   barrier?: boolean;
+  /** INF-784: optional per-state subset that contributes to barrier completion. */
+  barrier_scope?: string;
   /** AI-1490: semantic native Linear state this workflow state projects to.
    *  Must be a key in the CLI's SEMANTIC_STATE_MAP (doing, thinking, done, invalid, etc.)
    *  or a literal Linear state name. Validated at connector startup. */
@@ -972,14 +974,16 @@ export function resetWorkflowRegistry(): void {
  * is the ac-validate failure signal.
  */
 export async function getWorkflowRegistryLiveness(): Promise<Record<string, {
+  id: string;
   version: number | undefined;
   states: string[];
 }>> {
   try {
     const registry = await loadWorkflowRegistry();
-    const out: Record<string, { version: number | undefined; states: string[] }> = {};
+    const out: Record<string, { id: string; version: number | undefined; states: string[] }> = {};
     for (const [id, def] of registry) {
       out[id] = {
+        id,
         version: def.version,
         states: (def.states ?? []).map((s) => s.id),
       };

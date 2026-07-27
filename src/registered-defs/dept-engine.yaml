@@ -1,0 +1,126 @@
+id: dept-engine
+version: 1
+archetype: continuous-loop
+entry_state: evaluating
+
+instantiation:
+  charter_ref: department-charter
+  department: department
+  foundation_milestone: runtime-dispatch-hardened
+
+output_classes:
+  - id: owned-infra
+    barrier: true
+    terminal_predicate: department-owned-infra
+  - id: product-backlog-proposal
+    barrier: false
+    provenance_label: "dept-proposed: <dept>, cycle N"
+    proposes_never_prioritizes: true
+    unlock_after: foundation_milestone
+  - id: standards-proposal
+    barrier: false
+    continuous_rule: true
+    provenance_label: "dept-proposed: <dept>, cycle N"
+    proposes_never_prioritizes: true
+    unlock_after: foundation_milestone
+
+foundation_gate:
+  early_cycles: internal-infra-only
+  unlocks:
+    - product-backlog-proposal
+    - standards-proposal
+
+terminal_predicates:
+  ENG:
+    owned-infra:
+      pull-request:
+        tests: green
+        merged: true
+    non-pr:
+      terminal_signal: department-head-approval
+
+states:
+  - id: evaluating
+    owner_role: department-head
+    kind: normal
+    native_state: thinking
+    transitions:
+      - command: propose-theme
+        to: theme-proposal
+        generic: continue
+
+  - id: theme-proposal
+    owner_role: department-head
+    kind: normal
+    native_state: thinking
+    transitions:
+      - command: confirm-theme
+        to: theme-confirm
+        generic: continue
+        human_confirm:
+          first_cycles: 3
+
+  - id: theme-confirm
+    owner_role: department-head
+    kind: approval_gate
+    native_state: todo
+    transitions:
+      - command: solicit
+        to: solicit
+        generic: continue
+
+  - id: solicit
+    owner_role: engine
+    kind: normal
+    native_state: doing
+    fanout:
+      spec_source: solicitations
+      child_workflow: wf:task
+      barrier: all-responded
+    transitions:
+      - command: synthesize
+        to: synthesize-scope
+        generic: continue
+
+  - id: synthesize-scope
+    owner_role: department-head
+    kind: barrier
+    barrier: true
+    native_state: doing
+    fanout:
+      spec_source: synthesized-scope
+      child_workflow: wf:dev-impl
+    transitions:
+      - command: spawn
+        to: managing
+        generic: continue
+
+  - id: managing
+    owner_role: department-head
+    kind: barrier
+    barrier: true
+    barrier_scope: owned-infra
+    native_state: managing
+    transitions:
+      - command: validate
+        to: validation
+        generic: continue
+
+  - id: validation
+    owner_role: department-head
+    kind: normal
+    native_state: thinking
+    transitions:
+      - command: complete-cycle
+        to: done
+        generic: continue
+
+  - id: done
+    owner_role: engine
+    kind: terminal
+    native_state: done
+    satisfies_parent_barrier: true
+    transitions:
+      - command: loop
+        to: evaluating
+        generic: continue
