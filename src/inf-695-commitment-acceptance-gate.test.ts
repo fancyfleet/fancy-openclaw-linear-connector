@@ -495,4 +495,69 @@ describe("INF-695 S2 — Commitment / acceptance gate", () => {
     });
     ops.close();
   });
+
+  it("INF-820: a bounce back into the gated state re-applies accept even though a stale commitment-exit row survives (no applied-state corroboration)", async () => {
+    // Repro of the LSO-32 deadlock: the ticket accepted once (row recorded),
+    // progressed downstream, then bounced back into the commitment-gate state
+    // (merge/deploy reject, code-review request-changes, ac-validate ac-fail).
+    // The bounce never cleared the `commitment-exit-recorded` row, and the
+    // applied-state TTL has since expired, so the live label authoritatively reads
+    // the gated state again. `accept` must RE-APPLY here — the old code no-op'd on
+    // the surviving row alone, wedging the ticket: `accept` idempotent-skipped while
+    // `submit` stayed gate-blocked.
+    const ops = new OperationalEventStore(path.join(dir, "ops-inf820.db"));
+    const { fetch, calls } = makeLinearFetch("investigation");
+    globalThis.fetch = fetch;
+
+    // Stale row from the prior implementation cycle; no recordAppliedState (TTL expired).
+    ops.append({
+      outcome: "commitment-exit-recorded",
+      agent: "igor",
+      key: ISSUE_IDENTIFIER,
+      sessionKey: `linear-${ISSUE_IDENTIFIER}`,
+      detail: { workflow: "commitment", from: "investigation", exit: "accept", to: "doing", auto: false },
+    });
+    expect(ops.query({ key: ISSUE_IDENTIFIER, outcome: "commitment-exit-recorded" })).toHaveLength(1);
+
+    const result = await applyStateTransition("accept", ISSUE_UUID, "Bearer tok-igor", {
+      bodyId: "igor",
+      operationalEventStore: ops,
+    });
+
+    // The fix: accept applies the investigation -> doing transition instead of no-opping.
+    expect(result.status).toBe("applied");
+    const doingWrites = calls.filter(
+      (c) => c.query.includes("ApplyAtomicTransition") && c.variables.stateId === "state-doing",
+    );
+    expect(doingWrites).toHaveLength(1);
+    ops.close();
+  });
+
+  it("INF-820: a genuine read-after-write duplicate accept still no-ops when applied-state corroborates the recorded exit", async () => {
+    // The dedup the no-op exists for: the SAME accept re-enters within the applied-state
+    // TTL (the first apply recorded both the row and applied-state=doing). This must
+    // still be suppressed — the fix only removes the no-op when applied-state does NOT
+    // corroborate (the bounce case above).
+    const ops = new OperationalEventStore(path.join(dir, "ops-inf820-dup.db"));
+    const { fetch } = makeLinearFetch("investigation");
+    globalThis.fetch = fetch;
+
+    ops.append({
+      outcome: "commitment-exit-recorded",
+      agent: "igor",
+      key: ISSUE_IDENTIFIER,
+      sessionKey: `linear-${ISSUE_IDENTIFIER}`,
+      detail: { workflow: "commitment", from: "investigation", exit: "accept", to: "doing", auto: false },
+    });
+    // Corroborating authoritative state from the just-applied accept (within TTL).
+    recordAppliedState(ISSUE_IDENTIFIER, "doing");
+
+    const result = await applyStateTransition("accept", ISSUE_UUID, "Bearer tok-igor", {
+      bodyId: "igor",
+      operationalEventStore: ops,
+    });
+
+    expect(result).toMatchObject({ status: "noop", code: "commitment-exit-already-recorded" });
+    ops.close();
+  });
 });

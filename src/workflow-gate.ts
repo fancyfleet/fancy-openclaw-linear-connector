@@ -5261,12 +5261,29 @@ export async function applyStateTransition(
       to: currentStateName,
     };
   }
+  // INF-820: the recorded-exit no-op must be CORROBORATED by the applied-state
+  // store, not fire on the ledger row alone. `currentCommitmentExit` is only
+  // non-null while we are sitting IN the commitment-gate state (that is the only
+  // state whose exits define this intent), so a recorded `commitment-exit-recorded`
+  // row here means one of two things:
+  //   (a) genuine read-after-write duplicate — the SAME accept re-entered within
+  //       the applied-state TTL, so getAppliedState still shows the exit target
+  //       (e.g. `doing`). This is the case the no-op exists to suppress.
+  //   (b) STALE row from a prior implementation cycle — the ticket left the gate,
+  //       progressed, then bounced back in (code-review request-changes, merge/deploy
+  //       reject, ac-validate ac-fail all re-enter `implementation`). The bounce never
+  //       cleared the ledger row, so the row now describes a commitment that no longer
+  //       holds. applied-state has expired (or reads the gate state), so it does NOT
+  //       corroborate. A fresh accept MUST re-apply — suppressing it is the INF-820
+  //       deadlock: `accept` no-ops forever while `submit` stays gate-blocked.
+  // Same applied-state-wins-over-stale-signal principle as AI-1534 / AI-2357.
   if (
     currentCommitmentExit &&
-    hasRecordedCommitmentExit(options?.operationalEventStore, issue.identifier)
+    hasRecordedCommitmentExit(options?.operationalEventStore, issue.identifier) &&
+    getAppliedState(issue.identifier) === currentCommitmentExit.to
   ) {
     log.info(
-      `workflow-gate: commitment gate: ${issue.identifier} already has a recorded exit — skipping duplicate '${intent}'`,
+      `workflow-gate: commitment gate: ${issue.identifier} already has a recorded exit corroborated by applied-state '${currentCommitmentExit.to}' — skipping duplicate '${intent}'`,
     );
     return {
       status: "noop",
