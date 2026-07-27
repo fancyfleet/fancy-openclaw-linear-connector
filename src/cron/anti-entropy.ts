@@ -30,6 +30,7 @@ import { createLogger, componentLogger } from "../logger.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
 import { type WorkflowDef } from "../workflow-gate.js";
 import { findOrCreateLabel } from "../linear-helpers.js";
+import { isParkedIssueState } from "../linear-actionable.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "anti-entropy");
 
@@ -50,6 +51,10 @@ export interface AntiEntropyResult {
   nativeDesyncHealed: number;
   barrierMissedFound: number;
   barrierMissedReconciled: number;
+  /** INF-814: wf:*+state:* tickets found in a native parked (Backlog) state. */
+  parkedFound: number;
+  /** INF-814: parked tickets de-enrolled (orphaned `wf:` + `state:` labels stripped). */
+  parkedDeEnrolled: number;
   errors: string[];
 }
 
@@ -69,7 +74,9 @@ interface IssueNode {
   id: string;
   identifier: string;
   team: { id: string };
-  state: { id: string; name: string };
+  // INF-814: `type` lets the parked-native guard match Linear's state type
+  // ("backlog") in addition to the display name, symmetric to isTerminalIssueState.
+  state: { id: string; name: string; type?: string };
   labels: { nodes: LabelNode[] };
   children: { nodes: ChildNode[] };
 }
@@ -242,7 +249,7 @@ async function fetchWorkflowIssues(authToken: string): Promise<IssueNode[]> {
             id
             identifier
             team { id }
-            state { id name }
+            state { id name type }
             labels { nodes { id name } }
             children {
               nodes {
@@ -348,6 +355,39 @@ async function processIssue(
   const workflowId = getWorkflowId(labels);
 
   if (!stateLabel || !workflowId) return;
+
+  // INF-814 — Native park wins over stale workflow labels (symmetric to the
+  // native-terminality guard the reconciliation sweeps apply via
+  // isTerminalIssueState). A wf:*+state:* ticket whose native Linear state is
+  // Backlog was parked by a raw/human move — none of the task/dev-impl workflows
+  // has a `park` transition or a state that rests in Backlog, and the engagement
+  // overlay only ever writes To Do / Thinking / Doing. So a native Backlog on an
+  // enrolled ticket can ONLY be a deliberate park that bypassed the FSM, which
+  // is exactly why it also has no engagement record — native-parked subsumes the
+  // "no engagement" condition.
+  //
+  // Left alone, AC1 below would "heal" native Backlog back to the label's
+  // native_state (e.g. To Do), fighting the park forever while the reconciliation
+  // sweeps re-wake the delegate off the still-actionable state:* label — the
+  // un-reconcilable wake loop. Instead, honor the park: strip the orphaned
+  // wf:*/state:* labels so the ticket converges to the same shape a legitimate
+  // `linear park` (→ __ad_hoc__) produces, and stop. With the labels gone, every
+  // wake source (AC1 here, bootstrap Pass 1/2, delegation sweep) goes quiet.
+  if (isParkedIssueState(issue.state)) {
+    result.parkedFound++;
+    const keepIds = labels
+      .filter((l) => !l.name.startsWith("state:") && !l.name.startsWith("wf:"))
+      .map((l) => l.id);
+    // Keep the native (parked) state as-is; only the labels are orphaned.
+    const applied = await issueUpdateLabelsAndState(issue.id, keepIds, issue.state.id, authToken);
+    if (applied) result.parkedDeEnrolled++;
+    log.info(
+      `[anti-entropy] INF-814 parked de-enroll ${issue.identifier}: ` +
+      `native=${issue.state.name}(${issue.state.type ?? "?"}) had [${stateLabel}, wf:${workflowId}] ` +
+      `→ stripped workflow labels applied=${applied}`,
+    );
+    return;
+  }
 
   const def = registry.get(workflowId);
   if (!def) return;
@@ -459,6 +499,8 @@ export async function runAntiEntropyPass(opts: AntiEntropyOptions): Promise<Anti
     nativeDesyncHealed: 0,
     barrierMissedFound: 0,
     barrierMissedReconciled: 0,
+    parkedFound: 0,
+    parkedDeEnrolled: 0,
     errors: [],
   };
 
@@ -494,12 +536,13 @@ export async function runAntiEntropyPass(opts: AntiEntropyOptions): Promise<Anti
     }
   }
 
-  const driftFound = result.nativeDesyncFound + result.barrierMissedFound;
+  const driftFound = result.nativeDesyncFound + result.barrierMissedFound + result.parkedFound;
   if (driftFound > 0 || result.errors.length > 0) {
     log.info(
       `[anti-entropy] Pass: scanned=${result.scanned} ` +
       `desync=${result.nativeDesyncFound}/${result.nativeDesyncHealed} ` +
       `barrier=${result.barrierMissedFound}/${result.barrierMissedReconciled} ` +
+      `parked=${result.parkedFound}/${result.parkedDeEnrolled} ` +
       `errors=${result.errors.length}`,
     );
   }

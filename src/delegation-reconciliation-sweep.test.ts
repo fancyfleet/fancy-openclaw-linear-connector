@@ -483,6 +483,40 @@ describe("AC1: sweep detects stranded delegations and re-dispatches", () => {
     expect(eventStore.query({ key: "linear-AI-2628", limit: 20 })).toHaveLength(0);
     eventStore.close();
   });
+
+  it("INF-814: skips a ticket whose native Linear state is parked (Backlog) even when workflow labels are active", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: string[] = [];
+    const { bus } = makeTestAlertBus();
+
+    globalThis.fetch = makeReconciliationFetch({
+      governedTickets: [
+        {
+          id: "issue-parked",
+          identifier: "INF-813",
+          updatedAt: OLD_TIMESTAMP,
+          labels: [WF_LABEL, STATE_IMPLEMENTATION_LABEL],
+          delegateId: DELEGATE_LINEAR_ID,
+          delegateName: DELEGATE_AGENT_NAME,
+          teamId: TEAM_ID,
+          state: { name: "Backlog", type: "backlog" },
+        },
+      ],
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (_, id) => { wakeDispatches.push(id); },
+    });
+
+    expect(result.healed).toBe(0);
+    expect(result.bootstrapHealed).toBe(0);
+    expect(wakeDispatches).toHaveLength(0);
+    expect(eventStore.query({ key: "linear-INF-813", limit: 20 })).toHaveLength(0);
+    eventStore.close();
+  });
 });
 
 // ══════════════════════════════════════════════════════════════════════════
