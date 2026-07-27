@@ -30,7 +30,7 @@
 
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
-import { checkEnforcementRules, bodyHasCapability } from "./escalation-gate.js";
+import { checkEnforcementRules, bodyHasCapability, getCapabilityPolicy } from "./escalation-gate.js";
 import { checkLeakedCredentialGate } from "./leaked-credential-gate.js";
 import { checkStaleSnapshotForTerminal } from "./proxy-cas-check.js";
 import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, setStateAtomic, verifyCommentSatisfiedBy, fetchTicketVerification, resolveSignoffWakeTargets, SIGNOFF_WAKE_DISPATCHED_PHRASE, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
@@ -209,6 +209,15 @@ function isIssueUpdateMutation(body: GraphQLRequestBody | null): boolean {
   return !!body?.query && /\bissueUpdate\s*\(/.test(body.query);
 }
 
+function isIssueCreateMutation(body: GraphQLRequestBody | null): boolean {
+  return !!body?.query && /\bissueCreate\s*\(/.test(body.query);
+}
+
+function issueCreateInput(body: GraphQLRequestBody | null): Record<string, unknown> | undefined {
+  const input = (body?.variables as Record<string, unknown> | undefined)?.input;
+  return input && typeof input === "object" ? (input as Record<string, unknown>) : undefined;
+}
+
 /**
  * AI-1612: strip `state:*` label deltas from a forwarded intent-bearing
  * `issueUpdate` mutation so the proxy becomes the sole writer of the workflow
@@ -287,6 +296,182 @@ function stripStateLabelDeltas(body: GraphQLRequestBody | null, stateLabelIds: S
     }
   }
   return stripped;
+}
+
+type XfnDemotionNotification = {
+  issueId: string | null;
+  requester: string;
+  dimension: string;
+  steward: string;
+};
+
+type TeamState = { id: string; name: string; type: string };
+type TeamLabel = { id: string; name: string };
+
+async function fetchIssueTeamId(issueId: string, authToken: string): Promise<string | null> {
+  const res = await fetch(LINEAR_API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: authToken },
+    body: JSON.stringify({
+      query: `query IssueContext($id: String!) {
+        issue(id: $id) {
+          id
+          team { id key name }
+          creator { id name }
+          state { id name type }
+          labels { nodes { id name } }
+          delegate { id name }
+        }
+      }`,
+      variables: { id: issueId },
+      operationName: "IssueContext",
+    }),
+  });
+  if (!res.ok) return null;
+  const data = (await res.json()) as { data?: { issue?: { team?: { id?: string } | null } | null } };
+  return data.data?.issue?.team?.id ?? null;
+}
+
+async function fetchTeamStates(teamId: string, authToken: string): Promise<TeamState[]> {
+  const res = await fetch(LINEAR_API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: authToken },
+    body: JSON.stringify({
+      query: `query($teamId: String!) {
+        team(id: $teamId) {
+          states { nodes { id name type } }
+        }
+      }`,
+      variables: { teamId },
+    }),
+  });
+  if (!res.ok) return [];
+  const data = (await res.json()) as { data?: { team?: { states?: { nodes?: TeamState[] } } } };
+  return data.data?.team?.states?.nodes ?? [];
+}
+
+async function fetchTeamLabels(teamId: string, authToken: string): Promise<TeamLabel[]> {
+  const res = await fetch(LINEAR_API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: authToken },
+    body: JSON.stringify({
+      query: `query($teamId: String!) {
+        team(id: $teamId) {
+          labels { nodes { id name } }
+        }
+      }`,
+      variables: { teamId },
+    }),
+  });
+  if (!res.ok) return [];
+  const data = (await res.json()) as { data?: { team?: { labels?: { nodes?: TeamLabel[] } } } };
+  return data.data?.team?.labels?.nodes ?? [];
+}
+
+async function requesterDimension(agentId: string): Promise<string> {
+  const policy = await getCapabilityPolicy();
+  const body = policy.bodies.find((b) => b.id === agentId || b.openclaw_agent === agentId);
+  return body?.container ?? agentId;
+}
+
+async function defaultSteward(): Promise<string> {
+  const policy = await getCapabilityPolicy();
+  return policy.bodies.find((b) => (b.fills_roles ?? []).includes("steward"))?.id ?? "steward";
+}
+
+function mergeLabelIds(input: Record<string, unknown>, ids: string[]): void {
+  const existing = Array.isArray(input.labelIds)
+    ? input.labelIds.filter((id): id is string => typeof id === "string")
+    : [];
+  input.labelIds = [...new Set([...existing, ...ids])];
+}
+
+function appendRequesterMetadata(input: Record<string, unknown>, requester: string, dimension: string): void {
+  const current = typeof input.description === "string" ? input.description : "";
+  const metadata = `[Cross-functional request]\nRequester: ${requester}\nSource: ${dimension}`;
+  input.description = current.includes("[Cross-functional request]")
+    ? current
+    : current.length > 0
+      ? `${current}\n\n${metadata}`
+      : metadata;
+}
+
+async function maybeDemoteCrossFunctionalRequest(
+  body: GraphQLRequestBody | null,
+  issueId: string | null,
+  authToken: string,
+  agentId: string,
+): Promise<XfnDemotionNotification | null> {
+  if (!body || !isMutationRequest(body)) return null;
+  if (await bodyHasCapability(agentId, "human:escalate")) return null;
+
+  const input = isIssueUpdateMutation(body) ? issueUpdateInput(body) : issueCreateInput(body);
+  if (!input) return null;
+  const requestedStateId = typeof input.stateId === "string" ? input.stateId : null;
+  if (!requestedStateId) return null;
+
+  const teamId = isIssueCreateMutation(body)
+    ? (typeof input.teamId === "string" ? input.teamId : null)
+    : (issueId ? await fetchIssueTeamId(issueId, authToken) : null);
+  if (!teamId) return null;
+
+  const states = await fetchTeamStates(teamId, authToken);
+  const requestedState = states.find((s) => s.id === requestedStateId);
+  if (!requestedState || !["unstarted", "started"].includes(requestedState.type)) return null;
+
+  const backlogState = states.find((s) => s.type === "backlog" || /^backlog$/i.test(s.name));
+  if (!backlogState) return null;
+
+  const dimension = await requesterDimension(agentId);
+  const labels = await fetchTeamLabels(teamId, authToken);
+  const wantedNames = new Set(["cross-functional-request", `xfn:${dimension}`]);
+  const labelIds = labels.filter((label) => wantedNames.has(label.name)).map((label) => label.id);
+  if (labelIds.length < wantedNames.size) return null;
+
+  input.stateId = backlogState.id;
+  input.assigneeId = null;
+  input.delegateId = null;
+  mergeLabelIds(input, labelIds);
+  appendRequesterMetadata(input, agentId, dimension);
+
+  return {
+    issueId: isIssueUpdateMutation(body) ? issueId : null,
+    requester: agentId,
+    dimension,
+    steward: await defaultSteward(),
+  };
+}
+
+async function emitXfnDemotionNotification(
+  notification: XfnDemotionNotification | null,
+  responseText: string | null,
+  authToken: string,
+): Promise<void> {
+  if (!notification) return;
+  let issueId = notification.issueId;
+  if (!issueId && responseText) {
+    try {
+      const parsed = JSON.parse(responseText) as { data?: { issueCreate?: { issue?: { id?: string } } } };
+      issueId = parsed.data?.issueCreate?.issue?.id ?? null;
+    } catch {
+      issueId = null;
+    }
+  }
+  if (!issueId) return;
+  const body =
+    `[Cross-functional request demoted] requester=${notification.requester}; source=${notification.dimension}; routed to Backlog for ${notification.steward} steward triage.`;
+  await fetch(LINEAR_API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: authToken },
+    body: JSON.stringify({
+      query: `mutation($issueId: String!, $body: String!) {
+        commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id url } }
+      }`,
+      variables: { issueId, body },
+    }),
+  }).catch((err: unknown) => {
+    log.warn(`cross-functional demotion notification failed for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
+  });
 }
 
 /**
@@ -1593,6 +1778,14 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
     }
   }
 
+  let xfnDemotionNotification: XfnDemotionNotification | null = null;
+  if (!intent && (isIssueUpdateMutation(body) || isIssueCreateMutation(body))) {
+    xfnDemotionNotification = await maybeDemoteCrossFunctionalRequest(body, issueId, authorization, agentId);
+    if (xfnDemotionNotification) {
+      log.info(`cross-functional-demotion agent=${agentId}${ticketCtx}: rewrote active-state request to Backlog`);
+    }
+  }
+
   // AGI-3: idempotent issueCreate dedup. An identical create from the same agent
   // inside the TTL is answered with the first create's upstream response, so the
   // caller receives the issue that already exists instead of minting a second one.
@@ -1692,6 +1885,8 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       createClaim.abandon();
     }
   }
+
+  await emitXfnDemotionNotification(xfnDemotionNotification, responseText, authorization);
 
   res
     .status(upstreamRes.status)
