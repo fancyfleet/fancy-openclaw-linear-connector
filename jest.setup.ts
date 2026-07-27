@@ -22,6 +22,17 @@ process.env.DATA_DIR = JEST_STATE_DIR;
 // cleanup; with no state dir, agents.ts falls back to process.cwd()/agents.json
 // (the live encrypted production file).
 process.env.OPENCLAW_LINEAR_CONNECTOR_STATE = JEST_STATE_DIR;
+// INF-844: implementer-store.ts defaults to a FIXED, shared /tmp/implementer-store.json
+// whenever IMPLEMENTER_STORE_PATH is unset. That path is written by tests running in
+// OTHER jest workers (workflow-gate.test.ts seeds ghost-body poison there, per AI-1531,
+// and never removes it), so any file that reads the default picks up another worker's
+// records — a real cross-worker race on disk, which jest's per-file environment isolation
+// does NOT cover (unlike process.env / globalThis / the module registry, which it resets
+// per file). This is the actual mechanism behind the INF-844 "different test fails per run"
+// flake. AI-1531 patched it per-suite in the files that knew to; pinning it here — like
+// DATA_DIR/AGENTS_FILE above — closes it for EVERY file, so no test defaults to the shared
+// path unless it explicitly opts in.
+process.env.IMPLEMENTER_STORE_PATH = path.join(JEST_STATE_DIR, "implementer-store.json");
 // jest only sets NODE_ENV=test when it is unset; the deployment container
 // exports NODE_ENV=production, which silently disabled createApp's test-mode
 // delivery config (50ms timeout, 0 retries) and let tests run with the
