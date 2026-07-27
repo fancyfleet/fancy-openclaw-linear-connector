@@ -403,7 +403,13 @@ async function maybeDemoteCrossFunctionalRequest(
   agentId: string,
 ): Promise<XfnDemotionNotification | null> {
   if (!body || !isMutationRequest(body)) return null;
-  if (await bodyHasCapability(agentId, "human:escalate")) return null;
+  try {
+    if (await bodyHasCapability(agentId, "human:escalate")) return null;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`cross-functional-demotion-skip agent=${agentId}: capability policy unavailable: ${msg}`);
+    return null;
+  }
 
   const input = isIssueUpdateMutation(body) ? issueUpdateInput(body) : issueCreateInput(body);
   if (!input) return null;
