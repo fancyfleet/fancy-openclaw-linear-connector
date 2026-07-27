@@ -255,7 +255,11 @@ function makeLinearFetch(stateLabel: "investigation" | "doing" = "investigation"
     }
     if (query.includes("VerifyTransitionWrite")) {
       const expectedLabelIds = (calls.find((c) => c.query.includes("ApplyAtomicTransition"))?.variables.labelIds ?? []) as string[];
-      const verifiedState = expectedLabelIds.includes("ac-validate-lbl") ? "ac-validate" : "doing";
+      const verifiedState = expectedLabelIds.includes("ac-validate-lbl")
+        ? "ac-validate"
+        : expectedLabelIds.includes("investigation-lbl")
+          ? "investigation"
+          : "doing";
       return json({
         data: {
           issue: {
@@ -363,6 +367,51 @@ describe("INF-695 S2 — Commitment / acceptance gate", () => {
       exit: "accept",
       to: "doing",
     });
+    ops.close();
+  });
+
+  it("INF-803: duplicate accept with a durable exit repairs a stale gated projection instead of no-oping", async () => {
+    const ops = new OperationalEventStore(path.join(dir, "ops-inf-803-duplicate.db"));
+    ops.append({
+      outcome: "commitment-exit-recorded",
+      agent: "igor",
+      key: ISSUE_IDENTIFIER,
+      detail: {
+        workflow: "commitment",
+        from: "investigation",
+        exit: "accept",
+        to: "doing",
+      },
+    });
+    const { fetch, calls } = makeLinearFetch("investigation");
+    globalThis.fetch = fetch;
+
+    const result = await applyStateTransition("accept", ISSUE_UUID, "Bearer tok-igor", {
+      bodyId: "igor",
+      operationalEventStore: ops,
+    });
+
+    expect(result).toMatchObject({ status: "applied", from: "investigation", to: "doing" });
+    expect(ops.query({ key: ISSUE_IDENTIFIER, outcome: "commitment-exit-recorded" })).toHaveLength(1);
+    const mutation = calls.find((c) => c.query.includes("ApplyAtomicTransition"));
+    expect(mutation?.variables.labelIds).toContain("doing-lbl");
+    ops.close();
+  });
+
+  it("INF-803: break-glass can escape a working state even when no commitment exit is recorded", async () => {
+    const ops = new OperationalEventStore(path.join(dir, "ops-inf-803-break-glass.db"));
+    const { fetch, calls } = makeLinearFetch("doing");
+    globalThis.fetch = fetch;
+
+    const result = await applyStateTransition("escape", ISSUE_UUID, "Bearer tok-igor", {
+      bodyId: "igor",
+      operationalEventStore: ops,
+    });
+
+    expect(result).toMatchObject({ status: "applied", from: "doing", to: "investigation" });
+    expect(ops.query({ key: ISSUE_IDENTIFIER, outcome: "failure-taxonomy" })).toHaveLength(0);
+    const mutation = calls.find((c) => c.query.includes("ApplyAtomicTransition"));
+    expect(mutation?.variables.labelIds).toContain("investigation-lbl");
     ops.close();
   });
 
