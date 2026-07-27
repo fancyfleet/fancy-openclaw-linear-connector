@@ -16,6 +16,8 @@ import {
   type SessionSpawnRunState,
 } from "./store/session-spawn-idempotency-store.js";
 import { deliverToAgent, type DeliveryConfig } from "./delivery/deliver.js";
+import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "./bag/index.js";
+import type { WakeUpConfig } from "./bag/wake-up.js";
 import type { RouteResult } from "./types.js";
 import type { LinearEvent } from "./webhook/schema.js";
 
@@ -273,5 +275,42 @@ describe("INF-879 sessions_spawn task-key idempotency", () => {
     expect(attempts.filter((attempt) => attempt.idempotentReplay)).toHaveLength(7);
     expect(calls).toHaveLength(1);
     expect(store.listByTicket("INF-879").filter((record) => record.task_key === "race-fixture")).toHaveLength(1);
+  });
+
+  it("AC1/AC3/AC4: pending-bag wake replays converge before a second transport spawn", async () => {
+    const store = createStore();
+    const bag = new PendingWorkBag();
+    const sessionTracker = new SessionTracker();
+    const { calls } = installFetchMock({ ok: true, runId: "bag-wake-run" });
+    const wakeConfig: WakeUpConfig = {
+      nodeBin: process.execPath,
+      hooksUrl: "http://openclaw.test/hooks",
+      hooksToken: "token",
+      timeoutMs: 50,
+      runtimeStatePath: "/tmp/openclaw/sessions.json",
+      sessionSpawnStore: store,
+      sessionSpawnTaskKey: "implementation",
+    };
+
+    await Promise.all(
+      Array.from({ length: 4 }, () =>
+        resignalPendingTickets(
+          "igor",
+          ["INF-879"],
+          bag,
+          sessionTracker,
+          wakeConfig,
+          { isTicketActionable: () => true },
+        ),
+      ),
+    );
+
+    expect(calls).toHaveLength(1);
+    expect(store.listByTicket("INF-879")).toHaveLength(1);
+    expect(store.inspect("INF-879", "implementation")).toMatchObject({
+      run_id: "bag-wake-run",
+      session_id: "linear-INF-879",
+      runtime_state_path: "/tmp/openclaw/sessions.json",
+    });
   });
 });

@@ -1511,7 +1511,10 @@ export function createWebhookRouter(
         const staleSessions = sessionTracker.cleanupStale();
         for (const stale of staleSessions) {
           log.info(`Webhook stale-session drain: re-signaling ${stale.agentId} for ${stale.pendingTickets.length} ticket(s)`);
-          await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfigForAgent(stale.agentId), { markActive: true, onDispatched });
+          await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, {
+            ...wakeConfigForAgent(stale.agentId),
+            sessionSpawnStore,
+          }, { markActive: true, onDispatched });
         }
 
         if (sessionTracker.isActiveForTicket(agentName, normalizedTicketId)) {
@@ -1546,7 +1549,10 @@ export function createWebhookRouter(
         const pending = bag.getPendingTickets(agentName);
         const pendingIds = pending.map((e) => e.ticketId);
         log.info(`Bag: sending wake-up signal(s) to ${agentName} with ${pendingIds.length} ticket(s)`);
-        const dispatchResults = await resignalPendingTickets(agentName, pendingIds, bag, sessionTracker, wakeConfigForAgent(agentName), { markActive: true, onDispatched });
+        const dispatchResults = await resignalPendingTickets(agentName, pendingIds, bag, sessionTracker, {
+          ...wakeConfigForAgent(agentName),
+          sessionSpawnStore,
+        }, { markActive: true, onDispatched });
         const dispatched = dispatchResults.filter(r => r.dispatched).length;
         const firstRunId = dispatchResults.find(r => r.runId)?.runId ?? null;
         const firstCanonVersion = dispatchResults.find(r => r.canonVersion)?.canonVersion ?? null;

@@ -735,6 +735,7 @@ export function createApp(options?: CreateAppOptions) {
       // scheduler declared below is safe.
       deliveryScheduler: dispatchDeliveryScheduler,
       gateway: cfg?.host ?? "local",
+      sessionSpawnStore,
     };
   };
   const resignalOptions = {
