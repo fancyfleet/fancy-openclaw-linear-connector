@@ -413,8 +413,34 @@ function commitmentExitFor(state: WorkflowState | undefined, intent: string): { 
 }
 
 function hasRecordedCommitmentExit(store: OperationalEventStore | undefined, identifier: string): boolean {
-  if (!store) return false;
+  // Tolerate an append-only sink (ObservationEventSink) with no query(): this
+  // helper can now be reached on non-commitment transitions, where callers may
+  // pass a write-only store. A missing query() means "nothing recorded".
+  if (!store || typeof store.query !== "function") return false;
   return store.query({ key: identifier, outcome: COMMITMENT_EXIT_OUTCOME }).length > 0;
+}
+
+function getRecordedCommitmentExit(
+  store: OperationalEventStore | undefined,
+  identifier: string,
+): { workflow: string; from: string; exit: string; to: string } | null {
+  // Eager lookup at the top of applyStateTransition runs on every transition,
+  // including non-commitment ones whose callers pass an append-only sink with
+  // no query(). Treat a query-less store as "nothing recorded" rather than
+  // throwing — applyStateTransition gates every workflow transition, so an
+  // unconditional throw here has engine-wide blast radius.
+  if (!store || typeof store.query !== "function") return null;
+  const event = store.query({ key: identifier, outcome: COMMITMENT_EXIT_OUTCOME, limit: 1 })[0];
+  if (!event || !event.detail || typeof event.detail !== "object") return null;
+  const detail = event.detail as Record<string, unknown>;
+  const workflow = detail.workflow;
+  const from = detail.from;
+  const exit = detail.exit;
+  const to = detail.to;
+  if (typeof workflow !== "string" || typeof from !== "string" || typeof exit !== "string" || typeof to !== "string") {
+    return null;
+  }
+  return { workflow, from, exit, to };
 }
 
 function recordCommitmentExitIfMissing(params: {
@@ -5239,12 +5265,14 @@ export async function applyStateTransition(
     currentStateName ? def.states.find((s) => s.id === currentStateName) : undefined,
     intent,
   );
+  const recordedCommitmentExit = getRecordedCommitmentExit(options?.operationalEventStore, issue.identifier);
   const acceptTarget = commitmentGateState?.commitment_gate?.exits?.accept?.to;
   if (
     currentStateName &&
+    intent !== breakGlassCommand &&
     acceptTarget &&
     currentStateName === acceptTarget &&
-    !hasRecordedCommitmentExit(options?.operationalEventStore, issue.identifier)
+    !recordedCommitmentExit
   ) {
     recordDoingNeverSet({
       store: options?.operationalEventStore,
@@ -5279,18 +5307,44 @@ export async function applyStateTransition(
   // Same applied-state-wins-over-stale-signal principle as AI-1534 / AI-2357.
   if (
     currentCommitmentExit &&
-    hasRecordedCommitmentExit(options?.operationalEventStore, issue.identifier) &&
-    getAppliedState(issue.identifier) === currentCommitmentExit.to
+    recordedCommitmentExit
   ) {
-    log.info(
-      `workflow-gate: commitment gate: ${issue.identifier} already has a recorded exit corroborated by applied-state '${currentCommitmentExit.to}' — skipping duplicate '${intent}'`,
-    );
-    return {
-      status: "noop",
-      code: "commitment-exit-already-recorded",
-      from: currentStateName,
-      to: currentCommitmentExit.to,
-    };
+    if (recordedCommitmentExit.exit !== currentCommitmentExit.exit || recordedCommitmentExit.to !== currentCommitmentExit.to) {
+      log.warn(
+        `workflow-gate: commitment gate: ${issue.identifier} already recorded exit ` +
+        `'${recordedCommitmentExit.exit}' to '${recordedCommitmentExit.to}' — refusing conflicting duplicate '${intent}'`,
+      );
+      return {
+        status: "blocked",
+        code: "commitment-exit-conflict",
+        detail:
+          `workflow '${workflowId}' already recorded commitment exit '${recordedCommitmentExit.exit}' ` +
+          `to '${recordedCommitmentExit.to}'; refusing conflicting '${intent}' to '${currentCommitmentExit.to}'`,
+        from: currentStateName,
+        to: recordedCommitmentExit.to,
+      };
+    }
+    if (getAppliedState(issue.identifier) === recordedCommitmentExit.to) {
+      log.info(
+        `workflow-gate: commitment gate: ${issue.identifier} already has a recorded exit corroborated by applied-state '${recordedCommitmentExit.to}' - skipping duplicate '${intent}'`,
+      );
+      return {
+        status: "noop",
+        code: "commitment-exit-already-recorded",
+        from: currentStateName,
+        to: recordedCommitmentExit.to,
+      };
+    }
+    if (currentStateName !== recordedCommitmentExit.to) {
+      log.warn(
+        `workflow-gate: commitment gate: ${issue.identifier} already has a recorded exit but ` +
+        `is still projected at '${currentStateName}' - repairing via duplicate '${intent}' to '${recordedCommitmentExit.to}'`,
+      );
+    } else {
+      log.info(
+        `workflow-gate: commitment gate: ${issue.identifier} has a recorded exit without applied-state corroboration - re-applying '${intent}' to '${recordedCommitmentExit.to}'`,
+      );
+    }
   }
 
   // AI-2035: terminal re-entry guard (reciprocal of the setStateAtomic terminal
