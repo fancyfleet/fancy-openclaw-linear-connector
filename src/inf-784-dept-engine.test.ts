@@ -94,6 +94,51 @@ async function loadDeptEngineRuntime(): Promise<LooseRecord> {
   return dynamicImport(pathToFileUrl(RUNTIME_MODULE)) as Promise<LooseRecord>;
 }
 
+async function readBoundPort(portFile: string, timeoutMs: number): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  let lastErr: unknown = new Error("port file was never written");
+  while (Date.now() < deadline) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(portFile, "utf8")) as LooseRecord;
+      if (typeof parsed.port === "number" && parsed.port > 0) return parsed.port;
+    } catch (err) {
+      lastErr = err;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw lastErr;
+}
+
+function writeListenPortProbe(tmpDir: string): { preload: string; portFile: string } {
+  const portFile = path.join(tmpDir, "bound-port.json");
+  const preload = path.join(tmpDir, "record-listen-port.mjs");
+  fs.writeFileSync(
+    preload,
+    `
+import fs from "node:fs";
+import net from "node:net";
+
+const originalListen = net.Server.prototype.listen;
+net.Server.prototype.listen = function patchedListen(...args) {
+  const result = originalListen.apply(this, args);
+  this.once("listening", () => {
+    const address = this.address();
+    if (address && typeof address === "object" && address.port > 0) {
+      fs.writeFileSync(
+        process.env.INF784_LISTEN_PORT_FILE,
+        JSON.stringify({ port: address.port }),
+        "utf8",
+      );
+    }
+  });
+  return result;
+};
+`,
+    "utf8",
+  );
+  return { preload, portFile };
+}
+
 describe("INF-784 AC1/AC7: wf:dept-engine def registration and fixture canary", () => {
   afterEach(() => {
     resetWorkflowCache();
@@ -151,6 +196,13 @@ describe("INF-784 AC1/AC7: wf:dept-engine def registration and fixture canary", 
       barrier: "all-responded",
     }));
     expect(transition(state(def, "solicit"), "synthesize", "synthesize-scope").generic).toBe("continue");
+    expect(state(def, "synthesize-scope")).toEqual(expect.objectContaining({
+      barrier: true,
+      fanout: expect.objectContaining({
+        spec_source: "synthesized-scope",
+        child_workflow: "wf:dev-impl",
+      }),
+    }));
     expect(transition(state(def, "synthesize-scope"), "spawn", "managing").generic).toBe("continue");
     expect(state(def, "managing").barrier).toBe(true);
     expect(transition(state(def, "managing"), "validate", "validation")).toBeDefined();
@@ -161,8 +213,8 @@ describe("INF-784 AC1/AC7: wf:dept-engine def registration and fixture canary", 
   it("boots the production entry point and exposes wf:dept-engine in /health.workflowRegistry without launching a cycle", async () => {
     expect(fs.existsSync(DIST_ENTRY)).toBe(true);
 
-    const port = 49_000 + (process.pid % 500);
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-784-bootstrap-"));
+    const { preload, portFile } = writeListenPortProbe(tmpDir);
     const agentsFile = path.join(tmpDir, "agents.json");
     fs.writeFileSync(
       agentsFile,
@@ -192,14 +244,16 @@ describe("INF-784 AC1/AC7: wf:dept-engine def registration and fixture canary", 
           ...process.env,
           AGENTS_FILE: agentsFile,
           DATA_DIR: path.join(tmpDir, "data"),
-          PORT: String(port),
+          PORT: "0",
+          INF784_LISTEN_PORT_FILE: portFile,
           LOG_LEVEL: "error",
           LINEAR_CONNECTOR_SECRET: "test-secret-inf784",
           LINEAR_WEBHOOK_SECRET: "test-webhook-inf784",
           LINEAR_OAUTH_TOKEN: "test-linear-oauth-token",
-          OPENCLAW_HOOKS_URL: `http://127.0.0.1:${port}/unused-hooks`,
+          OPENCLAW_HOOKS_URL: "http://127.0.0.1:9/unused-hooks",
           OPENCLAW_HOOKS_TOKEN: "test-hooks-token",
           CRON_STARTUP_GRACE_MS: "60000",
+          NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import ${preload}`.trim(),
         },
         stdio: ["ignore", "ignore", "pipe"],
       });
@@ -209,6 +263,7 @@ describe("INF-784 AC1/AC7: wf:dept-engine def registration and fixture canary", 
 
       let body: LooseRecord;
       try {
+        const port = await readBoundPort(portFile, 30_000);
         body = await pollHealth(`http://127.0.0.1:${port}/health`, 30_000);
       } catch (err) {
         throw new Error(

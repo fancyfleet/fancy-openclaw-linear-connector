@@ -87,8 +87,12 @@ states:
 
   - id: synthesize-scope
     owner_role: department-head
-    kind: normal
+    kind: barrier
+    barrier: true
     native_state: doing
+    fanout:
+      spec_source: synthesized-scope
+      child_workflow: wf:dev-impl
     transitions:
       - command: spawn
         to: managing
