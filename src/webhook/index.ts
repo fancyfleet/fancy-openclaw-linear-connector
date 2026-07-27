@@ -1,7 +1,7 @@
 import crypto from "crypto";
 import { Router, Request, Response } from "express";
 import { diagnoseLinearSignatureMismatch, matchLinearSignature, parseWebhookSecrets } from "./signature.js";
-import { recordWebhookSeen } from "./registry.js";
+import { recordWebhookSeen, describeRegisteredWebhooks } from "./registry.js";
 import { normalizeLinearEvent } from "./normalize.js";
 import type { LinearEvent } from "./schema.js";
 import { EventStore } from "../store/event-store.js";
@@ -43,7 +43,7 @@ import { emitStreamTopic } from "../admin-stream.js";
 import { DelegatePingPongDetector, shouldCheckDelegatePingPong } from "../delegate-ping-pong-detector.js";
 import type { DispatchRecordStore } from "../liveness-channel/dispatch-record-store.js";
 import type { GatewayDispatchAck } from "../liveness-channel/gateway-ack-types.js";
-import { extractRejectedWebhookDiagnostic, WebhookSecretDriftTracker } from "./drift.js";
+import { extractRejectedWebhookDiagnostic, correlateRegistration, WebhookSecretDriftTracker } from "./drift.js";
 
 const log = componentLogger(createLogger(), "webhook");
 
@@ -52,9 +52,12 @@ export { verifyLinearSignature } from "./signature.js";
 export { normalizeLinearEvent } from "./normalize.js";
 
 function signatureRejectedDetail(rawBody: Buffer | undefined, secretCount: number): Record<string, unknown> {
+  // INF-667 — include the registry's human-facing table so a reject is
+  // actionable (which registration to check) rather than an opaque Linear UUID.
   return {
     ...extractRejectedWebhookDiagnostic(rawBody),
     loadedHmacCount: secretCount,
+    registeredWebhooks: describeRegisteredWebhooks(),
   };
 }
 
@@ -349,14 +352,20 @@ export function createWebhookRouter(
       log.info(`Signature validation result: ${signatureValid ? "valid" : "invalid"}`);
         if (!signatureValid) {
           const diagnostic = extractRejectedWebhookDiagnostic(rawBody);
+          // INF-667 — resolve the rejected delivery to the connector's own
+          // registry metadata (wh_ id + teamLabel + url + preview + lastSeen)
+          // so the diagnostic is actionable; the payload's Linear webhookId is
+          // an opaque UUID no human can open in Linear's UI.
+          const registered = describeRegisteredWebhooks();
+          const suspect = correlateRegistration(diagnostic, registered);
           appendOperationalEvent(operationalEventStore, {
             outcome: "signature-rejected",
             type: diagnostic.type,
             key: diagnostic.teamKey && diagnostic.webhookId ? `${diagnostic.teamKey}:${diagnostic.webhookId}` : diagnostic.webhookId ?? diagnostic.teamKey,
             errorSummary: "Invalid signature",
-            detail: { ...diagnostic, loadedHmacCount: secrets.length },
+            detail: { ...diagnostic, loadedHmacCount: secrets.length, suspectRegistration: suspect, registeredWebhooks: registered },
           });
-          webhookSecretDriftTracker.record({ diagnostic, secretCount: secrets.length });
+          webhookSecretDriftTracker.record({ diagnostic, secretCount: secrets.length, registered });
           const mismatchDiagnostic = diagnoseLinearSignatureMismatch(rawBody, signature, secrets);
           if (mismatchDiagnostic.armed) {
             if (mismatchDiagnostic.match) {

@@ -237,3 +237,55 @@ export function removeWebhook(id: string): { ok: boolean; status: number } {
   }
   return { ok: true, status: 200 };
 }
+
+/**
+ * INF-667 — human-facing registry snapshot for signature-reject diagnostics.
+ *
+ * A rejected delivery only carries Linear's own `webhookId` (an opaque UUID that
+ * is NOT searchable in Linear's Settings → API → Webhooks UI, and does NOT map
+ * to this connector's registry — we key registrations by `wh_` + sha256(secret)).
+ * So a diagnostic that reports only that UUID is unactionable (INF-586 named
+ * `9aaf41cd-…`, which a human cannot open anywhere). This hands the operator the
+ * registry's own view instead: for every registered secret its stable `wh_` id,
+ * teamLabel, url and masked preview, plus lastSeen. Where a registered url
+ * carries a `?team=<KEY>` hint we surface that key so a rejected delivery's
+ * teamKey can be matched to a specific registration.
+ */
+export interface RegisteredWebhookDescriptor {
+  id: string;
+  teamLabel: string;
+  url: string;
+  /** Team key parsed from a `?team=` query param on the url, when present. */
+  teamKey: string | null;
+  secretPreview: string;
+  lastSeen: string | null;
+}
+
+/** Best-effort extraction of a `?team=<KEY>` hint from a registered url. */
+function teamKeyFromUrl(url: string): string | null {
+  if (!url) return null;
+  try {
+    const key = new URL(url).searchParams.get("team");
+    return key && key.trim().length > 0 ? key.trim() : null;
+  } catch {
+    // Relative / non-absolute url — fall back to a bare query-string scan.
+    const match = /[?&]team=([^&]+)/.exec(url);
+    return match ? decodeURIComponent(match[1]) : null;
+  }
+}
+
+/**
+ * The registry as a diagnostic table: same rows as {@link listWebhooks} plus the
+ * parsed `?team=` key. Never leaks a full secret — only the masked preview that
+ * the admin console already exposes.
+ */
+export function describeRegisteredWebhooks(): RegisteredWebhookDescriptor[] {
+  return listWebhooks().map((row) => ({
+    id: row.id,
+    teamLabel: row.teamLabel,
+    url: row.url,
+    teamKey: teamKeyFromUrl(row.url),
+    secretPreview: row.secretPreview,
+    lastSeen: row.lastSeen,
+  }));
+}

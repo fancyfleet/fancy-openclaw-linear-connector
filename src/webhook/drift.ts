@@ -1,4 +1,5 @@
 import { notify } from "../alerts/alert-bus.js";
+import type { RegisteredWebhookDescriptor } from "./registry.js";
 
 export interface RejectedWebhookDiagnostic {
   webhookId: string | null;
@@ -12,7 +13,29 @@ export interface RejectedWebhookDiagnostic {
 export interface WebhookSecretDriftRecord {
   diagnostic: RejectedWebhookDiagnostic;
   secretCount: number;
+  /**
+   * INF-667 — the registry snapshot at reject time, so the alert can name the
+   * actionable registration (wh_ id + teamLabel + url + preview) instead of the
+   * unactionable Linear webhookId UUID. Optional so callers/tests without a
+   * registry still work.
+   */
+  registered?: RegisteredWebhookDescriptor[];
   occurredAt?: Date;
+}
+
+/**
+ * INF-667 — correlate a rejected delivery to the registration it *should* have
+ * matched, by the `?team=` key surfaced on each registered url. Returns the
+ * suspect registration (its secret is missing/rotated relative to Linear) or
+ * null when the team can't be matched to a single registration.
+ */
+export function correlateRegistration(
+  diagnostic: RejectedWebhookDiagnostic,
+  registered: RegisteredWebhookDescriptor[] | undefined,
+): RegisteredWebhookDescriptor | null {
+  if (!registered || !diagnostic.teamKey) return null;
+  const matches = registered.filter((r) => r.teamKey === diagnostic.teamKey);
+  return matches.length === 1 ? matches[0] : null;
 }
 
 interface DriftBucket {
@@ -111,6 +134,18 @@ export class WebhookSecretDriftTracker {
 
     const team = record.diagnostic.teamKey ?? "unknown team";
     const webhook = record.diagnostic.webhookId ?? "unknown webhook";
+    // INF-667 — resolve the unactionable Linear UUID to the registry's own
+    // human-facing metadata so the operator knows exactly which registration to
+    // fix. The suspect is the single registration whose `?team=` matches; the
+    // full table is attached as a fallback when no single suspect is found.
+    const suspect = correlateRegistration(record.diagnostic, record.registered);
+    const remediation = suspect
+      ? `The registered webhook for team ${team} is "${suspect.teamLabel}" (${suspect.id}) → ${suspect.url}, ` +
+        `last matched ${suspect.lastSeen ?? "never"}. ` +
+        "Its signing secret does not match what Linear signs with — re-copy the signing secret from " +
+        "Linear → Settings → API → Webhooks into the helm Webhook UI for that team (or rotate on both sides)."
+      : "Its signing secret is missing or rotated; add/regenerate it through /admin/api/webhooks " +
+        "(see registeredWebhooks below for the registered secrets and their last-matched times).";
     notify({
       severity: "warning",
       source: "webhook-secret-drift",
@@ -124,10 +159,12 @@ export class WebhookSecretDriftTracker {
         rejectCount: bucket.count,
         windowMs: this.windowMs,
         loadedHmacCount: record.secretCount,
+        suspectRegistration: suspect,
+        registeredWebhooks: record.registered ?? null,
         message:
           `Team ${team} / webhook ${webhook} sent ${bucket.count} events in the drift window ` +
           `that matched none of the ${record.secretCount} loaded Linear webhook secrets. ` +
-          "Its signing secret is missing or rotated; add/regenerate it through /admin/api/webhooks.",
+          remediation,
       },
       dedupKey: `webhook-secret-drift|${key}`,
     });
