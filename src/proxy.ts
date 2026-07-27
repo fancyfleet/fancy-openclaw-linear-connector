@@ -50,6 +50,7 @@ import { IssueCreateDedupCache, extractIssueCreateInput, fingerprintIssueCreate,
 import { checkArtifactDisclosure } from "./artifact-disclosure.js";
 import { recordTransitionCarriedComment } from "./transition-comment-logic.js";
 import { LINEAR_PROXY_PROTOCOL_VERSION, minWorkflowCliVersion } from "./proxy-compatibility.js";
+import { findOrCreateLabel } from "./linear-helpers.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
@@ -306,7 +307,6 @@ type XfnDemotionNotification = {
 };
 
 type TeamState = { id: string; name: string; type: string };
-type TeamLabel = { id: string; name: string };
 
 async function fetchIssueTeamId(issueId: string, authToken: string): Promise<string | null> {
   const res = await fetch(LINEAR_API_URL, {
@@ -348,24 +348,6 @@ async function fetchTeamStates(teamId: string, authToken: string): Promise<TeamS
   if (!res.ok) return [];
   const data = (await res.json()) as { data?: { team?: { states?: { nodes?: TeamState[] } } } };
   return data.data?.team?.states?.nodes ?? [];
-}
-
-async function fetchTeamLabels(teamId: string, authToken: string): Promise<TeamLabel[]> {
-  const res = await fetch(LINEAR_API_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: authToken },
-    body: JSON.stringify({
-      query: `query($teamId: String!) {
-        team(id: $teamId) {
-          labels { nodes { id name } }
-        }
-      }`,
-      variables: { teamId },
-    }),
-  });
-  if (!res.ok) return [];
-  const data = (await res.json()) as { data?: { team?: { labels?: { nodes?: TeamLabel[] } } } };
-  return data.data?.team?.labels?.nodes ?? [];
 }
 
 async function requesterDimension(agentId: string): Promise<string> {
@@ -429,10 +411,10 @@ async function maybeDemoteCrossFunctionalRequest(
   if (!backlogState) return null;
 
   const dimension = await requesterDimension(agentId);
-  const labels = await fetchTeamLabels(teamId, authToken);
-  const wantedNames = new Set(["cross-functional-request", `xfn:${dimension}`]);
-  const labelIds = labels.filter((label) => wantedNames.has(label.name)).map((label) => label.id);
-  if (labelIds.length < wantedNames.size) return null;
+  const wantedNames = ["cross-functional-request", `xfn:${dimension}`];
+  const labelIds = (await Promise.all(wantedNames.map((name) => findOrCreateLabel(teamId, name, authToken))))
+    .filter((id): id is string => typeof id === "string");
+  if (labelIds.length < wantedNames.length) return null;
 
   input.stateId = backlogState.id;
   input.assigneeId = null;
