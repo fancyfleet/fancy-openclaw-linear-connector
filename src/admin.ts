@@ -536,12 +536,18 @@ export function createAdminRouter(deps: AdminDeps): Router {
       // operator who hot-reloaded the registry could not re-verify drift without
       // a full restart — /health.fixtureDrift stayed pinned to the pre-reload
       // state. Awaited so the response reflects the post-reload drift status.
-      const drift = await runFixtureDriftCheck();
-      res.json({
-        ok: true,
-        registry: result.registry,
-        fixtureDrift: { healthy: drift.healthy, drifted: drift.drifted, total: drift.total },
-      });
+      const fixtureDrift = await runFixtureDriftCheck();
+      if (!fixtureDrift.healthy || !fixtureDrift.gate.healthy) {
+        deps.operationalEventStore?.append({
+          outcome: "fixture-drift-non-green",
+          type: "workflow-defs-reload",
+          key: "fixtureDrift",
+          errorSummary: `fixtureDrift non-green: ${fixtureDrift.drifted}/${fixtureDrift.total} workflow def(s) refused`,
+          detail: { fixtureDrift },
+          plane: "connector",
+        });
+      }
+      res.json({ ok: true, registry: result.registry, fixtureDrift });
     } catch (err) {
       res.status(502).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
     }

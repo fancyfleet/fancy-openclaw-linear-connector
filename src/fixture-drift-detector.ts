@@ -33,6 +33,14 @@ const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "fixt
 export interface FixtureDriftEntry {
   /** Workflow def id (e.g. "dev-impl", "task"). */
   workflowId: string;
+  /** Release/reload gate verdict for this def. */
+  gateVerdict: "served" | "refused";
+  /** Human-readable gate reason. */
+  reason: string | null;
+  /** Loaded workflow def version. */
+  version: number | undefined;
+  /** Canonical fixture version. */
+  fixtureVersion: number | undefined;
   /** Whether the canonical fixture exists for this def. */
   fixtureExists: boolean;
   /** Whether the canonical fixture is structurally in sync. */
@@ -41,11 +49,21 @@ export interface FixtureDriftEntry {
   driftDescription: string | null;
 }
 
+export interface FixtureDriftGateStatus {
+  mode: "enforce";
+  healthy: boolean;
+  refused: number;
+  served: number;
+  bootFailure: string | null;
+}
+
 export interface FixtureDriftStatus {
   /** ISO timestamp of the last check, or null if never run. */
   lastCheck: string | null;
   /** True only when ALL deployed defs have matching canonical fixtures. */
   healthy: boolean;
+  /** Release/reload gate summary derived from the same drift check. */
+  gate: FixtureDriftGateStatus;
   /** Per-def drift details. */
   entries: FixtureDriftEntry[];
   /** Number of defs with drift. */
@@ -59,6 +77,7 @@ export interface FixtureDriftStatus {
 let _status: FixtureDriftStatus = {
   lastCheck: null,
   healthy: true,
+  gate: { mode: "enforce", healthy: true, refused: 0, served: 0, bootFailure: null },
   entries: [],
   drifted: 0,
   total: 0,
@@ -96,9 +115,16 @@ export async function runFixtureDriftCheck(): Promise<FixtureDriftStatus> {
     const entries: FixtureDriftEntry[] = [];
 
     for (const { id, content } of await deployedDefSources()) {
+      const parsed = yaml.load(content) as Record<string, unknown> | null;
       const result = await checkDefAgainstFixture(id, content);
+      const reason = result.inSync ? null : result.driftDescription;
+      const version = parsed && typeof parsed.version === "number" ? parsed.version : undefined;
       entries.push({
         workflowId: id,
+        gateVerdict: result.inSync ? "served" : "refused",
+        reason,
+        version,
+        fixtureVersion: result.fixtureVersion,
         fixtureExists: result.fixtureExists,
         inSync: result.inSync,
         driftDescription: result.driftDescription,
@@ -109,7 +135,20 @@ export async function runFixtureDriftCheck(): Promise<FixtureDriftStatus> {
     const healthy = drifted === 0;
     const lastCheck = new Date().toISOString();
 
-    _status = { lastCheck, healthy, entries, drifted, total: entries.length };
+    _status = {
+      lastCheck,
+      healthy,
+      gate: {
+        mode: "enforce",
+        healthy,
+        refused: drifted,
+        served: entries.length - drifted,
+        bootFailure: null,
+      },
+      entries,
+      drifted,
+      total: entries.length,
+    };
 
     if (drifted > 0) {
       const driftDetails = entries
@@ -135,6 +174,13 @@ export async function runFixtureDriftCheck(): Promise<FixtureDriftStatus> {
     _status = {
       lastCheck: new Date().toISOString(),
       healthy: false,
+      gate: {
+        mode: "enforce",
+        healthy: false,
+        refused: 0,
+        served: 0,
+        bootFailure: msg,
+      },
       entries: [],
       drifted: 0,
       total: 0,
@@ -154,5 +200,12 @@ export function getFixtureDriftLiveness(): FixtureDriftStatus {
  * Reset status (for tests).
  */
 export function resetFixtureDriftStatus(): void {
-  _status = { lastCheck: null, healthy: true, entries: [], drifted: 0, total: 0 };
+  _status = {
+    lastCheck: null,
+    healthy: true,
+    gate: { mode: "enforce", healthy: true, refused: 0, served: 0, bootFailure: null },
+    entries: [],
+    drifted: 0,
+    total: 0,
+  };
 }
