@@ -30,7 +30,20 @@ const FIXTURE_PATH = "src/__fixtures__/";
 const DOC_PATH = path.join(REPO_ROOT, "docs", "workflow-def-packaging.md");
 const DOCKERFILE = path.join(REPO_ROOT, "Dockerfile");
 const SYNC_SCRIPT = path.join(REPO_ROOT, "scripts", "check-workflow-def-sync.mjs");
-const INSTALLED_NODE_MODULES = path.resolve(REPO_ROOT, "..", "..", "node_modules");
+
+function installedNodeModules(): string {
+  const candidates = [
+    path.join(REPO_ROOT, "node_modules"),
+    path.resolve(REPO_ROOT, "..", "..", "node_modules"),
+  ];
+  const found = candidates.find((candidate) =>
+    fs.existsSync(path.join(candidate, "js-yaml", "package.json")),
+  );
+  if (!found) {
+    throw new Error(`Could not find installed js-yaml under: ${candidates.join(", ")}`);
+  }
+  return found;
+}
 
 function copyYamlDir(source: string, target: string): void {
   fs.mkdirSync(target, { recursive: true });
@@ -64,7 +77,7 @@ function makeCleanRepoShape(): string {
   fs.copyFileSync(path.join(REPO_ROOT, "package-lock.json"), path.join(root, "package-lock.json"));
   // Model a clean clone after dependency install without making this contract
   // test run npm install itself.
-  fs.symlinkSync(INSTALLED_NODE_MODULES, path.join(root, "node_modules"), "dir");
+  fs.symlinkSync(installedNodeModules(), path.join(root, "node_modules"), "dir");
   return root;
 }
 
