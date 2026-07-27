@@ -52,6 +52,7 @@ import { AlertStore } from "./alerts/alert-store.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
 import { resetCronRegistryForTest, getRegisteredCrons } from "./cron/registry.js";
 import { reloadAgents } from "./agents.js";
+import { resetPolicyCache } from "./escalation-gate.js";
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
 
@@ -547,6 +548,43 @@ describe("AC1: sweep detects stranded delegations and re-dispatches", () => {
 // ══════════════════════════════════════════════════════════════════════════
 
 describe("INF-334 AC2: reconciliation redispatches missed plain delegations", () => {
+  let policyDir: string;
+  let prevPolicyPath: string | undefined;
+
+  beforeEach(() => {
+    prevPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+    policyDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf334-policy-"));
+    const policyFile = path.join(policyDir, "capability-policy.yaml");
+    fs.writeFileSync(
+      policyFile,
+      [
+        "capabilities:",
+        "  - id: linear:transition",
+        "containers:",
+        "  - id: worker",
+        "    grants: [linear:transition]",
+        "roles:",
+        "  - id: worker",
+        "    requires: [linear:transition]",
+        "bodies:",
+        "  - id: igor",
+        "    container: worker",
+        "    fills_roles: [worker]",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+    resetPolicyCache();
+  });
+
+  afterEach(() => {
+    if (prevPolicyPath === undefined) delete process.env.CAPABILITY_POLICY_PATH;
+    else process.env.CAPABILITY_POLICY_PATH = prevPolicyPath;
+    resetPolicyCache();
+    fs.rmSync(policyDir, { recursive: true, force: true });
+  });
+
   it("redispatches a plain delegated ticket with no wf:* labels and no dispatch record", async () => {
     const eventStore = makeEventStore();
     const wakeDispatches: Array<{ agentName: string; ticketIdentifier: string }> = [];
@@ -2426,16 +2464,19 @@ describe("INF-589: governed heal wakes by resolved OpenClaw id, not Linear displ
   let prevAgentsFile: string | undefined;
   let prevEncKey: string | undefined;
   let prevEncKeyFile: string | undefined;
+  let prevPolicyPath: string | undefined;
 
   beforeEach(() => {
     prevAgentsFile = process.env.AGENTS_FILE;
     prevEncKey = process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
     prevEncKeyFile = process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
+    prevPolicyPath = process.env.CAPABILITY_POLICY_PATH;
     delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
     delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
 
     agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf589-agents-"));
     const agentsFile = path.join(agentsDir, "agents.json");
+    const policyFile = path.join(agentsDir, "capability-policy.yaml");
     // Seed a roster where the Linear display name differs from the OpenClaw id.
     fs.writeFileSync(
       agentsFile,
@@ -2453,7 +2494,28 @@ describe("INF-589: governed heal wakes by resolved OpenClaw id, not Linear displ
       }),
       "utf8",
     );
+    fs.writeFileSync(
+      policyFile,
+      [
+        "capabilities:",
+        "  - id: linear:transition",
+        "containers:",
+        "  - id: worker",
+        "    grants: [linear:transition]",
+        "roles:",
+        "  - id: worker",
+        "    requires: [linear:transition]",
+        "bodies:",
+        "  - id: felix",
+        "    container: worker",
+        "    fills_roles: [worker]",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
     process.env.AGENTS_FILE = agentsFile;
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+    resetPolicyCache();
     reloadAgents();
   });
 
@@ -2464,6 +2526,9 @@ describe("INF-589: governed heal wakes by resolved OpenClaw id, not Linear displ
     else process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = prevEncKey;
     if (prevEncKeyFile === undefined) delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
     else process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE = prevEncKeyFile;
+    if (prevPolicyPath === undefined) delete process.env.CAPABILITY_POLICY_PATH;
+    else process.env.CAPABILITY_POLICY_PATH = prevPolicyPath;
+    resetPolicyCache();
     reloadAgents();
     fs.rmSync(agentsDir, { recursive: true, force: true });
   });
@@ -2508,6 +2573,52 @@ describe("INF-589: governed heal wakes by resolved OpenClaw id, not Linear displ
     const events = eventStore.query({ key: "linear-LSO-24", limit: 50 });
     const dispatch = events.find((e) => e.outcome === "dispatch-accepted");
     expect(dispatch?.agent).toBe(FELIX_OPENCLAW_ID);
+
+    eventStore.close();
+  });
+
+  it("auto-enrolls plain worker delegations using the resolved OpenClaw id, not the display name", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: Array<{ agentName: string; ticketIdentifier: string }> = [];
+    const labelUpdates: string[][] = [];
+    const { bus } = makeTestAlertBus();
+
+    globalThis.fetch = makeReconciliationFetch({
+      adhocDelegatedTickets: [
+        {
+          id: "issue-felix-plain",
+          identifier: "DSN-826",
+          updatedAt: OLD_TIMESTAMP,
+          labels: [],
+          delegateId: FELIX_LINEAR_ID,
+          delegateName: FELIX_DISPLAY_NAME,
+          teamId: TEAM_ID,
+        },
+      ],
+      labelUpdates,
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (agentName, ticketIdentifier) => {
+        wakeDispatches.push({ agentName, ticketIdentifier });
+      },
+    });
+
+    expect(result.errors).toEqual([]);
+    expect(result.healed).toBe(1);
+    expect(labelUpdates).toEqual([
+      expect.arrayContaining(["label-wf-task", "label-state-doing"]),
+    ]);
+    expect(wakeDispatches).toEqual([
+      { agentName: FELIX_OPENCLAW_ID, ticketIdentifier: "DSN-826" },
+    ]);
+
+    const events = eventStore.query({ key: "linear-DSN-826", limit: 50 });
+    const autoEnroll = events.find((e) => e.outcome === "auto-enrolled");
+    expect(autoEnroll?.agent).toBe(FELIX_OPENCLAW_ID);
 
     eventStore.close();
   });

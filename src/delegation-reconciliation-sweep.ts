@@ -747,7 +747,7 @@ export async function runDelegationReconciliationSweep(
               });
             },
             opts.enrolledTicketsStore,
-            ticket.delegateName,
+            delegateAgentName,
             delegationTimestamp,
           );
           if (enrollResult.enrolled) {

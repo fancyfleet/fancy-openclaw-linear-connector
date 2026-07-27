@@ -106,6 +106,7 @@ describe("INF-334 plain delegation webhook dispatch", () => {
     currentLinearDelegateId = null;
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-334-plain-dispatch-"));
     const agentsFile = path.join(dir, "agents.json");
+    const policyFile = path.join(dir, "capability-policy.yaml");
     fs.writeFileSync(
       agentsFile,
       JSON.stringify({
@@ -128,9 +129,32 @@ describe("INF-334 plain delegation webhook dispatch", () => {
       }),
       "utf8",
     );
+    fs.writeFileSync(
+      policyFile,
+      [
+        "capabilities:",
+        "  - id: linear:transition",
+        "containers:",
+        "  - id: worker",
+        "    grants: [linear:transition]",
+        "roles:",
+        "  - id: worker",
+        "    requires: [linear:transition]",
+        "bodies:",
+        "  - id: igor",
+        "    container: worker",
+        "    fills_roles: [worker]",
+        "  - id: sage",
+        "    container: worker",
+        "    fills_roles: [worker]",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
     process.env = {
       ...originalEnv,
       AGENTS_FILE: agentsFile,
+      CAPABILITY_POLICY_PATH: policyFile,
       LINEAR_WEBHOOK_SECRET: SECRET,
       LINEAR_API_KEY: "linear-test-token",
       REQUIRE_GATEWAY_DELIVERY: "false",
