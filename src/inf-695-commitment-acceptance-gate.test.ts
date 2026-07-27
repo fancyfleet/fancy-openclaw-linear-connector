@@ -82,7 +82,13 @@ states:
     native_state: doing
     transitions:
       - command: submit
-        to: ac-validate
+        to: code-review
+  - id: code-review
+    owner_role: dev
+    native_state: todo
+    transitions:
+      - command: request-revision
+        to: investigation
   - id: needs-info
     owner_role: dev
     native_state: todo
@@ -228,6 +234,7 @@ function makeLinearFetch(stateLabel: "investigation" | "doing" = "investigation"
               nodes: [
                 { id: "investigation-lbl", name: "state:investigation" },
                 { id: "doing-lbl", name: "state:doing" },
+                { id: "code-review-lbl", name: "state:code-review" },
                 { id: "ac-validate-lbl", name: "state:ac-validate" },
               ],
             },
@@ -254,8 +261,15 @@ function makeLinearFetch(stateLabel: "investigation" | "doing" = "investigation"
       return json({ data: { issueUpdate: { success: true } } });
     }
     if (query.includes("VerifyTransitionWrite")) {
-      const expectedLabelIds = (calls.find((c) => c.query.includes("ApplyAtomicTransition"))?.variables.labelIds ?? []) as string[];
-      const verifiedState = expectedLabelIds.includes("ac-validate-lbl") ? "ac-validate" : "doing";
+      const transitionWrites = calls.filter((c) => c.query.includes("ApplyAtomicTransition"));
+      const expectedLabelIds = (transitionWrites[transitionWrites.length - 1]?.variables.labelIds ?? []) as string[];
+      const verifiedState = expectedLabelIds.includes("ac-validate-lbl")
+        ? "ac-validate"
+        : expectedLabelIds.includes("code-review-lbl")
+          ? "code-review"
+          : expectedLabelIds.includes("investigation-lbl")
+            ? "investigation"
+            : "doing";
       return json({
         data: {
           issue: {
@@ -417,6 +431,52 @@ describe("INF-695 S2 — Commitment / acceptance gate", () => {
 
     // Legal transition -> no proxy error, and specifically not the missing-commitment-exit refusal.
     expect(error).toBeNull();
+  });
+
+  it("INF-764: a downstream revision bounce re-arms the commitment gate for a second accept/submit round", async () => {
+    const ops = new OperationalEventStore(path.join(dir, "ops-inf764.db"));
+    const { fetch } = makeLinearFetch("investigation");
+    globalThis.fetch = fetch;
+
+    const firstAccept = await applyStateTransition("accept", ISSUE_UUID, "Bearer tok-igor", {
+      bodyId: "igor",
+      operationalEventStore: ops,
+      sourceStateOverride: "investigation",
+    });
+    expect(firstAccept.status).toBe("applied");
+    expect(ops.query({ key: ISSUE_IDENTIFIER, outcome: "commitment-exit-recorded" })).toHaveLength(1);
+
+    const firstSubmit = await applyStateTransition("submit", ISSUE_UUID, "Bearer tok-igor", {
+      bodyId: "igor",
+      operationalEventStore: ops,
+      sourceStateOverride: "doing",
+    });
+    expect(firstSubmit.status).toBe("applied");
+
+    const revisionBounce = await applyStateTransition("request-revision", ISSUE_UUID, "Bearer tok-igor", {
+      bodyId: "igor",
+      operationalEventStore: ops,
+      sourceStateOverride: "code-review",
+    });
+    expect(revisionBounce.status).toBe("applied");
+    expect(ops.query({ key: ISSUE_IDENTIFIER, outcome: "commitment-exit-recorded" })).toHaveLength(0);
+
+    const secondAccept = await applyStateTransition("accept", ISSUE_UUID, "Bearer tok-igor", {
+      bodyId: "igor",
+      operationalEventStore: ops,
+      sourceStateOverride: "investigation",
+    });
+    expect(secondAccept.status).toBe("applied");
+    expect(ops.query({ key: ISSUE_IDENTIFIER, outcome: "commitment-exit-recorded" })).toHaveLength(1);
+
+    const secondSubmit = await applyStateTransition("submit", ISSUE_UUID, "Bearer tok-igor", {
+      bodyId: "igor",
+      operationalEventStore: ops,
+      sourceStateOverride: "doing",
+    });
+    expect(secondSubmit.status).toBe("applied");
+
+    ops.close();
   });
 
   it("AC2.3 + AC2.5: production webhook activity auto-fires accept once, sets doing once, and exposes liveness at /health", async () => {

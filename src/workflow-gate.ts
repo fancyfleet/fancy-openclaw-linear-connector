@@ -416,6 +416,35 @@ function hasRecordedCommitmentExit(store: OperationalEventStore | undefined, ide
   return store.query({ key: identifier, outcome: COMMITMENT_EXIT_OUTCOME }).length > 0;
 }
 
+function clearRecordedCommitmentExit(store: OperationalEventStore | undefined, identifier: string): number {
+  if (!store) return 0;
+  return store.deleteWhere({ key: identifier, outcome: COMMITMENT_EXIT_OUTCOME });
+}
+
+function isReachableFromState(def: WorkflowDef, from: string, target: string): boolean {
+  const seen = new Set<string>();
+  const queue = [from];
+  while (queue.length > 0) {
+    const stateName = queue.shift();
+    if (!stateName || seen.has(stateName)) continue;
+    seen.add(stateName);
+    const state = def.states.find((s) => s.id === stateName);
+    for (const transition of state?.transitions ?? []) {
+      if (transition.to === target) return true;
+      if (!seen.has(transition.to)) queue.push(transition.to);
+    }
+  }
+  return false;
+}
+
+function isCommitmentGateReentry(def: WorkflowDef, from: string | null | undefined, to: string): boolean {
+  if (!from) return false;
+  const gateState = getCommitmentGateState(def);
+  if (!gateState || to !== gateState.id || from === gateState.id) return false;
+  const acceptTarget = gateState.commitment_gate?.exits?.accept?.to;
+  return !!acceptTarget && isReachableFromState(def, acceptTarget, from);
+}
+
 function recordCommitmentExitIfMissing(params: {
   store?: OperationalEventStore;
   identifier: string;
@@ -6385,6 +6414,15 @@ export async function applyStateTransition(
   const applied = writeOutcome.ok;
 
   if (applied) {
+    if (isCommitmentGateReentry(def, currentStateName, toStateName)) {
+      const cleared = clearRecordedCommitmentExit(options?.operationalEventStore, issue.identifier);
+      if (cleared > 0) {
+        log.info(
+          `workflow-gate: commitment gate: ${issue.identifier} re-armed after '${currentStateName}' → '${toStateName}' bounce (${cleared} recorded exit row(s) cleared)`,
+        );
+      }
+    }
+
     // AI-1534: record the authoritative destination state so the outbound
     // per-step delivery prefers it over a lag-prone live label read. Keyed by
     // the human identifier to match build-message's lookup key.

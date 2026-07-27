@@ -245,6 +245,12 @@ export class OperationalEventStore {
     const rows = this.db.prepare(`SELECT id, occurred_at, outcome, event_type, agent, subject_key, delivery_mode, attempt_count, run_id, session_key, error_summary, detail_json, workflow_state, plane, wake_id FROM operational_events ${where} ORDER BY occurred_at DESC, id DESC LIMIT ?`).all(...params, limit) as Record<string, unknown>[];
     return rows.map(rowToEvent);
   }
+  deleteWhere(query: { key: string; outcome: OperationalEventOutcome }): number {
+    const result = this.db
+      .prepare(`DELETE FROM operational_events WHERE subject_key = ? AND outcome = ?`)
+      .run(query.key, query.outcome);
+    return result.changes;
+  }
   snapshot(query: { key?: string; agent?: string; limit?: number }): OperationalSnapshot {
     const lifecycle = this.query({ key: query.key, agent: query.agent, limit: query.limit ?? 50 });
     return { key: query.key, agent: query.agent, lastSuccess: lifecycle.find((event) => SUCCESS_OUTCOMES.has(event.outcome)), lastError: lifecycle.find((event) => ERROR_OUTCOMES.has(event.outcome) || event.errorSummary), lifecycle };
