@@ -308,7 +308,7 @@ describe("INF-873 AC1/AC3: DSN enrollment/runtime scope resolves department-head
       workflowEnrollment: { department: "DSN", team: "Design", charterRef: "design-department-charter" },
     }), TOK);
 
-    expect(message).toContain("This is a [dept-engine] workflow ticket");
+    expect(message).toContain("This is a [dept-engine] managed workflow ticket");
     expect(message).toContain("linear continue-workflow DSN-15");
     expect(message).toContain("[auto-assigns to laren]");
     expect(message).not.toContain("charles");

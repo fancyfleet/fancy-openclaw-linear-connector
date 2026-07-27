@@ -35,6 +35,8 @@ const _getCurrentState = (labels: string[]): string | null => {
 jest.unstable_mockModule("./workflow-gate.js", () => ({
   loadWorkflowDef: mockLoadWorkflowDef,
   loadWorkflowDefById: mockLoadWorkflowDefById,
+  deriveWorkflowInstanceScope: jest.fn((def, context) => context ?? (def as { department_scope?: unknown }).department_scope),
+  describeMissingInstanceScope: jest.fn(() => undefined),
   getWorkflowId: jest.fn().mockImplementation(_getWorkflowId),
   getCurrentState: jest.fn().mockImplementation(_getCurrentState),
 }));
