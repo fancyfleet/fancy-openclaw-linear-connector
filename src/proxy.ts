@@ -290,6 +290,23 @@ function stripStateLabelDeltas(body: GraphQLRequestBody | null, stateLabelIds: S
 }
 
 /**
+ * Remove native Linear state writes from governed workflow transition forwards.
+ *
+ * The proxy's verified atomic writer owns the full transition tuple after the
+ * upstream semantic mutation succeeds: workflow state label, delegate, and
+ * native Linear state. Letting the CLI's forwarded mutation carry `stateId`
+ * re-opens a partial-apply window where Linear can move the native column before
+ * B2 has resolved and verified the real workflow destination.
+ */
+function stripNativeStateField(body: GraphQLRequestBody | null): boolean {
+  const input = issueUpdateInput(body);
+  if (!input || !("stateId" in input)) return false;
+  delete input.stateId;
+  return true;
+}
+export const _stripNativeStateFieldForTests = stripNativeStateField;
+
+/**
  * AI-1857: Strip null delegateId/assigneeId from an intent-bearing issueUpdate input.
  * The proxy owns delegate management; CLIs must not directly null these fields.
  *
@@ -1136,6 +1153,17 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           }
         }
 
+        // INF-835: Native Linear state is part of the same governed transition
+        // tuple as the state:* label and delegate. Strip the CLI's forwarded
+        // native stateId and let applyStateTransition write the resolved
+        // destination atomically after delegate resolution succeeds.
+        if (isIssueUpdateMutation(body)) {
+          const strippedNativeState = stripNativeStateField(body);
+          if (strippedNativeState) {
+            log.info(`native-state-strip agent=${agentId} intent=${effectiveIntent}${ticketCtx}: stripped stateId — applyStateTransition is sole native-state writer`);
+          }
+        }
+
         // INF-274: Guard raw-path delegate=null on plain (non-workflow) tickets.
         // Only applies to non-intent-bearing mutations (raw-path). Intent-bearing
         // verbs like note, handoff-work, etc. are handled by
@@ -1266,8 +1294,9 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
                       const input = issueUpdateInput(body);
                       if (input) {
                         input.delegateId = resolved;
+                        input.assigneeId = null;
                         log.info(
-                          `delegate-pre-resolve agent=${agentId} intent=${effectiveIntent}${ticketCtx}: injected delegateId=${resolved} into forwarded mutation`,
+                          `delegate-pre-resolve agent=${agentId} intent=${effectiveIntent}${ticketCtx}: injected delegateId=${resolved} and assigneeId:null into forwarded mutation`,
                         );
                       }
                     }
