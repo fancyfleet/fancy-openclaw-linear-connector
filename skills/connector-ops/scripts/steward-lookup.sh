@@ -43,6 +43,6 @@ if [ -n "$LINEAR_OAUTH_TOKEN" ]; then
   curl -sf -X POST "$LINEAR_PROXY_URL/graphql" \
     -H "Authorization: $LINEAR_OAUTH_TOKEN" \
     -H "Content-Type: application/json" \
-    -d "{\"query\": \"{ issue(id: \\\"$TICKET_ID\\\") { identifier title state { name type } assignee { name } description \`delegate\` { ... on User { name } } } }\"}" \
+    -d "{\"query\": \"{ issue(id: \\\"$TICKET_ID\\\") { identifier title state { name type } assignee { name } delegate { ... on User { name } } } }\"}" \
     | python3 -m json.tool 2>/dev/null || echo "(could not fetch Linear state)"
 fi
