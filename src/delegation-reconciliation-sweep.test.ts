@@ -1317,6 +1317,49 @@ describe("AC5: POST /redispatch admin endpoint", () => {
     eventStore.close();
   });
 
+  it("syncs the engagement overlay from the targeted issue even when redispatch is idempotent", async () => {
+    const eventStore = makeEventStore();
+    const { bus } = makeTestAlertBus();
+
+    eventStore.append({
+      outcome: "dispatch-accepted",
+      agent: DELEGATE_AGENT_NAME,
+      key: "linear-AI-1807",
+      occurredAt: new Date(Date.now() + 1000).toISOString(),
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      ticketIdentifiers: ["AI-1807"],
+      fetchFn: makeReconciliationFetch({
+        governedTickets: [
+          {
+            id: "issue-stranded",
+            identifier: "AI-1807",
+            updatedAt: OLD_TIMESTAMP,
+            labels: [WF_LABEL, STATE_IMPLEMENTATION_LABEL],
+            delegateId: DELEGATE_LINEAR_ID,
+            delegateName: DELEGATE_AGENT_NAME,
+            teamId: TEAM_ID,
+            stateName: "To Do",
+            stateType: "unstarted",
+          },
+        ],
+      }),
+      wakeFn: async () => { throw new Error("should not wake"); },
+    });
+
+    expect(result.healed).toBe(0);
+    expect(result.skippedIdempotent).toBe(1);
+    const events = eventStore.query({ key: "linear-AI-1807", limit: 20 });
+    const engagement = events.find((e) => e.outcome === "engagement-todo");
+    expect(engagement).toBeDefined();
+    expect(engagement!.agent).toBe(DELEGATE_AGENT_NAME);
+    eventStore.close();
+  });
+
   it("supports time-window mode (since/until) for batch reconciliation", async () => {
     const eventStore = makeEventStore();
     const wakeDispatches: string[] = [];

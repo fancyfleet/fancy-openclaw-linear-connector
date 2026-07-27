@@ -154,6 +154,47 @@ function toReconciliationTicket(n: LinearIssueNode, plainDelegation: boolean): G
   };
 }
 
+function engagementSemanticFromNativeState(
+  nativeState: GovernedTicket["nativeState"],
+): "thinking" | "doing" | "todo" | null {
+  const name = nativeState?.name?.toLowerCase();
+  if (name === "thinking") return "thinking";
+  if (name === "doing") return "doing";
+  if (name === "to do" || name === "todo") return "todo";
+
+  const type = nativeState?.type?.toLowerCase();
+  if (type === "started") return "doing";
+  if (type === "unstarted" || type === "backlog") return "todo";
+  return null;
+}
+
+function recordTargetedEngagementOverlay(
+  operationalEventStore: OperationalEventStore,
+  ticket: GovernedTicket,
+  agentId: string,
+): void {
+  const semantic = engagementSemanticFromNativeState(ticket.nativeState);
+  if (!semantic) return;
+
+  const outcomeMap = {
+    thinking: "engagement-thinking",
+    doing: "engagement-doing",
+    todo: "engagement-todo",
+  } as const;
+
+  operationalEventStore.append({
+    outcome: outcomeMap[semantic],
+    agent: agentId,
+    key: `linear-${ticket.identifier}`,
+    type: "engagement",
+    detail: {
+      mode: "targeted-redispatch-sync",
+      nativeStateName: ticket.nativeState?.name ?? null,
+      nativeStateType: ticket.nativeState?.type ?? null,
+    },
+  });
+}
+
 // ── Linear API query ─────────────────────────────────────────────────────────
 
 /**
@@ -748,6 +789,13 @@ export async function runDelegationReconciliationSweep(
           `delegation-reconciliation: could not resolve delegate id ` +
           `${ticket.delegateId} ("${ticket.delegateName}") to an OpenClaw agent ` +
           `for ${ticket.identifier}; waking by display name may not route (INF-589)`,
+        );
+      }
+      if (opts.ticketIdentifiers && opts.ticketIdentifiers.length > 0) {
+        recordTargetedEngagementOverlay(
+          operationalEventStore,
+          ticket,
+          delegateAgentName,
         );
       }
 
