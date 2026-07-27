@@ -416,6 +416,24 @@ function hasRecordedCommitmentExit(store: OperationalEventStore | undefined, ide
   return store.query({ key: identifier, outcome: COMMITMENT_EXIT_OUTCOME }).length > 0;
 }
 
+function getRecordedCommitmentExit(
+  store: OperationalEventStore | undefined,
+  identifier: string,
+): { workflow: string; from: string; exit: string; to: string } | null {
+  if (!store) return null;
+  const event = store.query({ key: identifier, outcome: COMMITMENT_EXIT_OUTCOME, limit: 1 })[0];
+  if (!event || !event.detail || typeof event.detail !== "object") return null;
+  const detail = event.detail as Record<string, unknown>;
+  const workflow = detail.workflow;
+  const from = detail.from;
+  const exit = detail.exit;
+  const to = detail.to;
+  if (typeof workflow !== "string" || typeof from !== "string" || typeof exit !== "string" || typeof to !== "string") {
+    return null;
+  }
+  return { workflow, from, exit, to };
+}
+
 function recordCommitmentExitIfMissing(params: {
   store?: OperationalEventStore;
   identifier: string;
@@ -5212,13 +5230,14 @@ export async function applyStateTransition(
     currentStateName ? def.states.find((s) => s.id === currentStateName) : undefined,
     intent,
   );
+  const recordedCommitmentExit = getRecordedCommitmentExit(options?.operationalEventStore, issue.identifier);
   const acceptTarget = commitmentGateState?.commitment_gate?.exits?.accept?.to;
   if (
     currentStateName &&
     intent !== breakGlassCommand &&
     acceptTarget &&
     currentStateName === acceptTarget &&
-    !hasRecordedCommitmentExit(options?.operationalEventStore, issue.identifier)
+    !recordedCommitmentExit
   ) {
     recordDoingNeverSet({
       store: options?.operationalEventStore,
@@ -5237,12 +5256,27 @@ export async function applyStateTransition(
   }
   if (
     currentCommitmentExit &&
-    hasRecordedCommitmentExit(options?.operationalEventStore, issue.identifier)
+    recordedCommitmentExit
   ) {
-    if (currentStateName !== currentCommitmentExit.to) {
+    if (recordedCommitmentExit.exit !== currentCommitmentExit.exit || recordedCommitmentExit.to !== currentCommitmentExit.to) {
+      log.warn(
+        `workflow-gate: commitment gate: ${issue.identifier} already recorded exit ` +
+        `'${recordedCommitmentExit.exit}' to '${recordedCommitmentExit.to}' — refusing conflicting duplicate '${intent}'`,
+      );
+      return {
+        status: "blocked",
+        code: "commitment-exit-conflict",
+        detail:
+          `workflow '${workflowId}' already recorded commitment exit '${recordedCommitmentExit.exit}' ` +
+          `to '${recordedCommitmentExit.to}'; refusing conflicting '${intent}' to '${currentCommitmentExit.to}'`,
+        from: currentStateName,
+        to: recordedCommitmentExit.to,
+      };
+    }
+    if (currentStateName !== recordedCommitmentExit.to) {
       log.warn(
         `workflow-gate: commitment gate: ${issue.identifier} already has a recorded exit but ` +
-        `is still projected at '${currentStateName}' - repairing via duplicate '${intent}' to '${currentCommitmentExit.to}'`,
+        `is still projected at '${currentStateName}' - repairing via duplicate '${intent}' to '${recordedCommitmentExit.to}'`,
       );
     } else {
       log.info(
@@ -5252,7 +5286,7 @@ export async function applyStateTransition(
         status: "noop",
         code: "commitment-exit-already-recorded",
         from: currentStateName,
-        to: currentCommitmentExit.to,
+        to: recordedCommitmentExit.to,
       };
     }
   }
