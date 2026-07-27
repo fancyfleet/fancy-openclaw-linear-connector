@@ -34,7 +34,7 @@ import { checkEnforcementRules, bodyHasCapability } from "./escalation-gate.js";
 import { checkLeakedCredentialGate } from "./leaked-credential-gate.js";
 import { checkStaleSnapshotForTerminal } from "./proxy-cas-check.js";
 import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, setStateAtomic, verifyCommentSatisfiedBy, fetchTicketVerification, resolveSignoffWakeTargets, SIGNOFF_WAKE_DISPATCHED_PHRASE, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
-import { buildTransitionAuditRecord, emitTransitionAuditRecord, verifyPostTransition, type GateResult, type TransitionAuditRecord } from "./transition-audit.js";
+import { buildTransitionAuditRecord, emitTransitionAuditRecord, healPostTransitionDesync, type GateResult, type TransitionAuditRecord } from "./transition-audit.js";
 import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import type { ObservationStore } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
@@ -1464,17 +1464,38 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
               // Schedule on next tick so test mocks don't see the verification fetch
               // interleaved with the transition-associated fetches.
               Promise.resolve().then(() => {
-                verifyPostTransition(issueId, verifyTargetState, authorization).then((verification) => {
-                if (verification && !verification.match) {
-                  log.warn(
-                    `[transition-audit] post-transition LABEL MISMATCH for ${issueId} ${ticketCtx}: ` +
-                    `expected state:${verifyTargetState}, got ${verification.actualState ?? "(null)"}`,
-                  );
-                }
-              }).catch((verifyErr: unknown) => {
-                const vm = verifyErr instanceof Error ? verifyErr.message : String(verifyErr);
-                log.warn(`[transition-audit] post-transition verify threw for ${issueId}: ${vm}`);
-              });
+                // INF-771: don't just WARN on a label desync — self-heal it. The
+                // live incident (INF-768) advanced native state while the B2
+                // `state:*` swap failed to land, and the warn-only verifier let
+                // the desync persist. Reconcile the stale label with a label-only
+                // setStateAtomic (delegate untouched, no fanout/comment side
+                // effects; AI-1762 read-after-write verifies the write). A
+                // reconcile that cannot apply is reported loudly, not swallowed.
+                healPostTransitionDesync(
+                  issueId,
+                  verifyTargetState,
+                  authorization,
+                  (id, target, auth) =>
+                    setStateAtomic(id, target, undefined, auth, {
+                      operationalEventStore: deps?.operationalEventStore,
+                    }).then((r) => ({ ok: r.ok, error: r.error })),
+                ).then((heal) => {
+                  if (!heal.verified) return;
+                  if (!heal.matched && heal.healed) {
+                    log.warn(
+                      `[transition-audit] post-transition desync SELF-HEALED for ${issueId} ${ticketCtx}: ` +
+                      `reconciled to state:${verifyTargetState}`,
+                    );
+                  } else if (!heal.matched && !heal.healed) {
+                    log.error(
+                      `[transition-audit] post-transition desync UNHEALED for ${issueId} ${ticketCtx}: ` +
+                      `${heal.detail}`,
+                    );
+                  }
+                }).catch((verifyErr: unknown) => {
+                  const vm = verifyErr instanceof Error ? verifyErr.message : String(verifyErr);
+                  log.warn(`[transition-audit] post-transition verify/heal threw for ${issueId}: ${vm}`);
+                });
               });
             }
           }
