@@ -59,6 +59,14 @@ export interface LinearIssueWithRelations extends LinearIssueReference {
   delegate?: LinearUserReference | null;
   assignee?: LinearUserReference | null;
   relations?: { nodes?: LinearIssueRelation[] | null } | null;
+  /**
+   * INF-794: relations where this issue is the TARGET (`relatedIssue`) rather
+   * than the source. A ticket that is *blocked by* another is the target of a
+   * `blocks` edge, so its blocker only appears here — Linear never returns it
+   * under `relations`. Must be fetched and scanned or blocked-target
+   * suppression is blind (the INF-777 → INF-773 loop).
+   */
+  inverseRelations?: { nodes?: LinearIssueRelation[] | null } | null;
   /** INF-83: whether the ticket is soft-deleted (trashed). Trashed tickets
    *  are still fetchable but reject commentCreate. */
   trashed?: boolean | null;
@@ -136,7 +144,12 @@ function blockerOf(issue: LinearIssueWithRelations, relation: LinearIssueRelatio
 }
 
 export function isBlockedByOpenIssue(issue: LinearIssueWithRelations): boolean {
-  const nodes = issue.relations?.nodes ?? [];
+  // INF-794: scan BOTH directions. Linear stores a "A blocks B" edge once, with
+  // A as `issue` and B as `relatedIssue`. Querying B returns it under
+  // `inverseRelations` (B is the target); querying A returns it under
+  // `relations`. The blocked ticket is B, so its blocker lives in
+  // `inverseRelations` — scanning `relations` alone (AI-984) never saw it.
+  const nodes = [...(issue.relations?.nodes ?? []), ...(issue.inverseRelations?.nodes ?? [])];
   return nodes.some((rel) => {
     const blocker = blockerOf(issue, rel);
     return blocker !== null && !isTerminalIssueState(blocker.state);
@@ -244,6 +257,9 @@ export async function checkLinearIssueRouting(
             trashed
             archivedAt
             relations(first: 50) {
+              nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
+            }
+            inverseRelations(first: 50) {
               nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
             }
           }
@@ -402,6 +418,9 @@ export async function isLinearIssueActionable(ticketId: string, agentId: string)
             trashed
             archivedAt
             relations(first: 50) {
+              nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
+            }
+            inverseRelations(first: 50) {
               nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
             }
           }

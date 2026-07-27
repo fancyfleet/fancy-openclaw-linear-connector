@@ -80,6 +80,171 @@ function appendOperationalEvent(store: OperationalEventStore | undefined, input:
   try { store.append(input); } catch (err) { log.error(`Operational event write failed: ${errorSummary(err)}`); }
 }
 
+const unblockWakeClaims = new Set<string>();
+
+function authHeaderForLinear(token: string): string {
+  return /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
+}
+
+function terminalEventUpdatedAt(event: LinearEvent): string {
+  const data = (event.data as Record<string, unknown> | undefined) ?? {};
+  return (data.updatedAt as string | undefined) ?? event.createdAt ?? "unknown";
+}
+
+function sameLinearIssueRef(a: Record<string, unknown> | null | undefined, b: Record<string, unknown>): boolean {
+  if (!a) return false;
+  return Boolean(
+    (typeof a.id === "string" && typeof b.id === "string" && a.id === b.id) ||
+    (typeof a.identifier === "string" && typeof b.identifier === "string" && a.identifier === b.identifier),
+  );
+}
+
+function isDoneOrCanceledState(state: unknown): boolean {
+  if (!state || typeof state !== "object") return false;
+  const record = state as Record<string, unknown>;
+  const type = typeof record.type === "string" ? record.type.toLowerCase() : "";
+  const name = typeof record.name === "string" ? record.name.toLowerCase() : "";
+  return type === "completed" || type === "canceled" || type === "cancelled" ||
+    name === "done" || name === "canceled" || name === "cancelled";
+}
+
+function syntheticUnblockEvent(target: Record<string, unknown>, blocker: Record<string, unknown>, sourceEvent: LinearEvent): LinearEvent {
+  const now = new Date().toISOString();
+  const targetIdentifier = target.identifier as string | undefined;
+  const team = target.team as Record<string, unknown> | undefined;
+  const state = target.state as Record<string, unknown> | undefined;
+  return {
+    type: "Issue",
+    action: "update",
+    createdAt: now,
+    actor: sourceEvent.actor,
+    data: {
+      ...target,
+      identifier: targetIdentifier,
+      updatedAt: (target.updatedAt as string | undefined) ?? now,
+      state: {
+        id: (state?.id as string | undefined) ?? "unknown",
+        name: (state?.name as string | undefined) ?? "unknown",
+        type: (state?.type as string | undefined) ?? "unknown",
+      },
+      priority: (target.priority as number | undefined) ?? 0,
+      priorityLabel: (target.priorityLabel as string | undefined) ?? "No priority",
+      teamId: (team?.id as string | undefined) ?? "unknown",
+      teamKey: (team?.key as string | undefined) ?? "",
+      labelIds: Array.isArray(target.labelIds) ? target.labelIds : [],
+      url: (target.url as string | undefined) ?? "",
+      createdAt: (target.createdAt as string | undefined) ?? now,
+    },
+    updatedFrom: {
+      blockedBy: String(blocker.identifier ?? blocker.id ?? "unknown"),
+    },
+    raw: { synthetic: "unblock-wake", source: sourceEvent.raw },
+  } as unknown as LinearEvent;
+}
+
+/**
+ * INF-794 AC2/AC3: when a blocker reaches Done/Canceled, Linear sends the
+ * webhook for the blocker, not for each newly-unblocked target. Fan out from
+ * the blocker relation graph and synthesize ordinary delegate/assignee routes
+ * for live targets, so they pass through the normal dispatch pipeline.
+ */
+export async function findUnblockWakeRoutesForTerminalIssue(event: LinearEvent): Promise<RouteResult[]> {
+  if (!isTerminalIssueEvent(event)) return [];
+  const blocker = ((event.data as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+  const blockerId = blocker.id as string | undefined;
+  const blockerIdentifier = issueIdentifierFromEvent(event);
+  const blockerLookup = blockerId ?? blockerIdentifier;
+  if (!blockerLookup || !isDoneOrCanceledState(blocker.state)) return [];
+
+  const token = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+  if (!token) return [];
+
+  const response = await fetch("https://api.linear.app/graphql", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: authHeaderForLinear(token),
+    },
+    body: JSON.stringify({
+      query: `query BlockedTargets($id: String!) {
+        issue(id: $id) {
+          id identifier
+          relations(first: 50) {
+            nodes {
+              type
+              issue { id identifier }
+              relatedIssue {
+                id identifier title url priority priorityLabel createdAt updatedAt
+                state { id name type }
+                team { id key }
+                labelIds
+                delegate { id name app }
+                assignee { id name app }
+              }
+            }
+          }
+        }
+      }`,
+      variables: { id: blockerLookup },
+    }),
+  });
+  if (!response.ok) {
+    log.warn(`Blocked-target lookup failed for ${blockerIdentifier ?? blockerLookup}: HTTP ${response.status}`);
+    return [];
+  }
+  const body = await response.json() as {
+    data?: { issue?: { id?: string; identifier?: string; relations?: { nodes?: Array<Record<string, unknown>> | null } | null } | null };
+    errors?: Array<{ message?: string }>;
+  };
+  if (body.errors?.length) {
+    log.warn(`Blocked-target lookup errored for ${blockerIdentifier ?? blockerLookup}: ${body.errors.map((e) => e.message).join("; ")}`);
+    return [];
+  }
+
+  const sourceIssue = {
+    id: body.data?.issue?.id ?? blockerId,
+    identifier: body.data?.issue?.identifier ?? blockerIdentifier,
+  } as Record<string, unknown>;
+  const agentMap = buildAgentMap();
+  const routes: RouteResult[] = [];
+  for (const rel of body.data?.issue?.relations?.nodes ?? []) {
+    const type = typeof rel.type === "string" ? rel.type.toLowerCase() : "";
+    if (type !== "blocks" && type !== "blocking") continue;
+    const issue = rel.issue as Record<string, unknown> | null | undefined;
+    if (!sameLinearIssueRef(issue, sourceIssue)) continue;
+    const target = rel.relatedIssue as Record<string, unknown> | null | undefined;
+    const targetIdentifier = target?.identifier as string | undefined;
+    if (!target || !targetIdentifier) continue;
+
+    const delegate = target.delegate as { id?: string } | null | undefined;
+    const assignee = target.assignee as { id?: string } | null | undefined;
+    const delegateAgent = delegate?.id ? agentMap[delegate.id] : undefined;
+    const assigneeAgent = assignee?.id ? agentMap[assignee.id] : undefined;
+    const agentId = delegateAgent ?? assigneeAgent;
+    const routingReason = delegateAgent ? "delegate" : assigneeAgent ? "assignee" : undefined;
+    if (!agentId || !routingReason) continue;
+
+    const claimKey = [
+      sourceIssue.identifier ?? sourceIssue.id ?? blockerLookup,
+      terminalEventUpdatedAt(event),
+      targetIdentifier,
+      agentId,
+    ].join("->");
+    if (unblockWakeClaims.has(claimKey)) continue;
+    unblockWakeClaims.add(claimKey);
+
+    const targetEvent = syntheticUnblockEvent(target, sourceIssue, event);
+    routes.push({
+      agentId: getOpenclawAgentName(agentId),
+      sessionKey: normalizeSessionKey(targetIdentifier),
+      priority: 0,
+      routingReason,
+      event: targetEvent,
+    });
+  }
+  return routes;
+}
+
 async function checkDelegatePingPong(
   event: LinearEvent,
   detector: DelegatePingPongDetector,
@@ -423,6 +588,31 @@ export function createWebhookRouter(
             ` and ${removedQueued} queued signal${removedQueued === 1 ? "" : "s"}; skipping agent dispatch`,
           );
           appendOperationalEvent(operationalEventStore, { outcome: "terminal-pruned", type: event.type, key: sessionKey, sessionKey, detail: { removedBag, removedQueued } });
+
+          try {
+            const unblockRoutes = await findUnblockWakeRoutesForTerminalIssue(event);
+            for (const unblockRoute of unblockRoutes) {
+              try {
+                await dispatchRoute(unblockRoute);
+              } catch (err) {
+                log.error(
+                  `unblock dispatchRoute failed for ${unblockRoute.agentId} [${unblockRoute.sessionKey}]: ` +
+                  `${err instanceof Error ? err.message : String(err)}`,
+                );
+              }
+            }
+            if (unblockRoutes.length > 0) {
+              appendOperationalEvent(operationalEventStore, {
+                outcome: "unblock-wake-dispatched" as never,
+                type: event.type,
+                key: sessionKey,
+                sessionKey,
+                detail: { count: unblockRoutes.length, targets: unblockRoutes.map((r) => r.sessionKey) },
+              });
+            }
+          } catch (err) {
+            log.warn(`Blocked-target wake fanout failed for terminal ${sessionKey}: ${errorSummary(err)}`);
+          }
 
           // Phase 5 / B-3: Barrier (N→1) — event-driven parent auto-advance.
           // When a child reaches a terminal state, check if all siblings are
@@ -810,6 +1000,7 @@ export function createWebhookRouter(
       return;
 
       async function dispatchRoute(route: RouteResult): Promise<void> {
+      const event = route.event;
       // AI-1799 AC2: mint a wake_id at route time so the full dispatch cycle
       // (routed → bag-added → dispatch-accepted → delivered) can be correlated.
       const wakeId = crypto.randomUUID();
