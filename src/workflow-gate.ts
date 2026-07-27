@@ -169,6 +169,14 @@ export interface WorkflowTransition {
   generic?: 'continue' | 'revision';
 }
 
+function hasMergeEvidenceReference(commentBody: string | null | undefined): boolean {
+  const body = commentBody?.trim() ?? "";
+  if (!body) return false;
+  if (/https:\/\/github\.com\/[^\s)]+\/pull\/\d+/i.test(body)) return true;
+  if (/\b[0-9a-f]{40}\b/i.test(body)) return true;
+  return /\b(merge|merged|squash|commit|sha|pr|pull request)\b[\s\S]*\b[0-9a-f]{7,40}\b/i.test(body);
+}
+
 /**
  * AI-1992: Declarative fan-out configuration for a workflow state.
  *
@@ -3275,6 +3283,7 @@ export async function checkWorkflowRules(
   // re-gated against its own post-transition state (the "'<intent>' is not a legal
   // command in state '<new-state>'" repro on ac-fail / request-revision / needs-human).
   snapshotState?: string | null,
+  commentBody?: string | null,
 ): Promise<string | null> {
   // TODO(AI-1347): fail-open on missing issueId is a Layer A carry-forward.
   // Harden by deriving issueId from the request body when headers are absent.
@@ -3756,10 +3765,14 @@ export async function checkWorkflowRules(
   }
 
   const transitions = stateNode.transitions ?? [];
-  // INF-112: `force-deploy` is an alias for `continue` in merge/deploy states.
-  // It maps to the same transition but skips the evidence gate.
-  const resolvedIntent = (intent === 'force-deploy') ? 'continue' : intent;
-  const match = transitions.find((t) => t.command === resolvedIntent);
+  // INF-867: prefer an explicit `force-deploy` transition when a workflow state
+  // declares one (post-escape recovery from intake). Otherwise preserve the
+  // INF-112 alias: `force-deploy` maps to `continue` in merge/deploy states and
+  // skips only the PR evidence gate.
+  const directMatch = transitions.find((t) => t.command === intent);
+  const aliasMatch = intent === 'force-deploy' ? transitions.find((t) => t.command === 'continue') : undefined;
+  const match = directMatch ?? aliasMatch;
+  const resolvedIntent = match?.command ?? intent;
 
   if (!match) {
     if (resolvedIntent === "complete" && isTerminalIssueState(nativeState)) {
@@ -3807,6 +3820,44 @@ export async function checkWorkflowRules(
       `[Proxy] '${intent}' is not a legal command in state '${currentState}'. ` +
       `Legal moves: ${legalMoves}.`
     );
+  }
+
+  if (intent === 'force-deploy' && isCallerKnown) {
+    const forceDeployAllowed = await bodyHasCapability(bodyId, 'workflow:force-deploy');
+    if (!forceDeployAllowed) {
+      log.warn(`workflow-gate: force-deploy blocked agent=${bodyId} ticket=${issueId} — lacks workflow:force-deploy`);
+      const holders = await resolveBodiesWithCapability('workflow:force-deploy');
+      return (
+        `[Proxy] 'force-deploy' blocked: caller '${bodyId}' does not hold 'workflow:force-deploy'. ` +
+        `This break-glass bypass of the PR evidence gate is restricted to the merge role-holder and the workflow steward` +
+        (holders.length ? ` (${holders.join(', ')})` : '') +
+        `. If a merge is verified but the evidence gate cannot see it, ask one of them to fire force-deploy, or escalate to the steward.`
+      );
+    }
+    log.info(`workflow-gate: force-deploy authorized agent=${bodyId} ticket=${issueId} (holds workflow:force-deploy)`);
+  }
+
+  if (
+    workflowId === "dev-impl" &&
+    currentState === "intake" &&
+    intent === "force-deploy" &&
+    match.to === "deploy" &&
+    !breakGlassOverride
+  ) {
+    if (!hasComment) {
+      log.warn(`workflow-gate: INF-867 recovery blocked on ${issueId} — force-deploy from intake requires evidence comment`);
+      return (
+        `[Proxy] 'force-deploy' from intake requires a comment naming the verified merge evidence ` +
+        `(PR URL and/or merge commit SHA). This recovery resumes at deploy and still requires AC validation.`
+      );
+    }
+    if (!hasMergeEvidenceReference(commentBody)) {
+      log.warn(`workflow-gate: INF-867 recovery blocked on ${issueId} — comment lacks merge evidence reference`);
+      return (
+        `[Proxy] 'force-deploy' from intake requires an explicit merge evidence reference in the comment ` +
+        `(for example, a GitHub PR URL or merge commit SHA). This recovery resumes at deploy and still requires AC validation.`
+      );
+    }
   }
 
   // Capability gate — e.g. deploy:execute is Hanzo-only (§16.2).
@@ -4131,20 +4182,6 @@ export async function checkWorkflowRules(
       // (Hanzo, `deployment` container) and the recovery steward (Astrid,
       // `workflow` container). isCallerKnown guards the human sign-off path
       // (unknown callers are already handled upstream at ~L2916).
-      if (isCallerKnown) {
-        const forceDeployAllowed = await bodyHasCapability(bodyId, 'workflow:force-deploy');
-        if (!forceDeployAllowed) {
-          log.warn(`workflow-gate: force-deploy blocked agent=${bodyId} ticket=${issueId} — lacks workflow:force-deploy`);
-          const holders = await resolveBodiesWithCapability('workflow:force-deploy');
-          return (
-            `[Proxy] 'force-deploy' blocked: caller '${bodyId}' does not hold 'workflow:force-deploy'. ` +
-            `This break-glass bypass of the PR evidence gate is restricted to the merge role-holder and the workflow steward` +
-            (holders.length ? ` (${holders.join(', ')})` : '') +
-            `. If a merge is verified but the evidence gate cannot see it, ask one of them to fire force-deploy, or escalate to the steward.`
-          );
-        }
-        log.info(`workflow-gate: force-deploy authorized agent=${bodyId} ticket=${issueId} (holds workflow:force-deploy)`);
-      }
       log.warn(`workflow-gate: done gate: ${issueId} — force-deploy used, skipping evidence check`);
       notify({
         severity: "info",
@@ -5458,15 +5495,14 @@ export async function applyStateTransition(
       return { status: "failed", code: "no-state-label", detail: `workflow ticket ${issueId} has no state:* label` };
     }
     const stateNode = def.states.find((s) => s.id === currentStateName);
-    // INF-522: `force-deploy` is an alias for `continue` in merge/deploy states —
-    // mirror the same resolution B1 (checkWorkflowRules, §3202) applies. B1 accepts
-    // force-deploy (aliasing to the `continue` transition and skipping the evidence
-    // gate), but B2 matched on the raw intent, so a `force-deploy` that passed B1 hit
-    // the `no-transition` fail-open here and the native state write was silently
-    // skipped — the ticket never advanced. Alias here so the merge→deploy / deploy→
-    // ac-validate edge actually applies.
-    const b2ResolvedIntent = intent === "force-deploy" ? "continue" : intent;
-    matchedTransition = stateNode?.transitions?.find((t) => t.command === b2ResolvedIntent);
+    // INF-867: prefer an explicit `force-deploy` transition when the current
+    // state declares one (post-escape recovery from intake). Otherwise preserve
+    // INF-522's alias to `continue` for merge/deploy force-deploy.
+    matchedTransition =
+      stateNode?.transitions?.find((t) => t.command === intent) ??
+      (intent === "force-deploy"
+        ? stateNode?.transitions?.find((t) => t.command === "continue")
+        : undefined);
     if (!matchedTransition) {
       if (intent === "complete") {
         toStateName = "__terminal_sync__";
