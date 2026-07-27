@@ -243,6 +243,7 @@ describe("attemptBarrierTransition — mocked Linear API", () => {
     children?: Array<{ identifier: string; labels: string[] }>;
     /** Existing team labels. */
     teamLabels?: Array<{ id: string; name: string }>;
+    teamStates?: Array<{ id: string; name: string; type: string }>;
   }): typeof globalThis.fetch {
     const parentLabels = opts.parentLabels ?? [
       { id: "wf-lbl", name: `wf:${opts.parentWorkflow ?? "ux-audit"}` },
@@ -262,6 +263,27 @@ describe("attemptBarrierTransition — mocked Linear API", () => {
       fetchCalls.push({ url, body: parsed });
 
       const query = parsed.query ?? "";
+
+      // Team native state lookup
+      if (query.includes("TeamStates") || (query.includes("team(") && query.includes("states"))) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              team: {
+                states: {
+                  nodes: opts.teamStates ?? [
+                    { id: "ns-thinking", name: "Thinking", type: "started" },
+                    { id: "ns-managing", name: "Managing", type: "started" },
+                    { id: "ns-done", name: "Done", type: "completed" },
+                    { id: "ns-invalid", name: "Invalid", type: "canceled" },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
 
       // Fetch children
       if (query.includes("ParentChildren")) {
@@ -348,13 +370,49 @@ describe("attemptBarrierTransition — mocked Linear API", () => {
     expect(result.terminalCount).toBe(2);
     expect(result.totalChildren).toBe(2);
 
-    // Should have done a label swap
-    const swapCall = fetchCalls.find((c) => (c.body.query ?? "").includes("UpdateLabels"));
-    expect(swapCall).toBeDefined();
+    // Should update labels + native state together for the target projection.
+    const transitionCall = fetchCalls.find((c) => (c.body.query ?? "").includes("ApplyBarrierTransition"));
+    expect(transitionCall).toBeDefined();
+    expect(transitionCall?.body.variables).toMatchObject({
+      issueId: "parent-internal-id",
+      input: {
+        labelIds: ["wf-lbl", "label-state:review"],
+        stateId: "ns-thinking",
+      },
+    });
 
     // Should have posted a barrier comment
     const commentCall = fetchCalls.find((c) => (c.body.query ?? "").includes("commentCreate"));
     expect(commentCall).toBeDefined();
+  });
+
+  it("terminal barrier target writes native state and clears ownership atomically", async () => {
+    globalThis.fetch = makeBarrierFetch({
+      parentWorkflow: "terminal-barrier",
+      parentState: "managing",
+      parentLabels: [
+        { id: "wf-lbl", name: "wf:terminal-barrier" },
+        { id: "state-lbl", name: "state:managing" },
+      ],
+      teamLabels: [{ id: "state-done-lbl", name: "state:done" }],
+    });
+
+    const result = await attemptBarrierTransition("AI-1439", "Bearer tok");
+
+    expect(result.transitioned).toBe(true);
+    const transitionCall = fetchCalls.find((c) => (c.body.query ?? "").includes("ApplyBarrierTransition"));
+    expect(transitionCall).toBeDefined();
+    expect(transitionCall?.body.variables).toMatchObject({
+      issueId: "parent-internal-id",
+      input: {
+        labelIds: ["wf-lbl", "state-done-lbl"],
+        stateId: "ns-done",
+        delegateId: null,
+        assigneeId: null,
+      },
+    });
+    const labelOnlyCall = fetchCalls.find((c) => (c.body.query ?? "").includes("UpdateLabels"));
+    expect(labelOnlyCall).toBeUndefined();
   });
 
   it("does not transition when not all children terminal", async () => {
@@ -719,6 +777,29 @@ describe("detectStalledChildren — mocked Linear API", () => {
         );
       }
 
+      // AI-1493 introduced per-state SLA gating via ChildStateHistory (state-entry
+      // time), which supersedes the flat idle threshold for stall detection. The
+      // implementation state carries a 72h SLA, so the stale child must have entered
+      // its state beyond that window to trip; the recent child stays well within it.
+      if ((parsed.query ?? "").includes("ChildStateHistory")) {
+        const vars = (JSON.parse(bodyText).variables ?? {}) as { id?: string };
+        const enteredAt =
+          vars.id === "AI-2001"
+            ? new Date(now - 80 * 60 * 60 * 1000).toISOString() // 80h ago — breaches 72h implementation SLA
+            : new Date(now - 10 * 60 * 1000).toISOString(); // 10 min ago — within SLA
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                labels: { nodes: [{ name: "state:implementation" }] },
+                history: { nodes: [{ __typename: "IssueHistory", createdAt: enteredAt }] },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
       throw new Error(`unexpected query: ${(parsed.query ?? "").slice(0, 80)}`);
     };
 
@@ -841,6 +922,24 @@ describe("surfaceStalledChildren — §5.5 tripwire", () => {
       if ((parsed.query ?? "").includes("ChildActivity")) {
         return new Response(
           JSON.stringify({ data: { issue: { updatedAt: staleTime } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // AI-1493: stall detection gates on state-entry time vs the per-state SLA.
+      // implementation carries a 72h SLA, so the child must have entered its state
+      // beyond that window (here 80h ago) to be surfaced as stalled.
+      if ((parsed.query ?? "").includes("ChildStateHistory")) {
+        const enteredAt = new Date(now - 80 * 60 * 60 * 1000).toISOString(); // 80h ago — breaches 72h SLA
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                labels: { nodes: [{ name: "state:implementation" }] },
+                history: { nodes: [{ __typename: "IssueHistory", createdAt: enteredAt }] },
+              },
+            },
+          }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }

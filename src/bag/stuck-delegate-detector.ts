@@ -547,8 +547,18 @@ function defaultSendWakeFactory(
  *
  * Returns candidates matching the stuck pattern.
  */
-async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCandidate[]> {
-  const token = getAccessToken(agent.name);
+export async function defaultFetchStuckCandidates(
+  agent: AgentConfig,
+  deps?: {
+    /** Overridable for testing — resolves the agent's Linear access token. */
+    getToken?: (agentName: string) => string | null | undefined;
+    /** Overridable for testing — HTTP fetch. */
+    fetchImpl?: typeof fetch;
+  },
+): Promise<StuckCandidate[]> {
+  const getToken = deps?.getToken ?? getAccessToken;
+  const fetchImpl = deps?.fetchImpl ?? fetch;
+  const token = getToken(agent.name);
   if (!token) {
     log.warn(`No access token for agent ${agent.name}; skipping stuck-delegate check`);
     return [];
@@ -556,11 +566,14 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
 
   const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
 
-  // Query all issues delegated to this agent that have state:* labels
+  // Query all issues delegated to this agent that have state:* labels.
+  // INF-719: `$after` threads the cursor so a delegate holding more than 50
+  // tickets is fully scanned; `first: 50` alone silently truncated the set.
   const query = `
-    query DelegatedIssues($delegateId: ID!) {
+    query DelegatedIssues($delegateId: ID!, $after: String) {
       issues(
         first: 50,
+        after: $after,
         filter: { delegate: { id: { eq: $delegateId } } }
       ) {
         nodes {
@@ -599,44 +612,32 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
             }
           }
         }
+        pageInfo { hasNextPage endCursor }
       }
     }
   `;
 
   try {
-    const res = await fetch("https://api.linear.app/graphql", {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: authHeader },
-      body: JSON.stringify({ query, variables: { delegateId: agent.linearUserId } }),
-    });
-
-    if (!res.ok) {
-      throw new Error(`Linear API returned ${res.status} for agent ${agent.name}`);
-    }
-
-    const body = (await res.json()) as {
-      data?: {
-        issues?: {
-          nodes?: Array<{
-            identifier: string;
-            labels: { nodes: Array<{ name: string }> };
-            delegate: { id: string } | null;
-            updatedAt: string;
-            state: { name: string; type: string } | null;
-            children?: {
-              nodes?: Array<{
-                identifier: string;
-                state?: { type: string } | null;
-                labels?: { nodes?: Array<{ name: string }> };
-              }>;
-            };
-            comments: {
-              nodes: Array<{
-                id: string;
-                createdAt: string;
-                body: string;
-                user: { id: string; name: string } | null;
-              }>;
+    type StuckIssueNode = {
+      identifier: string;
+      labels: { nodes: Array<{ name: string }> };
+      delegate: { id: string } | null;
+      updatedAt: string;
+      state: { name: string; type: string } | null;
+      children?: {
+        nodes?: Array<{
+          identifier: string;
+          state?: { type: string } | null;
+          labels?: { nodes?: Array<{ name: string }> };
+        }>;
+      };
+      comments: {
+        nodes: Array<{
+          id: string;
+          createdAt: string;
+          body: string;
+          user: { id: string; name: string } | null;
+        }>;
             };
             history: {
               nodes: Array<{
@@ -649,17 +650,44 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
                 toState?: { name: string } | null;
               }>;
             };
-          }>;
+    };
+    type StuckResp = {
+      data?: {
+        issues?: {
+          nodes?: StuckIssueNode[];
+          pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
         };
       };
       errors?: Array<{ message: string }>;
     };
 
-    if (body.errors?.length) {
-      throw new Error(`Linear API errors: ${body.errors.map((e) => e.message).join("; ")}`);
+    // INF-719: page through the full delegated set — a delegate holding more
+    // than one page of tickets was silently truncated at 50.
+    const issues: StuckIssueNode[] = [];
+    let cursor: string | null = null;
+    let hasNextPage = true;
+    while (hasNextPage) {
+      const res = await fetchImpl("https://api.linear.app/graphql", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: authHeader },
+        body: JSON.stringify({ query, variables: { delegateId: agent.linearUserId, after: cursor } }),
+      });
+
+      if (!res.ok) {
+        throw new Error(`Linear API returned ${res.status} for agent ${agent.name}`);
+      }
+
+      const body = (await res.json()) as StuckResp;
+      if (body.errors?.length) {
+        throw new Error(`Linear API errors: ${body.errors.map((e) => e.message).join("; ")}`);
+      }
+      issues.push(...(body.data?.issues?.nodes ?? []));
+      const pageInfo = body.data?.issues?.pageInfo;
+      hasNextPage = pageInfo?.hasNextPage === true;
+      cursor = pageInfo?.endCursor ?? null;
+      if (hasNextPage && !cursor) break;
     }
 
-    const issues = body.data?.issues?.nodes ?? [];
     const candidates: StuckCandidate[] = [];
 
     for (const issue of issues) {
@@ -674,6 +702,32 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
 
       // Skip terminal states (done, escape)
       if (currentState === "done" || currentState === "escape") continue;
+
+      // INF-572: Skip Linear-retired entities. When Linear retires an issue
+      // out-of-band (native state type completed/canceled) the proxy's
+      // workflow-state cache can still hold a non-terminal `state:*`
+      // label + delegate (the AI-2628 repro: native Invalid/`canceled`, label
+      // still `state:implementation`, delegate still set). Such a ticket is a
+      // dead end for the delegate: every corrective verb is an `issueUpdate`
+      // (or even a `commentCreate`) and Linear refuses ALL mutations on a
+      // retired entity ("Entity is retired: issue ↳ Could not modify retired
+      // issue"). Re-prompting the delegate therefore recurs on every cadence
+      // with no possible resolution. Treat native terminality as authoritative
+      // and never surface a retired issue as a stuck candidate — matching the
+      // INF-205 guard the delegation sweep and first-action watchdog already
+      // apply. Reuses this module's TERMINAL_NATIVE_STATE_TYPES (completed/
+      // canceled) — the same native-terminal set used for child-barrier
+      // suppression. (The `state:*`/delegate cleanup on the retired ticket is
+      // owned by the reconciliation sweeps' native-terminal crosscheck, not this
+      // read-only detector.)
+      if (issue.state?.type && TERMINAL_NATIVE_STATE_TYPES.has(issue.state.type)) {
+        log.info(
+          `Stuck-delegate: skipping ${issue.identifier} — Linear entity is natively terminal ` +
+          `(state.type='${issue.state?.type ?? "null"}', label state:${currentState}); ` +
+          `no legal transition exists on a retired issue`,
+        );
+        continue;
+      }
 
       // Find when the current state:* label was last set (state entry time)
       // In the new Linear schema, IssueLabelPayload no longer exists as a fragment type.

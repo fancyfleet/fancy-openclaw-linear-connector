@@ -1,36 +1,9 @@
-# dev-sprint — Sprint Execution Workflow (v8)
-# owner: steward (Astrid), engine (spawn-arms, spawn-impl)
-# last-updated: 2026-07-22
-# status: v8 deployed to production (INF-359 sprint coherence)
-#
-# v5 (2026-07-21): added `cancelled` terminal state — explicit sprint
-#   termination path without completing (break-glass, not normal).
-# v6 (2026-07-21): added `auto_derive_from` to spawn-arms fanout — auto-
-#   populate the ## Structured section from prior-phase children on entry,
-#   so the spawn command has a valid spec even when the sprint creator did
-#   not hand-author it (INF-258).
-# v7 (2026-07-21): incremental re-entry fix — re-running spawn after
-#   children exist uses the dedup path (AI-1994) instead of re-creating.
-# v8 (2026-07-22): sprint coherence gates — product-definition requires
-#   capability statements; implementation fanout requires classification and
-#   adds per-capability integration-verify children; validation approval
-#   requires passed demonstration-walk evidence.
-#
-# Registered-def copy for CI conformance validation (INF-42). The canonical
-# source is the vault markdown spec at:
-#   life-os/project-management/workflows/dev-sprint/dev-sprint-workflow-spec.md
-# Keep in sync with that spec.
-#
-# Arm workflows (wf:sprint-arm-scope, wf:sprint-arm-ux, wf:sprint-arm-design,
-# wf:sprint-arm-spike) are registered as v0 stubs in src/registered-defs/.
-# They match the arm archetype table in dev-sprint-workflow-spec.md.
-#
-# Sprint spine (from dev-sprint-workflow-spec.md):
-#   1. intake → 2. product-definition → 3. spawn-arms → 4. managing-arms
-#   → 5. ac-definition → 6. spawn-impl → 7. managing-impl → 8. validation → done
+# GENERATED from src/registered-defs/dev-sprint.yaml — do not hand-edit.
+# Regenerate: node scripts/check-workflow-def-sync.mjs --write dev-sprint
+# The canonical fixture is a mirror of the registered-def (INF-723 single-source rule).
 
 id: dev-sprint
-version: 8
+version: 12
 archetype: orchestrator
 entry_state: intake
 
@@ -91,6 +64,12 @@ states:
       - command: spawn
         to: managing-arms
         generic: continue
+      - command: cancel
+        to: cancelled
+        generic: cancel
+      - command: abandon
+        to: cancelled
+        generic: cancel
 
   - id: managing-arms
     owner_role: steward
@@ -103,6 +82,12 @@ states:
       - command: continue
         to: ac-definition
         generic: continue
+      - command: cancel
+        to: cancelled
+        generic: cancel
+      - command: abandon
+        to: cancelled
+        generic: cancel
 
   - id: ac-definition
     owner_role: steward
@@ -116,6 +101,20 @@ states:
       - command: continue
         to: spawn-impl
         generic: continue
+      # INF-504: governed completion when implementation shipped out-of-band.
+      # `continue` here mints a redundant impl arm (INF-271 debt); `converge`
+      # is the terminal edge for a sprint whose tracked work is already Done.
+      # Gated on all children terminal (acceptance walk satisfied) + a steward
+      # attestation comment. Steward-only via delegate-gating. Fire with
+      # `linear transition <id> converge`.
+      - command: converge
+        to: done
+        requires_children_terminal: true
+        # INF-758: converge is a false-Done hole unless a real impl child shipped.
+        # requires_children_terminal is satisfied vacuously by scope/design arms
+        # (wf:sprint-arm-*) — the LIF-291 defect. Require >=1 COMPLETED impl child.
+        requires_implementation_child: true
+        requires_comment: true
 
   - id: spawn-impl
     owner_role: engine
@@ -142,6 +141,23 @@ states:
       - command: spawn
         to: managing-impl
         generic: continue
+      # INF-528: governed completion when the impl children were already spawned
+      # and shipped out-of-band, leaving the sprint wedged here. From spawn-impl
+      # the only other move is `spawn` — which dedups to a no-op once children
+      # exist (v7) and never advances — so `converge → done` was unreachable
+      # (INF-504 covered ac-definition + managing-impl but not spawn-impl). Same
+      # gate as the other converge edges: all children terminal (acceptance walk
+      # satisfied) + a steward attestation comment. Fire with
+      # `linear transition <id> converge`. Live victim: LSO-1 (children LSO-5/6/7
+      # all Done, wedged at spawn-impl for 2 days).
+      - command: converge
+        to: done
+        requires_children_terminal: true
+        # INF-758: converge is a false-Done hole unless a real impl child shipped.
+        # requires_children_terminal is satisfied vacuously by scope/design arms
+        # (wf:sprint-arm-*) — the LIF-291 defect. Require >=1 COMPLETED impl child.
+        requires_implementation_child: true
+        requires_comment: true
 
   - id: managing-impl
     owner_role: steward
@@ -155,6 +171,17 @@ states:
       - command: continue
         to: validation
         generic: continue
+      # INF-504: governed completion when validation happened out-of-band and
+      # the normal continue→validation walk is redundant. Same gate as the
+      # ac-definition edge: all children terminal + steward attestation comment.
+      - command: converge
+        to: done
+        requires_children_terminal: true
+        # INF-758: converge is a false-Done hole unless a real impl child shipped.
+        # requires_children_terminal is satisfied vacuously by scope/design arms
+        # (wf:sprint-arm-*) — the LIF-291 defect. Require >=1 COMPLETED impl child.
+        requires_implementation_child: true
+        requires_comment: true
 
   - id: validation
     owner_role: steward
@@ -208,6 +235,7 @@ states:
   # escape to cancelled state. Not a normal forward path.
   - id: cancelled
     kind: terminal
+    barrier: true
     native_state: done
     description: >
       Sprint terminated without completing all arms. Used via break-glass

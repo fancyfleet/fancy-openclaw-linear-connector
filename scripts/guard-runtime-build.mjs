@@ -28,47 +28,50 @@ if (process.env.CI) process.exit(0);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+const RUNTIME_TREE =
+  process.env.CONNECTOR_RUNTIME_TREE ||
+  "/home/fancymatt/Code/repos/fancy-openclaw-linear-connector";
+
+function resolveReal(path) {
+  try {
+    return realpathSync(path);
+  } catch {
+    return null;
+  }
+}
 
 function main() {
   const projectRoot = resolve(__dirname, "..");
   const outDir = resolve(projectRoot, "dist");
 
-  // Resolve symlinks — the runtime tree may be a symlink target.
-  let outDirReal;
-  try {
-    outDirReal = realpathSync(outDir);
-  } catch {
+  const outDirReal = resolveReal(outDir);
+  if (!outDirReal) {
     // dist/ doesn't exist yet — nothing to overwrite, allow build.
     process.exit(0);
   }
 
-  // Resolve the current working directory's real path.
-  let cwdReal;
-  try {
-    cwdReal = realpathSync(process.cwd());
-  } catch {
+  const projectRootReal = resolveReal(projectRoot);
+  if (!projectRootReal) {
     // Can't resolve cwd — abort safely rather than silently allowing.
     console.error(
-      "error [build-guard]: cannot resolve cwd – refusing build. " +
+      "error [build-guard]: cannot resolve project root – refusing build. " +
         "Set CONNECTOR_DEPLOY=1 to bypass, or work in a worktree.",
     );
     process.exit(1);
   }
 
-  // Are we building into the runtime tree's dist/?
-  // Compare resolved paths: if the runtime's dist/ doesn't exist then we're
-  // clearly not in the production runtime tree, so allow.
-  const runtimeDist = resolve(cwdReal, "dist");
-  let runtimeDistReal;
-  try {
-    runtimeDistReal = realpathSync(runtimeDist);
-  } catch {
-    // runtime dist/ doesn't exist — not the runtime tree. Allow.
+  const runtimeTreeReal = resolveReal(RUNTIME_TREE);
+  if (!runtimeTreeReal) {
+    // Runtime tree is not mounted in this environment; this cannot overwrite it.
     process.exit(0);
   }
+  const runtimeDistReal = resolveReal(resolve(runtimeTreeReal, "dist"));
 
-  if (outDirReal !== runtimeDistReal) {
-    // Different output location — not the runtime tree. Allow.
+  const isRuntimeTree =
+    projectRootReal === runtimeTreeReal ||
+    (runtimeDistReal !== null && outDirReal === runtimeDistReal);
+
+  if (!isRuntimeTree) {
     process.exit(0);
   }
 

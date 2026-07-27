@@ -45,6 +45,25 @@ type DispatchRecordRow = {
   delegate_at_dispatch: string | null;
 };
 
+const SYNTHETIC_LINEAR_LIKE_ID_RE = /^[A-Z]{1,10}-\d{1,6}(?:-[A-Z0-9]+)+$/;
+
+function normalizeDispatchRecordKey(key: string): string {
+  try {
+    return normalizeSessionKey(key);
+  } catch (err) {
+    const cleaned = key
+      .replace(/^wake-linear-/i, "")
+      .replace(/^linear-wake-/i, "")
+      .replace(/^wake-/i, "")
+      .replace(/^linear-/i, "")
+      .toUpperCase();
+    if (SYNTHETIC_LINEAR_LIKE_ID_RE.test(cleaned)) {
+      return `linear-${cleaned}`;
+    }
+    throw err;
+  }
+}
+
 export class DispatchRecordStore {
   private db: Database.Database;
   public readonly config: Required<DispatchRecordStoreConfig>;
@@ -82,8 +101,8 @@ export class DispatchRecordStore {
   }
 
   recordDispatch(input: RecordDispatchInput): DispatchRecord {
-    const ticketId = normalizeSessionKey(input.ticketId);
-    const sessionKey = normalizeSessionKey(input.sessionKey);
+    const ticketId = normalizeDispatchRecordKey(input.ticketId);
+    const sessionKey = normalizeDispatchRecordKey(input.sessionKey);
     const dispatchId = crypto.randomUUID();
     const createdAt = new Date().toISOString();
 
@@ -162,7 +181,7 @@ export class DispatchRecordStore {
 
     let normalizedTicketId: string;
     try {
-      normalizedTicketId = normalizeSessionKey(dispatchIdOrTicketId);
+      normalizedTicketId = normalizeDispatchRecordKey(dispatchIdOrTicketId);
     } catch {
       return null;
     }
@@ -183,7 +202,7 @@ export class DispatchRecordStore {
   getDispatchesForTicket(ticketId: string): DispatchRecord[] {
     let normalizedTicketId: string;
     try {
-      normalizedTicketId = normalizeSessionKey(ticketId);
+      normalizedTicketId = normalizeDispatchRecordKey(ticketId);
     } catch {
       return [];
     }

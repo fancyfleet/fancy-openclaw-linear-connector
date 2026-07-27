@@ -41,11 +41,21 @@ function setupRepo(hasDist: boolean): TempRepo {
 }
 
 function invokeGuard(guardScript: string, cwd: string, env: Record<string, string> = {}): { status: number | null; stderr: string } {
+  // INF-590: scrub ambient env that would short-circuit the guard before its
+  // real logic runs. The guard exits 0 early when process.env.CI is set (a
+  // production convenience for disposable checkouts), and honors deploy markers.
+  // GitHub Actions sets CI=true, so inheriting it made the AC1 refuse assertion
+  // fail in CI only — the guard exited 0 (allow) before reaching the refuse path.
+  // Each test opts into the markers it needs via the `env` arg below.
+  const baseEnv = { ...process.env };
+  delete baseEnv.CI;
+  delete baseEnv.CONNECTOR_DEPLOY;
+  delete baseEnv.CONNECTOR_DEPLOY_BUILD;
   try {
     const result = execFileSync(
       process.execPath,
       [guardScript],
-      { cwd, env: { ...process.env, ...env }, timeout: 10_000, encoding: "utf8" },
+      { cwd, env: { ...baseEnv, CONNECTOR_RUNTIME_TREE: cwd, ...env }, timeout: 10_000, encoding: "utf8" },
     );
     return { status: 0, stderr: result.stderr ?? "" };
   } catch (err: unknown) {
@@ -86,10 +96,7 @@ describe("build guard — guard-runtime-build.mjs", () => {
     writeFileSync(join(worktree, "dist", "index.js"), "// worktree build");
     try {
       const guardScript = join(repo.root, "scripts", "guard-runtime-build.mjs");
-      // cwd=worktree, so cwdReal resolves to worktree; runtimeDist = worktree/dist
-      // projectRoot from scriptDir = repo.root; outDir = repo.root/dist
-      // outDirReal (repo.root/dist) ≠ runtimeDistReal (worktree/dist) → allow
-      const result = invokeGuard(guardScript, worktree);
+      const result = invokeGuard(guardScript, repo.root, { CONNECTOR_RUNTIME_TREE: worktree });
       expect(result.status).toBe(0);
     } finally {
       repo.cleanup();

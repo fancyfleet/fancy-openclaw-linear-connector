@@ -31,8 +31,9 @@
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules, bodyHasCapability } from "./escalation-gate.js";
+import { checkLeakedCredentialGate } from "./leaked-credential-gate.js";
 import { checkStaleSnapshotForTerminal } from "./proxy-cas-check.js";
-import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, setStateAtomic, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
+import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, setStateAtomic, verifyCommentSatisfiedBy, fetchTicketVerification, resolveSignoffWakeTargets, SIGNOFF_WAKE_DISPATCHED_PHRASE, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
 import { buildTransitionAuditRecord, emitTransitionAuditRecord, verifyPostTransition, type GateResult, type TransitionAuditRecord } from "./transition-audit.js";
 import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import type { ObservationStore } from "./store/observation-store.js";
@@ -42,10 +43,13 @@ import type { MutationAuditStore, MutationAuditInput, ChangeType } from "./store
 import { isTerminalState } from "./barrier.js";
 import { getAgent, getAgentByProxyToken } from "./agents.js";
 import type { NoActivityDetector } from "./bag/no-activity-detector.js";
+import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
+import type { DispatchRecordStore } from "./liveness-channel/dispatch-record-store.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
 import { IssueCreateDedupCache, extractIssueCreateInput, fingerprintIssueCreate, isSuccessfulIssueCreate, DEFAULT_DEDUP_TTL_MS, type Claim } from "./issue-create-dedup.js";
 import { checkArtifactDisclosure } from "./artifact-disclosure.js";
 import { recordTransitionCarriedComment } from "./transition-comment-logic.js";
+import { LINEAR_PROXY_PROTOCOL_VERSION, minWorkflowCliVersion } from "./proxy-compatibility.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
@@ -95,17 +99,6 @@ async function runWithTicketLock(
   } finally {
     inFlightTickets.delete(ticketId);
   }
-}
-
-/**
- * Minimum CLI version required to issue workflow mutations (AI-1397).
- * CLIs below this version lack proxy-side delegate guards and advancement
- * guards, so they must be rejected before any enforcement can be bypassed.
- * Override via PROXY_MIN_CLI_VERSION env for testing. Evaluated at request
- * time so tests can override the env var after module load.
- */
-function minWorkflowCliVersion(): string {
-  return process.env.PROXY_MIN_CLI_VERSION ?? "0.3.0";
 }
 
 /**
@@ -545,6 +538,12 @@ export interface ProxyDeps {
   onProxyCall?: (agentId: string, ticketId: string) => void;
   /** AI-2565: dispatch lease store for CAS stale-snapshot enforcement on terminal transitions. */
   dispatchLeaseStore?: DispatchLeaseStore;
+  /** INF-570: canonical wake delivery for actionable fan-out children. */
+  fanoutWakeFn?: (agentName: string, ticketIdentifier: string) => Promise<void>;
+  /** INF-570: ack tracker for actionable fan-out child dispatches. */
+  getDispatchAckTracker?: () => DispatchAckTracker | undefined;
+  /** INF-696: liveness dispatch store for post-fanout child dispatch verification. */
+  postFanoutDispatchStore?: DispatchRecordStore;
 }
 
 export async function handleProxyRequest(req: Request, res: Response, deps?: ProxyDeps): Promise<void> {
@@ -585,6 +584,9 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
   const opName = body?.operationName ?? "(unnamed)";
   const issueId = extractIssueId(body);
   const ticketCtx = issueId ? ` ticket=${issueId}` : "";
+
+  res.setHeader("X-Openclaw-Linear-Protocol-Version", LINEAR_PROXY_PROTOCOL_VERSION);
+  res.setHeader("X-Openclaw-Linear-Min-Cli-Version", minWorkflowCliVersion());
 
   // AI-1397: resolve caller's Linear user ID from agent config for delegate enforcement.
   const callerLinearUserId = getAgent(agentId)?.linearUserId ?? null;
@@ -925,6 +927,28 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         return;
       }
 
+      // INF-529: leaked-credential rotation gate. Standalone (not inside the
+      // workflow gate) because the origin failure was a plain, non-workflow
+      // ticket — this keys on the `sec:leaked-credential` label alone and blocks
+      // any close (semantic verb or raw stateId → completed/canceled) that lacks
+      // a rotation-confirmation artifact. Break-glass bypasses; see module doc.
+      {
+        const targetStateId = issueUpdateInput(body)?.stateId;
+        const rotationRejection = await checkLeakedCredentialGate(
+          effectiveIntent,
+          issueId,
+          authorization,
+          typeof targetStateId === "string" ? targetStateId : null,
+          breakGlassOverride,
+        );
+        if (rotationRejection) {
+          log.warn(`leaked-credential-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${rotationRejection}`);
+          deps?.operationalEventStore?.append({ outcome: "leaked-credential-close-blocked" as never, agent: agentId, key: issueId ?? undefined });
+          res.status(200).json({ errors: [{ message: rotationRejection }] });
+          return;
+        }
+      }
+
       // G-13a: emit audit event for authorized break-glass use.
       if (breakGlassOverride) {
         deps?.operationalEventStore?.append({ outcome: "break-glass-used", agent: agentId, key: issueId ?? undefined });
@@ -967,6 +991,36 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             errorSummary: p3rejection,
           });
         }
+        // INF-629: a non-holder's attempted designated-approver gated transition
+        // IS the signoff-request event. When the capability gate emitted the
+        // designated-approver signoff block, emit a wake to the approver so the
+        // signoff surfaces in their `linear queue` instead of stranding the loop.
+        // The fan-out wake is bounded by its own session-active + dispatch-lease
+        // guards, so repeated attempts on the same still-open signoff do not spam
+        // the approver. Fail-open: a wake-emission failure must never suppress the
+        // gate rejection the caller needs to see.
+        if (issueId && deps?.fanoutWakeFn && p3rejection.includes(SIGNOFF_WAKE_DISPATCHED_PHRASE)) {
+          try {
+            const { targets, identifier } = await resolveSignoffWakeTargets(issueId, effectiveIntent, authorization);
+            const wakeTicket = identifier ?? issueId;
+            for (const approver of targets) {
+              await deps.fanoutWakeFn(approver, wakeTicket);
+              log.info(`signoff-wake dispatched approver=${approver} ticket=${wakeTicket} intent=${effectiveIntent}`);
+            }
+            if (targets.length > 0) {
+              deps?.operationalEventStore?.append({
+                outcome: "signoff-wake-dispatched" as never,
+                type: "designated-approver-signoff",
+                agent: agentId,
+                key: issueId,
+                detail: { approvers: targets, intent: effectiveIntent },
+              });
+            }
+          } catch (err) {
+            log.warn(`signoff-wake emission failed ticket=${issueId}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+
         // AI-1857 AC4: include gate-verification snapshot so CLI can verify "no partial state was written"
         const gateDeclineResponse: Record<string, unknown> = { errors: [{ message: p3rejection }] };
         if (issueId) {
@@ -1369,6 +1423,9 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             enrolledTicketsStore: deps?.enrolledTicketsStore,
             operationalEventStore: deps?.operationalEventStore,
             delegateOverride,
+            fanoutWakeFn: deps?.fanoutWakeFn,
+            getDispatchAckTracker: deps?.getDispatchAckTracker,
+            postFanoutDispatchStore: deps?.postFanoutDispatchStore,
           });
 
           // ── AI-2554: Structured transition audit record ──────────────

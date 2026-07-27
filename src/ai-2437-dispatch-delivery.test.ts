@@ -281,7 +281,7 @@ describe("AI-2437 gateway dispatch delivery classification and retry bounds", ()
     const [_url, init] = fetchMock.mock.calls[0];
     expect(init?.headers).toMatchObject({
       Authorization: `Bearer ${GATEWAY_TOKEN}`,
-      "x-openclaw-session-key": "linear-ai-2437",
+      "x-openclaw-session-key": "agent:igor:linear-ai-2437",
     });
   });
 });

@@ -22,6 +22,7 @@ import {
   StuckDelegateDetector,
   PromptCounter,
   buildRePrompt,
+  defaultFetchStuckCandidates,
   type StuckCandidate,
 } from "./stuck-delegate-detector.js";
 import type { WorkflowDef } from "../workflow-gate.js";
@@ -1122,5 +1123,89 @@ describe("StuckDelegateDetector", () => {
       deps.sessionTracker.close();
       deps.operationalEventStore.close();
     });
+  });
+});
+
+// ── INF-572: retired-entity guard in the candidate fetcher ───────────────────
+//
+// Repro (AI-2628, 2026-07-24): Linear retires an issue out-of-band (native
+// state → Invalid / type `canceled`) while the proxy's workflow-state cache
+// still holds a non-terminal `state:*` label + delegate. Every corrective verb
+// is an issueUpdate/commentCreate that Linear refuses on a retired entity, so a
+// stuck-delegate re-prompt recurs on every cadence with no legal action. The
+// fetcher must never surface a natively-terminal issue as a stuck candidate.
+describe("defaultFetchStuckCandidates — retired-entity guard (INF-572)", () => {
+  const DELEGATE_ID = "igor-user-uuid";
+
+  const agent = {
+    name: "igor",
+    linearUserId: DELEGATE_ID,
+  } as unknown as AgentConfig;
+
+  /** Build a GraphQL issue node in the AI-2628 stuck shape with a settable native state type. */
+  function issueNode(nativeStateType: string, nativeStateName: string) {
+    return {
+      identifier: "AI-2628",
+      labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] },
+      delegate: { id: DELEGATE_ID },
+      updatedAt: "2026-07-24T02:00:00.000Z",
+      state: { name: nativeStateName, type: nativeStateType },
+      children: { nodes: [] },
+      // A delegate completion comment AFTER state entry, no transition verb since —
+      // exactly the pattern the detector treats as "stuck".
+      comments: {
+        nodes: [
+          {
+            id: "c1",
+            createdAt: "2026-07-24T01:00:00.000Z",
+            body: "Implementation complete.",
+            user: { id: DELEGATE_ID, name: "Igor" },
+          },
+        ],
+      },
+      // A single non-transition history entry establishes the state-entry timestamp.
+      history: {
+        nodes: [
+          { __typename: "IssueHistory", createdAt: "2026-07-24T00:00:00.000Z", actor: { id: DELEGATE_ID } },
+        ],
+      },
+    };
+  }
+
+  function fakeFetch(node: ReturnType<typeof issueNode>): typeof fetch {
+    // Returns the same payload on every call (call-count-independent) so a red
+    // baseline fails on the guard, not on mock exhaustion.
+    return (async () =>
+      ({
+        ok: true,
+        status: 200,
+        json: async () => ({ data: { issues: { nodes: [node] } } }),
+      })) as unknown as typeof fetch;
+  }
+
+  const deps = (node: ReturnType<typeof issueNode>) => ({
+    getToken: () => "test-token",
+    fetchImpl: fakeFetch(node),
+  });
+
+  it("excludes a natively-canceled (retired) issue whose workflow state:* label is still non-terminal", async () => {
+    const candidates = await defaultFetchStuckCandidates(agent, deps(issueNode("canceled", "Invalid")));
+    expect(candidates).toHaveLength(0);
+  });
+
+  it("excludes a natively-completed issue with a stale non-terminal state:* label too", async () => {
+    const completed = await defaultFetchStuckCandidates(agent, deps(issueNode("completed", "Done")));
+    expect(completed).toHaveLength(0);
+  });
+
+  it("still surfaces a live (non-terminal native state) issue in the same stuck shape as a candidate", async () => {
+    const candidates = await defaultFetchStuckCandidates(agent, deps(issueNode("started", "In Progress")));
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].identifier).toBe("AI-2628");
+    expect(candidates[0].currentState).toBe("implementation");
+    // The stuck pattern (delegate comment after entry, no transition) is intact —
+    // proving the guard excludes on native terminality alone, not by breaking the shape.
+    expect(candidates[0].delegateComments).toHaveLength(1);
+    expect(candidates[0].transitionsAfterEntry).toHaveLength(0);
   });
 });

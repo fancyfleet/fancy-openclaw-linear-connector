@@ -1,0 +1,27 @@
+id: synthetic-child
+version: 1
+archetype: engine-primitive-child
+entry_state: queued
+
+break_glass:
+  command: abort-path
+  to: escaped
+  owner_role: synthetic-steward
+
+states:
+  - id: queued
+    owner_role: synthetic-worker
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: begin-child
+        to: finished
+
+  - id: finished
+    kind: terminal
+    native_state: done
+
+  - id: escaped
+    owner_role: synthetic-steward
+    kind: terminal
+    native_state: invalid

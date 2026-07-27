@@ -302,6 +302,17 @@ const BACKWARD_COMPAT_SPEC = [
   "- **Spike shaping**: Technical spike",
 ].join("\n");
 
+const LSO_8_NATURAL_ARM_SPEC = [
+  "## structured",
+  "* **Scope arm — Snake CLI PoC execution plan:** Confirm the minimal Unity project structure, test seams, CLI transcript format, and evidence checklist.",
+  "* **Spike arm — Unity CLI pipeline proof:** Verify the license preflight wrapper, running-editor supervisor, headless test invocation, and build command path.",
+].join("\n");
+
+const LSO_8_BAD_IMPL_ARM_SPEC = [
+  LSO_8_NATURAL_ARM_SPEC,
+  "* **Implementation arm seed — Primitive Snake:** Build the grid/rules/input/view split in C# primitives.",
+].join("\n");
+
 const MIXED_SPEC = [
   "## Structured",
   "- **[wf:sprint-arm-scope → igor] Scope shaping**: Define scope",
@@ -374,6 +385,38 @@ describe("AC1: extractSpecFindings per-entry workflow markers", () => {
     }
   });
 
+  it("infers natural dev-sprint arm titles from LSO-8 structured specs", () => {
+    const findings = extractSpecFindings(LSO_8_NATURAL_ARM_SPEC, "structured");
+    expect(findings).toHaveLength(2);
+    expect(findings[0].title).toBe("Scope arm — Snake CLI PoC execution plan");
+    expect(findings[0].child_workflow).toBe("wf:sprint-arm-scope");
+    expect(findings[0].delegate).toBe("astrid");
+    expect(findings[1].title).toBe("Spike arm — Unity CLI pipeline proof");
+    expect(findings[1].child_workflow).toBe("wf:sprint-arm-spike");
+    expect(findings[1].delegate).toBe("igor");
+  });
+
+  it("rejects implementation-arm seeds during spawn-arms", () => {
+    const config = {
+      spec_source: "structured",
+      child_workflow: "wf:sprint-arm-scope",
+    } as FanoutConfig;
+    const registeredWorkflows = new Set([
+      "wf:sprint-arm-scope",
+      "wf:sprint-arm-ux",
+      "wf:sprint-arm-design",
+      "wf:sprint-arm-spike",
+    ]);
+
+    const result = validateFanoutSpec(LSO_8_BAD_IMPL_ARM_SPEC, config, registeredWorkflows);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toMatch(/implementation arm seed/i);
+      expect(result.reason).toMatch(/spawn-impl/i);
+    }
+  });
+
   it("preserves existing AI-1994 stable ids on per-entry findings", () => {
     const findings = extractSpecFindings(PER_ENTRY_SPEC, "Structured");
     for (const f of findings) {
@@ -408,6 +451,13 @@ describe("AC1: executeFanout per-entry child_workflow", () => {
   function makeFetch(
     parentDescription: string,
     existingTeamLabels: Array<{ id: string; name: string }> = [],
+    existingChildren: Array<{
+      identifier: string;
+      title: string;
+      description: string;
+      labels: Array<{ name: string }>;
+      state?: string;
+    }> = [],
   ): typeof globalThis.fetch {
     let childCount = 0;
     return async (url, init) => {
@@ -433,7 +483,19 @@ describe("AC1: executeFanout per-entry child_workflow", () => {
         });
       }
       if (query.includes("FanoutChildren") || (query.includes("children") && !query.includes("issueCreate"))) {
-        return jsonResp({ issue: { children: { nodes: [] } } });
+        return jsonResp({
+          issue: {
+            children: {
+              nodes: existingChildren.map((c) => ({
+                identifier: c.identifier,
+                title: c.title,
+                description: c.description,
+                state: { name: c.state ?? "Doing" },
+                labels: { nodes: c.labels },
+              })),
+            },
+          },
+        });
       }
       if (query.includes("TeamLabels")) {
         return jsonResp({ team: { labels: { nodes: existingTeamLabels } } });
@@ -499,6 +561,69 @@ describe("AC1: executeFanout per-entry child_workflow", () => {
     // ran (it returns wf:* label IDs matching our mock).
     const childCreates = fetchCalls.filter((c) => c.query.includes("issueCreate"));
     expect(childCreates.length).toBe(4);
+  });
+
+  it("does not leak internal spec markers into child descriptions", async () => {
+    globalThis.fetch = makeFetch(LSO_8_NATURAL_ARM_SPEC, [
+      { id: "label-sprint-arm-scope", name: "wf:sprint-arm-scope" },
+      { id: "label-sprint-arm-spike", name: "wf:sprint-arm-spike" },
+      { id: "label-state-intake", name: "state:intake" },
+    ]);
+    const config = {
+      spec_source: "structured",
+      child_workflow: "wf:sprint-arm-scope",
+      initial_delegate: "astrid",
+    } as FanoutConfig;
+
+    const result = await executeFanout("AI-2199", "Bearer tok", config, {
+      skipPreview: true,
+    });
+
+    expect(result.created).toBe(2);
+    const childCreates = fetchCalls.filter((c) => c.query.includes("issueCreate"));
+    expect(childCreates).toHaveLength(2);
+    for (const create of childCreates) {
+      const input = create.variables.input as Record<string, unknown>;
+      expect(input.description).toContain("Parent: AI-2199");
+      expect(input.description).not.toContain("ai-1994:spec-entry-id");
+      expect(input.description).not.toContain("inf-32:child-workflow");
+    }
+  });
+
+  it("dedups clean marker-free spawned children on re-entry", async () => {
+    const firstFinding = extractSpecFindings(LSO_8_NATURAL_ARM_SPEC, "structured")[0];
+    globalThis.fetch = makeFetch(
+      LSO_8_NATURAL_ARM_SPEC,
+      [
+        { id: "label-sprint-arm-scope", name: "wf:sprint-arm-scope" },
+        { id: "label-sprint-arm-spike", name: "wf:sprint-arm-spike" },
+        { id: "label-state-intake", name: "state:intake" },
+      ],
+      [
+        {
+          identifier: "LSO-9",
+          title: firstFinding.title,
+          description: `Parent: AI-2199\n\n${firstFinding.description ?? ""}`,
+          labels: [{ name: "wf:sprint-arm-scope" }],
+        },
+      ],
+    );
+    const config = {
+      spec_source: "structured",
+      child_workflow: "wf:sprint-arm-scope",
+      initial_delegate: "astrid",
+    } as FanoutConfig;
+
+    const result = await executeFanout("AI-2199", "Bearer tok", config, {
+      skipPreview: true,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.specMatchedChildren).toContain("LSO-9");
+    const childCreates = fetchCalls.filter((c) => c.query.includes("issueCreate"));
+    expect(childCreates).toHaveLength(1);
+    const input = childCreates[0].variables.input as Record<string, unknown>;
+    expect(input.title).toBe("Spike arm — Unity CLI pipeline proof");
   });
 
   it("uses per-entry delegate for delegateId on child issue create", async () => {
@@ -1273,6 +1398,9 @@ describe("Integration: end-to-end spawn with per-entry child workflows", () => {
       }
       if (query.includes("ApplyAtomicTransition")) {
         return jsonResp({ issueUpdate: { success: true } });
+      }
+      if (query.includes("IssueWithComments")) {
+        return jsonResp({ issue: { id: "parent-internal-id", description: parentDescription, comments: { nodes: [] } } });
       }
       if (query.includes("IssueTeamParent") || (query.includes("IssueParent") && !query.includes("ParentChildren"))) {
         return jsonResp({

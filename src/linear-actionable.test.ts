@@ -160,6 +160,67 @@ describe("isLinearIssueActionable", () => {
     await expect(isLinearIssueStillRoutedToAgent("linear-AI-982", "igor", "delegate")).resolves.toBe(false);
   });
 
+  // ── INF-794: the blocked ticket is the TARGET of a `blocks` relation, so
+  // Linear returns that relation in `inverseRelations`, NOT `relations`. The
+  // AI-984 suppression only scanned `relations`, so a ticket blocked by an
+  // open prerequisite (the INF-777 → INF-773 shape) was never suppressed and
+  // looped. These fixtures use the real Linear response shape (verified live
+  // against INF-777: blocker in inverseRelations, an unrelated outbound
+  // `related` edge in relations). ──────────────────────────────────────────
+  it("suppresses a ticket whose open blocker is in inverseRelations (INF-777 shape)", async () => {
+    const fetchMock = okFetch({
+      id: "issue-777", identifier: "INF-777",
+      delegate: { id: IGOR_LINEAR_USER_ID, name: "Igor" },
+      state: { name: "Verification", type: "started" },
+      // Outbound edges only — none of them a blocker of INF-777.
+      relations: {
+        nodes: [{
+          type: "related",
+          issue: { id: "issue-777", identifier: "INF-777" },
+          relatedIssue: { id: "issue-794", identifier: "INF-794", state: { name: "Doing", type: "started" } },
+        }],
+      },
+      // The block lives here: INF-773 (not Done) blocks INF-777.
+      inverseRelations: {
+        nodes: [{
+          type: "blocks",
+          issue: { id: "issue-773", identifier: "INF-773", state: { name: "To Do", type: "unstarted" } },
+          relatedIssue: { id: "issue-777", identifier: "INF-777", state: { name: "Verification", type: "started" } },
+        }],
+      },
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    await expect(isLinearIssueStillRoutedToAgent("linear-INF-777", "igor", "delegate")).resolves.toBe(false);
+    await expect(isLinearIssueActionable("linear-INF-777", "igor")).resolves.toBe(false);
+  });
+
+  it("re-dispatches once the inverseRelations blocker reaches Done (INF-773 → Done)", async () => {
+    const fetchMock = okFetch({
+      id: "issue-777", identifier: "INF-777",
+      delegate: { id: IGOR_LINEAR_USER_ID, name: "Igor" },
+      state: { name: "Verification", type: "started" },
+      relations: { nodes: [] },
+      inverseRelations: {
+        nodes: [{
+          type: "blocks",
+          issue: { id: "issue-773", identifier: "INF-773", state: { name: "Done", type: "completed" } },
+          relatedIssue: { id: "issue-777", identifier: "INF-777", state: { name: "Verification", type: "started" } },
+        }],
+      },
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    await expect(isLinearIssueStillRoutedToAgent("linear-INF-777", "igor", "delegate")).resolves.toBe(true);
+    await expect(isLinearIssueActionable("linear-INF-777", "igor")).resolves.toBe(true);
+  });
+
+  it("fetches inverseRelations in the routing query so blocked targets are visible", async () => {
+    const fetchMock = okFetch({ id: "issue-1", identifier: "AI-1", state: { name: "Todo", type: "unstarted" }, relations: { nodes: [] } });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    await isLinearIssueActionable("linear-AI-1", "unknown-agent");
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as { body: string }).body) as { query: string };
+    expect(body.query).toContain("inverseRelations");
+  });
+
   it("keeps mention routing independent from the delegate-ownership check", async () => {
     // A mention on a live ticket with no delegate is still a legitimate wake —
     // someone explicitly pinged the agent. Post-AI-2295 the issue IS fetched
@@ -382,6 +443,30 @@ describe("isLinearIssueActionable", () => {
     ).resolves.toBe(true);
   });
 
+  it("INF-498: does not hold INF-196 or LIF-45 on the INF-476 manual dispatch hold (hold lifted)", async () => {
+    for (const identifier of ["INF-196", "LIF-45"]) {
+      global.fetch = okFetch({
+        id: `issue-${identifier}`, identifier,
+        delegate: { id: IGOR_LINEAR_USER_ID, name: "Igor (Back End Dev)", app: true },
+        assignee: null,
+        state: { name: "To Do", type: "unstarted" },
+        relations: { nodes: [] },
+      }) as unknown as typeof fetch;
+
+      await expect(
+        isLinearIssueStillRoutedToAgent(`linear-${identifier}`, "igor", "delegate"),
+      ).resolves.toBe(true);
+
+      global.fetch = okFetch({
+        id: `issue-${identifier}`, identifier,
+        state: { name: "To Do", type: "unstarted" },
+        relations: { nodes: [] },
+      }) as unknown as typeof fetch;
+
+      await expect(isLinearIssueActionable(identifier, "igor")).resolves.toBe(true);
+    }
+  });
+
   describe("isHumanLinearUser", () => {
     const roster = new Set([IGOR_LINEAR_USER_ID]);
 
@@ -425,5 +510,40 @@ describe("isLinearIssueActionable", () => {
     };
     expect(isBlockedByOpenIssue(blockedIssue)).toBe(true);
     expect(isBlockedByOpenIssue(blockingIssue)).toBe(false);
+  });
+
+  it("detects a blocker carried in inverseRelations, not relations (INF-794)", () => {
+    // The real Linear shape for the blocked target: the `blocks` edge is an
+    // inverse relation. `relations` holds only unrelated outbound edges.
+    const blockedTarget = {
+      id: "issue-777", identifier: "INF-777",
+      state: { name: "Verification", type: "started" },
+      relations: {
+        nodes: [{
+          type: "related",
+          issue: { id: "issue-777", identifier: "INF-777" },
+          relatedIssue: { id: "issue-794", identifier: "INF-794", state: { name: "Doing", type: "started" } },
+        }],
+      },
+      inverseRelations: {
+        nodes: [{
+          type: "blocks",
+          issue: { id: "issue-773", identifier: "INF-773", state: { name: "To Do", type: "unstarted" } },
+          relatedIssue: { id: "issue-777", identifier: "INF-777", state: { name: "Verification", type: "started" } },
+        }],
+      },
+    };
+    expect(isBlockedByOpenIssue(blockedTarget)).toBe(true);
+    // Same shape but blocker Done ⇒ no longer blocked.
+    const doneBlocker = {
+      ...blockedTarget,
+      inverseRelations: {
+        nodes: [{
+          ...blockedTarget.inverseRelations.nodes[0],
+          issue: { id: "issue-773", identifier: "INF-773", state: { name: "Done", type: "completed" } },
+        }],
+      },
+    };
+    expect(isBlockedByOpenIssue(doneBlocker)).toBe(false);
   });
 });

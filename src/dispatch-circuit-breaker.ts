@@ -91,6 +91,15 @@ interface TicketState {
   lastActivityAt: string | null;
   /** Whether the breaker is currently alerting. */
   shouldAlert: boolean;
+  /**
+   * INF-629: true when the ticket carries a `designated-approver:*` label,
+   * meaning it is legitimately parked awaiting a designated approver's signoff
+   * rather than stuck. These tickets never fire transition-stuck / escape
+   * guidance — the repeated wakes are the signoff request, not a stall.
+   */
+  awaitingDesignatedApprover: boolean;
+  /** INF-629: the designated approver body named on the ticket, if any. */
+  designatedApprover: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +118,19 @@ const breakerState = new Map<string, TicketBreakerState>();
  */
 export function extractWorkflowLabel(labels: string[]): string | null {
   return labels.find((l) => /^wf:/i.test(l)) ?? null;
+}
+
+/**
+ * INF-629: extract the designated approver body from a `designated-approver:<body>`
+ * label, if present. Returns null when the ticket is not parked on a designated
+ * approver signoff. Used to distinguish "awaiting designated approver signoff"
+ * from ordinary transition-stuck so the breaker does not advise `escape`.
+ */
+export function extractDesignatedApprover(labels: string[]): string | null {
+  const label = labels.find((l) => /^designated-approver:/i.test(l));
+  if (!label) return null;
+  const value = label.slice(label.indexOf(":") + 1).trim();
+  return value.length > 0 ? value : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -138,11 +160,15 @@ export class DispatchCircuitBreaker {
    */
   recordWake(ticketId: string, labels: string[]): void {
     const wfLabel = extractWorkflowLabel(labels);
+    // INF-629: a ticket carrying a designated-approver signoff label is parked
+    // awaiting an approver, not stuck — never fire transition-stuck for it.
+    const designatedApprover = extractDesignatedApprover(labels);
+    const awaitingDesignatedApprover = designatedApprover !== null;
     const existing = this.state.get(ticketId);
 
     if (!existing) {
       // First wake for this ticket. Count starts at 1 (this IS a wake).
-      const shouldAlert = wfLabel !== null
+      const shouldAlert = wfLabel !== null && !awaitingDesignatedApprover
         ? 1 >= this.maxWakes
         : false;
       this.state.set(ticketId, {
@@ -150,6 +176,8 @@ export class DispatchCircuitBreaker {
         wakeCount: 1,
         lastActivityAt: null,
         shouldAlert,
+        awaitingDesignatedApprover,
+        designatedApprover,
       });
       return;
     }
@@ -163,6 +191,8 @@ export class DispatchCircuitBreaker {
         stateLabel: null,
         wakeCount: existing.wakeCount + 1,
         shouldAlert: false,
+        awaitingDesignatedApprover,
+        designatedApprover,
       });
       return;
     }
@@ -173,20 +203,27 @@ export class DispatchCircuitBreaker {
         ...existing,
         wakeCount: 1,
         shouldAlert: false,
+        awaitingDesignatedApprover,
+        designatedApprover,
       });
       return;
     }
 
     // wf:* ticket — accumulate wakes and alert if threshold exceeded without
-    // any delegate activity.
+    // any delegate activity. A designated-approver signoff park never alerts.
     const newCount = existing.wakeCount + 1;
-    const shouldAlert = newCount >= this.maxWakes && existing.lastActivityAt === null;
+    const shouldAlert =
+      !awaitingDesignatedApprover &&
+      newCount >= this.maxWakes &&
+      existing.lastActivityAt === null;
 
     this.state.set(ticketId, {
       stateLabel: wfLabel,
       wakeCount: newCount,
       lastActivityAt: existing.lastActivityAt,
       shouldAlert,
+      awaitingDesignatedApprover,
+      designatedApprover,
     });
   }
 
@@ -216,7 +253,19 @@ export class DispatchCircuitBreaker {
       return { shouldAlert: false, wakeCount: 0, stateLabel: null, reason: null };
     }
 
-    const { stateLabel, wakeCount, shouldAlert, lastActivityAt } = existing;
+    const { stateLabel, wakeCount, shouldAlert, lastActivityAt, awaitingDesignatedApprover, designatedApprover } = existing;
+
+    // INF-629: a ticket parked awaiting a designated approver's signoff is not
+    // transition-stuck — the repeated wakes ARE the signoff request. Report it
+    // as such and never advise `escape` (which would abandon the signoff loop).
+    if (awaitingDesignatedApprover) {
+      return {
+        shouldAlert: false,
+        wakeCount,
+        stateLabel,
+        reason: `awaiting designated approver signoff${designatedApprover ? ` (${designatedApprover})` : ""}`,
+      };
+    }
 
     if (stateLabel === null) {
       // Ad-hoc ticket — never fire transition-stuck.

@@ -15,6 +15,8 @@ import { extractFindings, executeFanout, shouldTriggerFanout, type Finding } fro
 import { applyStateTransition, resetWorkflowCache, type WorkflowDef, type FanoutConfig } from "./workflow-gate.js";
 import { reloadAgents } from "./agents.js";
 import { resetPolicyCache } from "./escalation-gate.js";
+import { DispatchRecordStore } from "./liveness-channel/dispatch-record-store.js";
+import { getFanoutOutcome } from "./fanout-outcome-store.js";
 
 const CANONICAL_UX_AUDIT_FIXTURE = path.resolve(process.cwd(), "src/__fixtures__/canonical-ux-audit.yaml");
 
@@ -41,6 +43,8 @@ containers:
     grants: [linear:transition]
   - id: engine
     grants: [linear:transition]
+  - id: reviewer
+    grants: [linear:transition]
 
 roles:
   - id: dev
@@ -53,6 +57,12 @@ roles:
     requires: [linear:transition]
   - id: engine
     requires: [linear:transition]
+  # INF-524: code-review must have a reachable body — a 0-body non-terminal
+  # owner_role is now rejected at registration (unreachable state) and fail-closed
+  # at runtime (candidate set of 0). Give the canonical dev-impl submit→code-review
+  # target a singleton so this fan-out test exercises the transition, not the guard.
+  - id: code-review
+    requires: [linear:transition]
 
 bodies:
   - id: hanzo
@@ -61,6 +71,9 @@ bodies:
   - id: charles
     container: dev
     fills_roles: [dev]
+  - id: cra
+    container: reviewer
+    fills_roles: [code-review]
   - id: astrid
     container: steward
     fills_roles: [steward]
@@ -397,7 +410,7 @@ describe("executeFanout — mocked Linear API", () => {
     globalThis.fetch = makeFanoutFetch({
       teamLabels: [
         { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
-        { id: "existing-state-intake", name: "state:intake" },
+        { id: "existing-state-todo", name: "state:todo" },
       ],
     });
 
@@ -413,11 +426,11 @@ describe("executeFanout — mocked Linear API", () => {
     const createCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
     expect(createCalls).toHaveLength(3);
 
-    // Verify each child has wf:dev-impl and state:intake labels
+    // Verify each child has wf:dev-impl and the workflow-defined entry state.
     for (const call of createCalls) {
       const input = ((call.body.variables as Record<string, unknown>).input as Record<string, unknown>);
       expect(input.labelIds).toContain("existing-wf-dev-impl");
-      expect(input.labelIds).toContain("existing-state-intake");
+      expect(input.labelIds).toContain("existing-state-todo");
       // AC2: each child is linked to the parent (parentId set)
       expect(input.parentId).toBe("parent-internal-uuid");
     }
@@ -469,7 +482,7 @@ describe("executeFanout — mocked Linear API", () => {
     globalThis.fetch = makeFanoutFetch({
       teamLabels: [
         { id: "existing-wf-label", name: "wf:dev-impl" },
-        { id: "existing-state-label", name: "state:intake" },
+        { id: "existing-state-label", name: "state:todo" },
       ],
     });
 
@@ -547,7 +560,7 @@ describe("executeFanout — mocked Linear API", () => {
     globalThis.fetch = makeFanoutFetch({
       teamLabels: [
         { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
-        { id: "existing-state-intake", name: "state:intake" },
+        { id: "existing-state-todo", name: "state:todo" },
       ],
     });
 
@@ -558,12 +571,12 @@ describe("executeFanout — mocked Linear API", () => {
     // Both children get exactly the same labels — no special-casing
     for (const call of createCalls) {
       const input = ((call.body.variables as Record<string, unknown>).input as Record<string, unknown>);
-      expect(input.labelIds).toEqual(["existing-wf-dev-impl", "existing-state-intake"]);
+      expect(input.labelIds).toEqual(["existing-wf-dev-impl", "existing-state-todo"]);
     }
   });
 
-  // AC1: each child is at state:intake, wf:dev-impl
-  it("AC1: each child is at state:intake with wf:dev-impl label", async () => {
+  // AC1: each child is at the child workflow's entry state, wf:dev-impl
+  it("AC1: each child is at the workflow-defined entry state with wf:dev-impl label", async () => {
     const findings: Finding[] = [
       { title: "Finding A" },
       { title: "Finding B" },
@@ -572,7 +585,7 @@ describe("executeFanout — mocked Linear API", () => {
     globalThis.fetch = makeFanoutFetch({
       teamLabels: [
         { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
-        { id: "existing-state-intake", name: "state:intake" },
+        { id: "existing-state-todo", name: "state:todo" },
       ],
     });
 
@@ -583,8 +596,8 @@ describe("executeFanout — mocked Linear API", () => {
     for (const call of createCalls) {
       const input = ((call.body.variables as Record<string, unknown>).input as Record<string, unknown>);
       expect(input.labelIds).toContain("existing-wf-dev-impl");
-      expect(input.labelIds).toContain("existing-state-intake");
-      // Exactly 2 labels: wf:dev-impl and state:intake
+      expect(input.labelIds).toContain("existing-state-todo");
+      // Exactly 2 labels: wf:dev-impl and the entry state.
       expect((input.labelIds as string[]).length).toBe(2);
     }
   });
@@ -765,6 +778,7 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
         { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-c", clientSecret: "a-s", accessToken: "a-t", refreshToken: "a-r" },
         { name: "charles", linearUserId: "charles-linear-uuid", clientId: "c-c", clientSecret: "c-s", accessToken: "c-t", refreshToken: "c-r" },
         { name: "hanzo", linearUserId: "hanzo-linear-uuid", clientId: "h-c", clientSecret: "h-s", accessToken: "h-t", refreshToken: "h-r" },
+        { name: "cra", linearUserId: "cra-linear-uuid", clientId: "cr-c", clientSecret: "cr-s", accessToken: "cr-t", refreshToken: "cr-r" },
       ],
     }), "utf8");
     process.env.AGENTS_FILE = agentsFile;
@@ -827,6 +841,9 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     parentDescription?: string;
     /** Parent issue title. */
     parentTitle?: string;
+    /** When false, child issueCreate returns a Linear refusal. */
+    childCreateSucceeds?: boolean;
+    childCreateError?: string;
   }): typeof globalThis.fetch {
     const parentLabels = opts.parentLabels ?? [
       { id: "wf-lbl", name: "wf:ux-audit" },
@@ -835,6 +852,8 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     const teamLabels = opts.teamLabels ?? [];
     const parentTitle = opts.parentTitle ?? "UX Audit";
     const parentDescription = opts.parentDescription ?? "## Findings\n- **Finding A**: Desc A\n- **Finding B**: Desc B\n";
+    const childCreateSucceeds = opts.childCreateSucceeds ?? true;
+    const childCreateError = opts.childCreateError ?? "Title must match <icon> <Project> Cycle <N> - <Theme>";
     let childCount = 0;
 
     return async (url, init) => {
@@ -846,6 +865,22 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
       fetchCalls.push({ url, body: parsed });
 
       const query = parsed.query ?? "";
+
+      // Workflow gate: fetch issue description/comments for fan-out spec validation.
+      if (query.includes("IssueWithComments")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                id: "parent-internal-id",
+                description: parentDescription,
+                comments: { nodes: [] },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
 
       // B2: fetch issue with labels
       if (query.includes("IssueWithLabels")) {
@@ -940,6 +975,14 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
         );
       }
 
+      // Fan-out: existing child dedupe query.
+      if (query.includes("FanoutChildren")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { children: { nodes: [] } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
       // Fan-out: resolve parent internal ID
       if (query.includes("issue(id: $id) { id }") && !query.includes("team") && !query.includes("parent") && !query.includes("labels")) {
         return new Response(
@@ -951,6 +994,15 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
       // Fan-out: create child issue
       if (query.includes("issueCreate")) {
         childCount++;
+        if (!childCreateSucceeds) {
+          return new Response(
+            JSON.stringify({
+              data: { issueCreate: { success: false, issue: null } },
+              errors: [{ message: childCreateError }],
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
         const input = (parsed.variables as Record<string, unknown>).input as Record<string, unknown>;
         return new Response(
           JSON.stringify({
@@ -982,7 +1034,7 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     globalThis.fetch = makeIntegrationFetch({
       teamLabels: [
         { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
-        { id: "existing-state-intake", name: "state:intake" },
+        { id: "existing-state-todo", name: "state:todo" },
       ],
     });
 
@@ -1001,6 +1053,77 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     expect(commentCall).toBeDefined();
     const commentVars = commentCall!.body.variables as Record<string, unknown>;
     expect(commentVars.issueId).toBe("parent-internal-id");
+  });
+
+  it("INF-624: fails closed when preview succeeds but invalid child title creates zero children", async () => {
+    const validatorReason = "Sprint title must match '<icon> <Project> Cycle <N> - <Theme>'";
+    globalThis.fetch = makeIntegrationFetch({
+      teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-todo", name: "state:todo" },
+      ],
+      parentDescription: "## Findings\n- **LifeOS 2026-07-25 Sprint**: invalid deployed sprint title shape\n",
+      childCreateSucceeds: false,
+      childCreateError: validatorReason,
+    });
+
+    const result = await applyStateTransition("spawn", "AI-1439", "Bearer tok");
+
+    expect(result.status).toBe("failed");
+    expect(result.code).toBe("fanout-create-failed");
+    expect(result.detail).toContain(validatorReason);
+
+    const childCreateCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
+    expect(childCreateCalls).toHaveLength(1);
+
+    const stateUpdateCall = fetchCalls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(stateUpdateCall).toBeUndefined();
+
+    const barrierFetch = fetchCalls.find((c) => (c.body.query ?? "").includes("ParentChildren"));
+    expect(barrierFetch).toBeUndefined();
+
+    const commentBodies = fetchCalls
+      .filter((c) => (c.body.query ?? "").includes("commentCreate"))
+      .map((c) => ((c.body.variables as Record<string, unknown>).body as string | undefined) ?? "");
+    expect(commentBodies.some((body) => body.includes("Spawn Preview"))).toBe(true);
+    const failureComment = commentBodies.find((body) => body.includes("Fan-out failed - transition not applied"));
+    expect(failureComment).toContain("proposed 1 child issue(s), but child creation created 0");
+    expect(failureComment).toContain("parent remains in `spawning`");
+    expect(failureComment).toContain(validatorReason);
+  });
+
+  it("INF-696: post-fanout verification records a failed outcome when spawned children lack delegate dispatch acks", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-696-fanout-integration-"));
+    const originalFanoutOutcomePath = process.env.FANOUT_OUTCOME_PATH;
+    process.env.FANOUT_OUTCOME_PATH = path.join(dir, "fanout-outcomes.json");
+    const dispatchStore = new DispatchRecordStore(path.join(dir, "liveness-dispatches.db"));
+
+    try {
+      globalThis.fetch = makeIntegrationFetch({
+        teamLabels: [
+          { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+          { id: "existing-state-todo", name: "state:todo" },
+        ],
+      });
+
+      await expect(
+        applyStateTransition("spawn", "AI-1439", "Bearer tok", {
+          postFanoutDispatchStore: dispatchStore,
+        }),
+      ).resolves.toMatchObject({ status: "applied" });
+
+      await expect(getFanoutOutcome("AI-1439")).resolves.toMatchObject({ outcome: "failed" });
+      const barrierFetch = fetchCalls.find((c) => (c.body.query ?? "").includes("ParentChildren"));
+      expect(barrierFetch).toBeUndefined();
+    } finally {
+      dispatchStore.close();
+      if (originalFanoutOutcomePath !== undefined) {
+        process.env.FANOUT_OUTCOME_PATH = originalFanoutOutcomePath;
+      } else {
+        delete process.env.FANOUT_OUTCOME_PATH;
+      }
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("does NOT trigger fan-out for non-ux-audit workflows", async () => {
@@ -1049,7 +1172,7 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     const baseFetch = makeIntegrationFetch({
       teamLabels: [
         { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
-        { id: "existing-state-intake", name: "state:intake" },
+        { id: "existing-state-todo", name: "state:todo" },
       ],
     });
 

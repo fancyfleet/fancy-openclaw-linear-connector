@@ -36,7 +36,7 @@
  */
 
 import { componentLogger, createLogger } from "./logger.js";
-import { loadWorkflowDef, loadWorkflowDefById, loadWorkflowRegistry, getWorkflowId, getCurrentState, type WorkflowDef, type WorkflowState } from "./workflow-gate.js";
+import { loadWorkflowDef, loadWorkflowDefById, loadWorkflowRegistry, getWorkflowId, getCurrentState, resolveNativeStateId, type WorkflowDef, type WorkflowState } from "./workflow-gate.js";
 import { getFanoutOutcome } from "./fanout-outcome-store.js";
 import { getAppliedState } from "./store/applied-state-store.js";
 import {
@@ -45,6 +45,7 @@ import {
   postComment,
   resolveInternalId,
   issueUpdateLabels,
+  issueUpdateWorkflowFields,
   fetchIssueWithLabels,
   type LabelNode,
   type IssueWithLabels,
@@ -822,9 +823,31 @@ export async function attemptBarrierTransition(
     reviewLabelId,
   ];
 
-  const updated = await issueUpdateLabels(parentWithLabels.internalId, newLabelIds, authToken);
+  const targetStateDef = wfDef!.states.find((s) => s.id === barrierTarget);
+  const targetIsTerminalOrOwnerless = targetStateDef?.kind === "terminal" || !targetStateDef?.owner_role;
+  const targetNativeSemantic = targetStateDef?.native_state;
+  const targetNativeId = targetNativeSemantic
+    ? await resolveNativeStateId(parentWithLabels.teamId, targetNativeSemantic, authToken)
+    : null;
+
+  if (targetIsTerminalOrOwnerless && targetNativeSemantic && !targetNativeId) {
+    result.error = `Failed to resolve native_state '${targetNativeSemantic}' for barrier target '${barrierTarget}'`;
+    return result;
+  }
+
+  const updated = targetIsTerminalOrOwnerless || targetNativeId
+    ? await issueUpdateWorkflowFields(
+      parentWithLabels.internalId,
+      {
+        labelIds: newLabelIds,
+        ...(targetNativeId ? { stateId: targetNativeId } : {}),
+        ...(targetIsTerminalOrOwnerless ? { delegateId: null, assigneeId: null } : {}),
+      },
+      authToken,
+    )
+    : await issueUpdateLabels(parentWithLabels.internalId, newLabelIds, authToken);
   if (!updated) {
-    result.error = "Label swap mutation returned non-success";
+    result.error = "Barrier transition mutation returned non-success";
     return result;
   }
 

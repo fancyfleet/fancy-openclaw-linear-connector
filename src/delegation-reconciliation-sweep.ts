@@ -26,6 +26,8 @@ import {
   applyBootstrapToIssue,
 } from "./workflow-bootstrap.js";
 import { autoEnrollPlainDelegation } from "./workflow-gate.js";
+import { isBlockedByOpenIssue, isTerminalIssueState, type LinearIssueRelation } from "./linear-actionable.js";
+import { getAgentIdForLinearUserId, getOpenclawAgentName } from "./agents.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
 import { OperationalEventStore, type OperationalEventStore as OperationalEventStoreType } from "./store/operational-event-store.js";
@@ -51,7 +53,7 @@ const LINEAR_ISSUES_PAGE_SIZE = 50;
 // ── Types ────────────────────────────────────────────────────────────────────
 
 export interface DelegationReconciliationOptions {
-  authToken: string;
+  authToken: string | (() => string);
   operationalEventStore: OperationalEventStoreType;
   alertBus: AlertBus;
   wakeFn: (agentName: string, ticketIdentifier: string) => Promise<void>;
@@ -88,6 +90,10 @@ interface GovernedTicket {
   delegateName: string | null;
   teamId: string;
   plainDelegation?: boolean;
+  /** INF-584: native Linear state, for native-terminality guard. */
+  nativeState?: { name?: string; type?: string } | null;
+  /** INF-821: verified inbound blockers make a ticket deliberately non-actionable. */
+  relations?: { nodes?: LinearIssueRelation[] | null } | null;
 }
 
 type LinearIssueNode = {
@@ -97,6 +103,8 @@ type LinearIssueNode = {
   labels: { nodes: Array<{ id: string; name: string }> };
   delegate: { id: string; name: string } | null;
   team: { id: string };
+  state?: { name?: string; type?: string } | null;
+  relations?: { nodes?: LinearIssueRelation[] | null } | null;
 };
 
 type IssuesPageResp = {
@@ -162,6 +170,10 @@ async function queryGovernedTickets(
             labels { nodes { id name } }
             delegate { id name }
             team { id }
+            state { name type }
+            relations(first: 50) {
+              nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
+            }
           }
           pageInfo {
             hasNextPage
@@ -181,6 +193,19 @@ async function queryGovernedTickets(
     });
 
     const data = (await res.json()) as IssuesPageResp;
+
+    // INF-585: fail loud on a non-2xx response or a 200-with-errors GraphQL
+    // validation failure. Previously the governed query read `nodes ?? []`
+    // with no guard, so a bad response (e.g. HTTP 400 GRAPHQL_VALIDATION_FAILED,
+    // or Linear's 200-with-`errors` for an invalid filter) was swallowed as an
+    // empty page → the sweep reported `scanned:0` and woke nobody. Throwing
+    // surfaces the failure via runDelegationReconciliationSweep's catch, which
+    // records it in result.errors and fires an alert-bus notify.
+    if (!res.ok || (data.errors && data.errors.length > 0)) {
+      const detail = data.errors?.[0]?.message ?? `HTTP ${res.status}`;
+      throw new Error(`GovernedTickets query failed: ${detail}`);
+    }
+
     nodes.push(...(data.data?.issues?.nodes ?? []));
 
     const pageInfo = data.data?.issues?.pageInfo;
@@ -205,6 +230,8 @@ async function queryGovernedTickets(
     delegateName: n.delegate?.name ?? null,
     teamId: n.team.id,
     plainDelegation: false,
+    nativeState: n.state ?? null,
+    relations: n.relations ?? null,
   }));
 }
 
@@ -226,7 +253,7 @@ async function queryAdhocDelegatedTickets(
     const afterArg = cursor ? `, after: ${JSON.stringify(cursor)}` : "";
     const query = `
       query AdhocDelegationReconciliation {
-        issues(first: ${LINEAR_ISSUES_PAGE_SIZE}${afterArg}, filter: { delegate: { isMe: false } }) {
+        issues(first: ${LINEAR_ISSUES_PAGE_SIZE}${afterArg}, filter: { delegate: { isMe: { eq: false } } }) {
           nodes {
             id
             identifier
@@ -235,6 +262,10 @@ async function queryAdhocDelegatedTickets(
             labels { nodes { id name } }
             delegate { id name }
             team { id }
+            state { name type }
+            relations(first: 50) {
+              nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
+            }
           }
           pageInfo {
             hasNextPage
@@ -256,12 +287,15 @@ async function queryAdhocDelegatedTickets(
     const data = (await res.json()) as IssuesPageResp;
 
     // INF-334: Linear returns 200 with "errors" for invalid filters.
-    if (data.errors && data.errors.length > 0) {
-      const msg = `delegation-reconciliation: AdhocDelegationReconciliation query failed: ${data.errors[0].message}`;
-      log.error(msg);
-      // We don't throw here to avoid killing the whole sweep, but we skip
-      // the adhoc part of this tick.
-      return [];
+    // INF-585: fail loud instead of returning []. The old behavior logged and
+    // returned an empty page, so an invalid filter (or an HTTP 400) reported
+    // `scanned:0` with no alert — indistinguishable from "no ad-hoc tickets to
+    // reconcile," which is exactly how the original broken filter went
+    // unnoticed. Throwing surfaces the failure via
+    // runDelegationReconciliationSweep's catch (result.errors + alert-bus).
+    if (!res.ok || (data.errors && data.errors.length > 0)) {
+      const detail = data.errors?.[0]?.message ?? `HTTP ${res.status}`;
+      throw new Error(`AdhocDelegationReconciliation query failed: ${detail}`);
     }
 
     const pageNodes = data.data?.issues?.nodes ?? [];
@@ -297,6 +331,8 @@ async function queryAdhocDelegatedTickets(
     delegateName: n.delegate?.name ?? null,
     teamId: n.team.id,
     plainDelegation: true,
+    nativeState: n.state ?? null,
+    relations: n.relations ?? null,
   }));
 }
 
@@ -439,7 +475,9 @@ function hasDispatchSinceDelegation(
 export async function runDelegationReconciliationSweep(
   opts: DelegationReconciliationOptions,
 ): Promise<DelegationReconciliationResult> {
-  const authToken = opts.authToken;
+  // INF-683: resolve the token at pass time (getter) so the boot/~20h token
+  // refresh can't strand a value captured at registration.
+  const authToken = typeof opts.authToken === "function" ? opts.authToken() : opts.authToken;
   const fetchFn = opts.fetchFn ?? globalThis.fetch;
   const alertBus = opts.alertBus;
   const operationalEventStore = opts.operationalEventStore;
@@ -494,7 +532,24 @@ export async function runDelegationReconciliationSweep(
 
   // ── Process each ticket ───────────────────────────────────────────────
   for (const ticket of filtered) {
-    // Skip terminal tickets
+    // Native Linear terminality wins over stale workflow labels on retired issues.
+    if (isTerminalIssueState(ticket.nativeState)) {
+      log.info(
+        `delegation-reconciliation: skipping ${ticket.identifier} — Linear entity is natively terminal ` +
+        `(state.type='${ticket.nativeState?.type ?? "null"}', name='${ticket.nativeState?.name ?? "null"}'); ` +
+        `no legal transition exists on a retired issue`,
+      );
+      continue;
+    }
+
+    if (isBlockedByOpenIssue(ticket)) {
+      log.info(
+        `delegation-reconciliation: skipping ${ticket.identifier} — blocked by unfinished prerequisite`,
+      );
+      continue;
+    }
+
+    // Skip terminal tickets (workflow-label terminal: state:done/escape/canceled)
     if (isTerminal(ticket.labels)) continue;
 
     // ── AC2: wf:* but no state:* and no delegate (dropped enrollment) ────
@@ -632,6 +687,27 @@ export async function runDelegationReconciliationSweep(
 
     // ── AC1: Enrolled ticket with delegate but no dispatch record ───────
     if (ticket.delegateId && ticket.delegateName) {
+      // INF-589: wake by the OpenClaw agent id, not the Linear display name.
+      // ticket.delegateName is the Linear display label (e.g.
+      // "Felix (Unity Dev)"), which delivery cannot resolve — getOpenclawAgentName
+      // matches on the lowercase id and returns the display name unchanged, so the
+      // gateway routes an unresolvable `openclaw/Felix (Unity Dev)` and the wake
+      // dies in delivered-pending-ack while the sweep still reports healed. Resolve
+      // the stable delegateId (Linear user id) to the OpenClaw id up front and key
+      // everything — idempotency, lease, wake, ledger — on it, mirroring the
+      // bootstrap path's resolved delegateAgentName. Fall back to the legacy
+      // display-name path only for an unrecognized delegate (no better answer).
+      const resolvedAgentId = getAgentIdForLinearUserId(ticket.delegateId);
+      const delegateAgentName =
+        resolvedAgentId ?? getOpenclawAgentName(ticket.delegateName);
+      if (resolvedAgentId === undefined) {
+        log.warn(
+          `delegation-reconciliation: could not resolve delegate id ` +
+          `${ticket.delegateId} ("${ticket.delegateName}") to an OpenClaw agent ` +
+          `for ${ticket.identifier}; waking by display name may not route (INF-589)`,
+        );
+      }
+
       // Check idempotency (AC4): has this delegate been dispatched since
       // they were set? Use the real delegate-set timestamp from Linear
       // history, NOT ticket.updatedAt (which changes on any mutation).
@@ -706,7 +782,7 @@ export async function runDelegationReconciliationSweep(
       if (
         hasDispatchSinceDelegation(
           operationalEventStore,
-          ticket.delegateName,
+          delegateAgentName,
           ticket.identifier,
           delegationTimestamp,
         )
@@ -723,14 +799,14 @@ export async function runDelegationReconciliationSweep(
       const leaseKey = `linear-${ticket.identifier}`;
       if (opts.dispatchLeaseStore) {
         const lease = opts.dispatchLeaseStore.acquire(
-          ticket.delegateName,
+          delegateAgentName,
           leaseKey,
           { updatedAt: ticket.updatedAt },
         );
         if (lease.refused) {
           log.info(
             `delegation-reconciliation: lease refused for ${ticket.identifier} → ` +
-            `active lease exists for ${ticket.delegateName}, skipping wake`,
+            `active lease exists for ${delegateAgentName}, skipping wake`,
           );
           result.skippedIdempotent++;
           continue;
@@ -739,17 +815,17 @@ export async function runDelegationReconciliationSweep(
 
       // Heal: re-dispatch the delegation wake through the normal delivery path
       try {
-        await wakeFn(ticket.delegateName, ticket.identifier);
+        await wakeFn(delegateAgentName, ticket.identifier);
 
         result.healed++;
         log.info(
-          `delegation-reconciliation: healed ${ticket.identifier} → wake dispatched to ${ticket.delegateName}`,
+          `delegation-reconciliation: healed ${ticket.identifier} → wake dispatched to ${delegateAgentName}`,
         );
 
         // Emit operational event
         operationalEventStore.append({
           outcome: "dispatch-accepted",
-          agent: ticket.delegateName,
+          agent: delegateAgentName,
           key: `linear-${ticket.identifier}`,
           detail: {
             mode: "delegation-reconciliation",
@@ -760,12 +836,12 @@ export async function runDelegationReconciliationSweep(
         // Also emit a delegation-reconciled event for AC3 observability
         operationalEventStore.append({
           outcome: "delegation-reconciled",
-          agent: ticket.delegateName,
+          agent: delegateAgentName,
           key: `linear-${ticket.identifier}`,
           detail: {
             mode: "delegation-wake",
             ticket: ticket.identifier,
-            delegate: ticket.delegateName,
+            delegate: delegateAgentName,
           },
         });
 
@@ -798,7 +874,7 @@ export async function runDelegationReconciliationSweep(
 
         operationalEventStore.append({
           outcome: "delegation-reconciliation-failed",
-          agent: ticket.delegateName,
+          agent: delegateAgentName,
           key: `linear-${ticket.identifier}`,
           errorSummary: msg,
           detail: {
@@ -834,7 +910,7 @@ export async function runDelegationReconciliationSweep(
  * Returns the NodeJS.Timeout so the caller can clear it on shutdown.
  */
 export function registerDelegationReconciliationCron(opts: {
-  authToken: string;
+  authToken: string | (() => string);
   intervalMs?: number;
   operationalEventStore?: OperationalEventStoreType;
   alertBus?: AlertBus;

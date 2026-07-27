@@ -28,7 +28,7 @@ import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgent
 import { checkAgentLiveness, type LivenessConfig } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
 import { checkRoleGuardAndBlock, type LinearUserIdResolver } from "../routing-guard.js";
-import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, autoEnrollPlainDelegation, markAutoEnrollRegistered } from "../workflow-gate.js";
+import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, autoEnrollPlainDelegation, markAutoEnrollRegistered, markCommitmentActivityObserverRegistered, applyStateTransition } from "../workflow-gate.js";
 import { checkLabelSyncForTicket, emitLabelSyncWarning } from "../transition-audit.js";
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/index.js";
@@ -40,15 +40,23 @@ import { maybeBootstrapWorkflow } from "../workflow-bootstrap.js";
 import { notify } from "../alerts/alert-bus.js";
 import { loadKnownHumans } from "../known-humans.js";
 import { emitStreamTopic } from "../admin-stream.js";
-import { DelegatePingPongDetector } from "../delegate-ping-pong-detector.js";
+import { DelegatePingPongDetector, shouldCheckDelegatePingPong } from "../delegate-ping-pong-detector.js";
 import type { DispatchRecordStore } from "../liveness-channel/dispatch-record-store.js";
 import type { GatewayDispatchAck } from "../liveness-channel/gateway-ack-types.js";
+import { extractRejectedWebhookDiagnostic, WebhookSecretDriftTracker } from "./drift.js";
 
 const log = componentLogger(createLogger(), "webhook");
 
 export type { LinearEvent } from "./schema.js";
 export { verifyLinearSignature } from "./signature.js";
 export { normalizeLinearEvent } from "./normalize.js";
+
+function signatureRejectedDetail(rawBody: Buffer | undefined, secretCount: number): Record<string, unknown> {
+  return {
+    ...extractRejectedWebhookDiagnostic(rawBody),
+    loadedHmacCount: secretCount,
+  };
+}
 
 /**
  * Creates the Express router for the Linear webhook endpoint.
@@ -72,13 +80,178 @@ function appendOperationalEvent(store: OperationalEventStore | undefined, input:
   try { store.append(input); } catch (err) { log.error(`Operational event write failed: ${errorSummary(err)}`); }
 }
 
+const unblockWakeClaims = new Set<string>();
+
+function authHeaderForLinear(token: string): string {
+  return /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
+}
+
+function terminalEventUpdatedAt(event: LinearEvent): string {
+  const data = (event.data as Record<string, unknown> | undefined) ?? {};
+  return (data.updatedAt as string | undefined) ?? event.createdAt ?? "unknown";
+}
+
+function sameLinearIssueRef(a: Record<string, unknown> | null | undefined, b: Record<string, unknown>): boolean {
+  if (!a) return false;
+  return Boolean(
+    (typeof a.id === "string" && typeof b.id === "string" && a.id === b.id) ||
+    (typeof a.identifier === "string" && typeof b.identifier === "string" && a.identifier === b.identifier),
+  );
+}
+
+function isDoneOrCanceledState(state: unknown): boolean {
+  if (!state || typeof state !== "object") return false;
+  const record = state as Record<string, unknown>;
+  const type = typeof record.type === "string" ? record.type.toLowerCase() : "";
+  const name = typeof record.name === "string" ? record.name.toLowerCase() : "";
+  return type === "completed" || type === "canceled" || type === "cancelled" ||
+    name === "done" || name === "canceled" || name === "cancelled";
+}
+
+function syntheticUnblockEvent(target: Record<string, unknown>, blocker: Record<string, unknown>, sourceEvent: LinearEvent): LinearEvent {
+  const now = new Date().toISOString();
+  const targetIdentifier = target.identifier as string | undefined;
+  const team = target.team as Record<string, unknown> | undefined;
+  const state = target.state as Record<string, unknown> | undefined;
+  return {
+    type: "Issue",
+    action: "update",
+    createdAt: now,
+    actor: sourceEvent.actor,
+    data: {
+      ...target,
+      identifier: targetIdentifier,
+      updatedAt: (target.updatedAt as string | undefined) ?? now,
+      state: {
+        id: (state?.id as string | undefined) ?? "unknown",
+        name: (state?.name as string | undefined) ?? "unknown",
+        type: (state?.type as string | undefined) ?? "unknown",
+      },
+      priority: (target.priority as number | undefined) ?? 0,
+      priorityLabel: (target.priorityLabel as string | undefined) ?? "No priority",
+      teamId: (team?.id as string | undefined) ?? "unknown",
+      teamKey: (team?.key as string | undefined) ?? "",
+      labelIds: Array.isArray(target.labelIds) ? target.labelIds : [],
+      url: (target.url as string | undefined) ?? "",
+      createdAt: (target.createdAt as string | undefined) ?? now,
+    },
+    updatedFrom: {
+      blockedBy: String(blocker.identifier ?? blocker.id ?? "unknown"),
+    },
+    raw: { synthetic: "unblock-wake", source: sourceEvent.raw },
+  } as unknown as LinearEvent;
+}
+
+/**
+ * INF-794 AC2/AC3: when a blocker reaches Done/Canceled, Linear sends the
+ * webhook for the blocker, not for each newly-unblocked target. Fan out from
+ * the blocker relation graph and synthesize ordinary delegate/assignee routes
+ * for live targets, so they pass through the normal dispatch pipeline.
+ */
+export async function findUnblockWakeRoutesForTerminalIssue(event: LinearEvent): Promise<RouteResult[]> {
+  if (!isTerminalIssueEvent(event)) return [];
+  const blocker = ((event.data as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+  const blockerId = blocker.id as string | undefined;
+  const blockerIdentifier = issueIdentifierFromEvent(event);
+  const blockerLookup = blockerId ?? blockerIdentifier;
+  if (!blockerLookup || !isDoneOrCanceledState(blocker.state)) return [];
+
+  const token = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+  if (!token) return [];
+
+  const response = await fetch("https://api.linear.app/graphql", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: authHeaderForLinear(token),
+    },
+    body: JSON.stringify({
+      query: `query BlockedTargets($id: String!) {
+        issue(id: $id) {
+          id identifier
+          relations(first: 50) {
+            nodes {
+              type
+              issue { id identifier }
+              relatedIssue {
+                id identifier title url priority priorityLabel createdAt updatedAt
+                state { id name type }
+                team { id key }
+                labelIds
+                delegate { id name app }
+                assignee { id name app }
+              }
+            }
+          }
+        }
+      }`,
+      variables: { id: blockerLookup },
+    }),
+  });
+  if (!response.ok) {
+    log.warn(`Blocked-target lookup failed for ${blockerIdentifier ?? blockerLookup}: HTTP ${response.status}`);
+    return [];
+  }
+  const body = await response.json() as {
+    data?: { issue?: { id?: string; identifier?: string; relations?: { nodes?: Array<Record<string, unknown>> | null } | null } | null };
+    errors?: Array<{ message?: string }>;
+  };
+  if (body.errors?.length) {
+    log.warn(`Blocked-target lookup errored for ${blockerIdentifier ?? blockerLookup}: ${body.errors.map((e) => e.message).join("; ")}`);
+    return [];
+  }
+
+  const sourceIssue = {
+    id: body.data?.issue?.id ?? blockerId,
+    identifier: body.data?.issue?.identifier ?? blockerIdentifier,
+  } as Record<string, unknown>;
+  const agentMap = buildAgentMap();
+  const routes: RouteResult[] = [];
+  for (const rel of body.data?.issue?.relations?.nodes ?? []) {
+    const type = typeof rel.type === "string" ? rel.type.toLowerCase() : "";
+    if (type !== "blocks" && type !== "blocking") continue;
+    const issue = rel.issue as Record<string, unknown> | null | undefined;
+    if (!sameLinearIssueRef(issue, sourceIssue)) continue;
+    const target = rel.relatedIssue as Record<string, unknown> | null | undefined;
+    const targetIdentifier = target?.identifier as string | undefined;
+    if (!target || !targetIdentifier) continue;
+
+    const delegate = target.delegate as { id?: string } | null | undefined;
+    const assignee = target.assignee as { id?: string } | null | undefined;
+    const delegateAgent = delegate?.id ? agentMap[delegate.id] : undefined;
+    const assigneeAgent = assignee?.id ? agentMap[assignee.id] : undefined;
+    const agentId = delegateAgent ?? assigneeAgent;
+    const routingReason = delegateAgent ? "delegate" : assigneeAgent ? "assignee" : undefined;
+    if (!agentId || !routingReason) continue;
+
+    const claimKey = [
+      sourceIssue.identifier ?? sourceIssue.id ?? blockerLookup,
+      terminalEventUpdatedAt(event),
+      targetIdentifier,
+      agentId,
+    ].join("->");
+    if (unblockWakeClaims.has(claimKey)) continue;
+    unblockWakeClaims.add(claimKey);
+
+    const targetEvent = syntheticUnblockEvent(target, sourceIssue, event);
+    routes.push({
+      agentId: getOpenclawAgentName(agentId),
+      sessionKey: normalizeSessionKey(targetIdentifier),
+      priority: 0,
+      routingReason,
+      event: targetEvent,
+    });
+  }
+  return routes;
+}
+
 async function checkDelegatePingPong(
   event: LinearEvent,
   detector: DelegatePingPongDetector,
 ): Promise<boolean> {
   if (event.type !== "Issue" || event.action !== "update") return false;
   const updatedFrom = (event as { updatedFrom?: Record<string, unknown> }).updatedFrom;
-  if (!updatedFrom || (!("delegateId" in updatedFrom) && !("delegate" in updatedFrom))) return false;
+  if (!shouldCheckDelegatePingPong(updatedFrom)) return false;
 
   const data = (event as { data?: Record<string, unknown> }).data;
   const delegate = data?.delegate as { id?: string; name?: string } | null | undefined;
@@ -178,6 +351,53 @@ function acknowledgeAgentAuthoredActivity(
   log.info(`Agent-authored Linear activity acknowledged: ${agentId} [${ticketId}]`);
 }
 
+const commitmentAutoAcceptClaims = new Set<string>();
+
+async function autoAcceptCommitmentOnActivity(
+  event: LinearEvent,
+  operationalEventStore?: OperationalEventStore,
+): Promise<void> {
+  if (event.type !== "Comment" && event.type !== "AgentSessionEvent") return;
+  const actorId = event.actor?.id;
+  if (!actorId) return;
+  const agentName = buildAgentMap()[actorId];
+  if (!agentName) return;
+  const bodyId = getOpenclawAgentName(agentName);
+  const data = (event as { data?: Record<string, unknown> }).data;
+  const issue = data?.issue as Record<string, unknown> | undefined;
+  const sessionIssue = ((data?.agentSession as Record<string, unknown> | undefined)?.issue ?? {}) as Record<string, unknown>;
+  const issueId =
+    (issue?.id as string | undefined) ??
+    (data?.issueId as string | undefined) ??
+    (sessionIssue.id as string | undefined) ??
+    issueIdentifierFromEvent(event);
+  if (!issueId) return;
+  const claimKey = issueIdentifierFromEvent(event) ?? issueId;
+  if (commitmentAutoAcceptClaims.has(claimKey)) return;
+  commitmentAutoAcceptClaims.add(claimKey);
+  const token = getAccessToken(bodyId) ?? getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+  if (!token) {
+    commitmentAutoAcceptClaims.delete(claimKey);
+    return;
+  }
+  try {
+    const result = await applyStateTransition("accept", issueId, token, {
+      bodyId,
+      operationalEventStore,
+      commitmentAutoAccept: true,
+    });
+    if (result.status === "applied") {
+      log.info(`Commitment gate auto-accepted ${issueIdentifierFromEvent(event) ?? issueId} on ${event.type} activity`);
+    }
+    if (result.status !== "applied" && result.code !== "commitment-exit-already-recorded") {
+      commitmentAutoAcceptClaims.delete(claimKey);
+    }
+  } catch (err) {
+    commitmentAutoAcceptClaims.delete(claimKey);
+    log.warn(`Commitment gate auto-accept failed (fail-open): ${errorSummary(err)}`);
+  }
+}
+
 /** Wrap deliverToAgent with the global concurrent-dispatch semaphore. */
 async function deliverWithSlot(
   route: RouteResult,
@@ -215,6 +435,7 @@ export function createWebhookRouter(
 ): Router {
   const router = Router();
   const delegatePingPongDetector = new DelegatePingPongDetector(undefined, undefined, operationalEventStore);
+  const webhookSecretDriftTracker = new WebhookSecretDriftTracker();
 
   // AI-2091 §2/§9 (G2): the delivery-time fetchability gate is wired into the
   // PRIMARY dispatch path (dispatchRoute → checkLinearIssueRouting →
@@ -227,6 +448,7 @@ export function createWebhookRouter(
     "primary webhook dispatch path (dispatchRoute → assertDispatchTargetFetchable)",
   );
   markAutoEnrollRegistered();
+  markCommitmentActivityObserverRegistered();
   markDispatchIntegrityGateActive(
     "deliveryTimeRecipientResolution",
     "primary webhook dispatch path (dispatchRoute → roster-based recipient validation, AI-2192)",
@@ -259,7 +481,11 @@ export function createWebhookRouter(
       if (secrets.length > 0) {
         const signature = req.headers["x-linear-signature"] ?? req.headers["linear-signature"];
         if (!signature || typeof signature !== "string") {
-          appendOperationalEvent(operationalEventStore, { outcome: "signature-rejected", errorSummary: "Missing signature header" });
+          appendOperationalEvent(operationalEventStore, {
+            outcome: "signature-rejected",
+            errorSummary: "Missing signature header",
+            detail: signatureRejectedDetail(rawBody, secrets.length),
+          });
           res.status(400).json({
             error: "Missing signature header",
           });
@@ -274,7 +500,15 @@ export function createWebhookRouter(
         const signatureValid = verifyLinearSignatureMulti(rawBody, signature as string, secrets);
       log.info(`Signature validation result: ${signatureValid ? "valid" : "invalid"}`);
         if (!signatureValid) {
-          appendOperationalEvent(operationalEventStore, { outcome: "signature-rejected", errorSummary: "Invalid signature" });
+          const diagnostic = extractRejectedWebhookDiagnostic(rawBody);
+          appendOperationalEvent(operationalEventStore, {
+            outcome: "signature-rejected",
+            type: diagnostic.type,
+            key: diagnostic.teamKey && diagnostic.webhookId ? `${diagnostic.teamKey}:${diagnostic.webhookId}` : diagnostic.webhookId ?? diagnostic.teamKey,
+            errorSummary: "Invalid signature",
+            detail: { ...diagnostic, loadedHmacCount: secrets.length },
+          });
+          webhookSecretDriftTracker.record({ diagnostic, secretCount: secrets.length });
           res.status(401).json({ error: "Invalid signature" });
           return;
         }
@@ -355,6 +589,31 @@ export function createWebhookRouter(
           );
           appendOperationalEvent(operationalEventStore, { outcome: "terminal-pruned", type: event.type, key: sessionKey, sessionKey, detail: { removedBag, removedQueued } });
 
+          try {
+            const unblockRoutes = await findUnblockWakeRoutesForTerminalIssue(event);
+            for (const unblockRoute of unblockRoutes) {
+              try {
+                await dispatchRoute(unblockRoute);
+              } catch (err) {
+                log.error(
+                  `unblock dispatchRoute failed for ${unblockRoute.agentId} [${unblockRoute.sessionKey}]: ` +
+                  `${err instanceof Error ? err.message : String(err)}`,
+                );
+              }
+            }
+            if (unblockRoutes.length > 0) {
+              appendOperationalEvent(operationalEventStore, {
+                outcome: "unblock-wake-dispatched" as never,
+                type: event.type,
+                key: sessionKey,
+                sessionKey,
+                detail: { count: unblockRoutes.length, targets: unblockRoutes.map((r) => r.sessionKey) },
+              });
+            }
+          } catch (err) {
+            log.warn(`Blocked-target wake fanout failed for terminal ${sessionKey}: ${errorSummary(err)}`);
+          }
+
           // Phase 5 / B-3: Barrier (N→1) — event-driven parent auto-advance.
           // When a child reaches a terminal state, check if all siblings are
           // terminal and auto-advance the parent managing → review.
@@ -376,6 +635,7 @@ export function createWebhookRouter(
       }
 
       acknowledgeAgentAuthoredActivity(event, onAgentActivity);
+      await autoAcceptCommitmentOnActivity(event, operationalEventStore);
 
       // AI-2350: Renew dispatch lease on agent activity (comment posted,
       // agent session event). This extends the lease TTL so long-running
@@ -551,7 +811,12 @@ export function createWebhookRouter(
           const bootstrapResult = await maybeBootstrapWorkflow(event, bootstrapToken, enrolledTicketsStore);
           if (bootstrapResult) {
             log.info(`Workflow bootstrap: ${bootstrapResult.action} (wf:${bootstrapResult.workflowId ?? "unknown"})`);
-            const bootstrapOutcome = bootstrapResult.action === "bootstrapped" ? "bootstrap-bootstrapped" : "bootstrap-demoted";
+            const bootstrapOutcome =
+              bootstrapResult.action === "bootstrapped"
+                ? "bootstrap-bootstrapped"
+                : bootstrapResult.action === "rejected"
+                  ? "bootstrap-rejected"
+                  : "bootstrap-demoted";
             appendOperationalEvent(operationalEventStore, { outcome: bootstrapOutcome, type: event.type });
 
             // AI-fix: after bootstrap, deliver a workflow-aware wake to the
@@ -735,6 +1000,7 @@ export function createWebhookRouter(
       return;
 
       async function dispatchRoute(route: RouteResult): Promise<void> {
+      const event = route.event;
       // AI-1799 AC2: mint a wake_id at route time so the full dispatch cycle
       // (routed → bag-added → dispatch-accepted → delivered) can be correlated.
       const wakeId = crypto.randomUUID();

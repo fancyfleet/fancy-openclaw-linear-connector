@@ -51,11 +51,19 @@ containers:
     grants: [linear:transition]
   - id: deployment
     grants: [linear:transition, deploy:execute]
+  - id: reviewer
+    grants: [linear:transition]
 roles:
   - id: steward
     requires: [human:escalate]
   - id: deployment
     requires: [deploy:execute]
+  # INF-524: code-review is a non-terminal owner_role, so it must have a reachable
+  # body — a candidate set of 0 is now rejected at registration and fail-closed at
+  # runtime. Give submit→code-review a singleton target so B2 exercises the
+  # transition write, not the delegate guard.
+  - id: code-review
+    requires: [linear:transition]
 bodies:
   - id: astrid
     container: steward
@@ -66,6 +74,9 @@ bodies:
   - id: hanzo
     container: deployment
     fills_roles: [deployment]
+  - id: cra
+    container: reviewer
+    fills_roles: [code-review]
 `;
 
 const TEST_WORKFLOW_YAML = `
@@ -120,7 +131,7 @@ function writeAgents(dir: string): string {
   const file = path.join(dir, "agents.json");
   fs.writeFileSync(
     file,
-    JSON.stringify({ agents: [{ name: "charles", linearUserId: "u1", openclawAgent: "charles", accessToken: "tok", host: "local" }, { name: "hanzo", linearUserId: "u2", openclawAgent: "hanzo", accessToken: "tok2", host: "local" }] }),
+    JSON.stringify({ agents: [{ name: "charles", linearUserId: "u1", openclawAgent: "charles", accessToken: "tok", host: "local" }, { name: "hanzo", linearUserId: "u2", openclawAgent: "hanzo", accessToken: "tok2", host: "local" }, { name: "cra", linearUserId: "u3", openclawAgent: "cra", accessToken: "tok3", host: "local" }] }),
     "utf8"
   );
   return file;
@@ -199,6 +210,22 @@ describe("proxy /proxy/graphql", () => {
     expect(res.body.errors).toBeDefined();
   });
 
+  it("advertises proxy compatibility as the connector-owned contract", async () => {
+    process.env.PROXY_MIN_CLI_VERSION = "9.8.7";
+
+    const res = await request(appState.app)
+      .get("/proxy/compatibility");
+
+    delete process.env.PROXY_MIN_CLI_VERSION;
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      protocolVersion: "1",
+      minCliVersion: "9.8.7",
+    });
+    expect(res.headers["x-openclaw-linear-protocol-version"]).toBe("1");
+    expect(res.headers["x-openclaw-linear-min-cli-version"]).toBe("9.8.7");
+  });
+
   it("forwards requests to Linear and returns the response transparently", async () => {
     const res = await request(appState.app)
       .post("/proxy/graphql")
@@ -208,6 +235,8 @@ describe("proxy /proxy/graphql", () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual(MOCK_RESPONSE);
+    expect(res.headers["x-openclaw-linear-protocol-version"]).toBe("1");
+    expect(res.headers["x-openclaw-linear-min-cli-version"]).toBe("0.3.0");
   });
 
   it("passes the Authorization header to Linear unchanged", async () => {

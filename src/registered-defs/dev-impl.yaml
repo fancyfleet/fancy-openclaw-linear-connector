@@ -47,11 +47,26 @@
 #   In-flight tickets at the old `state:deployment` / `state:host-deploy` labels
 #   are migrated via escape → re-intake (the state labels no longer exist in the
 #   def, so the gate rejects any command from them — operators must escape).
+#
+# v17 (2026-07-25, INF-695): commitment/acceptance gate. Implementation now has
+#   an explicit investigation-exit fork (`accept` → `doing`, `reject` →
+#   `rejected`, `not-ready` → `needs-info`). Downstream `submit` is present on
+#   implementation so the proxy can refuse it with the specific missing
+#   commitment-exit error until exactly one exit is recorded.
 
 id: dev-impl
-version: 11
+version: 17
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
+
+# AI-1579: recovery actor. `ai` (the orchestrator, fills no workflow role) may
+# re-establish a delegate on a ticket whose delegate is currently EMPTY (orphaned)
+# at ANY state — the authorization counterpart to the stale-session recovery
+# machinery. Scoped to the empty-delegate path only. Reconciled into the deploy
+# source by INF-745: the fixture carried this since INF-98 (matching the deployed
+# def, AI-1579) but registered-defs never had it — recovery_actor is a live engine
+# field (workflow-gate.ts def.recovery_actor), so the fixture held the truth.
+recovery_actor: ai
 
 # Phase 6.5 / H-7 (AI-1482): Stakes-threshold sign-off configuration.
 # When a ticket's stakes level meets or exceeds the threshold, the release
@@ -118,7 +133,23 @@ states:
     # entered from write-tests/tests-ready, code-review/request-changes,
     # merge/reject, deploy/reject, ac-validate/ac-fail — one dev work-phase,
     # no awaiting-vs-doing split. Dev makes the failing tests pass.
+    commitment_gate:
+      exits:
+        accept:
+          to: doing
+        reject:
+          to: rejected
+        not-ready:
+          to: needs-info
     transitions:
+      - command: accept
+        to: doing
+      - command: reject
+        to: rejected
+        requires_comment: true
+      - command: not-ready
+        to: needs-info
+        requires_comment: true
       - command: submit
         to: code-review
         generic: continue
@@ -134,6 +165,38 @@ states:
         to: implementation
         assign:
           mode: required          # caller must specify the delegate target
+
+  - id: doing
+    owner_role: dev
+    kind: normal
+    native_state: doing          # commitment accepted; active implementation work has begun
+    sla: 72h
+    transitions:
+      - command: submit
+        to: code-review
+        generic: continue
+        requires_comment: true
+        assign:
+          mode: required
+          constraint: not-implementer
+      - command: handoff
+        to: doing
+        assign:
+          mode: required
+
+  - id: needs-info
+    owner_role: dev
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: handoff
+        to: needs-info
+        assign:
+          mode: required
+
+  - id: rejected
+    kind: terminal
+    native_state: invalid
 
   - id: code-review
     owner_role: code-review
@@ -220,6 +283,7 @@ states:
         to: ac-validate
         generic: continue
         requires_capability: infra:ssh
+        requires_deploy_probe: true
         requires_human_signoff_above_stakes: true   # H-7 (AI-1482): high-stakes release needs human sign-off
         assign: { mode: auto }     # ac-validate steward is singleton (Astrid) — auto-assign
       - command: reject
@@ -251,6 +315,7 @@ states:
     transitions:
       - command: validated
         to: done
+        requires_deploy_probe: true
         # terminal → no assignment
       - command: ac-fail
         to: implementation

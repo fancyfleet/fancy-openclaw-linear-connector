@@ -16,7 +16,7 @@ import type { EnrolledTicketsStore } from "../store/enrolled-tickets-store.js";
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "label-sync-audit");
 
 export interface LabelSyncAuditOptions {
-  authToken: string;
+  authToken: string | (() => string);
   enrolledTicketsStore?: EnrolledTicketsStore;
   intervalMs?: number;
 }
@@ -37,7 +37,10 @@ export interface LabelSyncAuditResult {
 export async function runLabelSyncAuditPass(
   opts: LabelSyncAuditOptions,
 ): Promise<LabelSyncAuditResult> {
-  const { authToken, enrolledTicketsStore } = opts;
+  const { enrolledTicketsStore } = opts;
+  // INF-683: resolve the token at pass time (getter) so the boot/~20h token
+  // refresh can't strand a value captured at registration.
+  const authToken = typeof opts.authToken === "function" ? opts.authToken() : opts.authToken;
   const result: LabelSyncAuditResult = {
     scanned: 0,
     divergencesFound: 0,

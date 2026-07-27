@@ -117,6 +117,15 @@ describe("INF-359 AC3: integration-verify children for capabilities", () => {
     expect(fs.existsSync(path.join(REGISTERED_DEFS_DIR, "integration-verify.yaml"))).toBe(true);
   });
 
+  it("integration-verify routes the execution step to an explicit dev verifier", () => {
+    const raw = fs.readFileSync(path.join(REGISTERED_DEFS_DIR, "integration-verify.yaml"), "utf8");
+    const def = yamlLoad(raw) as WorkflowDef;
+    const intakeAccept = transition(def, "intake", "accept");
+
+    expect(state(def, "verification").owner_role).toBe("dev");
+    expect(intakeAccept.assign).toEqual({ mode: "required" });
+  });
+
   it("spawn-impl declares one integration-verify child per capability blocked by component tickets", () => {
     const def = loadDevSprint();
     const fanout = state(def, "spawn-impl").fanout as V8FanoutConfig;
@@ -162,5 +171,39 @@ describe("INF-359 E2E: sprint spine cannot close without v8 coherence gates", ()
     ]));
     expect(productContinue.requires_capability_statement).toBe(true);
     expect(validationApprove.requires_demonstration_walk).toBe(true);
+  });
+});
+
+
+describe("INF-453: dev-sprint redundant arm phase can terminate without break-glass", () => {
+  it.each(["spawn-arms", "managing-arms"])("%s exposes cancel and abandon transitions to cancelled", (stateId) => {
+    const def = loadDevSprint();
+
+    for (const command of ["cancel", "abandon"]) {
+      const tx = transition(def, stateId, command);
+      expect(tx.to).toBe("cancelled");
+      expect(tx.generic).toBe("cancel");
+    }
+  });
+
+  it("cancelled is a terminal state that satisfies parent barriers", () => {
+    const def = loadDevSprint();
+    const cancelled = state(def, "cancelled");
+
+    expect(cancelled.kind).toBe("terminal");
+    expect(cancelled.barrier).toBe(true);
+    expect(cancelled.native_state).toBe("done");
+  });
+
+  it("empty spawn-arms specs are refused before child creation", () => {
+    const def = loadDevSprint();
+    const spawnArms = state(def, "spawn-arms");
+
+    const rejected = validateFanoutSpec("No structured arm list here.", spawnArms.fanout as FanoutConfig);
+
+    expect(rejected.ok).toBe(false);
+    if (!rejected.ok) {
+      expect(rejected.reason).toMatch(/structured|at least one|parseable/i);
+    }
   });
 });

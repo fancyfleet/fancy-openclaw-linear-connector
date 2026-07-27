@@ -59,6 +59,14 @@ export interface LinearIssueWithRelations extends LinearIssueReference {
   delegate?: LinearUserReference | null;
   assignee?: LinearUserReference | null;
   relations?: { nodes?: LinearIssueRelation[] | null } | null;
+  /**
+   * INF-794: relations where this issue is the TARGET (`relatedIssue`) rather
+   * than the source. A ticket that is *blocked by* another is the target of a
+   * `blocks` edge, so its blocker only appears here — Linear never returns it
+   * under `relations`. Must be fetched and scanned or blocked-target
+   * suppression is blind (the INF-777 → INF-773 loop).
+   */
+  inverseRelations?: { nodes?: LinearIssueRelation[] | null } | null;
   /** INF-83: whether the ticket is soft-deleted (trashed). Trashed tickets
    *  are still fetchable but reject commentCreate. */
   trashed?: boolean | null;
@@ -74,8 +82,7 @@ export type RoutingReason =
   | "mention"
   | "body-mention"
   | "department-prefix"
-  | "steward-escalation"
-  | "manual-hold";
+  | "steward-escalation";
 
 /**
  * Routing reasons that carry a delegate/assignee ownership claim on the ticket,
@@ -91,14 +98,7 @@ const OWNERSHIP_REASONS = new Set<RoutingReason>(["delegate", "assignee"]);
  * mention / body-mention — a genuine @mention on a human-assigned ticket is a
  * legitimate wake (someone explicitly pinged the agent) and must still land.
  */
-const ROSTER_FANOUT_REASONS = new Set<RoutingReason>(["department-prefix", "steward-escalation", "manual-hold"]);
-
-/**
- * INF-476: Manual dispatch hold.
- * Tickets in this list are blocked from dispatch regardless of state or delegate.
- * Used when a workflow loop needs to be frozen without a governed 'park' move.
- */
-const DISPATCH_HOLD_TICKETS = new Set<string>(["INF-196", "LIF-45"]);
+const ROSTER_FANOUT_REASONS = new Set<RoutingReason>(["department-prefix", "steward-escalation"]);
 
 /**
  * Is this Linear user a human rather than one of our agents?
@@ -144,7 +144,12 @@ function blockerOf(issue: LinearIssueWithRelations, relation: LinearIssueRelatio
 }
 
 export function isBlockedByOpenIssue(issue: LinearIssueWithRelations): boolean {
-  const nodes = issue.relations?.nodes ?? [];
+  // INF-794: scan BOTH directions. Linear stores a "A blocks B" edge once, with
+  // A as `issue` and B as `relatedIssue`. Querying B returns it under
+  // `inverseRelations` (B is the target); querying A returns it under
+  // `relations`. The blocked ticket is B, so its blocker lives in
+  // `inverseRelations` — scanning `relations` alone (AI-984) never saw it.
+  const nodes = [...(issue.relations?.nodes ?? []), ...(issue.inverseRelations?.nodes ?? [])];
   return nodes.some((rel) => {
     const blocker = blockerOf(issue, rel);
     return blocker !== null && !isTerminalIssueState(blocker.state);
@@ -254,6 +259,9 @@ export async function checkLinearIssueRouting(
             relations(first: 50) {
               nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
             }
+            inverseRelations(first: 50) {
+              nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
+            }
           }
         }`,
         variables: { id: identifier },
@@ -276,12 +284,6 @@ export async function checkLinearIssueRouting(
     }
 
     const issue = body.data?.issue;
-
-    // ── Gate 0: INF-476 MANUAL HOLD ─────────────────────────────────────
-    if (DISPATCH_HOLD_TICKETS.has(identifier)) {
-      log.info(`Dropping ${routingReason ?? "unrouted"} event for ${identifier}: ticket is on MANUAL DISPATCH HOLD (INF-476)`);
-      return { actionable: false, failOpen: false };
-    }
 
     // ── Gate 1: LIVENESS (all routing reasons, AI-2295) ──────────────────
     // AI-2091 §2 (G2): an OK response with no errors and a null issue is a
@@ -418,6 +420,9 @@ export async function isLinearIssueActionable(ticketId: string, agentId: string)
             relations(first: 50) {
               nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
             }
+            inverseRelations(first: 50) {
+              nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
+            }
           }
         }`,
         variables: { id: identifier },
@@ -449,12 +454,6 @@ export async function isLinearIssueActionable(ticketId: string, agentId: string)
     // commentCreate with "Entity not found: Issue". Treat as non-actionable.
     if (issue.trashed || issue.archivedAt) {
       log.info(`Dropping pending Linear ticket ${identifier}: ticket is ${issue.trashed ? "trashed" : "archived"}`);
-      return false;
-    }
-
-    // INF-476: Manual hold guard
-    if (DISPATCH_HOLD_TICKETS.has(identifier)) {
-      log.info(`Dropping pending Linear ticket ${identifier}: ticket is on MANUAL DISPATCH HOLD (INF-476)`);
       return false;
     }
 

@@ -20,9 +20,74 @@ import request from "supertest";
 import { afterEach, describe, expect, it } from "@jest/globals";
 import { createAdminRouter } from "./admin.js";
 import { getFixtureDriftLiveness, resetFixtureDriftStatus, runFixtureDriftCheck } from "./fixture-drift-detector.js";
+import { resetPolicyCache } from "./escalation-gate.js";
 import { resetWorkflowCache } from "./workflow-gate.js";
 
 const ADMIN_SECRET = "inf-775-admin-secret";
+
+const TEST_POLICY_YAML = `
+capabilities:
+  - id: linear:transition
+containers:
+  - id: test
+    grants: [linear:transition]
+roles:
+  - id: browser-automation
+    requires: [linear:transition]
+  - id: code-review
+    requires: [linear:transition]
+  - id: department-head
+    requires: [linear:transition]
+  - id: deployment
+    requires: [linear:transition]
+  - id: design-lead
+    requires: [linear:transition]
+  - id: designer
+    requires: [linear:transition]
+  - id: dev
+    requires: [linear:transition]
+  - id: engine
+    requires: [linear:transition]
+  - id: host-deploy
+    requires: [linear:transition]
+  - id: requester
+    requires: [linear:transition]
+  - id: sprint-owner
+    requires: [linear:transition]
+  - id: steward
+    requires: [linear:transition]
+  - id: test-author
+    requires: [linear:transition]
+  - id: ui-designer
+    requires: [linear:transition]
+  - id: ux-researcher
+    requires: [linear:transition]
+  - id: visual-reviewer
+    requires: [linear:transition]
+  - id: worker
+    requires: [linear:transition]
+bodies:
+  - id: igor
+    container: test
+    fills_roles:
+      - browser-automation
+      - code-review
+      - department-head
+      - deployment
+      - design-lead
+      - designer
+      - dev
+      - engine
+      - host-deploy
+      - requester
+      - sprint-owner
+      - steward
+      - test-author
+      - ui-designer
+      - ux-researcher
+      - visual-reviewer
+      - worker
+`;
 
 function copyRegisteredDefsWithDrift(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-775-defs-"));
@@ -82,6 +147,7 @@ describe("INF-775 AC2: workflow reload re-runs drift gate and emits non-green dr
     }
     if (tmpRoot) fs.rmSync(tmpRoot, { recursive: true, force: true });
     tmpRoot = null;
+    resetPolicyCache();
     resetWorkflowCache();
     resetFixtureDriftStatus();
   });
@@ -89,9 +155,13 @@ describe("INF-775 AC2: workflow reload re-runs drift gate and emits non-green dr
   it("returns or records a non-green fixtureDrift signal when reloaded defs drift from fixtures", async () => {
     savedEnv.WORKFLOW_DEFS_DIR = process.env.WORKFLOW_DEFS_DIR;
     savedEnv.ADMIN_SECRET = process.env.ADMIN_SECRET;
+    savedEnv.CAPABILITY_POLICY_PATH = process.env.CAPABILITY_POLICY_PATH;
     tmpRoot = copyRegisteredDefsWithDrift();
+    fs.writeFileSync(path.join(tmpRoot, "capability-policy.yaml"), TEST_POLICY_YAML, "utf8");
     process.env.WORKFLOW_DEFS_DIR = path.join(tmpRoot, "defs");
+    process.env.CAPABILITY_POLICY_PATH = path.join(tmpRoot, "capability-policy.yaml");
     process.env.ADMIN_SECRET = ADMIN_SECRET;
+    resetPolicyCache();
     resetWorkflowCache();
     resetFixtureDriftStatus();
 

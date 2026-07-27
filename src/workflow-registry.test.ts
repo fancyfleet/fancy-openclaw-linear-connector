@@ -455,25 +455,15 @@ describe("AC4: dev-impl regression — registry-based gate identical to single-d
     expect(result).toContain("not a legal command");
   });
 
-  it("dev-impl: 'submit' from 'implementation' is allowed (dev body)", async () => {
-    // assign: required on the transition but with only one reviewer body in policy it auto-routes.
+  it("dev-impl: 'submit' from 'implementation' is blocked until a commitment exit is recorded", async () => {
     process.env.WORKFLOW_DEFS_DIR = registryDir;
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
 
     // AI-1731: submit now has requires_comment — pass hasComment=true to test legality, not the comment gate
     const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles", null, undefined, null, false, false, true);
 
-    // With a single reviewer body (reviewer), assign mode=required + not-implementer
-    // might block unless a target is provided. Key regression: the gate DOES NOT pass-through.
-    // It should enforce and produce either null (allowed) or a specific enforcement message.
-    // The enforcement must originate from the dev-impl def, not be a blanket pass-through.
-    // We verify the gate reached enforcement logic (non-null = blocked for the right reason,
-    // null = allowed — both are OK here; what's NOT OK is a null from wrong reason).
-    // For this specific case (charles submitting, reviewer is the only code-review body and
-    // not-implementer passes), the gate should allow after checking the constraint.
-    // If the reviewer role has multiple bodies the gate requires an explicit target.
-    // In REGISTRY_POLICY_YAML reviewer is the sole code-review body → auto-routes → allowed.
-    expect(result).toBeNull();
+    expect(result).toMatch(/missing commitment exit/i);
+    expect(result).toMatch(/accept, reject, or not-ready/i);
   });
 
   it("dev-impl: 'escape' break-glass is always allowed from any state", async () => {

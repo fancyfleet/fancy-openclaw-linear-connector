@@ -36,6 +36,7 @@ function createTestApp(onAgentActivity: (agentId: string, ticketId: string) => v
       undefined,
       undefined,
       undefined,
+      undefined,
       onAgentActivity,
     ),
   );

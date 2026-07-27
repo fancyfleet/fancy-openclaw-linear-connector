@@ -84,47 +84,64 @@ export function createLinearApi(linearToken?: string): LinearApi {
   return {
     async fetchDoneTickets(lookbackDays: number): Promise<LinearIssue[]> {
       const since = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000).toISOString();
-      const data = await graphQL<{
+      type DoneNode = {
+        id: string;
+        identifier: string;
+        createdAt: string;
+        team?: { key: string };
+        labels: { nodes: Array<{ name: string }> };
+        branchName?: string | null;
+        state?: { name: string };
+        completedAt?: string | null;
+        comments?: { nodes: Array<{ id: string; body: string; createdAt: string }> };
+      };
+      type DoneResp = {
         issues: {
-          nodes: Array<{
-            id: string;
-            identifier: string;
-            createdAt: string;
-            team?: { key: string };
-            labels: { nodes: Array<{ name: string }> };
-            branchName?: string | null;
-            state?: { name: string };
-            completedAt?: string | null;
-            comments?: { nodes: Array<{ id: string; body: string; createdAt: string }> };
-          }>;
+          nodes: DoneNode[];
+          pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
         };
-      }>(
-        `query DoneTickets($since: DateTime!) {
-          issues(
-            filter: {
-              state: { type: { eq: "completed" } }
-              completedAt: { gte: $since }
+      };
+      // INF-719: page through the full result set. `first: 100` alone silently
+      // dropped completed tickets beyond the first 100 in the lookback window.
+      const nodes: DoneNode[] = [];
+      let cursor: string | null = null;
+      let hasNextPage = true;
+      while (hasNextPage) {
+        const data: DoneResp = await graphQL<DoneResp>(
+          `query DoneTickets($since: DateTime!, $after: String) {
+            issues(
+              filter: {
+                state: { type: { eq: "completed" } }
+                completedAt: { gte: $since }
+              }
+              first: 100
+              after: $after
+              orderBy: completedAt
+            ) {
+              nodes {
+                id
+                identifier
+                createdAt
+                team { key }
+                labels { nodes { name } }
+                branchName
+                state { name }
+                completedAt
+                comments(first: 5) { nodes { id body createdAt } }
+              }
+              pageInfo { hasNextPage endCursor }
             }
-            first: 100
-            orderBy: completedAt
-          ) {
-            nodes {
-              id
-              identifier
-              createdAt
-              team { key }
-              labels { nodes { name } }
-              branchName
-              state { name }
-              completedAt
-              comments(first: 5) { nodes { id body createdAt } }
-            }
-          }
-        }`,
-        { since },
-      );
+          }`,
+          { since, after: cursor },
+        );
+        nodes.push(...(data.issues?.nodes ?? []));
+        const pageInfo = data.issues?.pageInfo;
+        hasNextPage = pageInfo?.hasNextPage === true;
+        cursor = pageInfo?.endCursor ?? null;
+        if (hasNextPage && !cursor) break;
+      }
 
-      return (data.issues?.nodes ?? []).map((n) => ({
+      return nodes.map((n) => ({
         id: n.id,
         identifier: n.identifier,
         createdAt: n.createdAt,

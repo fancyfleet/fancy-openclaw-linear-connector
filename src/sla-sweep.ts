@@ -25,6 +25,14 @@ import { isManagedBarrierFromLabels } from "./barrier.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
 
+/**
+ * INF-719: page size for the paginated wf:* sweep. Unpaginated issues() is
+ * hard-capped at 50 nodes by Linear; with 250+ governed tickets the sweep was
+ * structurally blind to ~80% of the board. Mirrors the cursor loop in
+ * delegation-reconciliation-sweep.ts.
+ */
+const LINEAR_ISSUES_PAGE_SIZE = 50;
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface SlaSweepOptions {
@@ -208,43 +216,61 @@ export async function runSlaSweep(opts: SlaSweepOptions): Promise<SlaSweepResult
   const defs = loadDefs(workflowDefPath);
   const store = new BreachStore(breachStorePath);
 
-  // Single batch query — no per-ticket fan-out (AC5).
-  // The query body includes "labels" and "issues" so it matches the test fetch mock.
-  const query = `
-    query SlaSweepGovernedTickets {
-      issues(filter: { labels: { name: { startsWith: "wf:" } } }) {
-        nodes {
-          id
-          identifier
-          team { id }
-          labels { nodes { id name } }
-          history(first: 1) { nodes { createdAt } }
-          parent {
-            id
-            identifier
-            labels { nodes { name } }
-          }
-        }
-      }
-    }
-  `;
-
+  // INF-719: page through the full wf:* set. An unpaginated issues() query is
+  // hard-capped at 50 nodes by Linear, so any governed ticket beyond the first
+  // page was never evaluated for an SLA breach. Mirror the proven cursor loop.
   let nodes: GovernedTicketNode[];
   try {
-    const res = await fetchFn(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({ query }),
-    });
-    type Resp = {
-      data?: { issues?: { nodes?: GovernedTicketNode[] } };
-      errors?: unknown[];
-    };
-    const data = (await res.json()) as Resp;
-    if (Array.isArray(data.errors) && data.errors.length > 0) {
-      throw new Error(`Linear GraphQL errors: ${formatGraphQlErrors(data.errors)}`);
+    const accumulated: GovernedTicketNode[] = [];
+    let cursor: string | null = null;
+    let hasNextPage = true;
+    while (hasNextPage) {
+      const afterArg = cursor ? `, after: ${JSON.stringify(cursor)}` : "";
+      // The query body includes "labels" and "issues" so it matches the test fetch mock.
+      const query = `
+        query SlaSweepGovernedTickets {
+          issues(first: ${LINEAR_ISSUES_PAGE_SIZE}${afterArg}, filter: { labels: { name: { startsWith: "wf:" } } }) {
+            nodes {
+              id
+              identifier
+              team { id }
+              labels { nodes { id name } }
+              history(first: 1) { nodes { createdAt } }
+              parent {
+                id
+                identifier
+                labels { nodes { name } }
+              }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      `;
+      const res = await fetchFn(LINEAR_API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authToken },
+        body: JSON.stringify({ query }),
+      });
+      type Resp = {
+        data?: {
+          issues?: {
+            nodes?: GovernedTicketNode[];
+            pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+          };
+        };
+        errors?: unknown[];
+      };
+      const data = (await res.json()) as Resp;
+      if (Array.isArray(data.errors) && data.errors.length > 0) {
+        throw new Error(`Linear GraphQL errors: ${formatGraphQlErrors(data.errors)}`);
+      }
+      accumulated.push(...(data.data?.issues?.nodes ?? []));
+      const pageInfo = data.data?.issues?.pageInfo;
+      hasNextPage = pageInfo?.hasNextPage === true;
+      cursor = pageInfo?.endCursor ?? null;
+      if (hasNextPage && !cursor) break;
     }
-    nodes = data.data?.issues?.nodes ?? [];
+    nodes = accumulated;
   } catch (err) {
     result.errors.push(err);
     return result;

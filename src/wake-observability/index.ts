@@ -6,6 +6,11 @@
  * detection, and the types shared by the watchdog integration.
  */
 
+import type { WakeFailureDiagnostic } from "./wake-failure-diagnostic.js";
+
+export type { WakeFailureDiagnostic } from "./wake-failure-diagnostic.js";
+export { WakeFailureClass, classifyWakeFailure, hasWakeFailureSignal, detectTurnFailureInResponse } from "./wake-failure-diagnostic.js";
+
 // ── Enums ─────────────────────────────────────────────────────────────────────
 
 /** Machine-readable reason codes for why a delegated ticket is not being picked up. */
@@ -16,6 +21,15 @@ export enum StallReasonCode {
   MODEL_DEGRADED = "model-degraded",
   ACTIVELY_PROCESSING = "actively-processing",
   CAPABILITY_BLOCKED = "capability-blocked",
+  /**
+   * INF-508 — the wake WAS delivered and the gateway accepted it, but the hook
+   * turn errored before producing any activity (context overflow on a
+   * tiny-context primary, auth failure, restricted-tool error). This is the
+   * "accepts dispatch, zero activity" signature that used to collapse into a
+   * generic "unreachable". Carries a structured WakeFailureDiagnostic in
+   * `StallReason.diagnostic`.
+   */
+  WAKE_TURN_FAILED = "wake-turn-failed",
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -24,6 +38,10 @@ export interface StallReason {
   reason: StallReasonCode;
   detail: string;
   resolvedAt: number;
+  /** INF-508 — structured wake-turn failure diagnostic, present only for
+   *  WAKE_TURN_FAILED. Lets the watchdog surface resolved model / error class /
+   *  gateway / fallback-skipped instead of a generic "unreachable". */
+  diagnostic?: WakeFailureDiagnostic;
 }
 
 export interface StallResolverDeps {
@@ -40,6 +58,9 @@ export interface StallResolverDeps {
   getResolvedModel?: (agentId: string) => Promise<ResolvedModelInfo | null>;
   getFirstActionAt?: (ticketId: string) => Promise<number | null>;
   getCapabilityBlock?: (agentId: string, ticketId: string) => Promise<{ blocked: boolean; reason: string } | null>;
+  /** INF-508 — fetch a structured wake-turn failure diagnostic for a ticket, if
+   *  the last dispatch's hook turn errored before first activity. */
+  getWakeFailureDiagnostic?: (ticketId: string) => Promise<WakeFailureDiagnostic | null>;
 }
 
 export interface AgentStatus {
@@ -130,7 +151,25 @@ export async function resolveStallReason(
     }
   }
 
-  // 3) Check model degradation — before session-dead check because a slow model
+  // 3) INF-508 — wake WAS delivered but the hook turn errored before any
+  //    activity (context overflow on a tiny-context primary, auth, tool). This
+  //    is checked BEFORE model-degraded and session-dead: a turn that hard-errored
+  //    is a more specific and actionable cause than "the model is slow" or "there
+  //    is no session" — indeed the errored turn is usually WHY the session looks
+  //    dead. Surfacing the resolved model + error class here is the whole point.
+  if (deps.getWakeFailureDiagnostic) {
+    const diagnostic = await deps.getWakeFailureDiagnostic(ticketId);
+    if (diagnostic) {
+      return {
+        reason: StallReasonCode.WAKE_TURN_FAILED,
+        detail: diagnostic.summary,
+        resolvedAt: now,
+        diagnostic,
+      };
+    }
+  }
+
+  // 4) Check model degradation — before session-dead check because a slow model
   //    may have caused the session to time out. An agent with no active session
   //    that IS on a slow local fallback should report MODEL_DEGRADED, not
   //    SESSION_DEAD, because the root cause is the model performance.
@@ -146,7 +185,7 @@ export async function resolveStallReason(
     }
   }
 
-  // 4) Check if agent has a live session (after model check, since a slow model
+  // 5) Check if agent has a live session (after model check, since a slow model
   //    with no session is MODEL_DEGRADED, not SESSION_DEAD)
   if (sessionKeys.length === 0) {
     return {
@@ -156,7 +195,7 @@ export async function resolveStallReason(
     };
   }
 
-  // 5) Check capability block
+  // 6) Check capability block
   if (deps.getCapabilityBlock) {
     const block = await deps.getCapabilityBlock(agentId, ticketId);
     if (block?.blocked) {
@@ -168,7 +207,7 @@ export async function resolveStallReason(
     }
   }
 
-  // 6) Check queue depth (agent is awake but processing other tickets)
+  // 7) Check queue depth (agent is awake but processing other tickets)
   if (deps.getQueueDepth) {
     const queueDepth = await deps.getQueueDepth(agentId);
     if (queueDepth > 0) {

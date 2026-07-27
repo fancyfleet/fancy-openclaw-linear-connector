@@ -45,7 +45,7 @@ const DEFAULT_MAX_REDISPATCH = 2;
 const DEFAULT_RECENT_DISPATCH_WINDOW_MS = 15 * 60 * 1000; // 15 min
 
 export interface StalePlainDelegateOptions {
-  authToken: string;
+  authToken: string | (() => string);
   operationalEventStore: OperationalEventStore;
   alertBus: AlertBus;
   ackTracker?: DispatchAckTracker;
@@ -77,8 +77,11 @@ async function queryStalePlainTickets(
 }>> {
   const cutoff = new Date(Date.now() - staleTimeoutMs).toISOString();
 
+  // INF-719: `$after` threads the cursor so the sweep pages through the full
+  // candidate set. `first: 100` alone silently drops stale tickets beyond the
+  // first 100. Mirrors delegation-reconciliation-sweep.ts.
   const query = `
-    query StalePlainDelegates($cutoff: DateTime!) {
+    query StalePlainDelegates($cutoff: DateTime!, $after: String) {
       issues(
         filter: {
           updatedAt: { lte: $cutoff }
@@ -86,6 +89,7 @@ async function queryStalePlainTickets(
           delegate: { id: { neq: null } }
         }
         first: 100
+        after: $after
         orderBy: updatedAt
       ) {
         nodes {
@@ -96,35 +100,48 @@ async function queryStalePlainTickets(
           labels { nodes { name } }
           delegate { id name }
         }
+        pageInfo { hasNextPage endCursor }
       }
     }
   `;
 
-  const res = await fetchFn(LINEAR_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: authToken,
-    },
-    body: JSON.stringify({ query, variables: { cutoff } }),
-  });
-
-  const body = (await res.json()) as {
+  type StaleNode = {
+    id: string;
+    identifier: string;
+    updatedAt: string;
+    state: { name: string } | null;
+    labels: { nodes: Array<{ name: string }> };
+    delegate: { id: string; name: string } | null;
+  };
+  type Body = {
     data?: {
       issues?: {
-        nodes: Array<{
-          id: string;
-          identifier: string;
-          updatedAt: string;
-          state: { name: string } | null;
-          labels: { nodes: Array<{ name: string }> };
-          delegate: { id: string; name: string } | null;
-        }>;
+        nodes: StaleNode[];
+        pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
       };
     };
   };
 
-  const nodes = body.data?.issues?.nodes ?? [];
+  const nodes: StaleNode[] = [];
+  let cursor: string | null = null;
+  let hasNextPage = true;
+  while (hasNextPage) {
+    const res = await fetchFn(LINEAR_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: authToken,
+      },
+      body: JSON.stringify({ query, variables: { cutoff, after: cursor } }),
+    });
+
+    const body = (await res.json()) as Body;
+    nodes.push(...(body.data?.issues?.nodes ?? []));
+    const pageInfo = body.data?.issues?.pageInfo;
+    hasNextPage = pageInfo?.hasNextPage === true;
+    cursor = pageInfo?.endCursor ?? null;
+    if (hasNextPage && !cursor) break;
+  }
 
   // Filter OUT any wf:* tickets — they belong to DelegationReconciliationSweep
   return nodes
@@ -197,7 +214,6 @@ export async function runStalePlainDelegateSweep(
   opts: StalePlainDelegateOptions,
 ): Promise<StalePlainDelegateResult> {
   const {
-    authToken,
     operationalEventStore,
     alertBus,
     ackTracker,
@@ -205,6 +221,9 @@ export async function runStalePlainDelegateSweep(
     postLinearComment,
   } = opts;
 
+  // INF-683: resolve the token at pass time (getter) so the boot/~20h token
+  // refresh can't strand a value captured at registration.
+  const authToken = typeof opts.authToken === "function" ? opts.authToken() : opts.authToken;
   const fetchFn = opts.fetchFn ?? globalThis.fetch;
   const staleTimeoutMs = opts.staleTimeoutMs ?? DEFAULT_STALE_TIMEOUT_MS;
 
@@ -361,7 +380,7 @@ export async function runStalePlainDelegateSweep(
 }
 
 export function registerStalePlainDelegateCron(opts: {
-  authToken: string;
+  authToken: string | (() => string);
   intervalMs?: number;
   staleTimeoutMs?: number;
   operationalEventStore?: OperationalEventStore;

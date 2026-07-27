@@ -324,7 +324,7 @@ export async function postComment(
   authToken: string,
 ): Promise<boolean> {
   const mutation = `
-    mutation($issueId: ID!, $body: String!) {
+    mutation($issueId: String!, $body: String!) {
       commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
     }
   `;
@@ -403,6 +403,48 @@ export async function issueUpdateLabels(
     return true;
   } catch (err) {
     log.error(`issueUpdate failed for ${internalId}: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
+export interface IssueUpdateWorkflowFieldsInput {
+  labelIds: string[];
+  stateId?: string;
+  delegateId?: string | null;
+  assigneeId?: string | null;
+}
+
+/**
+ * Atomically update the workflow projection fields that must move together for
+ * barrier/converge repairs: labels, optional native Linear state, and ownership.
+ */
+export async function issueUpdateWorkflowFields(
+  internalId: string,
+  input: IssueUpdateWorkflowFieldsInput,
+  authToken: string,
+): Promise<boolean> {
+  const mutation = `
+    mutation ApplyBarrierTransition($issueId: String!, $input: IssueUpdateInput!) {
+      issueUpdate(id: $issueId, input: $input) {
+        success
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: mutation, variables: { issueId: internalId, input } }),
+    });
+    type Resp = { data?: { issueUpdate?: { success: boolean } } };
+    const data = (await res.json()) as Resp;
+    if (!data.data?.issueUpdate?.success) {
+      log.warn(`issueUpdate workflow fields returned non-success for ${internalId}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    log.error(`issueUpdate workflow fields failed for ${internalId}: ${err instanceof Error ? err.message : String(err)}`);
     return false;
   }
 }

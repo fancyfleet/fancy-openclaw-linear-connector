@@ -23,6 +23,7 @@ import { normalizeSessionKey } from "../session-key.js";
 import type { OperationalEventStore } from "../store/operational-event-store.js";
 import type { DispatchAckTracker } from "../bag/dispatch-ack-tracker.js";
 import type { DeliveryResult } from "./deliver.js";
+import { classifyWakeFailure, hasWakeFailureSignal, detectTurnFailureInResponse } from "../wake-observability/wake-failure-diagnostic.js";
 
 export interface DeliverWithAckParams {
   /** Delegate agent id (also the "delegate" named in the loud warning). */
@@ -33,6 +34,12 @@ export interface DeliverWithAckParams {
   workflowState?: string;
   /** Gateway/host the delegate lives on (e.g. "grover"). */
   gateway?: string;
+  /**
+   * INF-508 — best-known resolved model for this agent (e.g. its configured
+   * default primary), used to attribute a wake-turn failure to a model even when
+   * the gateway error text does not carry an explicit `provider=<x>/<y>` token.
+   */
+  resolvedModelHint?: string;
   /**
    * Stable dispatch id, reused verbatim across every retry. Carried only by
    * delivery paths that forward it; the gateway path does not send it today, so
@@ -106,6 +113,33 @@ export async function deliverWithAck(params: DeliverWithAckParams): Promise<Deli
     attemptBound: totalAttempts,
   };
 
+  // INF-508: emit a structured per-container wake-failure diagnostic — resolved
+  // provider/model, error class (context-overflow / auth / tool), gateway id,
+  // and whether the fallback was skipped. This is the admin-visible record the
+  // first-action watchdog reads so a silent wake failure surfaces its real cause
+  // instead of collapsing into a generic "unreachable". Best-effort: a
+  // classification failure must never break the retry loop.
+  const emitDiagnostic = (attemptCount: number, errorSummary: string | null, rawResponse: Record<string, unknown> | null): void => {
+    const failureSignal = { agentId, gateway, errorSummary, rawResponse, resolvedModelHint: params.resolvedModelHint ?? null };
+    if (!hasWakeFailureSignal(failureSignal)) return;
+    try {
+      const diagnostic = classifyWakeFailure(failureSignal);
+      eventStore.append({
+        outcome: "wake-turn-failed",
+        agent: agentId,
+        key,
+        sessionKey: key,
+        workflowState: workflowState ?? null,
+        attemptCount,
+        wakeId: dispatchId,
+        errorSummary: diagnostic.summary,
+        detail: { ...baseDetail, diagnostic },
+      });
+    } catch {
+      /* diagnostic is advisory — never let it break delivery */
+    }
+  };
+
   let attempt = 0;
   while (attempt < totalAttempts) {
     attempt += 1;
@@ -124,6 +158,18 @@ export async function deliverWithAck(params: DeliverWithAckParams): Promise<Deli
         wakeId: dispatchId,
         detail: baseDetail,
       });
+      // INF-508: the dispatch was accepted, but a context overflow does NOT make
+      // the gateway return an HTTP error — on the live /v1 path it comes back as
+      // a 200-OK completion whose assistant content IS the overflow message and
+      // whose usage.prompt_tokens is 0. Inspect the delivered body for that
+      // turn-level failure surrogate; if present, the wake was accepted but the
+      // turn will die with zero activity — emit the diagnostic so the watchdog
+      // can name it. The "delivered" record stands (the ack/retry contract is
+      // unchanged); the diagnostic is additive.
+      const turnFailure = detectTurnFailureInResponse(result.rawResponse ?? null);
+      if (turnFailure) {
+        emitDiagnostic(attempt, turnFailure.errorText, result.rawResponse ?? null);
+      }
       // Register the ack expectation so an unacked wake self-heals via the watchdog.
       ackTracker.recordDispatch(agentId, ticketId);
       return { status: "delivered", attempts: attempt, dispatchId };
@@ -156,6 +202,10 @@ export async function deliverWithAck(params: DeliverWithAckParams): Promise<Deli
       errorSummary: result.hookErrorSummary ?? null,
       detail: baseDetail,
     });
+
+    // INF-508: a hard error (non-2xx / ok:false) carries the gateway's error
+    // text directly — classify and record it as a structured diagnostic.
+    emitDiagnostic(attempt, result.hookErrorSummary ?? null, result.rawResponse ?? null);
 
     // Bounded retry with backoff — only wait when another attempt follows.
     if (attempt < totalAttempts) {

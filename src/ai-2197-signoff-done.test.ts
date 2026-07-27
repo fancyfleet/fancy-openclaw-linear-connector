@@ -28,9 +28,12 @@ capabilities:
   - id: linear:transition
   - id: human:escalate
   - id: workflow:break-glass
+  - id: deploy:execute
 containers:
   - id: dev
     grants: [linear:transition]
+  - id: deployment
+    grants: [linear:transition, deploy:execute]
   - id: steward
     grants: [linear:transition, human:escalate, workflow:break-glass]
 roles:
@@ -40,6 +43,8 @@ roles:
     requires: [linear:transition]
   - id: worker
     requires: [linear:transition]
+  - id: deployment
+    requires: [deploy:execute]
 bodies:
   - id: ai
     container: steward
@@ -47,6 +52,9 @@ bodies:
   - id: astrid
     container: steward
     fills_roles: [department-head]
+  - id: hanzo
+    container: deployment
+    fills_roles: [deployment]
   - id: worker1
     container: dev
     fills_roles: [worker]

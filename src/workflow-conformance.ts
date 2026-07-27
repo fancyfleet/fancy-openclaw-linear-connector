@@ -49,6 +49,31 @@ export const ACCEPTED_WAIVER_KEYS: readonly string[] = [
   "fanout-before-barrier",
 ];
 
+const FROZEN_ENGINE_PRIMITIVES = [
+  "workflow-registration",
+  "governed-transitions",
+  "guards",
+  "fan-out",
+  "barrier-join",
+  "terminal-reachability",
+  "dispatch-wake",
+  "idempotency-mutex",
+  "parenting-reparenting",
+  "role-delegate-resolution",
+  "escape-break-glass",
+  "commitment-gate",
+] as const;
+
+interface CapabilityPolicyBody {
+  id: string;
+  fills_roles?: string[];
+}
+
+interface CapabilityPolicy {
+  bodies?: CapabilityPolicyBody[];
+  roles?: Array<{ id: string; synthetic?: boolean; no_body?: boolean }>;
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 /** Build index of state by id for quick lookup. */
@@ -84,6 +109,27 @@ function hasFanout(state: WorkflowState): boolean {
 }
 
 /**
+ * A transition INTO a terminal state is a governed exit, not a fanout barrier
+ * edge. The fanout-before-barrier / barrier-before-managing invariants exist to
+ * protect *managing* barriers — a state that waits on children its immediate
+ * predecessor spawned. A terminal state is an endpoint: it never waits on
+ * children, so entering one never requires a predecessor fanout, regardless of
+ * the command that gets there (cancel/abandon → cancelled, INF-453; converge →
+ * done, INF-504). The `barrier: true` flag on a terminal state means
+ * `satisfies_parent_barrier`, not "waits on children" — a distinct concept the
+ * fanout invariants must not conflate. Keying on the target's terminal kind
+ * (not an allowlist of command names) keeps a new governed terminal edge from
+ * tripping the invariant while it is exactly what the edge is designed to do.
+ */
+function isTerminalTransition(
+  transition: { command?: string; generic?: string; to?: string },
+  targetState?: WorkflowState,
+): boolean {
+  const targetKind = (targetState as unknown as Record<string, unknown> | undefined)?.kind;
+  return targetKind === "terminal";
+}
+
+/**
  * Get the set of registered def IDs from the gateway's cached registry.
  * Returns undefined if the registry hasn't been loaded yet this process lifetime.
  */
@@ -91,6 +137,46 @@ function getRegisteredDefIdsSync(): Set<string> | undefined {
   const cache = getCachedRegistrySync();
   if (cache === null || cache === undefined) return undefined;
   return new Set(cache.keys());
+}
+
+function loadCapabilityPolicySync(): CapabilityPolicy | null {
+  const policyPath = process.env.CAPABILITY_POLICY_PATH;
+  if (!policyPath) return null;
+
+  try {
+    const raw = fs.readFileSync(policyPath, "utf8");
+    const parsed = yamlLoad(raw) as CapabilityPolicy;
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function bodiesForRole(policy: CapabilityPolicy | null, roleId: string): string[] | undefined {
+  if (!policy) return undefined;
+  return (policy.bodies ?? [])
+    .filter((body) => Array.isArray(body.fills_roles) && body.fills_roles.includes(roleId))
+    .map((body) => body.id);
+}
+
+function roleIsDeclared(policy: CapabilityPolicy, roleId: string): boolean {
+  return (policy.roles ?? []).some((role) => role.id === roleId);
+}
+
+function roleIsSyntheticNoBody(policy: CapabilityPolicy, roleId: string): boolean {
+  const role = (policy.roles ?? []).find((candidate) => candidate.id === roleId);
+  return Boolean(role && role.synthetic === true && role.no_body === true);
+}
+
+function transitionDeclaresSelectionCriteria(transition: NonNullable<WorkflowState["transitions"]>[number]): boolean {
+  return Boolean(
+    transition.assign &&
+      (
+        Boolean(transition.assign.default) ||
+        Boolean(transition.assign.constraint) ||
+        (typeof transition.assign.selection_criteria === "string" && transition.assign.selection_criteria.trim().length > 0)
+      ),
+  );
 }
 
 // ── Invariant checks ──────────────────────────────────────────────────────
@@ -107,18 +193,19 @@ function checkBarrierInvariant(
 
   // Build a set of target states that are reached from a fanout state
   const targetsFromFanout = new Set<string>();
+  const stateIndex = indexStates(def.states);
 
   for (const state of def.states) {
     if (!state.transitions || !hasFanout(state)) continue;
     for (const t of state.transitions) {
-      if (t.to) {
-        targetsFromFanout.add(t.to);
-      }
+      if (!t.to) continue;
+      const targetState = stateIndex.get(t.to);
+      if (isTerminalTransition(t, targetState)) continue;
+      targetsFromFanout.add(t.to);
     }
   }
 
   // Any state that is a target from a fanout state must declare barrier: true
-  const stateIndex = indexStates(def.states);
   for (const targetId of targetsFromFanout) {
     const targetState = stateIndex.get(targetId);
     if (!targetState) continue; // skip unresolvable targets
@@ -147,6 +234,7 @@ function checkFanoutBeforeBarrier(
   const barrierStateIds = new Set(
     def.states.filter((s) => isBarrier(s)).map((s) => s.id),
   );
+  const stateIndex = indexStates(def.states);
 
   if (barrierStateIds.size === 0) return;
 
@@ -156,6 +244,7 @@ function checkFanoutBeforeBarrier(
     for (const t of state.transitions) {
       if (!t.to) continue;
       if (barrierStateIds.has(t.to)) {
+        if (isTerminalTransition(t, stateIndex.get(t.to))) continue;
         if (!hasFanout(state)) {
           errors.push({
             invariant: "fanout-before-barrier",
@@ -232,6 +321,84 @@ function checkChildWorkflowSync(
   }
 }
 
+function checkEnginePrimitiveMatrix(
+  def: WorkflowDef,
+  errors: ConformanceError[],
+): void {
+  const rawPrimitives = (def as unknown as Record<string, unknown>).x_engine_primitives;
+  if (def.archetype !== "engine-primitive-matrix" && rawPrimitives === undefined) return;
+
+  if (!Array.isArray(rawPrimitives)) {
+    errors.push({
+      invariant: "engine-primitive-matrix",
+      message: `Workflow '${def.id}' must declare x_engine_primitives with the frozen primitive matrix.`,
+    });
+    return;
+  }
+
+  const primitives = rawPrimitives.filter((value): value is string => typeof value === "string");
+  const frozenPrimitiveSet = new Set<string>(FROZEN_ENGINE_PRIMITIVES);
+  const missing = FROZEN_ENGINE_PRIMITIVES.filter((primitive) => !primitives.includes(primitive));
+  const unknown = primitives.filter((primitive) => !frozenPrimitiveSet.has(primitive));
+  if (missing.length > 0 || unknown.length > 0 || primitives.length !== rawPrimitives.length) {
+    errors.push({
+      invariant: "engine-primitive-matrix",
+      message:
+        `Workflow '${def.id}' must declare exactly the frozen engine primitive matrix. ` +
+        `Missing: ${missing.length ? missing.join(", ") : "none"}. ` +
+        `Unknown/non-string: ${unknown.length ? unknown.join(", ") : "none"}.`,
+    });
+  }
+}
+
+function checkDelegateResolution(
+  def: WorkflowDef,
+  errors: ConformanceError[],
+): void {
+  const policy = loadCapabilityPolicySync();
+  if (!policy) return;
+
+  const incoming = new Map<string, NonNullable<WorkflowState["transitions"]>>();
+  for (const state of def.states) {
+    for (const transition of state.transitions ?? []) {
+      const list = incoming.get(transition.to) ?? [];
+      list.push(transition);
+      incoming.set(transition.to, list);
+    }
+  }
+
+  for (const state of def.states) {
+    if (!state.owner_role || state.kind === "terminal") continue;
+
+    const candidates = bodiesForRole(policy, state.owner_role) ?? [];
+    if (candidates.length === 0) {
+      if (!roleIsDeclared(policy, state.owner_role)) continue;
+      if (roleIsSyntheticNoBody(policy, state.owner_role)) continue;
+      errors.push({
+        invariant: "delegate-resolution",
+        message: `State '${state.id}' owner_role '${state.owner_role}' resolves to no bodies.`,
+        state: state.id,
+      });
+      continue;
+    }
+
+    if (candidates.length > 1) {
+      const entries = incoming.get(state.id) ?? [];
+      for (const transition of entries) {
+        if (!transitionDeclaresSelectionCriteria(transition)) {
+          errors.push({
+            invariant: "delegate-resolution",
+            message:
+              `State '${state.id}' owner_role '${state.owner_role}' resolves to multiple bodies ` +
+              `(${candidates.join(", ")}); incoming transition '${transition.command}' must declare selection criteria.`,
+            state: state.id,
+          });
+        }
+      }
+    }
+  }
+}
+
 // ── Public API ─────────────────────────────────────────────────────────────
 
 /**
@@ -253,6 +420,8 @@ export function validateWorkflowDef(def: WorkflowDef, _file?: string): Conforman
   // Structural invariants
   checkBarrierInvariant(def, errors);
   checkFanoutBeforeBarrier(def, errors);
+  checkEnginePrimitiveMatrix(def, errors);
+  checkDelegateResolution(def, errors);
 
   // Child_workflow sync check (wf: prefix + cached registry)
   checkChildWorkflowSync(def, errors);

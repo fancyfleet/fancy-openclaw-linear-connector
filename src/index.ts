@@ -21,7 +21,8 @@ import { buildWorkflowAwareDeliveryMessage } from "./delivery/build-message.js";
 import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, StuckDelegateDetector, HoldRetryTracker, resignalPendingTickets, replayPendingBag, ManagingPoller } from "./bag/index.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 import { reconciliationWakeFn as reconciliationWakeWithLeaseCheck } from "./bag/reconciliation-wake.js";
-import { getAutoEnrollLiveness, getTicketNoActivityTimeoutMs, getWorkflowRegistryLiveness, loadWorkflowRegistry } from "./workflow-gate.js";
+import { getAutoEnrollLiveness, getCommitmentGateLiveness, getTicketNoActivityTimeoutMs, getWorkflowRegistryLiveness, loadWorkflowRegistry } from "./workflow-gate.js";
+import { getFanoutPreviewCreateLiveness, registerFanoutPreviewCreate } from "./fanout.js";
 import { getDefStateMigrationLiveness, registerDefStateMigrationRunner } from "./def-state-migration.js";
 import { getFixtureDriftLiveness, runFixtureDriftCheck } from "./fixture-drift-detector.js";
 import { registerTranscriptRedaction, getTranscriptRedactionHealth } from "./transcript-redaction.js";
@@ -43,6 +44,7 @@ import { registerStallSweepCron } from "./cron/stall-sweep-cron.js";
 import { getStallDetectionState, DEFAULT_STALL_CONFIG } from "./stall-detection-state.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
 import { registerDoneDetectorCron } from "./cron/done-ticket-detector-cron.js";
+import { registerLeakedCredentialSweepCron } from "./cron/leaked-credential-sweep-cron.js";
 import { registerMergedEvidenceReconcilerCron } from "./cron/merged-evidence-reconciler-cron.js";
 import { registerBootstrapReconciliationCron } from "./bootstrap-reconciliation-sweep.js";
 import { registerDelegationReconciliationCron, runDelegationReconciliationSweep } from "./delegation-reconciliation-sweep.js";
@@ -69,12 +71,15 @@ import { getRescueSweepState } from "./rescue-sweep-state.js";
 import { getDetectorState } from "./done-ticket-detector-state.js";
 import { registerFirstActionWatchdogCron } from "./first-action-watchdog.js";
 import { getFirstActionWatchdogState } from "./first-action-watchdog-state.js";
+import { classifyCrossCheckIssue, type CrossCheckIssue } from "./first-action-crosscheck.js";
+import { StallReasonCode, type StallReason, type WakeFailureDiagnostic } from "./wake-observability/index.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
 import { getCapabilityPolicy } from "./escalation-gate.js";
 import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
 import { onAlert as onConfigHealthAlert } from "./config-health.js";
 import { getRegistryPolicyStatus, startRegistryPolicyCheck } from "./registry-policy.js";
 import { resolveStartupCommit } from "./startup-commit.js";
+import { LINEAR_PROXY_PROTOCOL_VERSION, proxyCompatibilityPayload } from "./proxy-compatibility.js";
 import { getAccessToken, getAgent, getLinearUserIdForAgent, getAllTokenStatuses, isPolledForLinear } from "./agents.js";
 import { loadUniversalCanon, getCanonLiveness } from "./policy/universal-canon.js";
 import { loadRoster, getRoutingFunctionaryLiveness } from "./department-roster.js";
@@ -85,6 +90,7 @@ import { DispatchRecordStore } from "./liveness-channel/dispatch-record-store.js
 import { LivenessChannelEndpoint } from "./liveness-channel/index.js";
 import { SessionHealthProbe } from "./liveness-channel/session-health.js";
 import { TurnLivenessProbe } from "./liveness-channel/turn-liveness.js";
+import { reconcileBootWorkflowRegistry } from "./boot-workflow-registry-reconcile.js";
 import type { StaleSessionDetail } from "./bag/session-tracker.js";
 import crypto from "crypto";
 import path from "path";
@@ -303,6 +309,13 @@ export function createApp(options?: CreateAppOptions) {
   // test isolation is guaranteed and snapshots never outlive the app instance.
   const commandAuthSnapshots = new Map<string, { snapshotDelegateId: string | null; snapshotState: string | null; snapshotTicketDelegate: string | null; expiresAt: number }>();
 
+  app.get("/proxy/compatibility", (_req, res) => {
+    const payload = proxyCompatibilityPayload();
+    res.setHeader("X-Openclaw-Linear-Protocol-Version", LINEAR_PROXY_PROTOCOL_VERSION);
+    res.setHeader("X-Openclaw-Linear-Min-Cli-Version", payload.minCliVersion);
+    res.json(payload);
+  });
+
   app.post("/proxy/graphql", (req, res) => handleProxyRequest(req, res, {
     observationStore,
     operationalEventStore,
@@ -319,6 +332,59 @@ export function createApp(options?: CreateAppOptions) {
         log.info(`proxy-auto-ack agent=${agentId} ticket=${ticketId}`);
       }
     },
+    fanoutWakeFn: async (agentName, ticketIdentifier) => {
+      const sessionKey = normalizeSessionKey(ticketIdentifier);
+      const livenessRecord = livenessDispatchStore.recordDispatch({
+        agentId: agentName,
+        ticketId: ticketIdentifier,
+        sessionKey,
+        delegateAtDispatch: agentName,
+      });
+      if (sessionTracker.isActiveForTicket(agentName, sessionKey)) {
+        livenessDispatchStore.recordAck(livenessRecord.dispatchId, {
+          delivered: true,
+          target_identity: agentName,
+          status: "accepted",
+          target_session_key: sessionKey,
+        });
+        log.info(`fanout dispatch skipped for ${agentName} [${sessionKey}]: session already active`);
+        return;
+      }
+      const agentCfg = getAgent(agentName);
+      const authToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+      const deliveryConfig: DeliveryConfig = {
+        nodeBin: process.execPath,
+        hooksUrl: agentCfg?.hooksUrl ?? process.env.OPENCLAW_HOOKS_URL,
+        hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
+        hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
+        hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+        gatewayUrl: agentCfg?.gatewayUrl,
+        gatewayToken: agentCfg?.gatewayToken,
+      };
+      const actionText = `You were delegated ${ticketIdentifier}`;
+      const message = (await buildWorkflowAwareDeliveryMessage(ticketIdentifier, authToken, actionText)) ?? actionText;
+      const wakeResult = await reconciliationWakeWithLeaseCheck({
+        agentId: agentName,
+        ticketId: ticketIdentifier,
+        leaseStore: dispatchLeaseStore,
+        leaseTtlMs: 30_000,
+        deliveryConfig,
+        sendWake: async (agId, _tId, msg, cfg) => {
+          return await deliverMessageToAgent(agId, sessionKey, msg, cfg);
+        },
+      });
+      if (!wakeResult.dispatched && !wakeResult.suppressed) {
+        throw new Error(wakeResult.reason ?? "fanout wake delivery failed");
+      }
+      livenessDispatchStore.recordAck(livenessRecord.dispatchId, {
+        delivered: wakeResult.dispatched,
+        target_identity: agentName,
+        status: "queued",
+        target_session_key: sessionKey,
+      });
+    },
+    getDispatchAckTracker: () => ackTracker,
+    postFanoutDispatchStore: livenessDispatchStore,
   }));
 
   // Upload proxy — AI-1767. Agents can't fetch uploads.linear.app directly
@@ -482,6 +548,9 @@ export function createApp(options?: CreateAppOptions) {
       // completes; false means every fanout outcome is absent → current-behavior
       // → potential vacuous advance. Observable at ac-validate without log access.
       fanoutOutcomeStore: getFanoutOutcomeStoreLiveness(),
+      // INF-623: fanout preview/create component liveness — registered at
+      // bootstrap and using one sprint-title validator before preview or create.
+      fanoutPreviewCreate: getFanoutPreviewCreateLiveness(),
       // AI-2582: transcript redaction sweep — periodic .trajectory.jsonl
       // credential redaction. status is "idle"/"running"/"error"; lastRun
       // is null before the first sweep fires.
@@ -491,6 +560,9 @@ export function createApp(options?: CreateAppOptions) {
       matrixApprovalGate: getMatrixApprovalGateLiveness(),
       // AI-2542: auto-enroll liveness and demote/escape suppression counters.
       autoEnroll: getAutoEnrollLiveness(),
+      // INF-695 AC2.5: commitment activity observer liveness. registered=true
+      // only when createWebhookRouter wires the production webhook consumer.
+      commitmentGate: getCommitmentGateLiveness(),
       // AI-2624 AC7: ManagingPoller liveness — reports running state and
       // effective cycle/interval at /health without waiting for a wake.
       // Uses a forward ref because the poller is constructed later in
@@ -589,6 +661,7 @@ export function createApp(options?: CreateAppOptions) {
   // the /admin/api/proposals review console (C5) and the apply pipeline's
   // idempotency/retry surface (AC4.8).
   const proposalStore = new ProposalStore(options?.proposalsDbPath);
+  registerFanoutPreviewCreate();
   const agentQueue = new AgentQueue(options?.agentQueueDbPath);
   const bag = new PendingWorkBag(options?.bagDbPath);
   const wakeConfig = {
@@ -1546,7 +1619,11 @@ export function createApp(options?: CreateAppOptions) {
   // reachable from the production entry point (createApp), with load-time
   // liveness surfaced at /health.workflowMigrations. Fetches nothing unless a
   // registered def actually declares a migration map.
-  const migrationAuthToken =
+  // INF-683: lazy per-use getter — resolved at each use-site so the ~5s post-boot
+  // and ~20h token-refresh rotations can't strand a value captured at boot (the
+  // captured-const 401 that blinded fleet-wide reconciliation). Mirrors the
+  // already-correct resolveCronAuthToken/resolveValidationAuthToken siblings.
+  const resolveMigrationAuthToken = () =>
     getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
   const migrationWakeFn = async (agentName: string, ticketIdentifier: string) => {
     const sessionKey = normalizeSessionKey(ticketIdentifier);
@@ -1570,12 +1647,12 @@ export function createApp(options?: CreateAppOptions) {
     };
     const actionText = `${ticketIdentifier} was migrated to a new workflow state (its previous state was removed by a def change)`;
     const message =
-      (await buildWorkflowAwareDeliveryMessage(ticketIdentifier, migrationAuthToken, actionText)) ??
+      (await buildWorkflowAwareDeliveryMessage(ticketIdentifier, resolveMigrationAuthToken(), actionText)) ??
       actionText;
     await deliverMessageToAgent(agentName, sessionKey, message, deliveryConfig);
   };
   registerDefStateMigrationRunner({
-    authToken: migrationAuthToken,
+    authToken: resolveMigrationAuthToken,
     loadRegistry: () => loadWorkflowRegistry(),
     operationalEventStore,
     wakeFn: migrationWakeFn,
@@ -1675,6 +1752,21 @@ if (isEntryPoint) {
 
   log.info(`Starting connector [${DEPLOYMENT_NAME}] with ${agents.length} agent(s): ${agents.map((a) => a.name).join(", ")}`);
 
+  try {
+    await reconcileBootWorkflowRegistry();
+  } catch (err) {
+    const msg = `Fatal: boot workflow registry reconcile failed: ${err instanceof Error ? err.message : String(err)}`;
+    log.error(msg);
+    notify({
+      severity: "critical",
+      source: "workflow-def",
+      title: "Connector refusing to start — workflow registry reconcile failed",
+      detail: msg,
+      dedupKey: "workflow-def|boot-reconcile-failed",
+    });
+    process.exit(1);
+  }
+
   // AI-1848 (Pillar 2 D1): load the universal policy canon at bootstrap so
   // /health can report liveness immediately (fail-open: missing file is a
   // WARN, not a crash). The file is re-read per-dispatch for hot-reload.
@@ -1727,7 +1819,11 @@ if (isEntryPoint) {
   // same delivery primitive the webhook bootstrap path uses (buildWorkflowAware
   // DeliveryMessage + deliverMessageToAgent), so a healed ticket is not just
   // labeled-and-delegated but actually surfaced to its owner.
-  const reconciliationAuthToken =
+  // INF-683: lazy per-use getter — resolved at each use-site so the ~5s post-boot
+  // and ~20h token-refresh rotations can't strand a value captured at boot. This
+  // is the captured-const that 401'd every 5-min delegation-reconciliation cycle
+  // and every build-message title/label fetch, blinding fleet-wide reconciliation.
+  const resolveReconciliationAuthToken = () =>
     getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
   const reconciliationWakeFn = async (agentName: string, ticketIdentifier: string) => {
     const sessionKey = normalizeSessionKey(ticketIdentifier);
@@ -1749,7 +1845,7 @@ if (isEntryPoint) {
     };
     const actionText = `You were delegated ${ticketIdentifier}`;
     const message =
-      (await buildWorkflowAwareDeliveryMessage(ticketIdentifier, reconciliationAuthToken, actionText)) ??
+      (await buildWorkflowAwareDeliveryMessage(ticketIdentifier, resolveReconciliationAuthToken(), actionText)) ??
       actionText;
 
     // INF-282: Wire DispatchLeaseStore check into reconciliation wake path.
@@ -1768,15 +1864,16 @@ if (isEntryPoint) {
   };
 
   registerBootstrapReconciliationCron({
-    authToken: reconciliationAuthToken,
+    authToken: resolveReconciliationAuthToken,
     wakeFn: reconciliationWakeFn,
+    dispatchAckTracker: ackTracker,
   });
 
   // AI-1807: delegation reconciliation sweep — detect and heal stranded
   // delegation wakes caused by webhook-ingress gaps. Complements AI-1775
   // (bootstrap sweep) and the rescue/stuck-delegate/no-activity detectors.
   registerDelegationReconciliationCron({
-    authToken: reconciliationAuthToken,
+    authToken: resolveReconciliationAuthToken,
     operationalEventStore,
     wakeFn: reconciliationWakeFn,
     dispatchLeaseStore,
@@ -1787,7 +1884,7 @@ if (isEntryPoint) {
   // (non-wf) tickets with a delegate set that have been sitting in Thinking/
   // Doing/To Do with zero progress beyond the staleness threshold.
   registerStalePlainDelegateCron({
-    authToken: reconciliationAuthToken,
+    authToken: resolveReconciliationAuthToken,
     operationalEventStore,
     alertBus: getAlertBus(),
     wakeFn: reconciliationWakeFn,
@@ -1810,7 +1907,7 @@ if (isEntryPoint) {
     .catch(() => undefined);
   const firstActionAgentNames = new Set(getAgents().map((a) => a.name.toLowerCase()));
   registerFirstActionWatchdogCron({
-    authToken: reconciliationAuthToken,
+    authToken: resolveReconciliationAuthToken,
     workflowDefPath: process.env.WORKFLOW_DEFS_DIR ?? process.env.WORKFLOW_DEF_DIR,
     capabilityPolicy: firstActionCapabilityPolicy,
     listTickets: async () => {
@@ -1838,6 +1935,34 @@ if (isEntryPoint) {
               .filter((ms) => Number.isFinite(ms));
             if (actionTimes.length > 0) firstOwnerActionAtMs = Math.min(...actionTimes);
           }
+
+          // INF-508 — attach a WAKE_TURN_FAILED stall reason when this dispatch's
+          // hook turn errored before any activity. Only when there is no first
+          // owner action (a turn that produced work is not a silent failure) and
+          // the failure post-dates entry into the current state (a diagnostic from
+          // a prior dispatch must not shadow a fresh wake). The watchdog then
+          // surfaces the resolved model / error class / gateway instead of a
+          // generic "unreachable", and skips the pointless re-wake.
+          let stallReason: StallReason | undefined;
+          if (delegate && firstOwnerActionAtMs === null) {
+            const failures = operationalEventStore.query({
+              key: `linear-${row.ticket_id}`,
+              outcome: "wake-turn-failed",
+              since: row.entered_state_at,
+              limit: 20,
+            });
+            const latest = failures[0]; // query returns newest-first (occurred_at DESC)
+            const diagnostic = (latest?.detail as { diagnostic?: WakeFailureDiagnostic } | undefined)?.diagnostic;
+            if (latest && diagnostic) {
+              stallReason = {
+                reason: StallReasonCode.WAKE_TURN_FAILED,
+                detail: diagnostic.summary ?? latest.errorSummary ?? "wake turn failed",
+                resolvedAt: Date.parse(latest.occurredAt) || Date.now(),
+                diagnostic,
+              };
+            }
+          }
+
           return {
             ticket: row.ticket_id,
             workflow: row.workflow,
@@ -1848,6 +1973,7 @@ if (isEntryPoint) {
             dispatchDeliveredAtMs: Number.isFinite(deliveredMs) ? deliveredMs : Date.now(),
             dispatchUpdatedAt: row.entered_state_at,
             firstOwnerActionAtMs,
+            stallReason,
           };
         });
     },
@@ -1871,55 +1997,70 @@ if (isEntryPoint) {
     // the mirror is corrected; the fresh entered_state_at re-arms a clean
     // ladder on the next sweep.
     crossCheck: async (t) => {
-      const query = `query($id: String!) { issue(id: $id) { id state { type } labels { nodes { name } } } }`;
-      let issue: { state?: { type?: string } | null; labels?: { nodes?: Array<{ name: string }> } } | null;
+      // INF-604: select archivedAt/trashed so a soft-deleted (trashed) issue,
+      // which still resolves through the archive on a node query, is detected
+      // instead of reading as a live governed ticket and drawing endless wakes.
+      const query = `query($id: String!) { issue(id: $id) { id archivedAt trashed state { type } labels { nodes { name } } } }`;
+      let issue: CrossCheckIssue | null;
       try {
         const res = await fetch(LINEAR_API_URL, {
           method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: reconciliationAuthToken },
+          headers: { "Content-Type": "application/json", Authorization: resolveReconciliationAuthToken() },
           body: JSON.stringify({ query, variables: { id: t.ticket } }),
         });
-        const data = (await res.json()) as { data?: { issue?: typeof issue } };
+        const data = (await res.json()) as { data?: { issue?: CrossCheckIssue | null } };
         if (data.data === undefined) return "unknown"; // auth/transport error — fail open
         issue = data.data?.issue ?? null;
       } catch {
         return "unknown";
       }
-      if (!issue) {
-        enrolledTicketsStore.markTerminal(t.ticket, "watchdog-crosscheck-deleted");
-        return "stale";
+      // Interpretation is a pure, unit-tested function (INF-604); this closure
+      // owns only the mirror side-effect each verdict implies.
+      const action = classifyCrossCheckIssue(issue, t.state);
+      if (action.verdict === "live") return "live";
+      switch (action.heal) {
+        case "deleted":
+          enrolledTicketsStore.markTerminal(t.ticket, "watchdog-crosscheck-deleted");
+          break;
+        case "trashed":
+          enrolledTicketsStore.markTerminal(t.ticket, "watchdog-crosscheck-trashed");
+          break;
+        case "terminal":
+          enrolledTicketsStore.markTerminal(t.ticket, "watchdog-crosscheck-terminal");
+          break;
+        case "demoted":
+          enrolledTicketsStore.demoteEnrolled(t.ticket);
+          break;
+        case "state-drift":
+          enrolledTicketsStore.recordTransition({
+            ticketId: t.ticket,
+            toState: action.toState,
+            delegate: t.delegate,
+            eventKind: "watchdog-reconciled",
+          });
+          break;
       }
-      const labels = issue.labels?.nodes ?? [];
-      const stateType = issue.state?.type;
-      const stateLabel = labels.find((l) => l.name.startsWith("state:"))?.name.slice("state:".length);
-      if (stateType === "completed" || stateType === "canceled" || stateLabel === "done") {
-        enrolledTicketsStore.markTerminal(t.ticket, "watchdog-crosscheck-terminal");
-        return "stale";
-      }
-      if (!labels.some((l) => l.name.startsWith("wf:"))) {
-        enrolledTicketsStore.demoteEnrolled(t.ticket);
-        return "stale";
-      }
-      if (stateLabel && stateLabel !== t.state) {
-        enrolledTicketsStore.recordTransition({
-          ticketId: t.ticket,
-          toState: stateLabel,
-          delegate: t.delegate,
-          eventKind: "watchdog-reconciled",
-        });
-        return "stale";
-      }
-      return "live";
+      return "stale";
     },
     // Rung 2: alert the ops channel with ticket/state/delegate for the on-call.
-    notify: (alert) =>
+    // INF-508 — a WAKE_TURN_FAILED breach carries a structured diagnostic; put
+    // the resolved model / error class / gateway / fallback-skipped into the
+    // alert body so the on-call sees WHY the wake failed, not just "unreachable".
+    notify: (alert) => {
+      const diag = (alert as { diagnostic?: WakeFailureDiagnostic | null }).diagnostic;
+      const detail = diag
+        ? `${alert.ticket} (${alert.state}) — ${alert.delegate} wake turn failed: ${diag.failureClass} on ${diag.resolvedProvider ? `${diag.resolvedProvider}/${diag.resolvedModel}` : diag.resolvedModel ?? "unknown-model"}` +
+          `${diag.gateway ? ` @${diag.gateway}` : ""}${diag.fallbackSkipped ? " (fallback skipped — a re-wake will not help; fix the model config)" : ""}` +
+          `${diag.promptTokens != null && diag.promptBudget != null ? ` [prompt ${diag.promptTokens} tok > budget ${diag.promptBudget} tok]` : ""}`
+        : `${alert.ticket} (${alert.state}) — delegate ${alert.delegate} unreachable after ${alert.rungsFired} rung(s)`;
       notify({
-        severity: "warning",
+        severity: diag ? "critical" : "warning",
         source: "first-action-watchdog",
         title: alert.title,
-        detail: `${alert.ticket} (${alert.state}) — delegate ${alert.delegate} unreachable after ${alert.rungsFired} rung(s)`,
+        detail,
         dedupKey: `first-action-watchdog|${alert.ticket}|${alert.state}`,
-      }),
+      });
+    },
     // Rung 3: re-route to the fallback body by waking it directly. The delegate
     // reassignment itself is left to the steward — the ladder never mutates
     // workflow state — but the fallback body is surfaced immediately.
@@ -1951,7 +2092,7 @@ if (isEntryPoint) {
 
     try {
       const result = await runDelegationReconciliationSweep({
-        authToken: reconciliationAuthToken,
+        authToken: resolveReconciliationAuthToken,
         operationalEventStore,
         alertBus: getAlertBus(),
         wakeFn: reconciliationWakeFn,
@@ -2086,10 +2227,15 @@ if (isEntryPoint) {
   }
 
   // AI-2554: label-sync audit cron — periodic check for proxy-store vs Linear state divergence.
-  const labelSyncAuthToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+  // INF-683: lazy per-use getter — resolved per audit pass so the boot/~20h token
+  // refresh can't strand a value captured at boot. The eager resolve here is a
+  // registration gate only (skip when no token is available at boot).
+  const resolveLabelSyncAuthToken = () =>
+    getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  const labelSyncAuthToken = resolveLabelSyncAuthToken();
   if (labelSyncAuthToken) {
     registerLabelSyncAuditCron({
-      authToken: labelSyncAuthToken,
+      authToken: resolveLabelSyncAuthToken,
       enrolledTicketsStore,
     });
     log.info("AI-2554: label-sync audit cron registered (interval=15m)");
@@ -2123,6 +2269,11 @@ if (isEntryPoint) {
     graceHours: parseInt(process.env.DONE_DETECTOR_GRACE_HOURS ?? "4", 10),
     pollIntervalMs: parseInt(process.env.DONE_DETECTOR_POLL_INTERVAL_MS ?? String(60 * 60 * 1000), 10),
   });
+
+  // INF-529: leaked-credential reopen sweep (Layer 2). Reopens sec:leaked-credential
+  // tickets a human closed in the UI (bypassing the proxy gate) without a rotation
+  // artifact. Disabled unless LEAKED_CRED_SWEEP_ENABLED=1; the proxy gate is always on.
+  registerLeakedCredentialSweepCron();
 
   // INF-122: periodic anti-entropy reconciliation (G-7/G-17).
   // AC1 — native state desync heal; AC2 — missed barrier webhook auto-advance.

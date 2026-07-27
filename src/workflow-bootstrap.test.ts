@@ -138,6 +138,7 @@ const TEAM_ID = "team-uuid-abc";
 const WF_LABEL_ID = "label-wf-dev-impl-id";
 const STATE_INTAKE_LABEL_ID = "label-state-intake-id";
 const STATE_WF_UX_LABEL_ID = "label-wf-ux-audit-id";
+const CREATOR_USER_ID = "creator-linear-user-id";
 
 // ── Test suite setup ──────────────────────────────────────────────────────
 
@@ -220,6 +221,7 @@ function makeBootstrapFetch(opts: {
                 }),
               },
               delegate: null,
+              creator: { id: CREATOR_USER_ID },
             },
           },
         }),
@@ -494,22 +496,6 @@ describe("AC5/AC7c: a second workflow's entry state resolves correctly", () => {
 // ── Tests: AC7d — missing/invalid def fails safe ─────────────────────────
 
 describe("AC7d: missing/invalid def fails safe", () => {
-  it("returns null without crashing when wf:unknown workflow has no registered def", async () => {
-    globalThis.fetch = makeBootstrapFetch({
-      currentLabelNames: ["wf:unknown-workflow"],
-    });
-
-    const event = makeIssueUpdateEvent({
-      currentLabelIds: ["label-wf-unknown-id"],
-      previousLabelIds: [],
-    });
-
-    // Must not throw; should return null (fail safe)
-    await expect(
-      maybeBootstrapWorkflow(event, "test-token"),
-    ).resolves.toBeNull();
-  });
-
   it("returns null when the Linear fetch fails (network error)", async () => {
     globalThis.fetch = async () => {
       throw new Error("network failure");
@@ -1081,5 +1067,306 @@ describe("bootstrap wake regression (2026-07-03) — issue query must select ide
     expect(issueQuery).toBeDefined();
     expect(issueQuery).toContain("identifier");
     expect(issueQuery).toContain("title");
+  });
+});
+
+// ── INF-552: engine registration primitive ────────────────────────────────
+//
+// "Instantiate a node in any registered workflow at its entry state; reject
+// unregistered ids loudly." The pair below is the acceptance criteria for the
+// primitive and is deliberately written against a SYNTHETIC workflow with no
+// reference to our concrete types (task/dev-impl/…):
+//   (a) synthetic registered id → instantiates at its declared entry_state
+//   (b) unknown id              → loud rejection to requester, no state:* stamped
+
+// Synthetic workflow — a made-up id/state the registry has never heard of
+// outside this fixture, proving the entry-state instantiation is registry-driven
+// and branch-free (not keyed on our real workflow ids).
+const SYNTHETIC_YAML = `
+id: synthetic-flow
+version: 1
+entry_state: alpha
+break_glass:
+  command: escape
+  to: omega
+  owner_role: steward
+states:
+  - id: alpha
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: advance
+        to: omega
+  - id: omega
+    kind: terminal
+    native_state: done
+`;
+
+describe("INF-552: registration primitive (synthetic workflow)", () => {
+  let synthTmp: string;
+  const SYNTH_ISSUE_ID = "synth-issue-uuid";
+  const SYNTH_TEAM_ID = "synth-team-uuid";
+  const SYNTH_CREATOR_ID = "synth-creator-user-id";
+  const SYNTH_STATE_ALPHA_LABEL_ID = "label-state-alpha-id";
+  const SYNTH_WF_LABEL_ID = "label-wf-synthetic-flow-id";
+  const SYNTH_PENDING_LABEL_ID = "label-wf-pending-id";
+
+  beforeAll(async () => {
+    synthTmp = await fs.mkdtemp(path.join(os.tmpdir(), "inf552-synthetic-"));
+    const defsDir = path.join(synthTmp, "defs");
+    await fs.mkdir(defsDir);
+    await fs.writeFile(path.join(defsDir, "synthetic-flow.yaml"), SYNTHETIC_YAML);
+    const policyFile = path.join(synthTmp, "policy.yaml");
+    await fs.writeFile(policyFile, POLICY_YAML);
+    const agentsFile = path.join(synthTmp, "agents.json");
+    await fs.writeFile(agentsFile, AGENTS_JSON);
+    process.env.WORKFLOW_DEFS_DIR = defsDir;
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+    process.env.AGENTS_PATH = agentsFile;
+  });
+
+  afterAll(async () => {
+    await fs.rm(synthTmp, { recursive: true, force: true });
+  });
+
+  /** Fetch mock for the synthetic-workflow tests. */
+  function synthFetch(opts: {
+    currentLabelNames: string[];
+    calls?: string[];
+    /** INF-552: issue description carrying the wf:pending authoring marker. */
+    description?: string | null;
+  }): typeof globalThis.fetch {
+    const teamLabels = [
+      { id: SYNTH_STATE_ALPHA_LABEL_ID, name: "state:alpha" },
+      { id: SYNTH_WF_LABEL_ID, name: "wf:synthetic-flow" },
+      { id: SYNTH_PENDING_LABEL_ID, name: "wf:pending" },
+    ];
+    return async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const body = typeof init?.body === "string" ? init.body : "";
+      opts.calls?.push(body);
+
+      if (body.includes("IssueWithLabels") || body.includes("IssueContext")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                id: SYNTH_ISSUE_ID,
+                identifier: "INF-552",
+                title: "Synthetic authoring attempt",
+                team: { id: SYNTH_TEAM_ID },
+                labels: {
+                  nodes: opts.currentLabelNames.map((name) => {
+                    const known = teamLabels.find((l) => l.name === name);
+                    return { id: known?.id ?? `label-${name}-id`, name };
+                  }),
+                },
+                delegate: null,
+                creator: { id: SYNTH_CREATOR_ID },
+                description: opts.description ?? null,
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (body.includes("labels") && body.includes(SYNTH_TEAM_ID)) {
+        return new Response(
+          JSON.stringify({ data: { team: { labels: { nodes: teamLabels } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (body.includes("issueUpdate") || body.includes("ApplyAtomicTransition")) {
+        return new Response(
+          JSON.stringify({ data: { issueUpdate: { success: true } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (body.includes("commentCreate")) {
+        return new Response(
+          JSON.stringify({ data: { commentCreate: { success: true, comment: { id: "c1" } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ data: {} }), { status: 200 });
+    };
+  }
+
+  it("(a) a registered synthetic id instantiates at its declared entry_state", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = synthFetch({ currentLabelNames: ["wf:synthetic-flow"], calls });
+
+    const event = makeIssueUpdateEvent({
+      currentLabelIds: [SYNTH_WF_LABEL_ID],
+      previousLabelIds: [],
+    });
+    // Override the mocked event's issue id/team to the synthetic ones.
+    event.data.id = SYNTH_ISSUE_ID;
+    event.data.teamId = SYNTH_TEAM_ID;
+
+    const result = await maybeBootstrapWorkflow(event as never, "test-token");
+
+    expect(result).not.toBeNull();
+    expect(result?.action).toBe("bootstrapped");
+    expect(result?.workflowId).toBe("synthetic-flow");
+    // entry_state comes straight from the synthetic def — no per-workflow branch.
+    expect(result?.entryState).toBe("alpha");
+
+    const mutation = calls.find(
+      (b) => b.includes("issueUpdate") || b.includes("ApplyAtomicTransition"),
+    );
+    expect(mutation).toBeDefined();
+    expect(mutation).toContain(SYNTH_STATE_ALPHA_LABEL_ID);
+  });
+
+  it("(b) an unknown id is rejected loudly — bounced to requester, no state:* stamped", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = synthFetch({ currentLabelNames: ["wf:no-such-flow"], calls });
+
+    // Label id must match what synthFetch synthesizes for an unknown name
+    // (`label-<name>-id`), so the added-label check inside the hook fires.
+    const event = makeIssueUpdateEvent({
+      currentLabelIds: ["label-wf:no-such-flow-id"],
+      previousLabelIds: [],
+    });
+    event.data.id = SYNTH_ISSUE_ID;
+    event.data.teamId = SYNTH_TEAM_ID;
+
+    const result = await maybeBootstrapWorkflow(event as never, "test-token");
+
+    expect(result).not.toBeNull();
+    expect(result?.action).toBe("rejected");
+    expect(result?.workflowId).toBe("no-such-flow");
+    expect(result?.rejectionReason).toContain("not registered");
+
+    // The mutation must bounce to the requester and stamp NO state:* label.
+    const mutation = calls.find(
+      (b) => b.includes("issueUpdate") || b.includes("ApplyAtomicTransition"),
+    );
+    expect(mutation).toBeDefined();
+    // assignee = creator (returns it to whoever filed it)
+    expect(mutation).toContain(SYNTH_CREATOR_ID);
+    expect(mutation).toContain("assigneeId");
+    // delegate cleared
+    expect(mutation).toContain("delegateId");
+    // NO entry-state label was stamped
+    expect(mutation).not.toContain(SYNTH_STATE_ALPHA_LABEL_ID);
+    expect(mutation).not.toContain("state:");
+
+    // A named-reason comment was posted.
+    const comment = calls.find((b) => b.includes("commentCreate"));
+    expect(comment).toBeDefined();
+    expect(comment).toContain("no-such-flow");
+    expect(comment).toContain("not registered");
+  });
+
+  // ── INF-552 CLI sentinel channel (wf:pending + description marker) ──────────
+  // The CLI cannot create wf:<id> labels, so `linear create --workflow <id>`
+  // attaches the fixed `wf:pending` sentinel and carries the verbatim id in a
+  // description marker. These prove the engine resolves that channel identically
+  // to a direct wf:<id> label — enroll (registered) / loud reject (unknown).
+  const marker = (id: string) => `Do the work.\n\n<!-- openclaw:workflow-request id="${id}" -->`;
+
+  it("(c) wf:pending + marker for a registered id → swaps sentinel for wf:<id>, enrolls at entry_state", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = synthFetch({
+      currentLabelNames: ["wf:pending"],
+      description: marker("synthetic-flow"),
+      calls,
+    });
+
+    const event = makeIssueUpdateEvent({
+      currentLabelIds: [SYNTH_PENDING_LABEL_ID],
+      previousLabelIds: [],
+    });
+    event.data.id = SYNTH_ISSUE_ID;
+    event.data.teamId = SYNTH_TEAM_ID;
+
+    const result = await maybeBootstrapWorkflow(event as never, "test-token");
+
+    expect(result).not.toBeNull();
+    expect(result?.action).toBe("bootstrapped");
+    // Resolved from the marker, not the (sentinel) label suffix.
+    expect(result?.workflowId).toBe("synthetic-flow");
+    expect(result?.entryState).toBe("alpha");
+
+    const mutation = calls.find(
+      (b) => b.includes("issueUpdate") || b.includes("ApplyAtomicTransition"),
+    );
+    expect(mutation).toBeDefined();
+    // Entry-state label stamped, concrete wf:<id> attached, sentinel dropped.
+    expect(mutation).toContain(SYNTH_STATE_ALPHA_LABEL_ID);
+    expect(mutation).toContain(SYNTH_WF_LABEL_ID);
+    expect(mutation).not.toContain(SYNTH_PENDING_LABEL_ID);
+  });
+
+  it("(d) wf:pending + marker for an unknown id → loud rejection to requester, no state:* stamped", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = synthFetch({
+      currentLabelNames: ["wf:pending"],
+      description: marker("no-such-flow"),
+      calls,
+    });
+
+    const event = makeIssueUpdateEvent({
+      currentLabelIds: [SYNTH_PENDING_LABEL_ID],
+      previousLabelIds: [],
+    });
+    event.data.id = SYNTH_ISSUE_ID;
+    event.data.teamId = SYNTH_TEAM_ID;
+
+    const result = await maybeBootstrapWorkflow(event as never, "test-token");
+
+    expect(result).not.toBeNull();
+    expect(result?.action).toBe("rejected");
+    // The rejected id is the marker's id, not "pending".
+    expect(result?.workflowId).toBe("no-such-flow");
+    expect(result?.rejectionReason).toContain("not registered");
+
+    const mutation = calls.find(
+      (b) => b.includes("issueUpdate") || b.includes("ApplyAtomicTransition"),
+    );
+    expect(mutation).toBeDefined();
+    expect(mutation).toContain(SYNTH_CREATOR_ID);
+    expect(mutation).toContain("assigneeId");
+    expect(mutation).not.toContain(SYNTH_STATE_ALPHA_LABEL_ID);
+    expect(mutation).not.toContain("state:");
+
+    const comment = calls.find((b) => b.includes("commentCreate"));
+    expect(comment).toBeDefined();
+    expect(comment).toContain("no-such-flow");
+    expect(comment).toContain("not registered");
+  });
+
+  it("(e) wf:pending with no readable marker → loud rejection (malformed authoring attempt), never a silent strand", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = synthFetch({
+      currentLabelNames: ["wf:pending"],
+      description: "Just a plain description, no marker.",
+      calls,
+    });
+
+    const event = makeIssueUpdateEvent({
+      currentLabelIds: [SYNTH_PENDING_LABEL_ID],
+      previousLabelIds: [],
+    });
+    event.data.id = SYNTH_ISSUE_ID;
+    event.data.teamId = SYNTH_TEAM_ID;
+
+    const result = await maybeBootstrapWorkflow(event as never, "test-token");
+
+    expect(result).not.toBeNull();
+    expect(result?.action).toBe("rejected");
+
+    // No entry state stamped; bounced to requester with a comment.
+    const mutation = calls.find(
+      (b) => b.includes("issueUpdate") || b.includes("ApplyAtomicTransition"),
+    );
+    expect(mutation).toBeDefined();
+    expect(mutation).not.toContain(SYNTH_STATE_ALPHA_LABEL_ID);
+    expect(mutation).toContain(SYNTH_CREATOR_ID);
+    const comment = calls.find((b) => b.includes("commentCreate"));
+    expect(comment).toBeDefined();
+    // Not the misleading "unknown workflow 'pending'" — a marker-specific reason.
+    expect(comment).toContain("no workflow-request marker");
   });
 });

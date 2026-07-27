@@ -63,6 +63,10 @@ interface PolicyRole {
   requires: string[];
   /** Invariant: exactly ONE body fleet-wide may fill this role (§16.0). */
   exclusive?: boolean;
+  /** Synthetic engine/runtime role that is intentionally not filled by a policy body. */
+  synthetic?: boolean;
+  /** Explicit marker for roles that must not be staffed by a policy body. */
+  no_body?: boolean;
 }
 
 export interface CapabilityPolicy {
@@ -262,6 +266,48 @@ export async function resolveBodiesForRole(roleId: string): Promise<string[]> {
   return policy.bodies
     .filter((b) => b.fills_roles.includes(roleId))
     .map((b) => b.id);
+}
+
+/**
+ * INF-574: identifiers (body id + `openclaw_agent` alias, lowercased) for every
+ * body that fills the given role.
+ *
+ * `resolveBodiesForRole` returns policy body ids only. The delegate ping-pong
+ * detector needs to recognize a dispatch to a terminal merge-gate owner from the
+ * openclaw agent name the webhook carries, which may be the body id OR its
+ * `openclaw_agent` alias. This returns both, case-folded, so membership can be
+ * tested regardless of which identifier a caller holds.
+ */
+export async function resolveAgentIdentifiersForRole(roleId: string): Promise<Set<string>> {
+  const policy = await loadPolicy();
+  const out = new Set<string>();
+  for (const b of policy.bodies ?? []) {
+    if (!(b.fills_roles ?? []).includes(roleId)) continue;
+    out.add(b.id.toLowerCase());
+    if (b.openclaw_agent) out.add(b.openclaw_agent.toLowerCase());
+  }
+  return out;
+}
+
+/**
+ * Returns true when the role is explicitly declared in the capability policy.
+ * This lets workflow runtime distinguish a real |C|=0 role from older/minimal
+ * test policies that do not model every workflow role.
+ */
+export async function isRoleDeclared(roleId: string): Promise<boolean> {
+  const policy = await loadPolicy();
+  return (policy.roles ?? []).some((role) => role.id === roleId);
+}
+
+/**
+ * Returns true for explicitly declared synthetic engine/runtime roles that are
+ * intentionally bodyless. These roles are driven by the engine itself, not by a
+ * staffable Linear delegate, so registration reachability must skip |C|=0.
+ */
+export async function isSyntheticNoBodyRole(roleId: string): Promise<boolean> {
+  const policy = await loadPolicy();
+  const role = (policy.roles ?? []).find((candidate) => candidate.id === roleId);
+  return Boolean(role && role.synthetic === true && role.no_body === true);
 }
 
 /**

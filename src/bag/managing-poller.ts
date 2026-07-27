@@ -157,9 +157,12 @@ async function fetchManagingTicketsForAgent(agent: AgentConfig): Promise<LinearM
     return [];
   }
   const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
+  // INF-719: `$after` threads the cursor so the poller pages through every
+  // Managing ticket for this agent. `first: 100` alone silently drops any beyond
+  // the first 100. Mirrors delegation-reconciliation-sweep.ts.
   const query = `
-    query ManagingForAgent($delegateId: ID!) {
-      issues(first: 100, filter: {
+    query ManagingForAgent($delegateId: ID!, $after: String) {
+      issues(first: 100, after: $after, filter: {
         delegate: { id: { eq: $delegateId } },
         state: { name: { eq: "Managing" } }
       }) {
@@ -176,35 +179,48 @@ async function fetchManagingTicketsForAgent(agent: AgentConfig): Promise<LinearM
             name
           }
         }
+        pageInfo { hasNextPage endCursor }
       }
     }
   `;
-  const res = await fetch("https://api.linear.app/graphql", {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: authHeader },
-    body: JSON.stringify({ query, variables: { delegateId: agent.linearUserId } }),
-  });
-  if (!res.ok) {
-    throw new Error(`Linear API returned ${res.status} for agent ${agent.name}`);
-  }
-  const body = (await res.json()) as {
+  type ManagingNode = {
+    identifier: string;
+    title: string;
+    description: string | null;
+    labels?: { nodes?: Array<{ name: string }> };
+    state?: { name: string } | null;
+  };
+  type Body = {
     data?: {
       issues?: {
-        nodes?: Array<{
-          identifier: string;
-          title: string;
-          description: string | null;
-          labels?: { nodes?: Array<{ name: string }> };
-          state?: { name: string } | null;
-        }>;
+        nodes?: ManagingNode[];
+        pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
       };
     };
     errors?: unknown;
   };
-  if (body.errors) {
-    throw new Error(`Linear API errors for agent ${agent.name}: ${JSON.stringify(body.errors)}`);
+  const raw: ManagingNode[] = [];
+  let cursor: string | null = null;
+  let hasNextPage = true;
+  while (hasNextPage) {
+    const res = await fetch("https://api.linear.app/graphql", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: authHeader },
+      body: JSON.stringify({ query, variables: { delegateId: agent.linearUserId, after: cursor } }),
+    });
+    if (!res.ok) {
+      throw new Error(`Linear API returned ${res.status} for agent ${agent.name}`);
+    }
+    const body = (await res.json()) as Body;
+    if (body.errors) {
+      throw new Error(`Linear API errors for agent ${agent.name}: ${JSON.stringify(body.errors)}`);
+    }
+    raw.push(...(body.data?.issues?.nodes ?? []));
+    const pageInfo = body.data?.issues?.pageInfo;
+    hasNextPage = pageInfo?.hasNextPage === true;
+    cursor = pageInfo?.endCursor ?? null;
+    if (hasNextPage && !cursor) break;
   }
-  const raw = body.data?.issues?.nodes ?? [];
   return raw.map((n) => ({
     identifier: n.identifier,
     title: n.title,

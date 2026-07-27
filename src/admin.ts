@@ -17,6 +17,7 @@ import type { ObservationStore, ReasonCode, MetricSummary } from "./store/observ
 import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forensics.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
 import { setStateAtomic, loadWorkflowRegistry, resetWorkflowCache, reloadWorkflowDefs } from "./workflow-gate.js";
+import { runFixtureDriftCheck } from "./fixture-drift-detector.js";
 import { instanceConfigRoot } from "./instance-config.js";
 import { retryApply } from "./proposal/apply-pipeline.js";
 import type { ProposalStore } from "./store/proposal-store.js";
@@ -29,7 +30,6 @@ import { recaptureAc } from "./ac-record-store.js";
 import type { MutationAuditStore } from "./store/mutation-audit-store.js";
 import { getStatus as getConfigHealthStatus } from "./config-health.js";
 import { getRegistryPolicyStatus } from "./registry-policy.js";
-import { runFixtureDriftCheck } from "./fixture-drift-detector.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 import { runDelegationReconciliationSweep } from "./delegation-reconciliation-sweep.js";
 import { getAlertBus } from "./alerts/alert-bus.js";
@@ -531,6 +531,11 @@ export function createAdminRouter(deps: AdminDeps): Router {
         res.status(422).json({ ok: false, diagnostics: result.diagnostics });
         return;
       }
+      // INF-723: refresh the fixture-drift snapshot after a hot-reload. Without
+      // this, runFixtureDriftCheck() ran only at bootstrap (src/index.ts), so an
+      // operator who hot-reloaded the registry could not re-verify drift without
+      // a full restart — /health.fixtureDrift stayed pinned to the pre-reload
+      // state. Awaited so the response reflects the post-reload drift status.
       const fixtureDrift = await runFixtureDriftCheck();
       if (!fixtureDrift.healthy || !fixtureDrift.gate.healthy) {
         deps.operationalEventStore?.append({
@@ -1201,7 +1206,12 @@ export function createAdminRouter(deps: AdminDeps): Router {
         }
       : undefined;
 
-    const result = await setStateAtomic(ticketId, targetState, delegate, authToken, { sendWakeUp, operationalEventStore: deps.operationalEventStore, force });
+    const result = await setStateAtomic(ticketId, targetState, delegate, authToken, {
+      sendWakeUp,
+      operationalEventStore: deps.operationalEventStore,
+      enrolledTicketsStore: deps.enrolledTicketsStore,
+      force,
+    });
     if (!result.ok) {
       res.status(422).json(result);
       return;

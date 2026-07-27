@@ -88,7 +88,7 @@ else
 fi
 
 # Test 1.3: The script must have a block that copies files with a *.yaml glob.
-yaml_copy=$(grep -n '\.yaml.*$WORKFLOW_DEFS_DIR\|\.yaml.*"$WORKFLOW\|rsync.*\.yaml\|cp.*\.yaml' "$DEPLOY_SCRIPT" 2>/dev/null | head -5)
+yaml_copy=$(grep -n '\.yaml.*$WORKFLOW_DEFS_DIR\|\.yaml.*"$WORKFLOW\|rsync.*\.yaml\|cp.*\.yaml\|--include=.*\.yaml' "$DEPLOY_SCRIPT" 2>/dev/null | head -5)
 if [ -n "$yaml_copy" ]; then
   ok "AC1.3: has a *.yaml file copy command"
 else
@@ -114,6 +114,36 @@ if [ -n "$wf_defs" ]; then
   ok "AC1.5: defines WORKFLOW_DEFS_DIR"
 else
   no "AC1.5: no WORKFLOW_DEFS_DIR definition — target path not set"
+fi
+
+# Test 1.6: The sync must overwrite stale live defs; --ignore-existing preserves
+# old runtime YAML and silently defeats the deploy.
+ignore_existing=$(grep -n -- '--ignore-existing' "$DEPLOY_SCRIPT" 2>/dev/null | head -5)
+if [ -z "$ignore_existing" ]; then
+  ok "AC1.6: sync does not use --ignore-existing"
+else
+  no "AC1.6: sync still uses --ignore-existing, so stale live defs would survive: $ignore_existing"
+fi
+
+# Test 1.7: Overwrites/deletes should be recoverable from a deploy-scoped backup.
+workflow_backup=$(sed -n '/registered-defs/,/^  #\|^$)\|^esac\|^fi/ {
+  /--backup\|--backup-dir\|WORKFLOW_DEFS_BACKUP/ p
+}' "$DEPLOY_SCRIPT" 2>/dev/null | head -5)
+if [ -n "$workflow_backup" ]; then
+  ok "AC1.7: workflow sync keeps a backup for overwritten/deleted defs"
+else
+  no "AC1.7: workflow sync lacks a backup for overwritten/deleted defs"
+fi
+
+# Test 1.8: After sync, fail closed if the live workflow dir still differs from
+# registered-defs.
+post_sync_gate=$(sed -n '/registered-defs/,/^  #\|^$)\|^esac\|^fi/ {
+  /cmp -s\|WORKFLOW_DEF_DRIFT\|does not match registered-defs/ p
+}' "$DEPLOY_SCRIPT" 2>/dev/null | head -5)
+if [ -n "$post_sync_gate" ]; then
+  ok "AC1.8: workflow sync verifies target matches registered-defs before restart"
+else
+  no "AC1.8: workflow sync lacks a post-sync fail-closed verification gate"
 fi
 
 

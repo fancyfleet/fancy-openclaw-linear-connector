@@ -7,8 +7,10 @@
   "scripts": {
     "prebuild": "node scripts/guard-build-location.js && node scripts/guard-runtime-build.mjs",
     "check:json-keys": "node scripts/check-duplicate-json-keys.js",
+    "check:workflow-sync": "node scripts/check-workflow-def-sync.mjs --check",
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
-    "build": "tsc",
+    "build": "tsc && rm -rf dist/registered-defs && cp -R src/registered-defs dist/registered-defs",
+    "pretest": "npm run build",
     "start": "node dist/index.js",
     "lint": "eslint src --ext .ts",
     "test": "NODE_OPTIONS='--experimental-vm-modules' jest --forceExit",

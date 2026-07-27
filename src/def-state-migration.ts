@@ -31,6 +31,9 @@ const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "def-
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 
+/** INF-719: page size for the paginated wf:* enumeration (Linear caps unpaginated issues() at 50). */
+const LINEAR_ISSUES_PAGE_SIZE = 50;
+
 // ── Types ───────────────────────────────────────────────────────────────────
 
 export interface DefStateMigrationPlan {
@@ -53,8 +56,8 @@ interface OperationalEventSink {
 }
 
 export interface DefStateMigrationSweepOptions {
-  /** Linear auth token (Bearer ...). */
-  authToken: string;
+  /** Linear auth token (Bearer ...), or a lazy getter resolved per pass (INF-683). */
+  authToken: string | (() => string);
   /** Workflow registry: map of wf-id → WorkflowDef. */
   workflowRegistry: Map<string, WorkflowDef>;
   /** Operational event store (optional; one event per migrated ticket). */
@@ -141,33 +144,55 @@ export function validateDefStateRemovals(
 // ── Linear helpers ────────────────────────────────────────────────────────────
 
 async function fetchGovernedTickets(authToken: string): Promise<FetchedTicket[]> {
-  const query = `
-    query WorkflowIssues {
-      issues(filter: { labels: { some: { name: { startsWith: "wf:" } } } }) {
-        nodes {
-          id
-          identifier
-          state { name }
-          labels { nodes { id name } }
-          team { id }
-        }
-      }
-    }
-  `;
-  const res = await fetch(LINEAR_API_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: authToken },
-    body: JSON.stringify({ query }),
-  });
   type IssueNode = {
     id: string;
     identifier: string;
     labels: { nodes: Array<{ id: string; name: string }> };
     team: { id: string } | null;
   };
-  type Resp = { data?: { issues?: { nodes: IssueNode[] } } };
-  const data = (await res.json()) as Resp;
-  return (data.data?.issues?.nodes ?? []).map((n) => ({
+  type Resp = {
+    data?: {
+      issues?: {
+        nodes: IssueNode[];
+        pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+      };
+    };
+  };
+  // INF-719: page through the full wf:* set. An unpaginated issues() query is
+  // hard-capped at 50 nodes by Linear, so this migration would silently skip
+  // any in-flight ticket beyond the first page. Mirror the cursor loop.
+  const nodes: IssueNode[] = [];
+  let cursor: string | null = null;
+  let hasNextPage = true;
+  while (hasNextPage) {
+    const afterArg = cursor ? `, after: ${JSON.stringify(cursor)}` : "";
+    const query = `
+      query WorkflowIssues {
+        issues(first: ${LINEAR_ISSUES_PAGE_SIZE}${afterArg}, filter: { labels: { some: { name: { startsWith: "wf:" } } } }) {
+          nodes {
+            id
+            identifier
+            state { name }
+            labels { nodes { id name } }
+            team { id }
+          }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+    `;
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query }),
+    });
+    const data = (await res.json()) as Resp;
+    nodes.push(...(data.data?.issues?.nodes ?? []));
+    const pageInfo = data.data?.issues?.pageInfo;
+    hasNextPage = pageInfo?.hasNextPage === true;
+    cursor = pageInfo?.endCursor ?? null;
+    if (hasNextPage && !cursor) break;
+  }
+  return nodes.map((n) => ({
     id: n.id,
     identifier: n.identifier,
     labels: n.labels.nodes.map((l) => l.name),
@@ -219,6 +244,12 @@ function emitEvent(store: OperationalEventSink | undefined, event: OperationalEv
 
 // ── AC1: the sweep ────────────────────────────────────────────────────────────
 
+/** INF-683: resolve a captured-or-lazy auth token at the moment of use, so the
+ *  token-refresh rotation (boot + ~20h) can't strand a value captured at boot. */
+function resolveAuthToken(authToken: string | (() => string)): string {
+  return typeof authToken === "function" ? authToken() : authToken;
+}
+
 /**
  * Enumerate governed (wf:*) tickets and migrate each ticket stranded at a
  * removed state that carries a `migrations` mapping in its def: atomically swap
@@ -232,7 +263,8 @@ function emitEvent(store: OperationalEventSink | undefined, event: OperationalEv
 export async function runDefStateMigrationSweep(
   options: DefStateMigrationSweepOptions,
 ): Promise<DefStateMigrationSweepResult> {
-  const { authToken, workflowRegistry, operationalEventStore, wakeFn } = options;
+  const { workflowRegistry, operationalEventStore, wakeFn } = options;
+  const authToken = resolveAuthToken(options.authToken);
   const migrated: DefStateMigrationSweepResult["migrated"] = [];
   const errors: string[] = [];
 
@@ -371,7 +403,7 @@ export function resetDefStateMigrationLiveness(): void {
 }
 
 export interface DefStateMigrationRunnerOptions {
-  authToken: string;
+  authToken: string | (() => string);
   /** Lazily resolve the workflow registry (async load happens off the boot path). */
   loadRegistry: () => Promise<Map<string, WorkflowDef>>;
   operationalEventStore?: OperationalEventSink;
@@ -393,7 +425,8 @@ export function registerDefStateMigrationRunner(options: DefStateMigrationRunner
   // gate). This keeps the runner from triggering a config-health-recording
   // registry load on every createApp() in the test suite, which would otherwise
   // race into unrelated tests. Liveness still reports ranOnLoad with a 0 count.
-  if (!options.authToken || options.authToken.trim() === "") {
+  const gateToken = resolveAuthToken(options.authToken);
+  if (!gateToken || gateToken.trim() === "") {
     _liveness = { ranOnLoad: true, migratedCount: 0, scanned: 0, lastRunAt: null, errors: ["skipped: no Linear auth token"] };
     log.info("def-state migration runner registered but skipped — no Linear auth token available");
     return;

@@ -27,8 +27,10 @@
 
 import { componentLogger, createLogger } from "./logger.js";
 import { findLabel, findOrCreateLabel } from "./linear-helpers.js";
-import { generateSpawnPreview, checkCaps, formatPreviewComment, formatCapRefusalComment, parseSpawnCaps, type SpawnPreview, type CapCheckResult, type SpawnCaps } from "./spawn-preview.js";
+import { generateSpawnPreview, checkCaps, formatPreviewComment, formatCapRefusalComment, parseSpawnCaps, type SpawnPreview, type CapCheckResult, type SpawnCaps, type FindingInput } from "./spawn-preview.js";
 import type { FanoutConfig, SpawnIfConfig, WorkflowDef } from "./workflow-gate.js";
+import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
+import type { FanoutChildForVerification } from "./post-fanout-child-verification.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "fanout");
 
@@ -52,6 +54,63 @@ const SPEC_ENTRY_MARKER_RE = /<!--\s*ai-1994:spec-entry-id:\s*(\S+?)\s*-->/;
  */
 const CHILD_WORKFLOW_MARKER_PREFIX = "<!-- inf-32:child-workflow: ";
 const CHILD_WORKFLOW_MARKER_RE = /<!--\s*inf-32:child-workflow:\s*(\S+?)\s*-->/;
+
+interface DevSprintTitleParts {
+  icon: string;
+}
+
+const DEV_SPRINT_TITLE_SHAPE_ERROR =
+  `sprint title must include a unique leading icon, cycle number, and theme in the format ` +
+  `"<icon> <Project> Cycle <N> — <Theme>".`;
+
+function parseDevSprintTitle(title: string): DevSprintTitleParts | null {
+  const trimmed = title.trim();
+  const icon = trimmed.split(/\s+/, 1)[0] ?? "";
+  if (!icon || /^[A-Za-z0-9]/.test(icon)) return null;
+  if (!/\bCycle\s+\d+\b/i.test(trimmed)) return null;
+  if (!/\s[—–-]\s+\S/.test(trimmed)) return null;
+  return { icon };
+}
+
+function sprintTitleShapeError(title: string): string {
+  return `Refusing fan-out: ${DEV_SPRINT_TITLE_SHAPE_ERROR} Invalid sprint title: "${title}".`;
+}
+
+function validateSprintChildTitleShapes(
+  findings: Finding[],
+  defaultChildWorkflow: string,
+): { ok: true } | { ok: false; findingIndex: number; message: string } {
+  for (let i = 0; i < findings.length; i++) {
+    const finding = findings[i];
+    const childWorkflow = finding.child_workflow ?? defaultChildWorkflow;
+    if (childWorkflow !== "wf:dev-sprint") continue;
+    if (parseDevSprintTitle(finding.title)) continue;
+    return { ok: false, findingIndex: i, message: sprintTitleShapeError(finding.title) };
+  }
+  return { ok: true };
+}
+
+let fanoutPreviewCreateRegistered = false;
+
+export function registerFanoutPreviewCreate(): void {
+  fanoutPreviewCreateRegistered = true;
+  log.info("fanout: preview/create component registered (shared sprint title validation active)");
+}
+
+export function getFanoutPreviewCreateLiveness(): {
+  registered: boolean;
+  subscribed: boolean;
+  sprintTitleValidation: { preview: boolean; create: boolean };
+} {
+  return {
+    registered: fanoutPreviewCreateRegistered,
+    subscribed: fanoutPreviewCreateRegistered,
+    sprintTitleValidation: {
+      preview: true,
+      create: true,
+    },
+  };
+}
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -84,6 +143,8 @@ export interface Finding {
    * Parsed from the `[wf:sprint-arm-ux → signe]` marker (the part after →).
    */
   delegate?: string;
+  /** INF-530: natural dev-sprint arm types that are invalid in spawn-arms. */
+  unsupportedArmType?: string;
   /** INF-359: classification of this implementation entry. */
   classification?: string;
   /** INF-359: capability this entry traces to, when classification requires one. */
@@ -102,6 +163,13 @@ export interface ExistingChild {
   specEntryId: string;
   /** Current workflow state (any state suppresses re-spawn — informational). */
   state?: string;
+  /**
+   * INF-469: the child's title, as minted. Used by the duplicate-title guard
+   * (same-parent, same-child-workflow collision check) — see the mint loop in
+   * {@link executeFanout}. Optional: children fetched before this field existed
+   * carry no title, and the guard fail-opens on a missing value.
+   */
+  title?: string;
   /**
    * INF-32: the `wf:*` workflow that minted this child. Spec-entry ids are
    * content-addressed, so two fan-outs on one parent sharing a `spec_source`
@@ -182,6 +250,8 @@ export interface FanoutResult {
    * accumulated history.
    */
   specMatchedChildren: string[];
+  /** INF-696: created child delegate facts used by post-fanout dispatch verification. */
+  createdChildDelegates: FanoutChildForVerification[];
 }
 
 
@@ -243,7 +313,112 @@ function withFindingMetadata(finding: Finding): Finding {
   };
 }
 
+function applyDevSprintArmInference(finding: Finding): Finding {
+  if (finding.child_workflow) return finding;
+  const title = finding.title.trim();
+  const lower = title.toLowerCase();
+  const inferred =
+    /^(scope|scoping)\s+arm\b/.test(lower) ? { child_workflow: "wf:sprint-arm-scope", delegate: "astrid" } :
+    /^spike\s+arm\b/.test(lower) ? { child_workflow: "wf:sprint-arm-spike", delegate: "igor" } :
+    /^(ux|user experience)\s+arm\b/.test(lower) ? { child_workflow: "wf:sprint-arm-ux", delegate: "signe" } :
+    /^design\s+arm\b/.test(lower) ? { child_workflow: "wf:sprint-arm-design", delegate: "laren" } :
+    undefined;
+  if (inferred) return { ...finding, ...inferred };
+  if (/^(impl|implementation)\s+arm\b/.test(lower)) {
+    return { ...finding, unsupportedArmType: "implementation" };
+  }
+  return finding;
+}
+
+function cleanSpawnChildDescription(description: string | null | undefined, parentIssueId?: string): string | undefined {
+  let clean = description ?? "";
+  clean = clean.replace(SPEC_ENTRY_MARKER_RE, "");
+  clean = clean.replace(CHILD_WORKFLOW_MARKER_RE, "");
+  const parentLine = parentIssueId
+    ? new RegExp(`^Parent:\\s*${parentIssueId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\n?`, "i")
+    : /^Parent:\s*.+\n?/i;
+  clean = clean.replace(parentLine, "");
+  clean = clean.trim();
+  return clean || undefined;
+}
+
+function workflowDefForLabel(registry: Map<string, WorkflowDef> | undefined, workflowLabel: string): WorkflowDef | undefined {
+  if (!registry) return undefined;
+  return registry.get(workflowLabel) ?? registry.get(workflowLabel.replace(/^wf:/, ""));
+}
+
+function isWorkflowStateActionable(def: WorkflowDef | undefined, stateLabel: string): boolean {
+  if (!def) return false;
+  const stateId = stateLabel.replace(/^state:/, "");
+  const state = def.states.find((s) => s.id === stateId);
+  return Boolean(state?.owner_role && state.kind !== "terminal");
+}
+
 // ── Finding extraction ────────────────────────────────────────────────────
+
+/**
+ * INF-730: Split a spec/findings section body into one raw entry per TOP-LEVEL
+ * list bullet.
+ *
+ * A top-level bullet starts at column 0 (no leading whitespace) with `-`, `*`,
+ * or `N.`. Indented list items, continuation paragraphs, and blank lines belong
+ * to the *current* entry's description — they are never promoted to their own
+ * entry. A top-level non-bullet prose line is dropped (matching the pre-INF-730
+ * behavior of ignoring non-marker lines) so trailing section prose never leaks
+ * into the last finding.
+ *
+ * This is the defense against a rich multi-paragraph bullet over-fanning into N
+ * children. LIF-45 Cycle 9's single `## structured` bullet minted 9 scoping
+ * children (LIF-279..287) because the old flat line-regex matched every indented
+ * `1.`/`2.` sub-item — and each interstitial bold sub-line — as its own finding.
+ *
+ * Returns raw `{ title, description }`; callers apply their own post-processing
+ * (per-entry `[wf:...]` markers, trailing-colon strip, stable ids).
+ */
+function parseSpecEntries(sectionBody: string): { title: string; description?: string }[] {
+  const boldBullet = /^[-*]\s+\*\*(.+?)\*\*(?:[:\s-]+(.*))?$/;
+  const plainBullet = /^[-*]\s+(.+?)\s*$/;
+  const numberedBullet = /^\d+\.\s+(.+?)\s*$/;
+
+  const entries: { title: string; descLines: string[] }[] = [];
+  let current: { title: string; descLines: string[] } | null = null;
+
+  for (const line of sectionBody.split("\n")) {
+    // Top-level bullets carry no leading whitespace; anything indented (or a
+    // blank line) is a continuation of the current entry, never a new one.
+    const isTopLevel = line.length > 0 && !/^\s/.test(line);
+    let title: string | undefined;
+    let inlineDesc: string | undefined;
+
+    if (isTopLevel) {
+      const bold = boldBullet.exec(line);
+      if (bold) {
+        title = bold[1].trim();
+        inlineDesc = (bold[2] ?? "").trim() || undefined;
+      } else {
+        const plain = plainBullet.exec(line);
+        if (plain) {
+          title = plain[1].trim();
+        } else {
+          const numbered = numberedBullet.exec(line);
+          if (numbered) title = numbered[1].trim();
+        }
+      }
+    }
+
+    if (title !== undefined && title !== "") {
+      current = { title, descLines: inlineDesc ? [inlineDesc] : [] };
+      entries.push(current);
+    } else if (current && (line.trim() === "" || /^\s/.test(line))) {
+      current.descLines.push(line);
+    }
+  }
+
+  return entries.map((e) => ({
+    title: e.title,
+    description: e.descLines.join("\n").trim() || undefined,
+  }));
+}
 
 /**
  * Parse findings from the ticket description.
@@ -283,16 +458,10 @@ export function extractFindings(description: string | null | undefined, fallback
   const sectionMatch = findingsSectionRegex.exec(description);
 
   if (sectionMatch) {
-    const sectionBody = sectionMatch[1];
-    // Parse bullet points or numbered lists
-    const lineRegex = /[-*]\s+\*\*(.+?)\*\*(?:[:\s-]+(.*))?|[-*]\s+(.+?)(?:\n|$)|\d+\.\s+(.+?)(?:\n|$)/g;
-    let match: RegExpExecArray | null;
-    while ((match = lineRegex.exec(sectionBody)) !== null) {
-      const title = (match[1] ?? match[3] ?? match[4] ?? "").trim();
-      const desc = (match[2] ?? "").trim();
-      if (title) {
-        findings.push({ title, description: desc || undefined });
-      }
+    // INF-730: one finding per TOP-LEVEL bullet; indented sub-items and
+    // continuation prose fold into the current entry rather than over-fanning.
+    for (const entry of parseSpecEntries(sectionMatch[1])) {
+      findings.push({ title: entry.title, description: entry.description });
     }
   }
 
@@ -376,27 +545,25 @@ export function extractSpecFindings(
   const PER_ENTRY_MARKER_RE = /^\\?\[wf:([^\s\\\]]+)(?:\s*[→>-]\s*([^\s\\\]]+))?\\?\]\s*/;
 
   if (sectionMatch) {
-    const sectionBody = sectionMatch[1];
-    const lineRegex = /[-*]\s+\*\*(.+?)\*\*(?:[:\s-]+(.*))?|[-*]\s+(.+?)(?:\n|$)|\d+\.\s+(.+?)(?:\n|$)/g;
-    let match: RegExpExecArray | null;
-    while ((match = lineRegex.exec(sectionBody)) !== null) {
-      let title = (match[1] ?? match[3] ?? match[4] ?? "").trim();
-      const desc = (match[2] ?? "").trim();
-      if (title) {
-        // AI-2199: check for per-entry child workflow marker
-        const markerMatch = PER_ENTRY_MARKER_RE.exec(title);
-        const finding: Finding = {
-          title: markerMatch ? title.slice(markerMatch[0].length) : title,
-          description: desc || undefined,
-        };
-        if (markerMatch) {
-          finding.child_workflow = `wf:${markerMatch[1]}`;
-          if (markerMatch[2]) {
-            finding.delegate = markerMatch[2];
-          }
+    // INF-730: one entry per TOP-LEVEL bullet — a multi-paragraph structured
+    // bullet (nested IN/OUT numbered lists, prose, refs line) mints exactly one
+    // scoping child instead of over-fanning into N (LIF-45 → LIF-279..287).
+    for (const entry of parseSpecEntries(sectionMatch[1])) {
+      const title = entry.title.replace(/:\s*$/, "");
+      if (!title) continue;
+      // AI-2199: check for per-entry child workflow marker
+      const markerMatch = PER_ENTRY_MARKER_RE.exec(title);
+      const finding: Finding = {
+        title: markerMatch ? title.slice(markerMatch[0].length) : title,
+        description: entry.description,
+      };
+      if (markerMatch) {
+        finding.child_workflow = `wf:${markerMatch[1]}`;
+        if (markerMatch[2]) {
+          finding.delegate = markerMatch[2];
         }
-        findings.push(finding);
       }
+      findings.push(finding);
     }
   }
 
@@ -428,7 +595,7 @@ export function extractSpecFindings(
 
   // AI-1994: every extracted entry carries a stable, engine-derived id so the
   // fan-out can dedup against already-spawned children on re-entry.
-  return withStableIds(findings.map(withFindingMetadata));
+  return withStableIds(findings.map(applyDevSprintArmInference).map(withFindingMetadata));
 }
 
 // ── INF-123: Auto-derive Findings from completed arm children ──────────────
@@ -776,6 +943,23 @@ export function validateFanoutSpec(
         `Add a '## ${config.spec_source}' section with at least one bullet (e.g. "- **Title**: detail") and retry the spawn.`,
     };
   }
+  const unsupportedArm = findings.find((f) => f.unsupportedArmType);
+  if (unsupportedArm) {
+    return {
+      ok: false,
+      reason:
+        `fan-out spec entry "${unsupportedArm.title}" is an implementation arm seed, but '${config.spec_source}' ` +
+        `spawn-arms only supports shaping arms (scope, spike, ux, design). Move implementation work to spawn-impl ` +
+        `after AC definition.`,
+    };
+  }
+  const sprintTitleValidation = validateSprintChildTitleShapes(findings, config.child_workflow);
+  if (!sprintTitleValidation.ok) {
+    return {
+      ok: false,
+      reason: sprintTitleValidation.message,
+    };
+  }
   if (config.classification_required) {
     const field = config.classification_field?.trim() || "classification";
     const allowed = new Set(config.allowed_classifications ?? []);
@@ -1035,7 +1219,7 @@ async function postSpawnIfComment(
     .join("\n");
 
   const mutation = `
-    mutation($issueId: ID!, $body: String!) {
+    mutation($issueId: String!, $body: String!) {
       commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
     }
   `;
@@ -1072,7 +1256,7 @@ async function postSpawnIfErrorComment(
   ].join("\n");
 
   const mutation = `
-    mutation($issueId: ID!, $body: String!) {
+    mutation($issueId: String!, $body: String!) {
       commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
     }
   `;
@@ -1145,6 +1329,10 @@ async function fetchIssueTeamAndParent(
 /**
  * Returns the child's human-readable identifier (e.g. "AI-1443") on success.
  */
+type CreateChildIssueResult =
+  | { ok: true; child: { internalId: string; identifier: string } }
+  | { ok: false; error: string };
+
 async function createChildIssue(
   teamId: string,
   title: string,
@@ -1153,7 +1341,8 @@ async function createChildIssue(
   labelIds: string[],
   authToken: string,
   delegateId?: string | null,
-): Promise<{ internalId: string; identifier: string } | null> {
+  stateId?: string | null,
+): Promise<CreateChildIssueResult> {
   const mutation = `
     mutation CreateChild($input: IssueCreateInput!) {
       issueCreate(input: $input) {
@@ -1170,6 +1359,13 @@ async function createChildIssue(
     parentId: parentIssueId,
   };
   if (delegateId) input.delegateId = delegateId;
+  // INF-748: pin the child's native Linear state at mint so it is born in the
+  // column its state:* label declares (e.g. Doing/To Do), not the team-default
+  // Backlog. Without stateId the issueCreate lands the child in Backlog, where
+  // consider-work/begin-work are refused and the delegate cannot pick it up.
+  // Fail-open: when the caller could not resolve a stateId, omit it and let
+  // Linear apply the team default (legacy behavior) rather than aborting the mint.
+  if (stateId) input.stateId = stateId;
 
   try {
     const res = await fetch(LINEAR_API_URL, {
@@ -1184,17 +1380,21 @@ async function createChildIssue(
           issue?: { id: string; identifier: string } | null;
         };
       };
+      errors?: Array<{ message?: string }>;
     };
     const data = (await res.json()) as Resp;
     const result = data.data?.issueCreate;
     if (result?.success && result.issue) {
-      return { internalId: result.issue.id, identifier: result.issue.identifier };
+      return { ok: true, child: { internalId: result.issue.id, identifier: result.issue.identifier } };
     }
-    log.warn(`fanout: issueCreate returned non-success for '${title}': ${JSON.stringify(result)}`);
-    return null;
+    const errorDetail = data.errors?.map((e) => e.message ?? JSON.stringify(e)).join("; ")
+      ?? `issueCreate returned non-success: ${JSON.stringify(result)}`;
+    log.warn(`fanout: issueCreate returned non-success for '${title}': ${errorDetail}`);
+    return { ok: false, error: errorDetail };
   } catch (err) {
-    log.error(`fanout: issueCreate failed for '${title}': ${err instanceof Error ? err.message : String(err)}`);
-    return null;
+    const error = err instanceof Error ? err.message : String(err);
+    log.error(`fanout: issueCreate failed for '${title}': ${error}`);
+    return { ok: false, error };
   }
 }
 
@@ -1292,6 +1492,27 @@ export async function executeFanout(
      * auto-migrate children to escape (terminal).
      */
     lookupEntryState?: (workflowLabel: string) => Promise<string | undefined>;
+    /**
+     * INF-748: resolve a child workflow's entry-state native Linear stateId for
+     * the given team. Given a wf:* label and the team id, returns the Linear
+     * workflow state UUID that matches the entry state's `native_state`, so the
+     * child is minted directly into that column instead of the team-default
+     * Backlog. When omitted (or when it returns null/undefined), createChildIssue
+     * omits stateId and the child lands in the team default — the pre-INF-748
+     * behavior, preserved for backward compat and as a fail-open path.
+     */
+    lookupEntryStateId?: (
+      workflowLabel: string,
+      teamId: string,
+    ) => Promise<string | null | undefined>;
+    /**
+     * INF-570: workflow registry and dispatch seams used to route children born
+     * directly into an actionable entry state through the canonical wake/ack
+     * contract. Omitted callers preserve the historical no-dispatch behavior.
+     */
+    workflowRegistry?: Map<string, WorkflowDef>;
+    dispatchAckTracker?: DispatchAckTracker;
+    wakeFn?: (agentName: string, ticketIdentifier: string) => Promise<void>;
   },
 ): Promise<FanoutResult> {
   const result: FanoutResult = {
@@ -1304,6 +1525,7 @@ export async function executeFanout(
     unmatchedChildren: [],
     attempted: 0,
     specMatchedChildren: [],
+    createdChildDelegates: [],
   };
 
   // AI-1992 AC7 (spawn time): the child workflow type is config-driven and MUST
@@ -1342,6 +1564,36 @@ export async function executeFanout(
       findingIndex: -1,
       message: `No '${config.spec_source}' entries found — fan-out requires at least one parseable spec entry`,
     });
+    return result;
+  }
+  const unsupportedArm = findings.find((f) => f.unsupportedArmType);
+  if (unsupportedArm) {
+    result.refused = true;
+    result.errors.push({
+      findingIndex: findings.indexOf(unsupportedArm),
+      message:
+        `Refusing fan-out: "${unsupportedArm.title}" is an implementation arm seed, but '${config.spec_source}' ` +
+        `spawn-arms only supports shaping arms (scope, spike, ux, design). Move implementation work to spawn-impl.`,
+    });
+    return result;
+  }
+  const sprintTitleValidation = validateSprintChildTitleShapes(findings, childWorkflowLabel);
+  if (!sprintTitleValidation.ok) {
+    result.refused = true;
+    result.errors.push({
+      findingIndex: sprintTitleValidation.findingIndex,
+      message: sprintTitleValidation.message,
+    });
+    await postPreviewComment(
+      parentCtx.internalId,
+      `⛔️ **Fan-out refused — invalid sprint title.**\n\n${sprintTitleValidation.message}\n\n` +
+        `No preview was generated and no children were created. Fix the title and retry the fan-out.`,
+      authToken,
+    );
+    log.warn(
+      `fanout: REFUSED — invalid sprint title shape before preview/create for ${parentIssueId}: ` +
+        sprintTitleValidation.message,
+    );
     return result;
   }
 
@@ -1396,10 +1648,24 @@ export async function executeFanout(
   if (toSpawn.length === 0) {
     // AC3: unchanged spec re-entry (or every entry already has a child) spawns
     // nothing. This is a legitimate no-op, not a refusal.
+    // INF-453: if every entry is already spawned, the loop is satisfied.
     log.info(
       `fanout: incremental dedup — nothing new to spawn for ${parentIssueId} ` +
       `(${findings.length} spec entr${findings.length === 1 ? "y" : "ies"}, all already spawned)`,
     );
+    return result;
+  }
+
+  // INF-453: Guard against zero arms/spec in dev-sprint.
+  // If we reach this point and findings.length is 0, it means there is no spec
+  // and no existing children. For dev-sprint, this is a stall.
+  if (findings.length === 0 && config.child_workflow?.includes("sprint-arm")) {
+    const errorMsg = "Refusing to spawn: No arms found in the ## Structured section. A dev-sprint requires at least one arm to proceed. If arms were delivered out-of-band, use the 'cancel' or 'abandon' commands to terminate this sprint.";
+    result.errors.push({
+      findingIndex: -1,
+      message: errorMsg,
+    });
+    log.warn(`fanout: ${errorMsg}`);
     return result;
   }
 
@@ -1451,10 +1717,16 @@ export async function executeFanout(
   if (!options?.skipPreview) {
     const caps = options?.caps ?? parseSpawnCaps();
 
+    const previewFindings: FindingInput[] = toSpawn.map((f) => ({
+      title: f.title,
+      description: f.description,
+      child_workflow: f.child_workflow ?? childWorkflowLabel,
+    }));
+
     const previewResult = await generateSpawnPreview(
       parentIssueId,
       authToken,
-      toSpawn.map((f) => ({ title: f.title, description: f.description })),
+      previewFindings,
       caps,
     );
 
@@ -1526,6 +1798,11 @@ export async function executeFanout(
   //    Cache resolved label ids by state name to avoid redundant API calls
   //    when multiple children share the same workflow entry_state.
   const stateLabelCache = new Map<string, string>();
+  // INF-748: cache resolved native Linear stateIds by child workflow label so
+  // sibling children sharing a workflow reuse one team-states lookup. A resolved
+  // miss is cached as null so we don't re-probe a workflow that has no mappable
+  // entry native_state.
+  const stateIdCache = new Map<string, string | null>();
 
   // AI-1992: optional initial delegate from config (used as default when
   // per-entry delegate is not set). Resolve once for reuse.
@@ -1564,6 +1841,72 @@ export async function executeFanout(
 
     // AI-2199: per-entry child workflow override. Falls back to config default.
     const findingWorkflow = finding.child_workflow ?? childWorkflowLabel;
+
+    if (findingWorkflow === "wf:dev-sprint") {
+      const titleParts = parseDevSprintTitle(childTitle);
+      if (!titleParts) {
+        result.errors.push({
+          findingIndex: i,
+          message:
+            `Refusing to spawn: sprint title "${childTitle}" must include a unique leading icon, ` +
+            `cycle number, and theme in the format "<icon> <Project> Cycle <N> — <Theme>".`,
+        });
+        log.warn(`fanout: REFUSED — invalid sprint title shape for finding ${i + 1}/${toSpawn.length}: "${childTitle}"`);
+        continue;
+      }
+    }
+
+    // INF-469: duplicate-title guard for wf:dev-sprint children. INF-439/INF-468
+    // both minted as "🔒 Connector 2026-07-23 Sprint" — identical title, indistinguishable
+    // on Matt's active-sprint dashboard. The sprint title is entirely steward-authored
+    // free text (extractSpecFindings takes the `## sprint` bullet verbatim — there is no
+    // engine-side title template to "fix" beyond this). Refuse rather than silently mint
+    // a second identically-titled sprint (this codebase's established pattern — see the
+    // dangling `-->` guard above): a collision means the steward re-wrote the same
+    // "<emoji> <Project> <date> Sprint" bullet across a rework loop / incident-recovery
+    // re-entry without differentiating it. Scoped to same-parent history (existingChildren
+    // spans this spawner's full lifetime, including prior loop cycles) and to the same
+    // child_workflow, so an unrelated sibling fan-out can't false-positive the guard.
+    const normalizedTitle = childTitle.trim().toLowerCase();
+    const duplicateSibling = existingChildren.find(
+      (c) => c.childWorkflow === findingWorkflow && c.title?.trim().toLowerCase() === normalizedTitle,
+    );
+    if (findingWorkflow === "wf:dev-sprint" && duplicateSibling) {
+      result.errors.push({
+        findingIndex: i,
+        message:
+          `Refusing to spawn: title "${childTitle}" duplicates existing sibling ${duplicateSibling.identifier} ` +
+          `under this parent. Sprint titles must be unique for dashboard clarity — include a cycle number and ` +
+          `distinguish the theme, e.g. "<icon> <Project> Cycle <N> — <Theme>".`,
+      });
+      log.warn(
+        `fanout: REFUSED — duplicate sprint title for finding ${i + 1}/${toSpawn.length}: "${childTitle}" ` +
+        `(matches existing sibling ${duplicateSibling.identifier})`,
+      );
+      continue;
+    }
+
+    if (findingWorkflow === "wf:dev-sprint") {
+      const titleParts = parseDevSprintTitle(childTitle);
+      const sameIconSibling = existingChildren.find((c) => {
+        if (c.childWorkflow !== findingWorkflow || !c.title) return false;
+        return parseDevSprintTitle(c.title)?.icon === titleParts?.icon;
+      });
+      if (titleParts && sameIconSibling) {
+        result.errors.push({
+          findingIndex: i,
+          message:
+            `Refusing to spawn: sprint title "${childTitle}" reuses icon "${titleParts.icon}" from existing sibling ` +
+            `${sameIconSibling.identifier}. Sprint titles need a per-cycle unique icon for dashboard clarity.`,
+        });
+        log.warn(
+          `fanout: REFUSED — duplicate sprint icon for finding ${i + 1}/${toSpawn.length}: "${titleParts.icon}" ` +
+          `(matches existing sibling ${sameIconSibling.identifier})`,
+        );
+        continue;
+      }
+    }
+
     const wfLabelId = workflowLabelIds.get(findingWorkflow);
     if (!wfLabelId) {
       result.errors.push({
@@ -1598,6 +1941,26 @@ export async function executeFanout(
     }
     const labelIds = [wfLabelId, entryStateLabelId];
 
+    // INF-748: resolve the child's native Linear stateId so it is minted into
+    // the column its state:* label declares, not the team-default Backlog. Cache
+    // per workflow (incl. resolved misses) to avoid redundant team-states probes.
+    // Fail-open: a null result mints the child at the team default, as before.
+    let entryStateId: string | null | undefined;
+    if (options?.lookupEntryStateId) {
+      if (stateIdCache.has(findingWorkflow)) {
+        entryStateId = stateIdCache.get(findingWorkflow);
+      } else {
+        entryStateId = await options.lookupEntryStateId(findingWorkflow, parentCtx.teamId);
+        stateIdCache.set(findingWorkflow, entryStateId ?? null);
+        if (!entryStateId) {
+          log.warn(
+            `fanout: could not resolve native stateId for '${findingWorkflow}' (${stateLabelName}) ` +
+            `in finding "${childTitle}" — child will be minted at the team default state`,
+          );
+        }
+      }
+    }
+
     // AI-2199: per-entry delegate override. Falls back to config default.
     const delegateId = finding.delegate
       ? await resolveInitialDelegate(finding.delegate)
@@ -1606,16 +1969,11 @@ export async function executeFanout(
       log.warn(`fanout: per-entry delegate '${finding.delegate}' for finding "${childTitle}" did not resolve — spawning undelegated`);
     }
 
-    // Build child description: parent reference + a machine-readable spec-entry
-    // marker (AI-1994) so a later re-entry can match this child back to its spec
-    // entry and skip re-spawning it. The marker is an HTML comment — invisible
-    // in Linear's rendered markdown.
+    // Keep child descriptions user-facing. Older children may carry HTML
+    // comment markers; new children dedup by deriving the same spec-entry id
+    // from title + clean description on readback.
     const childDescription = [
       `Parent: ${parentIssueId}`,
-      finding.id ? `${SPEC_ENTRY_MARKER_PREFIX}${finding.id} -->` : "",
-      // INF-32: record the minting workflow so a later fan-out sharing this
-      // spec_source can tell this child apart from one of its own.
-      finding.id ? `${CHILD_WORKFLOW_MARKER_PREFIX}${findingWorkflow} -->` : "",
       finding.description ? `\n${finding.description}` : "",
     ].filter(Boolean).join("\n");
 
@@ -1627,20 +1985,42 @@ export async function executeFanout(
       labelIds,
       authToken,
       delegateId,
+      entryStateId,
     );
 
-    if (child) {
+    const delegateAgentName = finding.delegate ?? config.initial_delegate;
+    if (child.ok) {
       result.created++;
-      result.childIdentifiers.push(child.identifier);
-      createdInternalIds.push(child.internalId);
-      createdComponents.push({ ...child, finding });
-      log.info(`fanout: created child ${child.identifier} — "${childTitle}" (finding ${i + 1}/${toSpawn.length})`);
+      result.childIdentifiers.push(child.child.identifier);
+      result.createdChildDelegates.push({
+        identifier: child.child.identifier,
+        delegateAgentId: delegateAgentName && delegateId ? delegateAgentName : null,
+      });
+      createdInternalIds.push(child.child.internalId);
+      createdComponents.push({ ...child.child, finding });
+      log.info(`fanout: created child ${child.child.identifier} — "${childTitle}" (finding ${i + 1}/${toSpawn.length})`);
+
+      if (
+        delegateAgentName &&
+        delegateId &&
+        options?.wakeFn &&
+        options.dispatchAckTracker &&
+        isWorkflowStateActionable(workflowDefForLabel(options.workflowRegistry, findingWorkflow), stateLabelName)
+      ) {
+        try {
+          await options.wakeFn(delegateAgentName, child.child.identifier);
+          options.dispatchAckTracker.recordDispatch(delegateAgentName, child.child.identifier);
+        } catch (wakeErr) {
+          const wakeMsg = wakeErr instanceof Error ? wakeErr.message : String(wakeErr);
+          log.warn(`fanout: wake failed for child ${child.child.identifier} → ${delegateAgentName}: ${wakeMsg}`);
+        }
+      }
     } else {
       result.errors.push({
         findingIndex: i,
-        message: `Failed to create child for finding: "${childTitle}"`,
+        message: `Failed to create child for finding "${childTitle}": ${child.error}`,
       });
-      log.warn(`fanout: failed to create child for finding ${i + 1}/${toSpawn.length}: "${childTitle}"`);
+      log.warn(`fanout: failed to create child for finding ${i + 1}/${toSpawn.length}: "${childTitle}" — ${child.error}`);
     }
   }
 
@@ -1691,6 +2071,24 @@ export async function executeFanout(
           continue;
         }
 
+        // INF-748: mint the integration-verify child into its entry native
+        // state as well, on the same fail-open contract as the finding children.
+        let verifyStateId: string | null | undefined;
+        if (options?.lookupEntryStateId) {
+          if (stateIdCache.has(verifyWorkflow)) {
+            verifyStateId = stateIdCache.get(verifyWorkflow);
+          } else {
+            verifyStateId = await options.lookupEntryStateId(verifyWorkflow, parentCtx.teamId);
+            stateIdCache.set(verifyWorkflow, verifyStateId ?? null);
+            if (!verifyStateId) {
+              log.warn(
+                `fanout: could not resolve native stateId for integration verification workflow ` +
+                `'${verifyWorkflow}' (${stateLabelName}) — child will be minted at the team default state`,
+              );
+            }
+          }
+        }
+
         const verifyDescription = [
           `Parent: ${parentIssueId}`,
           `Capability: ${capability}`,
@@ -1706,22 +2104,27 @@ export async function executeFanout(
           [verifyWfLabelId, entryStateLabelId],
           authToken,
           configDelegateId,
+          verifyStateId,
         );
-        if (!verifyChild) {
+        if (!verifyChild.ok) {
           result.errors.push({
             findingIndex: -1,
-            message: `Failed to create integration verification child for capability '${capability}'`,
+            message: `Failed to create integration verification child for capability '${capability}': ${verifyChild.error}`,
           });
           continue;
         }
         result.created++;
-        result.childIdentifiers.push(verifyChild.identifier);
-        result.specMatchedChildren.push(verifyChild.identifier);
+        result.childIdentifiers.push(verifyChild.child.identifier);
+        result.createdChildDelegates.push({
+          identifier: verifyChild.child.identifier,
+          delegateAgentId: config.initial_delegate && configDelegateId ? config.initial_delegate : null,
+        });
+        result.specMatchedChildren.push(verifyChild.child.identifier);
         for (const component of components) {
-          await createBlockingRelation(component.internalId, verifyChild.internalId, authToken);
+          await createBlockingRelation(component.internalId, verifyChild.child.internalId, authToken);
         }
         log.info(
-          `fanout: created integration verification child ${verifyChild.identifier} for capability '${capability}' ` +
+          `fanout: created integration verification child ${verifyChild.child.identifier} for capability '${capability}' ` +
           `blocked by ${components.map((c) => c.identifier).join(", ")}`,
         );
       }
@@ -1756,7 +2159,7 @@ async function postPreviewComment(
   authToken: string,
 ): Promise<void> {
   const mutation = `
-    mutation($issueId: ID!, $body: String!) {
+    mutation($issueId: String!, $body: String!) {
       commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
     }
   `;
@@ -1774,10 +2177,10 @@ async function postPreviewComment(
 
 /**
  * AI-1994: read back the parent's already-spawned children so a re-entry of the
- * fan-out state can dedup against them. Only children carrying the spec-entry
- * marker (i.e. minted by a prior fan-out of this spec) are returned; pre-marker
- * or hand-created children have no marker and are ignored — they neither
- * suppress a spawn nor surface as unmatched.
+ * fan-out state can dedup against them. Marker-era children carry an explicit
+ * spec-entry id; clean INF-530 children derive the same id from child title plus
+ * the user-facing description after stripping the parent line and any legacy
+ * markers.
  *
  * INF-32: each child's minting workflow is resolved so dedup can scope to it —
  * from the `inf-32:child-workflow` marker when present, else from the child's own
@@ -1795,7 +2198,7 @@ async function fetchExistingSpawnChildren(
   const query = `
     query FanoutChildren($id: String!) {
       issue(id: $id) {
-        children { nodes { identifier description state { name } labels { nodes { name } } } }
+        children { nodes { identifier title description state { name } labels { nodes { name } } } }
       }
     }
   `;
@@ -1811,6 +2214,7 @@ async function fetchExistingSpawnChildren(
           children?: {
             nodes?: Array<{
               identifier: string;
+              title?: string | null;
               description?: string | null;
               state?: { name?: string } | null;
               labels?: { nodes?: Array<{ name?: string }> } | null;
@@ -1824,21 +2228,28 @@ async function fetchExistingSpawnChildren(
     const children: ExistingChild[] = [];
     for (const n of nodes) {
       const m = SPEC_ENTRY_MARKER_RE.exec(n.description ?? "");
-      if (m) {
-        // INF-32: marker first (authoritative — written at mint time), then the
-        // child's live wf:* label. Neither ⇒ a pre-INF-32 child; leave undefined
-        // rather than guessing, and let dedupeSpawnSpec report the fallback.
-        const wfMarker = CHILD_WORKFLOW_MARKER_RE.exec(n.description ?? "");
-        const wfLabel = (n.labels?.nodes ?? [])
-          .map((l) => l.name)
-          .find((name): name is string => typeof name === "string" && /^wf:.+/.test(name));
-        children.push({
-          identifier: n.identifier,
-          specEntryId: m[1],
-          state: n.state?.name,
-          childWorkflow: wfMarker ? wfMarker[1] : wfLabel,
-        });
-      }
+      // INF-530: recognize both legacy marker-bearing children and clean
+      // marker-free children. The spec-entry id comes from the marker when
+      // present, else it is re-derived from the child title + cleaned
+      // description (Parent: line + legacy markers stripped) so dedup survives
+      // marker removal. Require a wf:* label so childWorkflow is always known.
+      const wfMarker = CHILD_WORKFLOW_MARKER_RE.exec(n.description ?? "");
+      const wfLabel = (n.labels?.nodes ?? [])
+        .map((l) => l.name)
+        .find((name): name is string => typeof name === "string" && /^wf:.+/.test(name));
+      const hasParentRef = /^Parent:\s*.+/i.test(n.description ?? "");
+      const cleanDescription = cleanSpawnChildDescription(n.description);
+      const specEntryId = m?.[1] ?? (hasParentRef && n.title ? deriveFindingId(n.title, cleanDescription) : undefined);
+      if (!specEntryId || !wfLabel) continue;
+      children.push({
+        identifier: n.identifier,
+        specEntryId,
+        state: n.state?.name,
+        childWorkflow: wfMarker ? wfMarker[1] : wfLabel,
+        // INF-469/INF-501: preserved through the INF-530 merge — the duplicate-title
+        // guard in executeFanout reads ExistingChild.title.
+        title: n.title ?? undefined,
+      });
     }
     return children;
   } catch (err) {
@@ -1890,8 +2301,18 @@ export function shouldTriggerFanout(
   const breakGlass = def.break_glass?.command ?? "escape";
   if (intent === breakGlass) return null;
   // The intent must be a real forward transition command declared on this state.
-  const isForwardCommand = (state.transitions ?? []).some((t) => t.command === intent);
-  if (!isForwardCommand) return null;
+  const transition = (state.transitions ?? []).find((t) => t.command === intent);
+  if (!transition) return null;
+  // INF-528: a `requires_children_terminal` transition is a governed *convergence*
+  // edge — it fires only when the children already exist and are all terminal, the
+  // logical inverse of a spawn (which *creates* children). Such an edge must never
+  // trip the pre-transition fan-out spawn-spec gate. Without this guard, `converge`
+  // out of a fanout state (dev-sprint `spawn-impl`) resolves command-legality, then
+  // the AI-1992 gate intercepts it with `fanout-spec-invalid` ("no 'findings'
+  // entries") *before* its own children-terminal gate can run — re-wedging the very
+  // already-spawned sprint (LSO-1) this edge exists to close. Route it past the
+  // spawn gate to its declared gates.
+  if (transition.requires_children_terminal) return null;
   return state.fanout;
 }
 

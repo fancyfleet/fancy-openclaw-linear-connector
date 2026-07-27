@@ -98,6 +98,8 @@ interface FetchScenario {
     labelNodes: Array<{ id: string; name: string }>;
     delegateId?: string | null;
     teamId: string;
+    /** INF-608: native Linear state for the terminality guard. Defaults to null (non-terminal). */
+    nativeState?: { name: string; type: string } | null;
   }>;
   /** Whether the issueUpdate mutation returns success. */
   mutationSuccess?: boolean;
@@ -134,6 +136,7 @@ function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
         labels: { nodes: t.labelNodes },
         delegate: t.delegateId ? { id: t.delegateId } : null,
         team: { id: t.teamId },
+        state: t.nativeState ?? null,
         title: `Ticket ${t.identifier}`,
       }));
       return new Response(
@@ -628,6 +631,167 @@ describe("AC3: enrolled ticket (state:* present) never touched; no double-bootst
   });
 });
 
+// ── INF-497: terminal workflow label + active native state → reconciled ──────
+
+describe("INF-497: Pass 3 reconciles terminal-label / active-native-state mismatch", () => {
+  const ISSUE_ID_MISMATCH = "issue-uuid-inf496-shape";
+  const DONE_STATE_ID = "team-done-state-uuid";
+
+  /**
+   * Fetch mock for the INF-496 shape: a `wf:task` + `state:done` ticket whose
+   * native Linear state is still `To Do` (type unstarted) with a null delegate.
+   * `nativeType` lets a test override the native state type to exercise the
+   * skip guards (already-completed / canceled).
+   */
+  function makeMismatchFetch(opts: {
+    mutationCalls: string[];
+    nativeType?: string;
+    nativeName?: string;
+    completedStates?: Array<{ id: string; name: string; type: string; position: number }>;
+    mutationSuccess?: boolean;
+  }): typeof fetch {
+    const {
+      mutationCalls,
+      nativeType = "unstarted",
+      nativeName = "To Do",
+      completedStates = [{ id: DONE_STATE_ID, name: "Done", type: "completed", position: 3 }],
+      mutationSuccess = true,
+    } = opts;
+
+    return async (_url, init) => {
+      const body = typeof init?.body === "string" ? init.body : "";
+
+      // Native state + delegate lookup (queryEnrolledTicketState)
+      if (body.includes("IssueContextSweep")) {
+        return new Response(
+          JSON.stringify({
+            data: { issue: { id: ISSUE_ID_MISMATCH, state: { id: "todo-state-uuid", name: nativeName, type: nativeType }, delegate: null } },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Team completed-state resolution (queryTeamCompletedStateId)
+      if (body.includes("TeamCompletedState")) {
+        return new Response(
+          JSON.stringify({ data: { team: { states: { nodes: completedStates } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Reconcile mutation
+      if (body.includes("issueUpdate") || body.includes("IssueUpdate")) {
+        mutationCalls.push(body);
+        return new Response(
+          JSON.stringify({ data: { issueUpdate: { success: mutationSuccess } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Candidate sweep query
+      if (body.includes("BootstrapReconciliation") || body.includes("wf:")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issues: {
+                nodes: [
+                  {
+                    id: ISSUE_ID_MISMATCH,
+                    identifier: "INF-496",
+                    updatedAt: OLD_TIMESTAMP,
+                    labels: { nodes: [{ id: "label-wf-task", name: "wf:task" }, { id: "label-state-done", name: "state:done" }] },
+                    delegate: null,
+                    team: { id: TEAM_ID },
+                    title: "Ticket INF-496",
+                  },
+                ],
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      return new Response(JSON.stringify({ data: {} }), { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+  }
+
+  it("pushes native state to the team completed state, clears delegate, and leaves labels untouched", async () => {
+    const mutationCalls: string[] = [];
+    const { bus, alerts } = makeTestAlertBus();
+    globalThis.fetch = makeMismatchFetch({ mutationCalls });
+
+    const result = await runBootstrapReconciliationSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: WORKFLOW_REGISTRY as never,
+      alertBus: bus,
+    });
+
+    expect(result.healed).toBe(1);
+    expect(result.errors).toHaveLength(0);
+
+    // Exactly one reconcile mutation, targeting the completed state + clearing delegate.
+    expect(mutationCalls).toHaveLength(1);
+    const mutation = mutationCalls[0];
+    expect(mutation).toContain(DONE_STATE_ID);
+    expect(mutation).toContain("delegateId");
+    // Must NOT touch labels — the workflow record is already terminal and correct.
+    expect(mutation).not.toContain("labelIds");
+
+    // Audited via the alert bus, not a ticket comment.
+    const reconcileAlerts = alerts.filter((a) => a.title.includes("reconciled terminal-label"));
+    expect(reconcileAlerts).toHaveLength(1);
+    expect(reconcileAlerts[0].ticket).toBe("INF-496");
+  });
+
+  it("does NOT force-complete a ticket whose native state is already canceled", async () => {
+    const mutationCalls: string[] = [];
+    const { bus } = makeTestAlertBus();
+    globalThis.fetch = makeMismatchFetch({ mutationCalls, nativeType: "canceled", nativeName: "Canceled" });
+
+    const result = await runBootstrapReconciliationSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: WORKFLOW_REGISTRY as never,
+      alertBus: bus,
+    });
+
+    expect(result.healed).toBe(0);
+    expect(mutationCalls).toHaveLength(0);
+  });
+
+  it("does nothing when the native state is already completed (Pass 2's domain)", async () => {
+    const mutationCalls: string[] = [];
+    const { bus } = makeTestAlertBus();
+    // native already completed + no merged PR → Pass 2 skips, Pass 3 skips.
+    globalThis.fetch = makeMismatchFetch({ mutationCalls, nativeType: "completed", nativeName: "Done" });
+
+    const result = await runBootstrapReconciliationSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: WORKFLOW_REGISTRY as never,
+      alertBus: bus,
+    });
+
+    expect(result.healed).toBe(0);
+    expect(mutationCalls).toHaveLength(0);
+  });
+
+  it("records an error and does not heal when the team has no completed state", async () => {
+    const mutationCalls: string[] = [];
+    const { bus } = makeTestAlertBus();
+    globalThis.fetch = makeMismatchFetch({ mutationCalls, completedStates: [] });
+
+    const result = await runBootstrapReconciliationSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: WORKFLOW_REGISTRY as never,
+      alertBus: bus,
+    });
+
+    expect(result.healed).toBe(0);
+    expect(mutationCalls).toHaveLength(0);
+    expect(result.errors.some((e) => e.includes("no completed state"))).toBe(true);
+  });
+});
+
 // ── AC4: Linear API failure → alert emitted, no crash ────────────────────
 
 describe("AC4: Linear API error → alert rather than crash", () => {
@@ -810,5 +974,132 @@ describe("registerBootstrapReconciliationCron: behavioral — heal produces aler
 
     alertSpy.mockRestore();
     _resetAlertBusForTests();
+  });
+});
+
+// ── INF-608: native-terminal tickets draw zero wakes from the bootstrap sweep ──
+//
+// Sibling defect to INF-604 / symmetric to INF-584. The bootstrap-reconciliation
+// sweep queried issues(filter: wf:*), which INCLUDES native-Done issues (Done is
+// not archived). A native-Done ticket carrying a wf:* label but missing its
+// state:* label was treated as "unenrolled" by Pass 1 and re-enrolled to the
+// entry state — Done → Doing — then its first owner (TDD) was woken, which put it
+// straight back to Done: the observed DSN-5 Done→Doing→Done loop. Passes 1 & 2 are
+// now gated by isTerminalIssueState(nativeState).
+describe("INF-608: native-terminal ticket missing state:* draws zero wakes (Pass 1)", () => {
+  it("does not re-enroll or wake a native-Done wf:* ticket with no state:* label", async () => {
+    const mutationCalls: string[] = [];
+    const wakeDispatches: Array<{ agentName: string; ticketIdentifier: string }> = [];
+    const { bus, alerts } = makeTestAlertBus();
+
+    globalThis.fetch = async (url, init) => {
+      const body = typeof init?.body === "string" ? init.body : "";
+      if (body.includes("issueUpdate") || body.includes("IssueUpdate")) {
+        mutationCalls.push(body);
+      }
+      return makeReconciliationFetch({
+        unenrolledTickets: [
+          {
+            id: ISSUE_ID_UNENROLLED,
+            identifier: "DSN-5",
+            updatedAt: OLD_TIMESTAMP,
+            // wf:* present, NO state:* — the "unenrolled" shape Pass 1 heals…
+            labelNodes: [{ id: WF_LABEL_ID, name: WF_LABEL_NAME }],
+            delegateId: null,
+            teamId: TEAM_ID,
+            // …but the Linear entity is natively Done. Native terminality wins.
+            nativeState: { name: "Done", type: "completed" },
+          },
+        ],
+      })(url, init);
+    };
+
+    const result = await runBootstrapReconciliationSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: WORKFLOW_REGISTRY as Map<string, Parameters<typeof runBootstrapReconciliationSweep>[0]["workflowRegistry"] extends Map<string, infer V> ? V : never>,
+      alertBus: bus,
+      wakeFn: async (agentName, ticketIdentifier) => {
+        wakeDispatches.push({ agentName, ticketIdentifier });
+      },
+    });
+
+    // AC1/AC2: zero heals, zero re-enrollment mutation, zero wakes.
+    expect(result.healed).toBe(0);
+    expect(wakeDispatches).toHaveLength(0);
+    expect(result.errors).toHaveLength(0);
+    // No issueUpdate mutation carrying the entry state:* label (no Done→Doing).
+    const combined = mutationCalls.join("\n");
+    expect(combined).not.toContain(STATE_INTAKE_LABEL_ID);
+    // No bootstrap-reconciled heal alert.
+    expect(alerts.filter((a) => a.source === "bootstrap-reconciled")).toHaveLength(0);
+  });
+
+  it("also skips a native-Canceled wf:* ticket with no state:* label", async () => {
+    const mutationCalls: string[] = [];
+    const wakeDispatches: string[] = [];
+    const { bus } = makeTestAlertBus();
+
+    globalThis.fetch = async (url, init) => {
+      const body = typeof init?.body === "string" ? init.body : "";
+      if (body.includes("issueUpdate") || body.includes("IssueUpdate")) {
+        mutationCalls.push(body);
+      }
+      return makeReconciliationFetch({
+        unenrolledTickets: [
+          {
+            id: ISSUE_ID_UNENROLLED,
+            identifier: "DSN-9",
+            updatedAt: OLD_TIMESTAMP,
+            labelNodes: [{ id: WF_LABEL_ID, name: WF_LABEL_NAME }],
+            delegateId: null,
+            teamId: TEAM_ID,
+            nativeState: { name: "Canceled", type: "canceled" },
+          },
+        ],
+      })(url, init);
+    };
+
+    const result = await runBootstrapReconciliationSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: WORKFLOW_REGISTRY as Map<string, Parameters<typeof runBootstrapReconciliationSweep>[0]["workflowRegistry"] extends Map<string, infer V> ? V : never>,
+      alertBus: bus,
+      wakeFn: async (_agent, id) => { wakeDispatches.push(id); },
+    });
+
+    expect(result.healed).toBe(0);
+    expect(wakeDispatches).toHaveLength(0);
+    expect(mutationCalls.join("\n")).not.toContain(STATE_INTAKE_LABEL_ID);
+  });
+
+  it("still heals a genuinely-unenrolled non-terminal ticket (guard does not over-skip)", async () => {
+    // Control: same shape but native state is active — the sweep must still heal.
+    const wakeDispatches: string[] = [];
+    const { bus } = makeTestAlertBus();
+
+    globalThis.fetch = async (url, init) => {
+      return makeReconciliationFetch({
+        unenrolledTickets: [
+          {
+            id: ISSUE_ID_UNENROLLED,
+            identifier: "AI-1799",
+            updatedAt: OLD_TIMESTAMP,
+            labelNodes: [{ id: WF_LABEL_ID, name: WF_LABEL_NAME }],
+            delegateId: null,
+            teamId: TEAM_ID,
+            nativeState: { name: "In Progress", type: "started" },
+          },
+        ],
+      })(url, init);
+    };
+
+    const result = await runBootstrapReconciliationSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: WORKFLOW_REGISTRY as Map<string, Parameters<typeof runBootstrapReconciliationSweep>[0]["workflowRegistry"] extends Map<string, infer V> ? V : never>,
+      alertBus: bus,
+      wakeFn: async (_agent, id) => { wakeDispatches.push(id); },
+    });
+
+    expect(result.healed).toBe(1);
+    expect(wakeDispatches).toHaveLength(1);
   });
 });

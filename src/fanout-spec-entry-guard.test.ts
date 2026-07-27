@@ -84,7 +84,7 @@ async function assertTitleRejected(title: string): Promise<void> {
               labels: {
                 nodes: [
                   { id: "lbl-wf-dev-impl", name: "wf:dev-impl" },
-                  { id: "lbl-state-intake", name: "state:intake" },
+                  { id: "lbl-state-todo", name: "state:todo" },
                 ],
               },
             },
@@ -212,7 +212,7 @@ async function assertCleanTitleAccepted(title: string): Promise<void> {
         JSON.stringify({
           data: { team: { labels: { nodes: [
             { id: "lbl-wf-dev-impl", name: "wf:dev-impl" },
-            { id: "lbl-state-intake", name: "state:intake" },
+            { id: "lbl-state-todo", name: "state:todo" },
           ] } } },
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
@@ -336,7 +336,7 @@ describe("AC1: Spawner guard against spec-hash titles", () => {
         return new Response(
           JSON.stringify({ data: { team: { labels: { nodes: [
             { id: "lbl-wf-dev-impl", name: "wf:dev-impl" },
-            { id: "lbl-state-intake", name: "state:intake" },
+            { id: "lbl-state-todo", name: "state:todo" },
           ] } } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );

@@ -18,8 +18,11 @@
 # Completion path (all forward edges are `generic: continue`, so a single agent
 #   verb — `linear continue-workflow` — carries a ticket the whole way):
 #     intake --request--> routing --assign--> doing --submit--> review
-#            --approve--> sign-off --accept--> done
+#            --approve--> merge --continue--> sign-off --accept--> done
 #   `request-revision` walks the two revision edges (review→doing, sign-off→doing).
+#   It is also legal from intake as a steward recovery edge for bounced worker
+#   tickets whose labels re-entered at intake while the requested revision still
+#   belongs with the prior/intended worker.
 #
 # Break-glass (AI-2095): escape RE-ENTERS the workflow at `intake`, it does NOT
 #   land in a terminal state. Before AI-2095, break_glass.to pointed at a
@@ -50,7 +53,7 @@
 #   (Archetype C, §14b), it is not a `task`.
 
 id: task
-version: 2                      # AI-2095: break_glass.to intake + terminal escape state removed
+version: 3                      # INF-804: approved PR tasks route through merge gate before sign-off
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
 
@@ -79,6 +82,20 @@ states:
       - command: request
         to: routing
         generic: continue      # `linear continue-workflow` — routing auto-assigns the head (singleton)
+        assign: { mode: auto }
+      - command: request-changes
+        to: doing
+        generic: revision      # `linear request-revision <worker>` — recovery from bounced intake
+        assign:
+          mode: required       # worker is multi-body; do not guess
+        feedback:
+          required: true
+          category_enum:
+            - incomplete
+            - off-brief
+            - quality
+            - scope-creep
+            - correctness
       - command: demote
         to: __ad_hoc__         # leaves the workflow entirely (design.md §4.5) — also the escape exit
 
@@ -104,6 +121,8 @@ states:
       - command: submit
         to: review
         generic: continue      # `linear continue-workflow` — review auto-assigns the head (singleton)
+        assign: { mode: auto }
+        requires_deploy_probe: true
 
   - id: review
     owner_role: department-head    # SAME body as routing (domain-routed, pinned)
@@ -112,8 +131,9 @@ states:
     sla: 24h                       # time-in-state; breach → stall escalation (design.md §5.5)
     transitions:
       - command: approve
-        to: sign-off
-        generic: continue      # `linear continue-workflow` — sign-off auto-assigns the requester (singleton)
+        to: merge
+        generic: continue      # `linear continue-workflow` — merge auto-assigns Hanzo
+        assign: { mode: auto }
       - command: request-changes
         to: doing
         generic: revision      # `linear request-revision`
@@ -127,14 +147,41 @@ states:
             - scope-creep
             - correctness
 
+  - id: merge
+    owner_role: deployment          # Hanzo; protected-main merge gate
+    kind: normal
+    native_state: todo
+    sla: 4h
+    transitions:
+      - command: continue
+        to: sign-off
+        generic: continue           # after merge, requester sign-off can close
+        requires_capability: deploy:execute
+        assign:
+          mode: auto
+          selection_criteria: original-requester
+      - command: reject
+        to: doing
+        requires_comment: true
+        assign: { default: prior-implementer }
+        feedback:
+          required: true
+          category_enum:
+            - incomplete
+            - off-brief
+            - quality
+            - scope-creep
+            - correctness
+
   - id: sign-off
     owner_role: requester          # SAME body as intake (instance-bound: matt or ai)
-    kind: normal
+    kind: approval_gate            # INF-562: rests for requester sign-off; prior review approval cannot auto-complete it
     native_state: todo
     transitions:
       - command: accept
         to: done                   # terminal
         generic: continue          # `linear continue-workflow`
+        requires_deploy_probe: true
       - command: reject
         to: doing
         generic: revision          # `linear request-revision`
@@ -152,10 +199,3 @@ states:
     kind: terminal
     native_state: done
     satisfies_parent_barrier: true   # uniform terminal contract (design.md §5.4)
-
-  # AI-2095: the terminal `escape` state (native_state: invalid) was REMOVED.
-  # It was a roach motel — break-glass landed here and the only legal move was
-  # `escape` again, so an escaped ticket could never reach a clean terminal by
-  # agent verbs. break_glass.to now points at `intake` (see above), matching the
-  # dev-impl AI-1710 model, so no ticket can land in a terminal escape state and
-  # any legacy `state:escape` ticket recovers by escaping once more into intake.

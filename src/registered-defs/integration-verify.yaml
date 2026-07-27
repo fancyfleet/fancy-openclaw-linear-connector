@@ -1,14 +1,17 @@
-# integration-verify — Behavior-level capability verification child workflow (v1)
+# integration-verify — Behavior-level capability verification child workflow (v2)
 # owner: steward
-# last-updated: 2026-07-22
+# last-updated: 2026-07-26
 # status: v1 registered for dev-sprint v8 (INF-359)
 #
 # Spawned by dev-sprint spawn-impl, one child per capability. Component
 # implementation children block this ticket; the verifier records a
 # demonstration walk before completion.
+# v2 (INF-838): verification is a dev execution step, not a steward-only step,
+# so Unity demonstration work can be legally routed to Felix with an explicit
+# target while Astrid still owns intake/brief acceptance.
 
 id: integration-verify
-version: 1
+version: 2
 archetype: single-task
 entry_state: intake
 
@@ -29,10 +32,12 @@ states:
     transitions:
       - command: accept
         to: verification
+        assign:
+          mode: required
         generic: continue
 
   - id: verification
-    owner_role: steward
+    owner_role: dev
     kind: normal
     native_state: doing
     description: >
@@ -47,6 +52,20 @@ states:
         to: verification
         generic: revision
         requires_comment: true
+      - command: wait
+        to: waiting-on-blocker
+        requires_comment: true
+
+  - id: waiting-on-blocker
+    owner_role: steward
+    kind: normal
+    native_state: managing
+    description: >
+      Hold verification non-destructively while an open component ticket blocks
+      this capability demonstration.
+    transitions:
+      - command: resume
+        to: verification
 
   - id: done
     kind: terminal
