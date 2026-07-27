@@ -43,6 +43,7 @@ import type { PendingWorkBag } from "./pending-work-bag.js";
 import { normalizeSessionKey } from "../session-key.js";
 import { deliverMessageToAgent, type DeliveryConfig } from "../delivery/index.js";
 import type { DispatchAckTracker } from "./dispatch-ack-tracker.js";
+import { isBlockedByOpenIssue, isHumanLinearUser, type LinearIssueRelation, type LinearUserReference } from "../linear-actionable.js";
 
 const log = componentLogger(createLogger(), "stuck-delegate-detector");
 
@@ -119,6 +120,13 @@ export interface StuckCandidate {
    * pure noise and must be suppressed.
    */
   nonTerminalChildCount?: number;
+  /**
+   * True when the ticket is deliberately parked on a human authorization path
+   * using the connector's existing hold/actionability conventions.
+   */
+  humanHold?: boolean;
+  /** Optional assignee snapshot used by detector-boundary tests and hold checks. */
+  assignee?: LinearUserReference | null;
 }
 
 export interface StuckDelegateCycleResult {
@@ -196,6 +204,14 @@ function isChildTerminal(nativeStateType: string | null, labels: string[]): bool
   if (nativeStateType && TERMINAL_NATIVE_STATE_TYPES.has(nativeStateType)) return true;
   const workflowState = getCurrentState(labels);
   return workflowState !== null && TERMINAL_CHILD_STATES.has(workflowState);
+}
+
+function agentLinearUserIdSet(): ReadonlySet<string> {
+  return new Set(
+    getAgents()
+      .map((agent) => agent.linearUserId)
+      .filter((id): id is string => Boolean(id)),
+  );
 }
 
 // ── Build re-prompt message ──────────────────────────────────────────────────
@@ -436,6 +452,14 @@ export class StuckDelegateDetector {
           continue;
         }
 
+        if (candidate.humanHold === true) {
+          log.info(
+            `Stuck-delegate: skipping ${ticketId} — held for human authorization; ` +
+            `delegate re-prompt would be a false positive`,
+          );
+          continue;
+        }
+
         // Pattern matches: completion comment but no transition verb
         result.stuckFound++;
 
@@ -580,8 +604,15 @@ export async function defaultFetchStuckCandidates(
           identifier
           labels { nodes { name } }
           delegate { id }
+          assignee { id name app }
           updatedAt
           state { name type }
+          relations(first: 50) {
+            nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
+          }
+          inverseRelations(first: 50) {
+            nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
+          }
           children(first: 50) {
             nodes {
               identifier
@@ -622,8 +653,11 @@ export async function defaultFetchStuckCandidates(
       identifier: string;
       labels: { nodes: Array<{ name: string }> };
       delegate: { id: string } | null;
+      assignee?: LinearUserReference | null;
       updatedAt: string;
       state: { name: string; type: string } | null;
+      relations?: { nodes?: LinearIssueRelation[] | null } | null;
+      inverseRelations?: { nodes?: LinearIssueRelation[] | null } | null;
       children?: {
         nodes?: Array<{
           identifier: string;
@@ -689,6 +723,7 @@ export async function defaultFetchStuckCandidates(
     }
 
     const candidates: StuckCandidate[] = [];
+    const agentLinearUserIds = agentLinearUserIdSet();
 
     for (const issue of issues) {
       const labelNames = issue.labels.nodes.map((l) => l.name);
@@ -725,6 +760,13 @@ export async function defaultFetchStuckCandidates(
           `Stuck-delegate: skipping ${issue.identifier} — Linear entity is natively terminal ` +
           `(state.type='${issue.state?.type ?? "null"}', label state:${currentState}); ` +
           `no legal transition exists on a retired issue`,
+        );
+        continue;
+      }
+
+      if (isBlockedByOpenIssue(issue)) {
+        log.info(
+          `Stuck-delegate: skipping ${issue.identifier} — blocked by unfinished prerequisite`,
         );
         continue;
       }
@@ -779,6 +821,8 @@ export async function defaultFetchStuckCandidates(
         currentState,
         labels: labelNames,
         delegateId: issue.delegate?.id ?? "",
+        assignee: issue.assignee ?? null,
+        humanHold: isHumanLinearUser(issue.assignee, agentLinearUserIds),
         stateEnteredAt,
         delegateComments,
         transitionsAfterEntry,

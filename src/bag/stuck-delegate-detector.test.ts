@@ -1209,3 +1209,192 @@ describe("defaultFetchStuckCandidates — retired-entity guard (INF-572)", () =>
     expect(candidates[0].transitionsAfterEntry).toHaveLength(0);
   });
 });
+
+// ── INF-861: false-positive suppression at detector boundary ────────────────
+
+describe("defaultFetchStuckCandidates — INF-861 blocker suppression", () => {
+  const DELEGATE_ID = "igor-user-uuid";
+  const agent = {
+    name: "igor",
+    linearUserId: DELEGATE_ID,
+  } as unknown as AgentConfig;
+
+  function issueNodeWithBlocker(blockerState: { name: string; type: string }) {
+    return {
+      identifier: "INF-779",
+      labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] },
+      delegate: { id: DELEGATE_ID },
+      updatedAt: "2026-07-27T10:00:00.000Z",
+      state: { name: "In Progress", type: "started" },
+      children: { nodes: [] },
+      relations: { nodes: [] },
+      inverseRelations: {
+        nodes: [
+          {
+            type: "blocks",
+            issue: { id: "issue-blocker", identifier: "INF-778", state: blockerState },
+            relatedIssue: { id: "issue-blocked", identifier: "INF-779", state: { name: "In Progress", type: "started" } },
+          },
+        ],
+      },
+      comments: {
+        nodes: [
+          {
+            id: "c1",
+            createdAt: "2026-07-27T11:00:00.000Z",
+            body: "Implementation complete, waiting on blocker.",
+            user: { id: DELEGATE_ID, name: "Igor" },
+          },
+        ],
+      },
+      history: {
+        nodes: [
+          { __typename: "IssueHistory", createdAt: "2026-07-27T10:30:00.000Z", actor: { id: DELEGATE_ID } },
+        ],
+      },
+    };
+  }
+
+  function fakeFetch(node: ReturnType<typeof issueNodeWithBlocker>): typeof fetch {
+    return (async () =>
+      ({
+        ok: true,
+        status: 200,
+        json: async () => ({ data: { issues: { nodes: [node] } } }),
+      })) as unknown as typeof fetch;
+  }
+
+  const deps = (node: ReturnType<typeof issueNodeWithBlocker>) => ({
+    getToken: () => "test-token",
+    fetchImpl: fakeFetch(node),
+  });
+
+  it("AC2/AC4: excludes a stuck-looking ticket while an inbound blocker is non-terminal", async () => {
+    const candidates = await defaultFetchStuckCandidates(
+      agent,
+      deps(issueNodeWithBlocker({ name: "Doing", type: "started" })),
+    );
+    expect(candidates).toHaveLength(0);
+  });
+
+  it("AC5: still surfaces the same agent work once the blocker is terminal", async () => {
+    const candidates = await defaultFetchStuckCandidates(
+      agent,
+      deps(issueNodeWithBlocker({ name: "Done", type: "completed" })),
+    );
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].identifier).toBe("INF-779");
+    expect(candidates[0].delegateComments).toHaveLength(1);
+  });
+});
+
+describe("StuckDelegateDetector — INF-861 human-hold suppression", () => {
+  it("AC3/AC4: suppresses a stuck-looking ticket deliberately held for human authorization", async () => {
+    const dir = tempDir();
+    const deps = setupDeps(dir);
+    const wakeCalls: Array<{ agent: string; ticket: string; prompt: string }> = [];
+
+    const humanHeldCandidate = {
+      identifier: "TRVL-1",
+      currentState: "implementation",
+      labels: ["wf:dev-impl", "state:implementation"],
+      delegateId: "linear-user-igor",
+      assignee: { id: "matt-human-id", name: "Matt Henry", app: false },
+      humanHold: true,
+      stateEnteredAt: "2026-07-27T10:00:00.000Z",
+      delegateComments: [
+        {
+          id: "c1",
+          createdAt: "2026-07-27T11:00:00.000Z",
+          body: "Blocked pending Matt's authorization.",
+        },
+      ],
+      transitionsAfterEntry: [],
+    } as unknown as StuckCandidate;
+
+    const detector = new StuckDelegateDetector(
+      {
+        sessionTracker: deps.sessionTracker,
+        bag: deps.bag,
+        operationalEventStore: deps.operationalEventStore,
+        deliveryConfig: deps.deliveryConfig,
+        listAgents: () => [TEST_AGENT],
+        fetchStuckCandidates: async () => [humanHeldCandidate],
+        loadDef: async () => TEST_WORKFLOW_DEF,
+        sendWake: async (agent, ticket, prompt) => {
+          wakeCalls.push({ agent, ticket, prompt });
+          return true;
+        },
+      },
+      { pollMs: 60_000, idleGraceMs: 0, maxPrompts: 2 },
+    );
+
+    try {
+      const result = await detector.runCycle();
+      expect(result.stuckFound).toBe(0);
+      expect(result.rePromptsSent).toBe(0);
+      expect(wakeCalls).toHaveLength(0);
+    } finally {
+      detector.stop();
+      deps.bag.close();
+      deps.sessionTracker.close();
+      deps.operationalEventStore.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("AC5: still prompts unblocked non-terminal agent work with no human hold", async () => {
+    const dir = tempDir();
+    const deps = setupDeps(dir);
+    const wakeCalls: Array<{ agent: string; ticket: string; prompt: string }> = [];
+
+    const actionableCandidate: StuckCandidate = {
+      identifier: "INF-862",
+      currentState: "implementation",
+      labels: ["wf:dev-impl", "state:implementation"],
+      delegateId: "linear-user-igor",
+      stateEnteredAt: "2026-07-27T10:00:00.000Z",
+      delegateComments: [
+        {
+          id: "c1",
+          createdAt: "2026-07-27T11:00:00.000Z",
+          body: "Implementation complete.",
+        },
+      ],
+      transitionsAfterEntry: [],
+      totalChildren: 0,
+      nonTerminalChildCount: 0,
+    };
+
+    const detector = new StuckDelegateDetector(
+      {
+        sessionTracker: deps.sessionTracker,
+        bag: deps.bag,
+        operationalEventStore: deps.operationalEventStore,
+        deliveryConfig: deps.deliveryConfig,
+        listAgents: () => [TEST_AGENT],
+        fetchStuckCandidates: async () => [actionableCandidate],
+        loadDef: async () => TEST_WORKFLOW_DEF,
+        sendWake: async (agent, ticket, prompt) => {
+          wakeCalls.push({ agent, ticket, prompt });
+          return true;
+        },
+      },
+      { pollMs: 60_000, idleGraceMs: 0, maxPrompts: 2 },
+    );
+
+    try {
+      const result = await detector.runCycle();
+      expect(result.stuckFound).toBe(1);
+      expect(result.rePromptsSent).toBe(1);
+      expect(wakeCalls).toHaveLength(1);
+      expect(wakeCalls[0].ticket).toBe("INF-862");
+    } finally {
+      detector.stop();
+      deps.bag.close();
+      deps.sessionTracker.close();
+      deps.operationalEventStore.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
