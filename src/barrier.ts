@@ -491,19 +491,47 @@ async function fetchParentState(
  * barrier. When absent, all children are evaluated (current behavior).
  */
 export type ExpectedChildrenFilter = string[] | undefined;
+export interface BarrierEvaluationOptions {
+  expectedChildren?: string[];
+  barrierScope?: "owned-infra" | string;
+}
+
+function normalizeBarrierOptions(
+  input?: ExpectedChildrenFilter | BarrierEvaluationOptions,
+): { expectedChildren?: string[]; barrierScope?: string } {
+  if (Array.isArray(input)) return { expectedChildren: input };
+  if (input && typeof input === "object") {
+    return {
+      expectedChildren: Array.isArray(input.expectedChildren) ? input.expectedChildren : undefined,
+      barrierScope: input.barrierScope,
+    };
+  }
+  return {};
+}
+
+function childIsInBarrierScope(child: ChildState, barrierScope?: string): boolean {
+  if (!barrierScope) return true;
+  if (barrierScope === "owned-infra") {
+    return child.labels.includes("dept-output:owned-infra");
+  }
+  return true;
+}
 
 export async function evaluateBarrier(
   parentIdentifier: string,
   authToken: string,
-  expectedChildren?: ExpectedChildrenFilter,
+  expectedChildrenOrOptions?: ExpectedChildrenFilter | BarrierEvaluationOptions,
 ): Promise<BarrierResult> {
   const children = await fetchChildren(parentIdentifier, authToken);
+  const { expectedChildren, barrierScope } = normalizeBarrierOptions(expectedChildrenOrOptions);
 
   // INF-28: filter to the expected set if provided. This is the core fix:
   // waiting on exactly the children this cycle's fan-out produced, not the
   // accumulated history of all children the parent has ever had.
-  if (children !== null && expectedChildren && expectedChildren.length > 0) {
-    const filtered = children.filter((c) => expectedChildren.includes(c.identifier));
+  if (children !== null && (expectedChildren?.length || barrierScope)) {
+    const filtered = children
+      .filter((c) => !expectedChildren?.length || expectedChildren.includes(c.identifier))
+      .filter((c) => childIsInBarrierScope(c, barrierScope));
     if (filtered.length === 0) {
       // No expected children found — treat as zero, which means
       // all-terminal (vacuous satisfaction for the expected set).

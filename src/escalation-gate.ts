@@ -45,6 +45,8 @@ export interface PolicyBody {
    */
   openclaw_container?: string;
   fills_roles: string[];
+  departments?: string[];
+  teams?: string[];
 }
 
 interface PolicyContainer {
@@ -261,11 +263,48 @@ export async function isBodyKnown(bodyId: string): Promise<boolean> {
  * Returns body IDs that fill the given role (§16.2).
  * Used by the workflow gate to derive legal assignment targets.
  */
-export async function resolveBodiesForRole(roleId: string): Promise<string[]> {
+export interface RoleResolutionScope {
+  department?: string;
+  team?: string;
+}
+
+function bodyHasDepartmentScope(body: PolicyBody): boolean {
+  return Boolean((body.departments ?? []).length || (body.teams ?? []).length);
+}
+
+function bodyMatchesRoleScope(body: PolicyBody, scope: RoleResolutionScope): boolean {
+  const departments = body.departments ?? [];
+  const teams = body.teams ?? [];
+  if (departments.length > 0 && (!scope.department || !departments.includes(scope.department))) {
+    return false;
+  }
+  if (teams.length > 0 && (!scope.team || !teams.includes(scope.team))) {
+    return false;
+  }
+  return true;
+}
+
+export async function resolveBodiesForRole(roleId: string, scope?: RoleResolutionScope): Promise<string[]> {
   const policy = await loadPolicy();
-  return policy.bodies
-    .filter((b) => b.fills_roles.includes(roleId))
-    .map((b) => b.id);
+  const candidates = policy.bodies.filter((b) => b.fills_roles.includes(roleId));
+
+  if (roleId === "department-head" && candidates.some(bodyHasDepartmentScope)) {
+    if (!scope?.department && !scope?.team) {
+      throw new Error("department-head resolution requires a department or team scope");
+    }
+    return candidates
+      .filter(bodyHasDepartmentScope)
+      .filter((b) => bodyMatchesRoleScope(b, scope ?? {}))
+      .map((b) => b.id);
+  }
+
+  if (scope?.department || scope?.team) {
+    return candidates
+      .filter((b) => !bodyHasDepartmentScope(b) || bodyMatchesRoleScope(b, scope))
+      .map((b) => b.id);
+  }
+
+  return candidates.map((b) => b.id);
 }
 
 /**
