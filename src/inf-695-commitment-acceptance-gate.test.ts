@@ -398,6 +398,39 @@ describe("INF-695 S2 — Commitment / acceptance gate", () => {
     ops.close();
   });
 
+  it("INF-803: a conflicting duplicate commitment exit is refused without moving projection", async () => {
+    const ops = new OperationalEventStore(path.join(dir, "ops-inf-803-conflict.db"));
+    ops.append({
+      outcome: "commitment-exit-recorded",
+      agent: "igor",
+      key: ISSUE_IDENTIFIER,
+      detail: {
+        workflow: "commitment",
+        from: "investigation",
+        exit: "reject",
+        to: "rejected",
+      },
+    });
+    const { fetch, calls } = makeLinearFetch("investigation");
+    globalThis.fetch = fetch;
+
+    const result = await applyStateTransition("accept", ISSUE_UUID, "Bearer tok-igor", {
+      bodyId: "igor",
+      operationalEventStore: ops,
+    });
+
+    expect(result).toMatchObject({
+      status: "blocked",
+      code: "commitment-exit-conflict",
+      from: "investigation",
+      to: "rejected",
+    });
+    expect(result.detail).toMatch(/already recorded commitment exit 'reject'.*refusing conflicting 'accept'/i);
+    expect(ops.query({ key: ISSUE_IDENTIFIER, outcome: "commitment-exit-recorded" })).toHaveLength(1);
+    expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(false);
+    ops.close();
+  });
+
   it("INF-803: break-glass can escape a working state even when no commitment exit is recorded", async () => {
     const ops = new OperationalEventStore(path.join(dir, "ops-inf-803-break-glass.db"));
     const { fetch, calls } = makeLinearFetch("doing");
