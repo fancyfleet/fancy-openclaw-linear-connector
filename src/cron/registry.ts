@@ -293,14 +293,19 @@ export function getStaleCrons(options: GetStaleCronsOptions = {}): StaleCronEntr
   const stale: StaleCronEntry[] = [];
 
   for (const entry of getRegisteredCrons()) {
-    const baseIso = entry.lastRunAt ?? entry.registeredAt;
-    const baseMs = Date.parse(baseIso);
-    if (!Number.isFinite(baseMs)) continue;
+    const registeredMs = Date.parse(entry.registeredAt);
+    if (!Number.isFinite(registeredMs)) continue;
+
+    const lastRunMs = entry.lastRunAt == null ? null : Date.parse(entry.lastRunAt);
+    if (lastRunMs != null && !Number.isFinite(lastRunMs)) continue;
+
+    const hasPostRegistrationRun = lastRunMs != null && lastRunMs >= registeredMs;
+    const baseMs = hasPostRegistrationRun ? lastRunMs : registeredMs;
 
     const intervalMs = scheduleIntervalMs(entry.schedule, new Date(baseMs));
     if (intervalMs == null || !Number.isFinite(intervalMs) || intervalMs <= 0) continue;
 
-    const dueMs = entry.lastRunAt == null
+    const dueMs = !hasPostRegistrationRun
       ? baseMs + intervalMs
       : baseMs + intervalMs * stalenessMultiplier;
 
