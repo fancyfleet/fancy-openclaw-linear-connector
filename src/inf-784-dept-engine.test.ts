@@ -14,6 +14,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { load as loadYaml } from "js-yaml";
 import { afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals";
@@ -26,6 +27,7 @@ const REPO_ROOT = path.resolve(__dirname, "..");
 const REGISTERED_DEF_PATH = path.join(REPO_ROOT, "src/registered-defs/dept-engine.yaml");
 const CANONICAL_FIXTURE_PATH = path.join(REPO_ROOT, "src/__fixtures__/canonical-dept-engine.yaml");
 const RUNTIME_MODULE = path.join(REPO_ROOT, "src/dept-engine.ts");
+const DIST_ENTRY = path.join(REPO_ROOT, "dist/index.js");
 
 type LooseRecord = Record<string, any>;
 
@@ -53,6 +55,37 @@ function stable(value: unknown): unknown {
 
 function pathToFileUrl(file: string): string {
   return `file://${file.replace(/\\/g, "/").replace(/\.ts$/, ".js")}`;
+}
+
+async function pollHealth(url: string, timeoutMs: number): Promise<LooseRecord> {
+  const deadline = Date.now() + timeoutMs;
+  let lastErr: unknown = new Error("never attempted");
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(url);
+      const body = (await res.json()) as LooseRecord;
+      if (body && typeof body === "object") return body;
+    } catch (err) {
+      lastErr = err;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw lastErr;
+}
+
+async function stopChild(child: ChildProcess | undefined): Promise<void> {
+  if (!child || child.killed) return;
+  child.kill("SIGTERM");
+  await new Promise<void>((resolve) => {
+    const force = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve();
+    }, 2_000);
+    child.on("exit", () => {
+      clearTimeout(force);
+      resolve();
+    });
+  });
 }
 
 async function loadDeptEngineRuntime(): Promise<LooseRecord> {
@@ -124,6 +157,77 @@ describe("INF-784 AC1/AC7: wf:dept-engine def registration and fixture canary", 
     expect(transition(state(def, "validation"), "complete-cycle", "done").generic).toBe("continue");
     expect(transition(state(def, "done"), "loop", "evaluating").generic).toBe("continue");
   });
+
+  it("boots the production entry point and exposes wf:dept-engine in /health.workflowRegistry without launching a cycle", async () => {
+    expect(fs.existsSync(DIST_ENTRY)).toBe(true);
+
+    const port = 49_000 + (process.pid % 500);
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-784-bootstrap-"));
+    const agentsFile = path.join(tmpDir, "agents.json");
+    fs.writeFileSync(
+      agentsFile,
+      JSON.stringify({
+        agents: [
+          {
+            name: "charles",
+            linearUserId: "user-charles-inf784",
+            openclawAgent: "charles",
+            clientId: "client-id",
+            clientSecret: "client-secret",
+            accessToken: "access-token",
+            refreshToken: "refresh-token",
+            host: "local",
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    let child: ChildProcess | undefined;
+    let childStderr = "";
+    try {
+      child = spawn(process.execPath, [DIST_ENTRY], {
+        cwd: tmpDir,
+        env: {
+          ...process.env,
+          AGENTS_FILE: agentsFile,
+          DATA_DIR: path.join(tmpDir, "data"),
+          PORT: String(port),
+          LOG_LEVEL: "error",
+          LINEAR_CONNECTOR_SECRET: "test-secret-inf784",
+          LINEAR_WEBHOOK_SECRET: "test-webhook-inf784",
+          LINEAR_OAUTH_TOKEN: "test-linear-oauth-token",
+          OPENCLAW_HOOKS_URL: `http://127.0.0.1:${port}/unused-hooks`,
+          OPENCLAW_HOOKS_TOKEN: "test-hooks-token",
+          CRON_STARTUP_GRACE_MS: "60000",
+        },
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      child.stderr?.on("data", (chunk: Buffer) => {
+        childStderr += chunk.toString("utf8");
+      });
+
+      let body: LooseRecord;
+      try {
+        body = await pollHealth(`http://127.0.0.1:${port}/health`, 30_000);
+      } catch (err) {
+        throw new Error(
+          `production entry point never exposed /health: ${err instanceof Error ? err.message : String(err)}\n` +
+          `child stderr:\n${childStderr}`,
+        );
+      }
+
+      expect(body.workflowRegistry).toBeDefined();
+      expect(body.workflowRegistry["dept-engine"]).toEqual(expect.objectContaining({
+        id: "dept-engine",
+        states: expect.arrayContaining(["evaluating", "theme-proposal", "solicit", "managing", "validation", "done"]),
+      }));
+      expect(child.exitCode).toBeNull();
+    } finally {
+      await stopChild(child);
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }, 60_000);
 });
 
 describe("INF-784 AC2: department-head resolution is scoped", () => {
@@ -184,6 +288,10 @@ bodies:
     await expect(scopedResolver("department-head", { department: "ENG", team: "Engineering" })).resolves.toEqual(["charles"]);
     await expect(scopedResolver("department-head", { department: "DSN", team: "Design" })).resolves.toEqual(["laren"]);
     await expect(scopedResolver("steward", { department: "ENG", team: "Engineering" })).resolves.toEqual(["astrid"]);
+    await expect(scopedResolver("department-head", { department: "ENG", team: "Design" })).resolves.toEqual([]);
+    await expect(scopedResolver("department-head", { department: "DSN", team: "Engineering" })).resolves.toEqual([]);
+    await expect(scopedResolver("department-head", { department: "OPS", team: "Operations" })).resolves.toEqual([]);
+    await expect(scopedResolver("department-head", {})).rejects.toThrow(/department|team|scope/i);
   });
 });
 
