@@ -17,7 +17,7 @@ import path from "node:path";
 import os from "node:os";
 import { createLogger, componentLogger } from "../logger.js";
 import { getAccessToken, getAgent, getLinearUserIdForAgent, getOpenclawAgentName } from "../agents.js";
-import { normalizeSessionKey } from "../session-key.js";
+import { tryNormalizeSessionKey } from "../session-key.js";
 import { StaleRedispatchCounter } from "./stale-redispatch-counter.js";
 
 const log = componentLogger(createLogger(), "stale-forensics");
@@ -133,9 +133,42 @@ export interface ForensicsConfig {
   redispatchDbPath?: string;
   /** Max C2/C4 re-dispatch attempts before escalating to human. Default: 3 (STALE_REDISPATCH_MAX_ATTEMPTS env) */
   maxRedispatchAttempts?: number;
+  /**
+   * Deterministic replay fixture for same-key recovery guards. When a zero-output
+   * C4 husk is only a lifecycle claim collision and another same-key session is
+   * live/working, recovery is coalesced before redispatch attempts are counted.
+   */
+  sameKeySessionReplay?: SameKeySessionReplayEntry[];
+  /** Linear user ID of the sprint steward for infra/capacity escalation. */
+  sprintStewardLinearId?: string;
+  /** Linear user ID of the infra owner for infra/capacity escalation fallback. */
+  infraOwnerLinearId?: string;
+  /** Optional workflow/role context captured by the stale-session caller. */
+  recoveryRoleContext?: RecoveryRoleContext;
 }
 
 const DEFAULT_LOOP_THRESHOLD = 20;
+
+interface SameKeySessionReplayEntry {
+  sessionKey?: string | null;
+  sessionFile?: string | null;
+  totalCalls?: number | null;
+  assistantTurns?: number | null;
+  claimError?: string | null;
+  status?: string | null;
+}
+
+interface RecoveryRoleContext {
+  workflow?: string;
+  state?: string;
+  role?: string;
+  failure?: string;
+}
+
+interface SameKeyRecoveryContext {
+  hasCompetingLiveOwner: boolean;
+  detail: string;
+}
 
 function parseEnvInt(name: string, defaultVal: number): number {
   const raw = process.env[name];
@@ -739,6 +772,94 @@ export interface RecoveryResult {
  */
 const NEEDS_HUMAN_CLASSES = new Set<StaleClass>(["C1", "C3", "C5", "C6", "C-UNK"]);
 
+function hasSameKeyClaimCollision(snapshot: StaleSnapshot): boolean {
+  return snapshot.classification === "C4" &&
+    snapshot.toolCallSummary.totalCalls === 0 &&
+    snapshot.lastAssistantMessage === null &&
+    snapshot.lastToolCall === null &&
+    snapshot.errors.some((err) => /CronSessionLifecycleClaimError|lifecycle claim already held/i.test(err));
+}
+
+function sameNormalizedSessionKey(a: string | null | undefined, b: string | null | undefined): boolean {
+  if (!a || !b) return false;
+  const normalizedA = normalizeEmbeddedSessionKey(a);
+  const normalizedB = normalizeEmbeddedSessionKey(b);
+  return normalizedA !== null && normalizedA === normalizedB;
+}
+
+function normalizeEmbeddedSessionKey(key: string): string | null {
+  const direct = tryNormalizeSessionKey(key);
+  if (direct) return direct;
+  const match = key.match(/(?:linear-)?([A-Za-z]{1,10}-\d{1,6})/);
+  return match ? tryNormalizeSessionKey(match[1]) : null;
+}
+
+function getSameKeyRecoveryContext(snapshot: StaleSnapshot, replay?: SameKeySessionReplayEntry[]): SameKeyRecoveryContext {
+  const sameKeyEntries = (replay ?? []).filter((entry) =>
+    sameNormalizedSessionKey(entry.sessionKey, snapshot.metadata.sessionKey),
+  );
+  const liveOwner = sameKeyEntries.find((entry) => {
+    const status = (entry.status ?? "").toLowerCase();
+    const hasActivity = (entry.totalCalls ?? 0) > 0 || (entry.assistantTurns ?? 0) > 0 || Boolean(entry.sessionFile);
+    const isCollisionHusk = /claim-collision|husk/.test(status) || Boolean(entry.claimError);
+    const isLiveStatus = /working|running|active|live/.test(status);
+    return !isCollisionHusk && (isLiveStatus || hasActivity);
+  });
+
+  if (liveOwner) {
+    return {
+      hasCompetingLiveOwner: true,
+      detail: `coalesced with live working session for ${snapshot.metadata.sessionKey}`,
+    };
+  }
+
+  return {
+    hasCompetingLiveOwner: false,
+    detail: "no competing live owner for same normalized session key",
+  };
+}
+
+function isReviewerOrMergeGateC4(snapshot: StaleSnapshot, roleContext?: RecoveryRoleContext): boolean {
+  const role = (roleContext?.role ?? "").toLowerCase();
+  const state = (roleContext?.state ?? snapshot.linearTicket.stateAtTimeout ?? "").toLowerCase();
+  const agent = snapshot.metadata.agentId.toLowerCase();
+  return snapshot.classification === "C4" && (
+    role.includes("review") ||
+    role.includes("merge") ||
+    state.includes("code-review") ||
+    state.includes("merge") ||
+    agent === "charles" ||
+    agent === "hanzo"
+  );
+}
+
+function formatInfraEscalationComment(
+  snapshot: StaleSnapshot,
+  attempt: number | undefined,
+  maxAttempts: number | undefined,
+  roleContext?: RecoveryRoleContext,
+): string {
+  const duration = Math.round(snapshot.metadata.totalDurationMs / 60_000);
+  const totalCalls = snapshot.toolCallSummary.totalCalls;
+  const sessionFile = snapshot.metadata.sessionFile ?? "null";
+  const state = roleContext?.state ?? snapshot.linearTicket.stateAtTimeout ?? "unknown";
+  const role = roleContext?.role ?? "reviewer/merge-gate";
+  const failure = roleContext?.failure ?? `C4 Never started (totalCalls: ${totalCalls}, sessionFile: ${sessionFile})`;
+  const capLine = attempt !== undefined && maxAttempts !== undefined
+    ? `Re-dispatch cap reached: **${attempt}/${maxAttempts}**.`
+    : "Re-dispatch cap reached.";
+
+  return `🔴 **Stale reviewer capacity escalation** — class **C4** (${STALE_CLASS_NAMES.C4})\n\n` +
+    `Session timed out after ${duration} minutes in ${state}. ${capLine}\n\n` +
+    `This is reviewer capacity / merge-gate capacity context, not no-assignee human review. ` +
+    `Routing to the sprint steward or infra owner to inspect capacity, stale-session wake routing, and worker availability.\n\n` +
+    `Workflow role: ${role}\n` +
+    `Failure: ${failure}\n` +
+    `totalCalls: ${totalCalls}\n` +
+    `sessionFile: ${sessionFile}` +
+    (snapshot.diagnosticPath ? `\n\n📝 Diagnostics: \`${snapshot.diagnosticPath}\`` : "");
+}
+
 export async function recoverTicket(
   snapshot: StaleSnapshot,
   agentId: string,
@@ -751,6 +872,18 @@ export async function recoverTicket(
 
   const identifier = snapshot.metadata.ticketId.replace(/^linear-/, "");
   const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
+  const sameKeyContext = getSameKeyRecoveryContext(snapshot, config.sameKeySessionReplay);
+
+  if (hasSameKeyClaimCollision(snapshot) && sameKeyContext.hasCompetingLiveOwner) {
+    log.info(
+      `Recovery for ${identifier}: same-key C4 claim-collision husk coalesced before redispatch counter increment`,
+    );
+    return {
+      success: true,
+      action: "skipped-same-key-claim-collision",
+      detail: sameKeyContext.detail,
+    };
+  }
 
   // For C2/C4: track re-dispatch attempts and cap if necessary
   let redispatchAttempt: number | undefined;
@@ -765,8 +898,13 @@ export async function recoverTicket(
     isRedispatchCapped = redispatchAttempt >= redispatchMax;
   }
 
+  const isInfraCapacityEscalation =
+    isRedispatchCapped && isReviewerOrMergeGateC4(snapshot, config.recoveryRoleContext);
+
   // Build comment based on classification
-  const comment = buildRecoveryComment(snapshot, redispatchAttempt, redispatchMax);
+  const comment = isInfraCapacityEscalation
+    ? formatInfraEscalationComment(snapshot, redispatchAttempt, redispatchMax, config.recoveryRoleContext)
+    : buildRecoveryComment(snapshot, redispatchAttempt, redispatchMax);
 
   // Determine target state name based on classification
   const targetStateName = getRecoveryTargetStateName(snapshot.classification);
@@ -839,7 +977,7 @@ export async function recoverTicket(
         success: true,
         action: "re-poke-c4",
         rePoke: true,
-        detail: "C4 first stall — delegate retained, re-poke requested",
+        detail: `C4 first stall — delegate retained, re-poke requested; ${sameKeyContext.detail}`,
       };
     }
 
@@ -875,7 +1013,9 @@ export async function recoverTicket(
     // C1/C3/C5/C6/C-UNK → assign to human owner and clear delegate (human must review).
     // C2/C4 → clear both (connector will re-dispatch normally), unless cap is breached.
     const needsHuman = NEEDS_HUMAN_CLASSES.has(snapshot.classification) || isRedispatchCapped;
-    const humanId = config.humanAssigneeLinearId ?? process.env.STALE_HUMAN_ASSIGNEE_LINEAR_ID ?? null;
+    const humanId = isInfraCapacityEscalation
+      ? (config.sprintStewardLinearId ?? config.infraOwnerLinearId ?? config.humanAssigneeLinearId ?? process.env.STALE_HUMAN_ASSIGNEE_LINEAR_ID ?? null)
+      : (config.humanAssigneeLinearId ?? process.env.STALE_HUMAN_ASSIGNEE_LINEAR_ID ?? null);
     if (needsHuman && !humanId) {
       log.warn(
         `Recovery for ${identifier}: class=${snapshot.classification} requires human assignment ` +
@@ -932,7 +1072,9 @@ export async function recoverTicket(
     stateTransitioned = updateBody.data?.issueUpdate?.success ?? false;
 
     const className = STALE_CLASS_NAMES[snapshot.classification];
-    const ownershipTag = needsHuman ? (humanId ? "+needs-human(assignee+delegate-cleared)" : "+delegate-cleared") : "+delegate-cleared";
+    const ownershipTag = isInfraCapacityEscalation
+      ? (humanId ? "+infra-escalation(assignee+delegate-cleared)" : "+infra-escalation(delegate-cleared)")
+      : needsHuman ? (humanId ? "+needs-human(assignee+delegate-cleared)" : "+delegate-cleared") : "+delegate-cleared";
     log.info(
       `Recovery for ${identifier}: class=${snapshot.classification} (${className}), ` +
       `comment posted, state ${stateTransitioned ? "transitioned to " + targetStateName : "unchanged"}, ${ownershipTag}`,
@@ -940,8 +1082,12 @@ export async function recoverTicket(
 
     return {
       success: true,
-      action: `classify=${snapshot.classification} comment+${stateTransitioned ? "state(" + targetStateName + ")" : "comment-only"}${ownershipTag}`,
-      detail: `${className} — ${comment.slice(0, 200)}`,
+      action: isInfraCapacityEscalation
+        ? `infra-escalation classify=${snapshot.classification} comment+${stateTransitioned ? "state(" + targetStateName + ")" : "comment-only"}${ownershipTag}`
+        : `classify=${snapshot.classification} comment+${stateTransitioned ? "state(" + targetStateName + ")" : "comment-only"}${ownershipTag}`,
+      detail: isInfraCapacityEscalation
+        ? `reviewer capacity — ${comment.slice(0, 200)}`
+        : `${className} — ${comment.slice(0, 200)}`,
     };
   } catch (err) {
     return {
