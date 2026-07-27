@@ -406,6 +406,14 @@ describe("executeFanout — mocked Linear API", () => {
         );
       }
 
+      // Blocking relation creation (integration-verify or ordered siblings)
+      if (query.includes("issueRelationCreate")) {
+        return new Response(
+          JSON.stringify({ data: { issueRelationCreate: { success: true } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
       // Comment creation (fan-out summary)
       if (query.includes("commentCreate")) {
         return new Response(
@@ -485,6 +493,129 @@ describe("executeFanout — mocked Linear API", () => {
     expect(result.errors).toHaveLength(0);
     const createCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
     expect(createCalls).toHaveLength(0);
+  });
+
+  it("INF-799: mints 6 component children plus 2 integration-verify children grouped by capability", async () => {
+    const findings: Finding[] = [
+      {
+        title: "Roster API contract",
+        description: "Implement the roster API contract.",
+        classification: "traces-to-capability",
+        capability: "Roster",
+      },
+      {
+        title: "Roster persistence",
+        description: "Store roster assignments.",
+        classification: "traces-to-capability",
+        capability: "Roster",
+      },
+      {
+        title: "Roster dispatch wiring",
+        description: "Wire roster dispatch.",
+        classification: "traces-to-capability",
+        capability: "Roster",
+      },
+      {
+        title: "Telemetry schema",
+        description: "Implement telemetry schema.",
+        classification: "traces-to-capability",
+        capability: "Telemetry",
+      },
+      {
+        title: "Telemetry collector",
+        description: "Collect telemetry signals.",
+        classification: "traces-to-capability",
+        capability: "Telemetry",
+      },
+      {
+        title: "Telemetry dashboard",
+        description: "Expose telemetry dashboard.",
+        classification: "traces-to-capability",
+        capability: "Telemetry",
+      },
+    ];
+
+    globalThis.fetch = makeFanoutFetch({
+      teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-wf-integration-verify", name: "wf:integration-verify" },
+        { id: "existing-state-todo", name: "state:todo" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ],
+    });
+
+    const result = await executeFanout(
+      "LSO-28",
+      "Bearer tok",
+      {
+        spec_source: "findings",
+        child_workflow: "wf:dev-impl",
+        integration_verify: {
+          child_workflow: "wf:integration-verify",
+          per_capability: true,
+          blocked_by: "capability-components",
+        },
+      },
+      { skipPreview: true, findingsOverride: findings },
+    );
+
+    expect(result.created).toBe(8);
+    expect(result.childIdentifiers).toEqual([
+      "AI-2001",
+      "AI-2002",
+      "AI-2003",
+      "AI-2004",
+      "AI-2005",
+      "AI-2006",
+      "AI-2007",
+      "AI-2008",
+    ]);
+    expect(result.specMatchedChildren).toEqual(result.childIdentifiers);
+    expect(result.errors).toHaveLength(0);
+
+    const createCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
+    expect(createCalls).toHaveLength(8);
+
+    const childInputs = createCalls.map((c) => (c.body.variables as Record<string, unknown>).input as Record<string, unknown>);
+    const componentInputs = childInputs.slice(0, 6);
+    const verifyInputs = childInputs.slice(6);
+
+    expect(componentInputs.map((input) => input.title)).toEqual(findings.map((f) => f.title));
+    for (const input of componentInputs) {
+      expect(input.parentId).toBe("parent-internal-uuid");
+      expect(input.labelIds).toContain("existing-wf-dev-impl");
+      expect(input.labelIds).toContain("existing-state-todo");
+    }
+
+    expect(verifyInputs.map((input) => input.title)).toEqual([
+      "Integration verify: Roster",
+      "Integration verify: Telemetry",
+    ]);
+    for (const input of verifyInputs) {
+      expect(input.parentId).toBe("parent-internal-uuid");
+      expect(input.labelIds).toContain("existing-wf-integration-verify");
+      expect(input.labelIds).toContain("existing-state-intake");
+    }
+    expect(verifyInputs[0].description).toContain("Capability: Roster");
+    expect(verifyInputs[0].description).toContain("AI-2001: Roster API contract");
+    expect(verifyInputs[0].description).toContain("AI-2002: Roster persistence");
+    expect(verifyInputs[0].description).toContain("AI-2003: Roster dispatch wiring");
+    expect(verifyInputs[1].description).toContain("Capability: Telemetry");
+    expect(verifyInputs[1].description).toContain("AI-2004: Telemetry schema");
+    expect(verifyInputs[1].description).toContain("AI-2005: Telemetry collector");
+    expect(verifyInputs[1].description).toContain("AI-2006: Telemetry dashboard");
+
+    const relationInputs = fetchCalls
+      .filter((c) => (c.body.query ?? "").includes("issueRelationCreate"))
+      .map((c) => (c.body.variables as Record<string, unknown>).input as Record<string, unknown>);
+    expect(relationInputs).toEqual([
+      { issueId: "child-uuid-1", relatedIssueId: "child-uuid-7", type: "blocks" },
+      { issueId: "child-uuid-2", relatedIssueId: "child-uuid-7", type: "blocks" },
+      { issueId: "child-uuid-3", relatedIssueId: "child-uuid-7", type: "blocks" },
+      { issueId: "child-uuid-4", relatedIssueId: "child-uuid-8", type: "blocks" },
+      { issueId: "child-uuid-5", relatedIssueId: "child-uuid-8", type: "blocks" },
+      { issueId: "child-uuid-6", relatedIssueId: "child-uuid-8", type: "blocks" },
+    ]);
   });
 
   it("extracts findings from description when no override provided", async () => {
