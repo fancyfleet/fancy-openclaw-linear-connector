@@ -547,9 +547,10 @@ export async function evaluateBarrier(
       .filter((c) => !expectedChildren?.length || expectedChildren.includes(c.identifier))
       .filter((c) => childIsInBarrierScope(c, barrierScope));
     if (filtered.length === 0) {
-      // No expected children found — treat as zero, which means
-      // all-terminal (vacuous satisfaction for the expected set).
-      return { allTerminal: true, totalChildren: 0, terminalCount: 0, orphanedCount: 0, children: [] };
+      // Expected children were recorded but none are currently linked/readable
+      // under the parent. This is not the same as an unscoped zero-child
+      // barrier: do not let stale/missing scoped children satisfy vacuously.
+      return { allTerminal: false, totalChildren: 0, terminalCount: 0, orphanedCount: 0, children: [] };
     }
     const terminalCount = filtered.filter((c) => c.isTerminal).length;
     const orphanedCount = filtered.filter((c) => c.isOrphaned).length;
@@ -585,6 +586,71 @@ export async function evaluateBarrier(
     orphanedCount,
     children,
   };
+}
+
+function summarizeBarrierChildren(children: ChildState[]): string {
+  return children
+    .map((child) => `${child.identifier} (${child.workflowState ?? "unknown"})`)
+    .join(", ");
+}
+
+/**
+ * INF-864: Manual/generic continues out of a barrier state must not bypass the
+ * barrier predicate. Barrier states advance automatically; a manual continue is
+ * only allowed when the relevant child set is readable, non-empty, and terminal.
+ */
+export async function getManualBarrierContinueBlockReason(
+  parentIdentifier: string,
+  authToken: string,
+): Promise<string | null> {
+  let childFilter: ExpectedChildrenFilter | undefined;
+  const outcome = await getFanoutOutcome(parentIdentifier);
+  if (outcome?.outcome === "awaiting" && outcome.childIdentifiers && outcome.childIdentifiers.length > 0) {
+    childFilter = outcome.childIdentifiers;
+  } else if (outcome?.outcome === "refused" || outcome?.outcome === "failed") {
+    return (
+      `[Proxy] 'continue-workflow' blocked: barrier parent ${parentIdentifier} has recorded fan-out ` +
+      `outcome '${outcome.outcome}', so the barrier predicate is not satisfied.`
+    );
+  } else if (outcome?.outcome === "pending-approval") {
+    return (
+      `[Proxy] 'continue-workflow' blocked: barrier parent ${parentIdentifier} is waiting on ` +
+      `steward approval for its fan-out result.`
+    );
+  }
+
+  const barrier = await evaluateBarrier(parentIdentifier, authToken, childFilter);
+  if (barrier.readFailed) {
+    return (
+      `[Proxy] 'continue-workflow' blocked: barrier parent ${parentIdentifier} could not read its child set. ` +
+      `Retry after Linear is readable; an unreadable child set is not treated as complete.`
+    );
+  }
+
+  if (barrier.totalChildren === 0) {
+    return (
+      `[Proxy] 'continue-workflow' blocked: barrier parent ${parentIdentifier} has no relevant child ` +
+      `tickets for this phase. Barrier exits must be non-vacuous for manual continue.`
+    );
+  }
+
+  if (barrier.orphanedCount > 0) {
+    const orphaned = barrier.children.filter((child) => child.isOrphaned);
+    return (
+      `[Proxy] 'continue-workflow' blocked: barrier parent ${parentIdentifier} has orphaned child ` +
+      `ticket(s) with no workflow state: ${summarizeBarrierChildren(orphaned)}.`
+    );
+  }
+
+  if (!barrier.allTerminal) {
+    const pending = barrier.children.filter((child) => !child.isTerminal);
+    return (
+      `[Proxy] 'continue-workflow' blocked: barrier parent ${parentIdentifier} still has ` +
+      `non-terminal child ticket(s): ${summarizeBarrierChildren(pending)}.`
+    );
+  }
+
+  return null;
 }
 
 const UNREADABLE_CHILDREN_ERROR = "Failed to read child set — barrier held (INF-34)";

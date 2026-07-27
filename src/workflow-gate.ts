@@ -49,7 +49,7 @@ import { executeFanout, shouldTriggerFanout, validateFanoutSpec, extractSpecFind
 import { recordFanoutOutcome } from "./fanout-outcome-store.js";
 import type { DispatchRecordStore } from "./liveness-channel/dispatch-record-store.js";
 import { verifyStewardFanoutDelegates } from "./post-fanout-child-verification.js";
-import { onChildTerminal, onManagingEntry, isTerminalState, evaluateBarrier } from "./barrier.js";
+import { onChildTerminal, onManagingEntry, isTerminalState, evaluateBarrier, getManualBarrierContinueBlockReason } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
 import { fetchLastCommentByUser } from "./linear-helpers.js";
 import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store.js";
@@ -3893,6 +3893,20 @@ export async function checkWorkflowRules(
     }
   }
 
+  if (
+    isMetaIntent &&
+    intent === "continue" &&
+    match.generic === "continue" &&
+    stateNode.barrier === true &&
+    !breakGlassOverride
+  ) {
+    const barrierBlock = await getManualBarrierContinueBlockReason(fetchedIdentifier ?? issueId, authToken);
+    if (barrierBlock) {
+      log.warn(`workflow-gate: INF-864 manual barrier continue blocked on ${issueId}: ${barrierBlock}`);
+      return barrierBlock;
+    }
+  }
+
   // Capability gate — e.g. deploy:execute is Hanzo-only (§16.2).
   // Unknown callers (humans on the sign-off path) bypass capability checks.
   //
@@ -5557,6 +5571,19 @@ export async function applyStateTransition(
         return { status: "failed", code: "no-transition", detail: `no transition for '${intent}' in state '${currentStateName}'`, from: currentStateName };
       }
     } else {
+      if (intent === "continue" && stateNode?.barrier === true) {
+        const barrierBlock = await getManualBarrierContinueBlockReason(issue.identifier ?? issueId, authToken);
+        if (barrierBlock) {
+          log.warn(`workflow-gate: B2 apply: INF-864 barrier continue blocked on ${issueId}: ${barrierBlock}`);
+          return {
+            status: "blocked",
+            code: "barrier-not-satisfied",
+            detail: barrierBlock,
+            from: currentStateName,
+            to: matchedTransition.to,
+          };
+        }
+      }
       toStateName = matchedTransition.to;
     }
   }
