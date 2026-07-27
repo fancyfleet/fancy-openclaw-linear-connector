@@ -870,6 +870,78 @@ describe("AC3 — anti-entropy runs on a cadence and alerts on drift", () => {
   });
 });
 
+// ── INF-814: native park de-enroll ──────────────────────────────────────────
+
+describe("INF-814 — native parked (Backlog) wf:* ticket is de-enrolled, not native-healed", () => {
+  it("strips orphaned wf:*/state:* labels off an enrolled ticket whose native state is Backlog (keeping other labels, native state untouched)", async () => {
+    // Mirrors INF-813's wedge (a wf:task ticket raw-moved to Backlog while still
+    // carrying its active state:* label). Uses a registered workflow here so the
+    // RED baseline is substantive: unfixed code runs AC1 and heals native
+    // Backlog → To Do (fighting the park). The parked guard is workflow-agnostic.
+    const { fetch, issueUpdateCalls } = makeMockFetch({
+      issues: [
+        {
+          id: "uuid-INF-813",
+          identifier: "INF-813",
+          teamId: "team-inf",
+          labels: [
+            { id: "lbl-wf",       name: "wf:dev-impl" },
+            { id: "lbl-state-impl", name: "state:implementation" },
+            { id: "lbl-priority", name: "priority:high" },
+          ],
+          // Parked by a raw move: native Backlog while still carrying an active state:* label.
+          nativeStateId: "ns-backlog-1",
+          nativeStateName: "Backlog",
+        },
+      ],
+    });
+    globalThis.fetch = fetch;
+
+    const result = await runAntiEntropyPass({ authToken: "tok-test" });
+
+    expect(result.parkedFound).toBe(1);
+    expect(result.parkedDeEnrolled).toBe(1);
+    // The native-desync heal (AC1) must NOT run — we honor the park, we don't fight it.
+    expect(result.nativeDesyncFound).toBe(0);
+    expect(result.nativeDesyncHealed).toBe(0);
+
+    // Exactly one write: strip the wf:*/state:* labels, keep the rest, leave
+    // native state on Backlog (no heal toward a todo native id).
+    expect(issueUpdateCalls).toHaveLength(1);
+    const call = issueUpdateCalls[0];
+    expect(call.issueId).toBe("uuid-INF-813");
+    expect(call.labelIds).toEqual(["lbl-priority"]);
+    expect(call.stateId).toBe("ns-backlog-1");
+  });
+
+  it("does NOT treat a normally-active (native Todo) enrolled ticket as parked", async () => {
+    const { fetch, issueUpdateCalls } = makeMockFetch({
+      issues: [
+        {
+          id: "uuid-AI-2000",
+          identifier: "AI-2000",
+          teamId: "team-ai",
+          labels: [
+            { id: "lbl-wf", name: "wf:dev-impl" },
+            { id: "lbl-st", name: "state:intake" },
+          ],
+          // intake → native_state todo → ns-todo-1: in sync, active, NOT parked.
+          nativeStateId: "ns-todo-1",
+          nativeStateName: "Todo",
+        },
+      ],
+    });
+    globalThis.fetch = fetch;
+
+    const result = await runAntiEntropyPass({ authToken: "tok-test" });
+
+    expect(result.parkedFound).toBe(0);
+    expect(result.parkedDeEnrolled).toBe(0);
+    // Nothing to heal, nothing to strip.
+    expect(issueUpdateCalls).toHaveLength(0);
+  });
+});
+
 // ── Type / export smoke check ──────────────────────────────────────────────
 
 describe("exports — module shape contract", () => {

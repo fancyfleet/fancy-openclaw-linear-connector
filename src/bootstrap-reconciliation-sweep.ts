@@ -36,7 +36,7 @@ import {
   applyBootstrapToIssue,
 } from "./workflow-bootstrap.js";
 import { loadWorkflowRegistry, type WorkflowDef } from "./workflow-gate.js";
-import { isTerminalIssueState } from "./linear-actionable.js";
+import { isTerminalIssueState, isParkedIssueState } from "./linear-actionable.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { registerCron, markCronRun, formatIntervalMs } from "./cron/registry.js";
 import { buildAgentMap, getLinearUserIdForAgent, getOpenclawAgentName } from "./agents.js";
@@ -682,6 +682,19 @@ export async function runBootstrapReconciliationSweep(
       continue;
     }
 
+    // INF-814: a native parked (Backlog) issue was deliberately parked by a raw
+    // move; re-bootstrapping it (adding state:intake) would re-wake a ticket the
+    // human took out of the active pipeline. Anti-entropy strips its orphaned
+    // wf:* label; until then, do not re-enroll it. Symmetric to the terminal guard.
+    if (isParkedIssueState(ticket.nativeState)) {
+      log.info(
+        `bootstrap-reconciliation: skipping ${ticket.identifier} (Pass 1) — Linear entity is natively parked ` +
+        `(state.type='${ticket.nativeState?.type ?? "null"}', name='${ticket.nativeState?.name ?? "null"}'); ` +
+        `no re-enrollment on a parked issue`,
+      );
+      continue;
+    }
+
     // Filter: must have a wf:* label but NO state:* label
     const hasStateLabel = ticket.labels.some((l) => l.name.startsWith("state:"));
     if (hasStateLabel) continue; // already enrolled — handled in Pass 2
@@ -768,6 +781,9 @@ export async function runBootstrapReconciliationSweep(
     // sweep — an actionable-looking state:* label on a Done/Canceled ticket is
     // stale and must not re-dispatch its owner. Symmetric to INF-584.
     if (isTerminalIssueState(ticket.nativeState)) continue;
+    // INF-814: a natively-parked (Backlog) issue must not re-dispatch its owner
+    // off a stale actionable state:* label — that is the wedged-task wake loop.
+    if (isParkedIssueState(ticket.nativeState)) continue;
 
     const workflowLabel = ticket.labels.find((l) => l.name.startsWith("wf:"))?.name;
     const stateLabel = ticket.labels.find((l) => l.name.startsWith("state:"))?.name;

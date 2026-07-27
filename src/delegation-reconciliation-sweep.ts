@@ -26,7 +26,7 @@ import {
   applyBootstrapToIssue,
 } from "./workflow-bootstrap.js";
 import { autoEnrollPlainDelegation } from "./workflow-gate.js";
-import { isTerminalIssueState } from "./linear-actionable.js";
+import { isTerminalIssueState, isParkedIssueState } from "./linear-actionable.js";
 import { getAgentIdForLinearUserId, getOpenclawAgentName } from "./agents.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
@@ -527,6 +527,19 @@ export async function runDelegationReconciliationSweep(
         `delegation-reconciliation: skipping ${ticket.identifier} — Linear entity is natively terminal ` +
         `(state.type='${ticket.nativeState?.type ?? "null"}', name='${ticket.nativeState?.name ?? "null"}'); ` +
         `no legal transition exists on a retired issue`,
+      );
+      continue;
+    }
+
+    // INF-814: a natively-parked (Backlog) issue was pulled from the active
+    // pipeline by a raw move; do not re-dispatch its delegate off a stale
+    // state:* label. Anti-entropy strips the orphaned labels. Symmetric to the
+    // terminal guard above.
+    if (isParkedIssueState(ticket.nativeState)) {
+      log.info(
+        `delegation-reconciliation: skipping ${ticket.identifier} — Linear entity is natively parked ` +
+        `(state.type='${ticket.nativeState?.type ?? "null"}', name='${ticket.nativeState?.name ?? "null"}'); ` +
+        `no re-dispatch on a parked issue`,
       );
       continue;
     }
