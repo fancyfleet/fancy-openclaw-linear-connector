@@ -6328,9 +6328,14 @@ export async function applyStateTransition(
 
       const outcome = deriveFanoutBarrierOutcome(preTransitionFanoutResult);
       if (
-        outcome.outcome === "failed" &&
-        preTransitionFanoutResult.attempted > 0 &&
-        preTransitionFanoutResult.created === 0
+        (
+          outcome.outcome === "refused" ||
+          (
+            outcome.outcome === "failed" &&
+            preTransitionFanoutResult.attempted > 0 &&
+            preTransitionFanoutResult.created === 0
+          )
+        )
       ) {
         const detail = formatFanoutFailureDetail(preTransitionFanoutResult);
         log.error(

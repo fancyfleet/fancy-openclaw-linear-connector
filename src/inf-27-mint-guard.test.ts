@@ -220,6 +220,45 @@ describe("INF-27 AC2: mint guard — an absent wf:* label must fail loudly, not 
     expect(messages).toMatch(/wf:sprint-scoping/);
   });
 
+  it("AC2: an absent integration_verify workflow label is a loud all-or-nothing refusal", async () => {
+    globalThis.fetch = makeFanoutFetch({
+      teamLabels: [
+        { id: "existing-wf-label", name: "wf:dev-impl" },
+        { id: "existing-state-label", name: "state:todo" },
+      ],
+    });
+
+    const result = await executeFanout(
+      "AI-1439",
+      "Bearer tok",
+      {
+        ...DEV_IMPL_FANOUT_CONFIG,
+        integration_verify: {
+          child_workflow: "wf:integration-verify",
+          per_capability: true,
+          blocked_by: "capability-components",
+        },
+      },
+      {
+        skipPreview: true,
+        findingsOverride: [
+          {
+            title: "Component work",
+            classification: "traces-to-capability",
+            capability: "Capability A",
+          },
+        ],
+      },
+    );
+
+    expect(result.refused).toBe(true);
+    expect(result.created).toBe(0);
+    expect(issueCreateCalls()).toHaveLength(0);
+    const messages = result.errors.map((e) => e.message).join(" | ");
+    expect(messages).toMatch(/wf:integration-verify/);
+    expect(messages).toMatch(/team-uuid/);
+  });
+
   // ── Blast-radius pins: these are EXPECTED TO PASS today ───────────────────
 
   it("GREEN-PATH GUARD (passes today by design): a team that defines the wf:* label still mints normally", async () => {

@@ -160,7 +160,7 @@ export interface ExistingChild {
   /** Human-readable identifier (e.g. "AI-3001"). */
   identifier: string;
   /** The spec entry id this child was spawned from. */
-  specEntryId: string;
+  specEntryId?: string;
   /** Current workflow state (any state suppresses re-spawn — informational). */
   state?: string;
   /**
@@ -179,6 +179,11 @@ export interface ExistingChild {
    * the legacy read path.
    */
   childWorkflow?: string;
+}
+
+function normalizeDedupeTitle(title: string | undefined): string | undefined {
+  const normalized = title?.trim().replace(/\s+/g, " ").toLowerCase();
+  return normalized || undefined;
 }
 
 /**
@@ -900,6 +905,13 @@ export function dedupeSpawnSpec(
       continue;
     }
 
+    const titleMatch = existingChildren.find(
+      (c) =>
+        c.childWorkflow === effectiveWorkflow &&
+        normalizeDedupeTitle(c.title) === normalizeDedupeTitle(f.title),
+    );
+    if (titleMatch) continue;
+
     toSpawn.push(f);
   }
 
@@ -909,6 +921,7 @@ export function dedupeSpawnSpec(
   const specIds = new Set(findings.map((f) => f.id));
   const unmatchedChildren = existingChildren.filter(
     (c) =>
+      c.specEntryId !== undefined &&
       !specIds.has(c.specEntryId) &&
       (c.childWorkflow === undefined || c.childWorkflow === childWorkflow),
   );
@@ -1621,8 +1634,14 @@ export async function executeFanout(
   // matches a current finding. New mints are appended later. This is the set
   // the barrier waits on — not accumulated history (which includes stale siblings).
   const specFindingIds = new Set(findings.map((f) => f.id).filter(Boolean));
+  const specFindingTitles = new Set(findings.map((f) => normalizeDedupeTitle(f.title)).filter(Boolean));
   const matchedExisting = existingChildren.filter(
-    (c) => specFindingIds.has(c.specEntryId),
+    (c) =>
+      (c.specEntryId !== undefined && specFindingIds.has(c.specEntryId)) ||
+      (
+        c.childWorkflow === childWorkflowLabel &&
+        specFindingTitles.has(normalizeDedupeTitle(c.title))
+      ),
   );
   result.specMatchedChildren = matchedExisting.map((c) => c.identifier);
 
@@ -1781,14 +1800,25 @@ export async function executeFanout(
   const missingWorkflowLabels = distinctWorkflowLabels.filter((labelName) => !workflowLabelIds.has(labelName));
   if (missingWorkflowLabels.length > 0) {
     result.refused = true;
+    const reported = new Set<string>();
     for (let i = 0; i < toSpawn.length; i++) {
       const labelName = toSpawn[i].child_workflow ?? childWorkflowLabel;
       if (!missingWorkflowLabels.includes(labelName)) continue;
+      reported.add(labelName);
       const message =
         `Refusing fan-out (INF-27 AC2): workflow label '${labelName}' does not exist in team ${parentCtx.teamId}. ` +
         "Minting there would produce an inert ticket that no workflow engine picks up. " +
         "Create the label in the target team, or mint into a team that defines it.";
       result.errors.push({ findingIndex: i, message });
+      log.error(`fanout: ${message}`);
+    }
+    for (const labelName of missingWorkflowLabels) {
+      if (reported.has(labelName)) continue;
+      const message =
+        `Refusing fan-out (INF-27 AC2): workflow label '${labelName}' does not exist in team ${parentCtx.teamId}. ` +
+        "Minting there would produce an inert ticket that no workflow engine picks up. " +
+        "Create the label in the target team, or mint into a team that defines it.";
+      result.errors.push({ findingIndex: -1, message });
       log.error(`fanout: ${message}`);
     }
     return result;
@@ -2240,7 +2270,7 @@ async function fetchExistingSpawnChildren(
       const hasParentRef = /^Parent:\s*.+/i.test(n.description ?? "");
       const cleanDescription = cleanSpawnChildDescription(n.description);
       const specEntryId = m?.[1] ?? (hasParentRef && n.title ? deriveFindingId(n.title, cleanDescription) : undefined);
-      if (!specEntryId || !wfLabel) continue;
+      if (!wfLabel || (!specEntryId && !n.title)) continue;
       children.push({
         identifier: n.identifier,
         specEntryId,

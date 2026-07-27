@@ -288,6 +288,14 @@ describe("executeFanout — mocked Linear API", () => {
     };
     /** Existing team labels. */
     teamLabels?: Array<{ id: string; name: string }>;
+    /** Existing child issues returned by the parent children query. */
+    existingChildren?: Array<{
+      identifier: string;
+      title?: string | null;
+      description?: string | null;
+      state?: { name?: string } | null;
+      labels?: { nodes?: Array<{ name?: string }> } | null;
+    }>;
     /** Internal UUID for the parent issue. */
     parentInternalId?: string;
     /** Number of successful child creations before failure. -1 = all succeed. */
@@ -345,6 +353,16 @@ describe("executeFanout — mocked Linear API", () => {
         return new Response(
           JSON.stringify({
             data: { team: { labels: { nodes: opts.teamLabels ?? [] } } },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Existing children lookup for re-entry dedup.
+      if (query.includes("FanoutChildren")) {
+        return new Response(
+          JSON.stringify({
+            data: { issue: { children: { nodes: opts.existingChildren ?? [] } } },
           }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
@@ -434,6 +452,39 @@ describe("executeFanout — mocked Linear API", () => {
       // AC2: each child is linked to the parent (parentId set)
       expect(input.parentId).toBe("parent-internal-uuid");
     }
+  });
+
+  it("INF-799: re-entry dedups marker-free existing children by parent child list, workflow, and title", async () => {
+    const findings: Finding[] = [
+      { title: "Scope arm", description: "Audit implementation scope." },
+    ];
+
+    globalThis.fetch = makeFanoutFetch({
+      teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-todo", name: "state:todo" },
+      ],
+      existingChildren: [
+        {
+          identifier: "LSO-29",
+          title: "Scope arm",
+          description: "Manually created terminal child without fan-out markers.",
+          state: { name: "Done" },
+          labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:done" }] },
+        },
+      ],
+    });
+
+    const result = await executeFanout("LSO-28", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, {
+      skipPreview: true,
+      findingsOverride: findings,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.specMatchedChildren).toEqual(["LSO-29"]);
+    expect(result.errors).toHaveLength(0);
+    const createCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
+    expect(createCalls).toHaveLength(0);
   });
 
   it("extracts findings from description when no override provided", async () => {
@@ -1090,6 +1141,54 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     expect(failureComment).toContain("proposed 1 child issue(s), but child creation created 0");
     expect(failureComment).toContain("parent remains in `spawning`");
     expect(failureComment).toContain(validatorReason);
+  });
+
+  it("INF-799: fails closed when fan-out refuses before minting, leaving parent in place", async () => {
+    const uxFixturePath = path.join(uxDir, "canonical-ux-audit.yaml");
+    const originalUxFixture = fs.readFileSync(uxFixturePath, "utf8");
+    const withIntegrationVerify = originalUxFixture.replace(
+      "      child_workflow: wf:dev-impl\n",
+      [
+        "      child_workflow: wf:dev-impl",
+        "      integration_verify:",
+        "        child_workflow: wf:integration-verify",
+        "        per_capability: true",
+        "        blocked_by: capability-components",
+      ].join("\n") + "\n",
+    );
+    fs.writeFileSync(uxFixturePath, withIntegrationVerify, "utf8");
+    resetWorkflowCache();
+
+    try {
+      globalThis.fetch = makeIntegrationFetch({
+        teamLabels: [
+          { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+          { id: "existing-state-todo", name: "state:todo" },
+        ],
+      });
+
+      const result = await applyStateTransition("spawn", "AI-1439", "Bearer tok");
+
+      expect(result.status).toBe("failed");
+      expect(result.code).toBe("fanout-create-failed");
+      expect(result.detail).toContain("wf:integration-verify");
+
+      const stateUpdateCall = fetchCalls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+      expect(stateUpdateCall).toBeUndefined();
+
+      const childCreateCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
+      expect(childCreateCalls).toHaveLength(0);
+
+      const commentBodies = fetchCalls
+        .filter((c) => (c.body.query ?? "").includes("commentCreate"))
+        .map((c) => ((c.body.variables as Record<string, unknown>).body as string | undefined) ?? "");
+      const failureComment = commentBodies.find((body) => body.includes("Fan-out failed - transition not applied"));
+      expect(failureComment).toContain("parent remains in `spawning`");
+      expect(failureComment).toContain("wf:integration-verify");
+    } finally {
+      fs.writeFileSync(uxFixturePath, originalUxFixture, "utf8");
+      resetWorkflowCache();
+    }
   });
 
   it("INF-696: post-fanout verification records a failed outcome when spawned children lack delegate dispatch acks", async () => {
