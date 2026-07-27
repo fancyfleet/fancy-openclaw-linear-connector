@@ -13,8 +13,9 @@ const mockGetAccessToken = jest.fn<() => string | undefined>().mockReturnValue(u
 const mockGetAgents = jest.fn<() => { name: string; linearUserId: string }[]>().mockReturnValue([]);
 const mockLoadWorkflowDef = jest.fn<() => Promise<unknown>>();
 const mockLoadWorkflowDefById = jest.fn<() => Promise<unknown>>();
-const mockResolveBodiesForRole = jest.fn<(role: string) => Promise<string[]>>();
+const mockResolveBodiesForRole = jest.fn<(role: string, scope?: unknown) => Promise<string[]>>();
 const mockResolveBodiesWithCapability = jest.fn<(cap: string) => Promise<string[]>>().mockResolvedValue([]);
+const mockRoleResolutionScopeForOwnerRole = jest.fn<(role: string, def: unknown) => unknown>();
 
 jest.unstable_mockModule("./agents.js", () => ({
   getAccessToken: mockGetAccessToken,
@@ -41,6 +42,7 @@ jest.unstable_mockModule("./workflow-gate.js", () => ({
 jest.unstable_mockModule("./escalation-gate.js", () => ({
   resolveBodiesForRole: mockResolveBodiesForRole,
   resolveBodiesWithCapability: mockResolveBodiesWithCapability,
+  roleResolutionScopeForOwnerRole: mockRoleResolutionScopeForOwnerRole,
 }));
 
 // Dynamic import after mocks are registered.
@@ -155,6 +157,10 @@ describe("checkRoleGuard (Phase 1 advisory)", () => {
 describe("checkRoleGuardEnforced (Phase 2 enforcement)", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockRoleResolutionScopeForOwnerRole.mockImplementation((role: string, def: unknown) => {
+      const workflowDef = def as { department_scope?: { department?: string; team?: string } };
+      return role === "department-head" ? workflowDef.department_scope : undefined;
+    });
     mockLoadWorkflowDefById.mockImplementation(async (workflowId: string) => {
       // Only return a def for dev-impl — unknown workflows return null
       if (workflowId === "dev-impl") return DEV_IMPL_DEF;
@@ -220,6 +226,31 @@ describe("checkRoleGuardEnforced (Phase 2 enforcement)", () => {
     const result = await checkRoleGuardEnforced("igor", ["wf:dev-impl", "state:implementation"]);
     expect(result.blocked).toBe(false);
     expect(result.reason).toBeUndefined();
+  });
+
+  it("threads workflow department scope when enforcing a department-head-owned state", async () => {
+    const scopedTaskDef = {
+      id: "task",
+      department_scope: { department: "DSN", team: "Design" },
+      states: [
+        {
+          id: "review",
+          owner_role: "department-head",
+          transitions: [{ command: "approve", to: "done" }],
+        },
+        { id: "done", kind: "terminal", transitions: [] },
+      ],
+    };
+    mockLoadWorkflowDefById.mockResolvedValue(scopedTaskDef as never);
+    mockResolveBodiesForRole.mockResolvedValue(["laren"] as never);
+
+    const result = await checkRoleGuardEnforced("laren", ["wf:task", "state:review"]);
+
+    expect(result.blocked).toBe(false);
+    expect(mockResolveBodiesForRole).toHaveBeenCalledWith("department-head", {
+      department: "DSN",
+      team: "Design",
+    });
   });
 
   it("is case-insensitive when checking agent against legal bodies", async () => {

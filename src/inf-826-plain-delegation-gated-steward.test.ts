@@ -5,11 +5,13 @@
 import { jest, describe, it, expect, beforeEach, afterEach } from "@jest/globals";
 
 const mockResolveBodiesForRole = jest.fn<(role: string) => Promise<string[]>>();
+const mockRoleResolutionScopeForOwnerRole = jest.fn(() => undefined);
 
 jest.unstable_mockModule("./escalation-gate.js", () => ({
   bodyHasCapability: jest.fn(),
   resolveBodiesForRole: mockResolveBodiesForRole,
   resolveBodiesWithCapability: jest.fn(),
+  roleResolutionScopeForOwnerRole: mockRoleResolutionScopeForOwnerRole,
   isBodyKnown: jest.fn(),
   isRoleDeclared: jest.fn(),
   isSyntheticNoBodyRole: jest.fn(),

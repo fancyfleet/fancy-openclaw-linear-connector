@@ -97,6 +97,33 @@ states:
     native_state: invalid
 `;
 
+const DSN_REVIEW_YAML = `
+id: dsn-review
+version: 1
+entry_state: intake
+department_scope:
+  department: DSN
+  team: Design
+states:
+  - id: intake
+    owner_role: engine
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: route
+        to: review
+  - id: review
+    owner_role: department-head
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: approve
+        to: done
+  - id: done
+    kind: terminal
+    native_state: done
+`;
+
 // Capability policy with steward role filled by astrid (linearUserId: "astrid-linear-id").
 const POLICY_YAML = `
 capabilities:
@@ -106,15 +133,34 @@ capabilities:
 containers:
   - id: steward
     grants: [linear:transition, human:escalate]
+  - id: engine
+    no_body: true
+    grants: [linear:transition]
+  - id: department-lead
+    grants: [linear:transition]
 
 roles:
   - id: steward
     requires: [human:escalate]
+  - id: engine
+    requires: [linear:transition]
+  - id: department-head
+    requires: [linear:transition]
 
 bodies:
   - id: astrid
     container: steward
     fills_roles: [steward]
+  - id: laren
+    container: department-lead
+    fills_roles: [department-head]
+    departments: [DSN]
+    teams: [Design]
+  - id: charles
+    container: department-lead
+    fills_roles: [department-head]
+    departments: [ENG]
+    teams: [Engineering]
 `;
 
 // ── Fake agents.json (astrid with a known linearUserId) ───────────────────
@@ -129,6 +175,15 @@ const AGENTS_JSON = JSON.stringify({
       refreshToken: "r1",
       openclawAgent: "astrid",
     },
+    {
+      name: "laren",
+      linearUserId: "laren-linear-id",
+      clientId: "c2",
+      clientSecret: "s2",
+      accessToken: "tok-laren",
+      refreshToken: "r2",
+      openclawAgent: "laren",
+    },
   ],
 });
 
@@ -138,6 +193,7 @@ const TEAM_ID = "team-uuid-abc";
 const WF_LABEL_ID = "label-wf-dev-impl-id";
 const STATE_INTAKE_LABEL_ID = "label-state-intake-id";
 const STATE_WF_UX_LABEL_ID = "label-wf-ux-audit-id";
+const WF_DSN_REVIEW_LABEL_ID = "label-wf-dsn-review-id";
 const CREATOR_USER_ID = "creator-linear-user-id";
 
 // ── Test suite setup ──────────────────────────────────────────────────────
@@ -152,6 +208,7 @@ beforeAll(async () => {
   await fs.mkdir(defsDir);
   await fs.writeFile(path.join(defsDir, "dev-impl.yaml"), DEV_IMPL_YAML);
   await fs.writeFile(path.join(defsDir, "ux-audit.yaml"), UX_AUDIT_YAML);
+  await fs.writeFile(path.join(defsDir, "dsn-review.yaml"), DSN_REVIEW_YAML);
 
   // Write capability policy
   const policyFile = path.join(tmpDir, "policy.yaml");
@@ -199,6 +256,7 @@ function makeBootstrapFetch(opts: {
     { id: "label-state-ux-intake-id", name: "state:ux-intake" },
     { id: WF_LABEL_ID, name: "wf:dev-impl" },
     { id: STATE_WF_UX_LABEL_ID, name: "wf:ux-audit" },
+    { id: WF_DSN_REVIEW_LABEL_ID, name: "wf:dsn-review" },
   ];
   const mutationSuccess = opts.mutationSuccess ?? true;
 
@@ -356,6 +414,29 @@ describe("AC1/AC2/AC7a: wf:* label-add bootstraps entry state and delegate", () 
     // astrid-linear-id is the linearUserId from agents.json for the body that fills "steward"
     expect(mutationBodies.length).toBeGreaterThan(0);
     expect(mutationBodies.some((b) => b.includes("astrid-linear-id"))).toBe(true);
+  });
+
+  it("threads department scope through entry fallback when the next owner is department-head", async () => {
+    const mutationBodies: string[] = [];
+    globalThis.fetch = async (url, init) => {
+      const body = typeof init?.body === "string" ? init.body : "";
+      if (body.includes("issueUpdate") || body.includes("ApplyAtomicTransition")) {
+        mutationBodies.push(body);
+      }
+      return makeBootstrapFetch({ currentLabelNames: ["wf:dsn-review"] })(url, init);
+    };
+
+    const event = makeIssueUpdateEvent({
+      currentLabelIds: [WF_DSN_REVIEW_LABEL_ID],
+      previousLabelIds: [],
+    });
+
+    const result = await maybeBootstrapWorkflow(event, "test-token");
+
+    expect(result?.action).toBe("bootstrapped");
+    expect(result?.workflowId).toBe("dsn-review");
+    expect(mutationBodies.some((b) => b.includes("laren-linear-id"))).toBe(true);
+    expect(mutationBodies.some((b) => b.includes("charles"))).toBe(false);
   });
 });
 
