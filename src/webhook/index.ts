@@ -389,7 +389,11 @@ async function autoAcceptCommitmentOnActivity(
     if (result.status === "applied") {
       log.info(`Commitment gate auto-accepted ${issueIdentifierFromEvent(event) ?? issueId} on ${event.type} activity`);
     }
-    if (result.status !== "applied" && result.code !== "commitment-exit-already-recorded") {
+    if (
+      result.status !== "applied" &&
+      result.code !== "commitment-exit-already-recorded" &&
+      result.code !== "delegate-unresolved"
+    ) {
       commitmentAutoAcceptClaims.delete(claimKey);
     }
   } catch (err) {

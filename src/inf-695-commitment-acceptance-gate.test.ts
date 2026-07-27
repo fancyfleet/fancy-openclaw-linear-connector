@@ -47,6 +47,9 @@ bodies:
   - id: igor
     container: dev
     fills_roles: [dev]
+  - id: sage
+    container: dev
+    fills_roles: [dev]
 `;
 
 const WORKFLOW_YAML = `

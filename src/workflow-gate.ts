@@ -6260,6 +6260,28 @@ export async function applyStateTransition(
         }
       }
 
+      // INF-866: when a transition stays inside the same multi-body owner role,
+      // preserve the already-resolved delegate instead of demanding a fresh
+      // target. This is the dev-impl implementation -> doing commitment accept:
+      // TDD has already handed the ticket to a concrete dev, so auto-accept must
+      // not ask TDD to choose that dev again.
+      if (resolvedDelegateId === undefined && issue.delegateId) {
+        const sourceOwnerRole = currentStateName
+          ? def.states.find((s) => s.id === currentStateName)?.owner_role
+          : undefined;
+        if (sourceOwnerRole && sourceOwnerRole === destOwnerRole) {
+          const legalBodies = await resolveBodiesForOwnerRole(destOwnerRole!, def);
+          const seatedAgent = getAgents().find((a) => a.linearUserId === issue.delegateId);
+          if (seatedAgent?.name && legalBodies.includes(seatedAgent.name)) {
+            resolvedDelegateId = issue.delegateId;
+            log.info(
+              `workflow-gate: B2 apply: ${issueId} ${intent} — preserving seated ` +
+              `delegate '${seatedAgent.name}' across same-role '${destOwnerRole}' transition`,
+            );
+          }
+        }
+      }
+
       // Role-based resolution (singleton auto-assign, multi-body skip).
       if (resolvedDelegateId === undefined) {
         try {
