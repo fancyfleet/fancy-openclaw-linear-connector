@@ -1984,14 +1984,14 @@ describe("proxy — Phase 6.5 fail-closed (AI-1476)", () => {
     };
   }
 
-  // AC1: With the proxy stopped (upstream unreachable), a workflow command is refused.
-  // (e.g., config is broken). The proxy still runs but rejects wf:* commands.
+  // AC1: With a missing workflow definition, a workflow command is refused.
+  // The first failed load reports the registry-load failure; subsequent gates see degraded config health.
   it("rejects workflow commands when config is degraded (config-load fail-closed §16.0)", async () => {
     // Point the workflow def to a non-existent file so loadWorkflowDef fails
     process.env.WORKFLOW_DEF_PATH = path.join(dir, "nonexistent-workflow.yaml");
     resetWorkflowCache();
 
-    // The proxy should still work — it'll load config and record the failure
+    // The proxy should still work — it'll try to load config, record the failure, and fail closed.
     globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
 
     const res = await request(appState.app)
@@ -2004,7 +2004,7 @@ describe("proxy — Phase 6.5 fail-closed (AI-1476)", () => {
     expect(res.status).toBe(200);
     expect(res.body.errors).toBeDefined();
     expect(res.body.errors[0].message).toContain("[Proxy]");
-    expect(res.body.errors[0].message).toContain("config artifacts are degraded");
+    expect(res.body.errors[0].message).toContain("could not be loaded");
     expect(res.body.errors[0].message).toContain("break-glass");
   });
 
