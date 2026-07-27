@@ -51,6 +51,8 @@ states:
       - command: request-changes
         to: verification
         generic: revision
+        assign:
+          mode: required
         requires_comment: true
       - command: wait
         to: waiting-on-blocker
