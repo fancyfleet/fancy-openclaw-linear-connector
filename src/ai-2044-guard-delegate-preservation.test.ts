@@ -29,6 +29,7 @@ const mockGetAccessToken = jest.fn<(agentId: string) => string | undefined>().mo
 const mockGetAgents = jest.fn<() => { name: string; linearUserId: string }[]>().mockReturnValue([]);
 const mockLoadWorkflowDefById = jest.fn<(id: string) => Promise<unknown>>();
 const mockResolveBodiesForRole = jest.fn<(role: string) => Promise<string[]>>();
+const mockRoleResolutionScopeForOwnerRole = jest.fn(() => undefined);
 const mockNotify = jest.fn();
 
 jest.unstable_mockModule("./agents.js", () => ({
@@ -54,6 +55,7 @@ jest.unstable_mockModule("./workflow-gate.js", () => ({
 jest.unstable_mockModule("./escalation-gate.js", () => ({
   resolveBodiesForRole: mockResolveBodiesForRole,
   resolveBodiesWithCapability: jest.fn(async () => [] as string[]),
+  roleResolutionScopeForOwnerRole: mockRoleResolutionScopeForOwnerRole,
 }));
 
 jest.unstable_mockModule("./alerts/alert-bus.js", () => ({
