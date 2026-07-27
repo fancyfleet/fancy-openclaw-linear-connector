@@ -50,6 +50,7 @@ import {
   type LabelNode,
   type IssueWithLabels,
 } from "./linear-helpers.js";
+import { isTerminalIssueState } from "./linear-actionable.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "barrier");
 
@@ -93,7 +94,7 @@ export interface ChildState {
   identifier: string;
   /** Labels on the child issue. */
   labels: string[];
-  /** Whether the child is in a terminal workflow state. */
+  /** Whether the child is in a terminal workflow or native Linear state. */
   isTerminal: boolean;
   /** The child's workflow state (from state:* label), or null. */
   workflowState: string | null;
@@ -340,6 +341,7 @@ export async function fetchChildren(
         children {
           nodes {
             identifier
+            state { name type }
             labels { nodes { name } }
           }
         }
@@ -413,7 +415,7 @@ export async function fetchChildren(
       return {
         identifier: node.identifier,
         labels,
-        isTerminal: isChildTerminal(labels),
+        isTerminal: isTerminalIssueState(node.state) || isChildTerminal(labels),
         workflowState,
         isOrphaned,
       };
@@ -1237,7 +1239,7 @@ export function buildShepherdingMessage(
   ];
 
   for (const child of children) {
-    const state = child.workflowState ?? "no state";
+    const state = child.workflowState ?? (child.isTerminal ? "terminal" : "no state");
     const marker = child.isTerminal ? "✓" : "●";
     lines.push(`  ${marker} ${child.identifier}: ${state}`);
   }
