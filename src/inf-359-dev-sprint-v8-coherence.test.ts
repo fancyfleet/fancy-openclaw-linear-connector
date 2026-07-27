@@ -117,6 +117,15 @@ describe("INF-359 AC3: integration-verify children for capabilities", () => {
     expect(fs.existsSync(path.join(REGISTERED_DEFS_DIR, "integration-verify.yaml"))).toBe(true);
   });
 
+  it("integration-verify routes the execution step to an explicit dev verifier", () => {
+    const raw = fs.readFileSync(path.join(REGISTERED_DEFS_DIR, "integration-verify.yaml"), "utf8");
+    const def = yamlLoad(raw) as WorkflowDef;
+    const intakeAccept = transition(def, "intake", "accept");
+
+    expect(state(def, "verification").owner_role).toBe("dev");
+    expect(intakeAccept.assign).toEqual({ mode: "required" });
+  });
+
   it("spawn-impl declares one integration-verify child per capability blocked by component tickets", () => {
     const def = loadDevSprint();
     const fanout = state(def, "spawn-impl").fanout as V8FanoutConfig;

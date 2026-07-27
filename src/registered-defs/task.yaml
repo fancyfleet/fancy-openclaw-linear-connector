@@ -20,6 +20,9 @@
 #     intake --request--> routing --assign--> doing --submit--> review
 #            --approve--> merge --continue--> sign-off --accept--> done
 #   `request-revision` walks the two revision edges (review→doing, sign-off→doing).
+#   It is also legal from intake as a steward recovery edge for bounced worker
+#   tickets whose labels re-entered at intake while the requested revision still
+#   belongs with the prior/intended worker.
 #
 # Break-glass (AI-2095): escape RE-ENTERS the workflow at `intake`, it does NOT
 #   land in a terminal state. Before AI-2095, break_glass.to pointed at a
@@ -80,6 +83,19 @@ states:
         to: routing
         generic: continue      # `linear continue-workflow` — routing auto-assigns the head (singleton)
         assign: { mode: auto }
+      - command: request-changes
+        to: doing
+        generic: revision      # `linear request-revision <worker>` — recovery from bounced intake
+        assign:
+          mode: required       # worker is multi-body; do not guess
+        feedback:
+          required: true
+          category_enum:
+            - incomplete
+            - off-brief
+            - quality
+            - scope-creep
+            - correctness
       - command: demote
         to: __ad_hoc__         # leaves the workflow entirely (design.md §4.5) — also the escape exit
 

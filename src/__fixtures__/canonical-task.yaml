@@ -33,6 +33,19 @@ states:
         to: routing
         generic: continue      # `linear continue-workflow` — routing auto-assigns the head (singleton)
         assign: { mode: auto }
+      - command: request-changes
+        to: doing
+        generic: revision      # `linear request-revision <worker>` — recovery from bounced intake
+        assign:
+          mode: required       # worker is multi-body; do not guess
+        feedback:
+          required: true
+          category_enum:
+            - incomplete
+            - off-brief
+            - quality
+            - scope-creep
+            - correctness
       - command: demote
         to: __ad_hoc__         # leaves the workflow entirely (design.md §4.5) — also the escape exit
 
