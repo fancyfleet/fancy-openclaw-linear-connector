@@ -324,7 +324,7 @@ export async function postComment(
   authToken: string,
 ): Promise<boolean> {
   const mutation = `
-    mutation($issueId: ID!, $body: String!) {
+    mutation($issueId: String!, $body: String!) {
       commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
     }
   `;
