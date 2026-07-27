@@ -354,6 +354,14 @@ function isWorkflowStateActionable(def: WorkflowDef | undefined, stateLabel: str
   return Boolean(state?.owner_role && state.kind !== "terminal");
 }
 
+function normalizedWorkflowState(state: string | undefined): string | undefined {
+  return state?.trim().toLowerCase().replace(/^state:/, "");
+}
+
+function isEscapedSpawnChild(child: ExistingChild): boolean {
+  return normalizedWorkflowState(child.state) === "escape";
+}
+
 // ── Finding extraction ────────────────────────────────────────────────────
 
 /**
@@ -886,7 +894,10 @@ export function dedupeSpawnSpec(
     // AI-2199: the per-entry override is what the child is labeled with at mint
     // time (see the mint loop's `findingWorkflow`), so it is the dedup key.
     const effectiveWorkflow = f.child_workflow ?? childWorkflow;
-    const sameEntry = existingChildren.filter((c) => c.specEntryId === f.id);
+    // INF-900: an escaped arm is terminal history, not a live/satisfied arm slot.
+    // Keep escaped children in the wider input for orphan notes, but do not let
+    // them suppress a replacement for the same spec entry/workflow.
+    const sameEntry = existingChildren.filter((c) => c.specEntryId === f.id && !isEscapedSpawnChild(c));
 
     const scopedMatch = sameEntry.find(
       (c) => c.childWorkflow !== undefined && c.childWorkflow === effectiveWorkflow,
@@ -1622,7 +1633,7 @@ export async function executeFanout(
   // the barrier waits on — not accumulated history (which includes stale siblings).
   const specFindingIds = new Set(findings.map((f) => f.id).filter(Boolean));
   const matchedExisting = existingChildren.filter(
-    (c) => specFindingIds.has(c.specEntryId),
+    (c) => specFindingIds.has(c.specEntryId) && !isEscapedSpawnChild(c),
   );
   result.specMatchedChildren = matchedExisting.map((c) => c.identifier);
 
