@@ -329,6 +329,14 @@ let _registryCache: Map<string, WorkflowDef> | null = null;
 
 const REQUIRED_COMMITMENT_EXITS = ["accept", "reject", "not-ready"] as const;
 const COMMITMENT_EXIT_OUTCOME = "commitment-exit-recorded" as const;
+// INF-781: a revision bounce back into the commitment-gate state (e.g.
+// code-review `request-changes` → implementation) re-arms the gate so the dev
+// can record a fresh commitment exit for the new cycle. The rearm marker is an
+// append-only fence: a commitment exit only counts as "recorded" when it
+// post-dates the most recent rearm. Without this, the once-per-instance exit
+// recorded on the first `accept` permanently blocks re-commit after review
+// round-trips, stranding revised work with no legal forward move (LSO-23).
+const COMMITMENT_REARM_OUTCOME = "commitment-exit-rearmed" as const;
 
 /**
  * INF-758: workflow labels that mark a child as an IMPLEMENTATION arm of a
@@ -411,9 +419,54 @@ function commitmentExitFor(state: WorkflowState | undefined, intent: string): { 
   return target ? { exit: intent, to: target } : null;
 }
 
+// INF-781: id of the most recent event of `outcome` for this ticket, or -1 if
+// none. The store orders query results by (occurred_at DESC, id DESC), so the
+// first row is the latest; `id` is a monotonic autoincrement, which compares
+// reliably even when two events share an occurred_at timestamp.
+function latestEventId(
+  store: OperationalEventStore | undefined,
+  identifier: string,
+  outcome: typeof COMMITMENT_EXIT_OUTCOME | typeof COMMITMENT_REARM_OUTCOME,
+): number {
+  if (!store) return -1;
+  const rows = store.query({ key: identifier, outcome, limit: 1 });
+  return rows.length > 0 ? rows[0].id : -1;
+}
+
+// INF-781: an active recorded commitment exit is one that post-dates the most
+// recent rearm marker. A revision bounce appends a rearm marker, which fences
+// off the prior cycle's exit so the next `accept` records — and applies — a
+// fresh commitment exit rather than being skipped as a duplicate.
 function hasRecordedCommitmentExit(store: OperationalEventStore | undefined, identifier: string): boolean {
   if (!store) return false;
-  return store.query({ key: identifier, outcome: COMMITMENT_EXIT_OUTCOME }).length > 0;
+  const exitId = latestEventId(store, identifier, COMMITMENT_EXIT_OUTCOME);
+  if (exitId < 0) return false;
+  const rearmId = latestEventId(store, identifier, COMMITMENT_REARM_OUTCOME);
+  return exitId > rearmId;
+}
+
+// INF-781: fence off the prior cycle's commitment exit when a ticket re-enters
+// the commitment-gate state on a revision bounce. Only appends when there is an
+// active recorded exit to fence — the initial entry into the gate state (from
+// tests-ready) has no prior exit and needs no marker, and a self-loop within
+// the gate state (handoff) is excluded by the caller.
+function recordCommitmentRearmIfNeeded(params: {
+  store?: OperationalEventStore;
+  identifier: string;
+  workflow: string;
+  from: string;
+  to: string;
+  agent?: string | null;
+}): void {
+  const { store, identifier, workflow, from, to, agent } = params;
+  if (!store || !hasRecordedCommitmentExit(store, identifier)) return;
+  store.append({
+    outcome: COMMITMENT_REARM_OUTCOME,
+    agent: agent ?? null,
+    key: identifier,
+    sessionKey: normalizeLinearTicketKey(identifier),
+    detail: { workflow, from, to },
+  });
 }
 
 function recordCommitmentExitIfMissing(params: {
@@ -6424,6 +6477,29 @@ export async function applyStateTransition(
       (resolvedDelegateId != null ? ` delegate=${resolvedDelegateId}` : resolvedDelegateId === null ? ` delegate=cleared` : ``) +
       (resolvedNativeStateId ? ` native=${destNativeState}(${resolvedNativeStateId})` : ``),
     );
+
+    // INF-781: re-arm the commitment gate when this transition lands back in the
+    // gate state from a downstream state (a review round-trip: code-review
+    // `request-changes` → implementation, or a merge/deploy/ac-validate bounce).
+    // `destStateNode.commitment_gate` identifies the gate state; requiring a
+    // genuine entry (currentStateName !== toStateName) excludes the handoff
+    // self-loop, and recordCommitmentRearmIfNeeded no-ops unless a prior exit is
+    // active — so the initial tests-ready entry is untouched. This lets the next
+    // `accept` record a fresh exit instead of being skipped as a duplicate.
+    if (
+      destStateNode?.commitment_gate &&
+      currentStateName &&
+      currentStateName !== toStateName
+    ) {
+      recordCommitmentRearmIfNeeded({
+        store: options?.operationalEventStore,
+        identifier: issue.identifier,
+        workflow: workflowId,
+        from: currentStateName,
+        to: toStateName,
+        agent: options?.bodyId ?? null,
+      });
+    }
 
     if (currentCommitmentExit) {
       recordCommitmentExitIfMissing({
