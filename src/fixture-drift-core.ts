@@ -22,6 +22,7 @@ export async function checkDefAgainstFixture(
   fixtureExists: boolean;
   inSync: boolean;
   driftDescription: string | null;
+  fixtureVersion: number | undefined;
 }> {
   const fixturePath = fixturePathFor(deployedId);
 
@@ -33,17 +34,22 @@ export async function checkDefAgainstFixture(
       fixtureExists: false,
       inSync: false,
       driftDescription: `Canonical fixture not found at ${fixturePath}`,
+      fixtureVersion: undefined,
     };
   }
 
   const deployedParsed = parseYamlNormalized(deployedContent);
   const fixtureParsed = parseYamlNormalized(fixtureContent);
+  const rawFixtureVersion = fixtureParsed && typeof fixtureParsed === "object"
+    ? (fixtureParsed as { version?: unknown }).version
+    : undefined;
+  const fixtureVersion = typeof rawFixtureVersion === "number" ? rawFixtureVersion : undefined;
 
   const deployedStr = JSON.stringify(deployedParsed);
   const fixtureStr = JSON.stringify(fixtureParsed);
 
   if (deployedStr === fixtureStr) {
-    return { fixtureExists: true, inSync: true, driftDescription: null };
+    return { fixtureExists: true, inSync: true, driftDescription: null, fixtureVersion };
   }
 
   const differences: string[] = [];
@@ -61,5 +67,6 @@ export async function checkDefAgainstFixture(
     fixtureExists: true,
     inSync: false,
     driftDescription: `Structural drift detected: ${differences.join("; ")}`,
+    fixtureVersion,
   };
 }
