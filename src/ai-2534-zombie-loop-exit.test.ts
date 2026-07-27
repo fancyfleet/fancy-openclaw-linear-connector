@@ -510,7 +510,15 @@ beforeEach(() => {
     bagDbPath: path.join(dir, "bag.db"),
     agentQueueDbPath: path.join(dir, "queue.db"),
     operationalEventsDbPath: path.join(dir, "events.db"),
+    observationsDbPath: path.join(dir, "observations.db"),
+    managingStateDbPath: path.join(dir, "managing-state.db"),
     mutationAuditDbPath: path.join(dir, "audit.db"),
+    idempotencyDbPath: path.join(dir, "idempotency.db"),
+    dispatchLeaseDbPath: path.join(dir, "dispatch-leases.db"),
+    dispatchInFlightDbPath: path.join(dir, "dispatch-inflight.db"),
+    proposalsDbPath: path.join(dir, "proposals.db"),
+    livenessDispatchDbPath: path.join(dir, "liveness-dispatches.db"),
+    deadLetterQueueDbPath: path.join(dir, "dead-letter-queue.db"),
     enrolledTicketsDbPath: path.join(dir, "enrolled.db"),
   });
 });
@@ -522,8 +530,16 @@ afterEach(() => {
   appState.sessionTracker.close();
   appState.agentQueue.close();
   appState.operationalEventStore.close();
+  appState.observationStore.close();
+  appState.deadLetterQueue.close();
+  appState.managingStateStore.close();
   appState.mutationAuditStore.close();
   appState.enrolledTicketsStore.close();
+  appState.idempotencyStore.close();
+  appState.dispatchLeaseStore.close();
+  appState.dispatchInFlightStore.close();
+  appState.livenessDispatchStore.close();
+  appState.proposalStore.close();
   appState.dispatchDeliveryScheduler.stop();
   appState.watchdog.stop();
   appState.noActivityDetector.stop();

@@ -1,5 +1,5 @@
 import { jest } from "@jest/globals";
-import { classify, buildRecoveryComment, type ToolCallSummary, type LastAssistantMessage, type StaleSnapshot, STALE_CLASS_NAMES, buildSnapshot, writeSnapshot, aggregateDigest, formatDigestSummary, recoverTicket } from "./stale-session-forensics.js";
+import { classify, buildRecoveryComment, type ToolCallSummary, type LastAssistantMessage, type StaleSnapshot, STALE_CLASS_NAMES, buildSnapshot, writeSnapshot, aggregateDigest, formatDigestSummary, recoverTicket, collectSameKeySessionReplay } from "./stale-session-forensics.js";
 import { StaleRedispatchCounter } from "./stale-redispatch-counter.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -302,6 +302,26 @@ function makeSnapshot(cls: StaleSnapshot["classification"]): StaleSnapshot {
   };
 }
 
+function makeSnapshotWith(cls: StaleSnapshot["classification"], overrides: Partial<StaleSnapshot>): StaleSnapshot {
+  const base = makeSnapshot(cls);
+  return {
+    ...base,
+    ...overrides,
+    metadata: {
+      ...base.metadata,
+      ...(overrides.metadata ?? {}),
+    },
+    toolCallSummary: {
+      ...base.toolCallSummary,
+      ...(overrides.toolCallSummary ?? {}),
+    },
+    linearTicket: {
+      ...base.linearTicket,
+      ...(overrides.linearTicket ?? {}),
+    },
+  };
+}
+
 describe("buildRecoveryComment — C2 attempt tracking", () => {
   test("no attempt param: includes standard re-dispatch text, no attempt line", () => {
     const comment = buildRecoveryComment(makeSnapshot("C2"));
@@ -579,6 +599,251 @@ describe("recoverTicket — C2/C4 redispatch cap", () => {
       return b.query?.includes("OwnershipUpdate");
     });
     expect(ownershipOnlyCalls).toHaveLength(0);
+  });
+});
+
+// ── INF-859 / INF-665 / INF-824 recovery routing regressions ───────────────
+
+describe("INF-859 recovery routing — same-key collision and capped reviewer C4", () => {
+  let dbPath: string;
+
+  beforeEach(() => {
+    dbPath = `/tmp/inf-859-recovery-routing-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+    process.env.LINEAR_API_KEY = "test-key";
+  });
+
+  afterEach(() => {
+    delete process.env.LINEAR_API_KEY;
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+    try { fs.unlinkSync(dbPath + "-wal"); } catch { /* ignore */ }
+    try { fs.unlinkSync(dbPath + "-shm"); } catch { /* ignore */ }
+  });
+
+  function fetchCalls(): Array<[string, RequestInit]> {
+    return (global.fetch as ReturnType<typeof jest.fn>).mock.calls as Array<[string, RequestInit]>;
+  }
+
+  function graphqlBody(call: [string, RequestInit]) {
+    return JSON.parse((call[1]?.body ?? "{}") as string) as { query?: string; variables?: Record<string, unknown> };
+  }
+
+  function commentBodies(): string[] {
+    return fetchCalls()
+      .map(graphqlBody)
+      .filter((body) => body.query?.includes("commentCreate"))
+      .map((body) => String((body.variables as { body?: unknown } | undefined)?.body ?? ""));
+  }
+
+  test("INF-859/INF-665: same-key CronSessionLifecycleClaimError husk is coalesced before stale_redispatch_attempts increments", async () => {
+    global.fetch = makeFetchMock() as unknown as typeof fetch;
+
+    const collisionHusk = makeSnapshotWith("C4", {
+      metadata: {
+        ticketId: "linear-INF-665",
+        sessionKey: "agent:igor:linear-INF-665",
+        sessionFile: null,
+      },
+      toolCallSummary: { byName: {}, totalCalls: 0, last10: [] },
+      lastAssistantMessage: null,
+      lastToolCall: null,
+      errors: [
+        "CronSessionLifecycleClaimError: lifecycle claim already held for agent:igor:linear-INF-665 before first assistant turn",
+      ],
+      linearTicket: { identifier: "INF-665" },
+    });
+
+    const result = await recoverTicket(collisionHusk, "igor", {
+      redispatchDbPath: dbPath,
+      maxRedispatchAttempts: 3,
+      // Deterministic replay fixture: one live/working owner exists for the same
+      // normalized session key, plus this zero-output claim-collision husk.
+      sameKeySessionReplay: [
+        {
+          sessionKey: "agent:igor:linear-INF-665",
+          sessionFile: "/fixtures/inf-665-live-working.jsonl",
+          totalCalls: 6,
+          assistantTurns: 2,
+          claimError: null,
+          status: "working",
+        },
+        {
+          sessionKey: "agent:igor:linear-INF-665",
+          sessionFile: null,
+          totalCalls: 0,
+          assistantTurns: 0,
+          claimError: "CronSessionLifecycleClaimError",
+          status: "claim-collision-husk",
+        },
+      ],
+    } as Parameters<typeof recoverTicket>[2] & { sameKeySessionReplay: unknown[] });
+
+    expect(result.success).toBe(true);
+    expect(result.action).toBe("skipped-same-key-claim-collision");
+    expect(result.detail).toContain("coalesced with live working session");
+
+    const counter = new StaleRedispatchCounter(dbPath);
+    expect(counter.get("linear-INF-665")).toBe(0);
+    counter.close();
+
+    expect(commentBodies()).toHaveLength(0);
+    const recoveryMutations = fetchCalls().filter((call) => graphqlBody(call).query?.includes("RecoverIssue"));
+    expect(recoveryMutations).toHaveLength(0);
+  });
+
+  test("INF-859: production same-key replay is collected from OpenClaw session index", () => {
+    const openclawHome = fs.mkdtempSync(path.join(os.tmpdir(), "stale-replay-"));
+    const sessionsDir = path.join(openclawHome, "agents", "igor", "sessions");
+    fs.mkdirSync(sessionsDir, { recursive: true });
+
+    const liveFile = path.join(sessionsDir, "live.jsonl");
+    const huskFile = path.join(sessionsDir, "husk.jsonl");
+    fs.writeFileSync(
+      liveFile,
+      JSON.stringify({
+        type: "message",
+        timestamp: "2026-07-27T00:00:00.000Z",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", name: "exec", arguments: {} }],
+          stopReason: "tool_use",
+        },
+      }) + "\n",
+      "utf8",
+    );
+    fs.writeFileSync(
+      huskFile,
+      JSON.stringify({
+        type: "message",
+        timestamp: "2026-07-27T00:00:01.000Z",
+        message: {
+          role: "toolResult",
+          content: [{ type: "text", text: "Error: CronSessionLifecycleClaimError: lifecycle claim already held" }],
+        },
+      }) + "\n",
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(sessionsDir, "sessions.json"),
+      JSON.stringify({
+        "agent:igor:linear-INF-665": { sessionId: "live", sessionFile: liveFile, status: "working" },
+        "agent:igor:hook:linear-INF-665": { sessionId: "husk", sessionFile: huskFile, status: "claim-collision-husk" },
+        "agent:igor:linear-INF-999": { sessionId: "other", status: "working" },
+      }),
+      "utf8",
+    );
+
+    const replay = collectSameKeySessionReplay("igor", "linear-INF-665", { openclawHome });
+
+    expect(replay).toHaveLength(2);
+    expect(replay).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ sessionKey: "agent:igor:linear-INF-665", totalCalls: 1, assistantTurns: 1, claimError: null, status: "working" }),
+        expect.objectContaining({ sessionKey: "agent:igor:hook:linear-INF-665", totalCalls: 0, assistantTurns: 0, claimError: expect.stringContaining("CronSessionLifecycleClaimError"), status: "claim-collision-husk" }),
+      ]),
+    );
+  });
+
+  test("INF-859/INF-665: true C4 with no competing live owner still recovers as a first-stall re-poke and counts once", async () => {
+    global.fetch = makeFetchMock() as unknown as typeof fetch;
+
+    const trueC4 = makeSnapshotWith("C4", {
+      metadata: {
+        ticketId: "linear-INF-859",
+        sessionKey: "agent:igor:linear-INF-859",
+        sessionFile: null,
+      },
+      toolCallSummary: { byName: {}, totalCalls: 0, last10: [] },
+      lastAssistantMessage: null,
+      lastToolCall: null,
+      errors: [],
+      linearTicket: { identifier: "INF-859" },
+    });
+
+    const result = await recoverTicket(trueC4, "igor", {
+      redispatchDbPath: dbPath,
+      maxRedispatchAttempts: 3,
+      sameKeySessionReplay: [
+        {
+          sessionKey: "agent:igor:linear-INF-859",
+          sessionFile: null,
+          totalCalls: 0,
+          assistantTurns: 0,
+          claimError: null,
+          status: "never-started",
+        },
+      ],
+    } as Parameters<typeof recoverTicket>[2] & { sameKeySessionReplay: unknown[] });
+
+    expect(result.success).toBe(true);
+    expect(result.action).toBe("re-poke-c4");
+    expect(result.rePoke).toBe(true);
+    expect(result.detail).toContain("no competing live owner");
+
+    const counter = new StaleRedispatchCounter(dbPath);
+    expect(counter.get("linear-INF-859")).toBe(1);
+    counter.close();
+
+    expect(commentBodies().join("\n")).toContain("re-poking delegate");
+  });
+
+  test("INF-859/INF-824: capped reviewer C4 routes to sprint steward with infra/capacity context, not no-assignee human review", async () => {
+    const setupCounter = new StaleRedispatchCounter(dbPath);
+    setupCounter.incrementAndGet("linear-INF-824");
+    setupCounter.incrementAndGet("linear-INF-824");
+    setupCounter.close();
+
+    global.fetch = makeFetchMock() as unknown as typeof fetch;
+
+    const cappedReviewerC4 = makeSnapshotWith("C4", {
+      metadata: {
+        agentId: "charles",
+        ticketId: "linear-INF-824",
+        sessionKey: "agent:charles:linear-INF-824",
+        sessionFile: null,
+      },
+      toolCallSummary: { byName: {}, totalCalls: 0, last10: [] },
+      lastAssistantMessage: null,
+      lastToolCall: null,
+      errors: [],
+      linearTicket: { identifier: "INF-824", stateAtTimeout: "code-review" },
+    });
+
+    const cappedReviewerConfig = {
+      redispatchDbPath: dbPath,
+      maxRedispatchAttempts: 3,
+      sprintStewardLinearId: "sprint-steward-linear-id",
+      infraOwnerLinearId: "infra-owner-linear-id",
+      recoveryRoleContext: {
+        workflow: "dev-impl",
+        state: "code-review",
+        role: "reviewer",
+        failure: "C4 Never started (totalCalls:0, sessionFile:null)",
+      },
+    } as Parameters<typeof recoverTicket>[2] & {
+      sprintStewardLinearId: string;
+      infraOwnerLinearId: string;
+      recoveryRoleContext: unknown;
+    };
+
+    const result = await recoverTicket(cappedReviewerC4, "charles", cappedReviewerConfig);
+
+    expect(result.success).toBe(true);
+    expect(result.action).toContain("infra-escalation");
+    expect(result.detail).toContain("reviewer capacity");
+
+    const comment = commentBodies().join("\n");
+    expect(comment).toContain("reviewer capacity");
+    expect(comment).toContain("C4 Never started");
+    expect(comment).toContain("totalCalls: 0");
+    expect(comment).toContain("sessionFile: null");
+    expect(comment).not.toContain("Escalating to human review");
+
+    const recoverCall = fetchCalls().find((call) => graphqlBody(call).query?.includes("RecoverIssue"));
+    expect(recoverCall).toBeDefined();
+    const recoverBody = graphqlBody(recoverCall!);
+    const input = recoverBody.variables?.input as { assigneeId?: string | null; delegateId?: string | null };
+    expect(input.assigneeId).toBe("sprint-steward-linear-id");
+    expect(input.delegateId).toBeNull();
   });
 });
 
