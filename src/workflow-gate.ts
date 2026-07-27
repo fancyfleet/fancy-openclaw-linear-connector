@@ -4125,46 +4125,40 @@ export async function checkWorkflowRules(
         ticket: issueId,
         dedupKey: `done-gate|force-deploy|${issueId}`,
       });
-    }
-    let branchStatus = await fetchBranchAndPRStatus(issueId, authToken, fetchedIdentifier);
-    // AI-1497: retry once on null — transient Linear API failure during
-    // Hanzo merge+deploy quick succession.
-    if (!branchStatus) {
-      await new Promise((r) => setTimeout(r, 1000));
-      branchStatus = await fetchBranchAndPRStatus(issueId, authToken, fetchedIdentifier);
-    }
-    if (!branchStatus) {
-      // Two consecutive nulls — transient API failure. Fail-open to avoid
-      // stranding tickets; merge/deploy state is already past code review.
-      log.warn(`workflow-gate: done gate: could not verify branch/PR status for ${issueId} after retry — failing open`);
-    } else if (branchStatus.hasMergedPR) {
-      log.info(`workflow-gate: done gate: ${issueId} passed (merged PR confirmed)`);
-    } else if (!branchStatus.hasBranch && !branchStatus.hasPR) {
-      // INF-96: Complete absence of evidence → hard block. This was an AI-1497
-      // fail-open, but with no GitHub integration installed every ticket passed
-      // evidence-free — a silent false-completion failure mode. The warning-only
-      // alert scrolled past. Now treated as a hard block with an actionable alert.
-      log.warn(`workflow-gate: done gate: ${issueId} blocked — no branch/PR evidence`);
-      notify({
-        severity: "critical",
-        source: "done-gate",
-        title: "done gate blocked: no branch/PR evidence (GitHub integration missing?)",
-        detail: `Ticket ${issueId} blocked on '${intent}' with zero GitHub attachments. If this fires for every forward move, the Linear GitHub integration is not installed and the merged-PR gate is verifying nothing. Install the integration or use break-glass to bypass.`,
-        ticket: issueId,
-        dedupKey: "done-gate|no-evidence",
-      });
-      return `[Proxy] '${intent}' blocked: cannot release — no branch/PR evidence found.`;
     } else {
-      // Has some GitHub evidence but PR metadata does not show merged status.
-      // This happens when Hanzo creates branches externally — Linear's GitHub
-      // integration never syncs merge status metadata for externally-created
-      // branches (INF-112). Try GitHub API as fallback.
-      // Only enter the INF-112 metadata-gap path when no PR attachment has
-      // explicit merge status metadata — meaning Linear's GitHub integration
-      // didn't sync status for this externally-created branch. When metadata
-      // IS available (e.g. status: "open"), the PR is genuinely not merged
-      // and we block immediately (INF-96).
-      if (branchStatus.hasPR && !branchStatus.hasMergedPR && !branchStatus.prMetadataAvailable) {
+      let branchStatus = await fetchBranchAndPRStatus(issueId, authToken, fetchedIdentifier);
+      // AI-1497: retry once on null — transient Linear API failure during
+      // Hanzo merge+deploy quick succession.
+      if (!branchStatus) {
+        await new Promise((r) => setTimeout(r, 1000));
+        branchStatus = await fetchBranchAndPRStatus(issueId, authToken, fetchedIdentifier);
+      }
+      if (!branchStatus) {
+        // Two consecutive nulls — transient API failure. Fail-open to avoid
+        // stranding tickets; merge/deploy state is already past code review.
+        log.warn(`workflow-gate: done gate: could not verify branch/PR status for ${issueId} after retry — failing open`);
+      } else if (branchStatus.hasMergedPR) {
+        log.info(`workflow-gate: done gate: ${issueId} passed (merged PR confirmed)`);
+      } else if (!branchStatus.hasBranch && !branchStatus.hasPR) {
+        // INF-96: Complete absence of evidence → hard block. This was an AI-1497
+        // fail-open, but with no GitHub integration installed every ticket passed
+        // evidence-free — a silent false-completion failure mode. The warning-only
+        // alert scrolled past. Now treated as a hard block with an actionable alert.
+        log.warn(`workflow-gate: done gate: ${issueId} blocked — no branch/PR evidence`);
+        notify({
+          severity: "critical",
+          source: "done-gate",
+          title: "done gate blocked: no branch/PR evidence (GitHub integration missing?)",
+          detail: `Ticket ${issueId} blocked on '${intent}' with zero GitHub attachments. If this fires for every forward move, the Linear GitHub integration is not installed and the merged-PR gate is verifying nothing. Install the integration or use break-glass to bypass.`,
+          ticket: issueId,
+          dedupKey: "done-gate|no-evidence",
+        });
+        return `[Proxy] '${intent}' blocked: cannot release — no branch/PR evidence found.`;
+      } else if (branchStatus.hasPR && !branchStatus.hasMergedPR && !branchStatus.prMetadataAvailable) {
+        // Has PR evidence but metadata does not show merged status.
+        // This happens when Hanzo creates branches externally — Linear's GitHub
+        // integration never syncs merge status metadata for externally-created
+        // branches (INF-112). Try GitHub API as fallback.
         const prUrls = branchStatus.prUrls ?? [];
         let verifiedMerged = false;
         // INF-714: distinguish an authoritative "not merged" (a reachable 200

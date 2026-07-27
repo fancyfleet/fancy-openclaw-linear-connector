@@ -2360,6 +2360,18 @@ describe("checkWorkflowRules — INF-112: non-Linear-generated branch (metadata-
     expect(result).toBeNull();
   });
 
+  it("INF-839: force-deploy from merge state bypasses zero branch/PR evidence", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"], { hasBranch: false, hasPR: false });
+    const result = await checkWorkflowRules("force-deploy", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).toBeNull();
+  });
+
+  it("INF-839: force-deploy from deploy state bypasses zero branch/PR evidence", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deploy"], { hasBranch: false, hasPR: false });
+    const result = await checkWorkflowRules("force-deploy", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).toBeNull();
+  });
+
   it("INF-527: force-deploy is allowed for the recovery steward (holds workflow:force-deploy)", async () => {
     // astrid's steward container grants workflow:force-deploy in TEST_POLICY_YAML,
     // mirroring the live policy (steward is a co-holder, not just Hanzo).
