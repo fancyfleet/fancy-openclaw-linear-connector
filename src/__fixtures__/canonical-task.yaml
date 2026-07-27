@@ -3,7 +3,7 @@
 # The canonical fixture is a mirror of the registered-def (INF-723 single-source rule).
 
 id: task
-version: 2                      # AI-2095: break_glass.to intake + terminal escape state removed
+version: 3                      # INF-804: approved PR tasks route through merge gate before sign-off
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
 
@@ -68,15 +68,39 @@ states:
     sla: 24h                       # time-in-state; breach → stall escalation (design.md §5.5)
     transitions:
       - command: approve
-        to: sign-off
-        generic: continue      # `linear continue-workflow` — sign-off auto-assigns the requester (singleton)
-        assign:
-          mode: auto
-          selection_criteria: original-requester   # INF-745: reconciled from fixture (INF-649). sign-off rests with the requester.
+        to: merge
+        generic: continue      # `linear continue-workflow` — merge auto-assigns Hanzo
+        assign: { mode: auto }
       - command: request-changes
         to: doing
         generic: revision      # `linear request-revision`
         assign: { default: prior-implementer }   # returns to the worker who submitted (ENFORCED, def-driven)
+        feedback:
+          required: true
+          category_enum:
+            - incomplete
+            - off-brief
+            - quality
+            - scope-creep
+            - correctness
+
+  - id: merge
+    owner_role: deployment          # Hanzo; protected-main merge gate
+    kind: normal
+    native_state: todo
+    sla: 4h
+    transitions:
+      - command: continue
+        to: sign-off
+        generic: continue           # after merge, requester sign-off can close
+        requires_capability: deploy:execute
+        assign:
+          mode: auto
+          selection_criteria: original-requester
+      - command: reject
+        to: doing
+        requires_comment: true
+        assign: { default: prior-implementer }
         feedback:
           required: true
           category_enum:
