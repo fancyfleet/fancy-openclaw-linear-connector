@@ -47,6 +47,20 @@ states:
         to: verification
         generic: revision
         requires_comment: true
+      - command: wait
+        to: waiting-on-blocker
+        requires_comment: true
+
+  - id: waiting-on-blocker
+    owner_role: steward
+    kind: normal
+    native_state: managing
+    description: >
+      Hold verification non-destructively while an open component ticket blocks
+      this capability demonstration.
+    transitions:
+      - command: resume
+        to: verification
 
   - id: done
     kind: terminal

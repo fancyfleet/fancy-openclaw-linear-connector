@@ -26,7 +26,7 @@ import {
   applyBootstrapToIssue,
 } from "./workflow-bootstrap.js";
 import { autoEnrollPlainDelegation } from "./workflow-gate.js";
-import { isTerminalIssueState } from "./linear-actionable.js";
+import { isBlockedByOpenIssue, isTerminalIssueState, type LinearIssueRelation } from "./linear-actionable.js";
 import { getAgentIdForLinearUserId, getOpenclawAgentName } from "./agents.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
@@ -92,6 +92,8 @@ interface GovernedTicket {
   plainDelegation?: boolean;
   /** INF-584: native Linear state, for native-terminality guard. */
   nativeState?: { name?: string; type?: string } | null;
+  /** INF-821: verified inbound blockers make a ticket deliberately non-actionable. */
+  relations?: { nodes?: LinearIssueRelation[] | null } | null;
 }
 
 type LinearIssueNode = {
@@ -102,6 +104,7 @@ type LinearIssueNode = {
   delegate: { id: string; name: string } | null;
   team: { id: string };
   state?: { name?: string; type?: string } | null;
+  relations?: { nodes?: LinearIssueRelation[] | null } | null;
 };
 
 type IssuesPageResp = {
@@ -168,6 +171,9 @@ async function queryGovernedTickets(
             delegate { id name }
             team { id }
             state { name type }
+            relations(first: 50) {
+              nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
+            }
           }
           pageInfo {
             hasNextPage
@@ -225,6 +231,7 @@ async function queryGovernedTickets(
     teamId: n.team.id,
     plainDelegation: false,
     nativeState: n.state ?? null,
+    relations: n.relations ?? null,
   }));
 }
 
@@ -256,6 +263,9 @@ async function queryAdhocDelegatedTickets(
             delegate { id name }
             team { id }
             state { name type }
+            relations(first: 50) {
+              nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
+            }
           }
           pageInfo {
             hasNextPage
@@ -322,6 +332,7 @@ async function queryAdhocDelegatedTickets(
     teamId: n.team.id,
     plainDelegation: true,
     nativeState: n.state ?? null,
+    relations: n.relations ?? null,
   }));
 }
 
@@ -527,6 +538,13 @@ export async function runDelegationReconciliationSweep(
         `delegation-reconciliation: skipping ${ticket.identifier} — Linear entity is natively terminal ` +
         `(state.type='${ticket.nativeState?.type ?? "null"}', name='${ticket.nativeState?.name ?? "null"}'); ` +
         `no legal transition exists on a retired issue`,
+      );
+      continue;
+    }
+
+    if (isBlockedByOpenIssue(ticket)) {
+      log.info(
+        `delegation-reconciliation: skipping ${ticket.identifier} — blocked by unfinished prerequisite`,
       );
       continue;
     }

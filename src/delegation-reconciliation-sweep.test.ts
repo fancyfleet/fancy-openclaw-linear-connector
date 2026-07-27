@@ -74,6 +74,13 @@ interface MockTicket {
   delegateName: string | null;
   teamId: string;
   state?: { name?: string; type?: string } | null;
+  relations?: {
+    nodes?: Array<{
+      type?: string;
+      issue?: { id?: string; identifier?: string; state?: { name?: string; type?: string } | null } | null;
+      relatedIssue?: { id?: string; identifier?: string; state?: { name?: string; type?: string } | null } | null;
+    }> | null;
+  } | null;
   title?: string;
 }
 
@@ -175,6 +182,7 @@ function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
         delegate: t.delegateId ? { id: t.delegateId, name: t.delegateName } : null,
         team: { id: t.teamId },
         state: t.state ?? { name: "In Progress", type: "started" },
+        relations: t.relations ?? { nodes: [] },
       }));
       return new Response(
         JSON.stringify({ data: { issues: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } } }),
@@ -195,6 +203,7 @@ function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
         delegate: t.delegateId ? { id: t.delegateId, name: t.delegateName } : null,
         team: { id: t.teamId },
         state: t.state ?? { name: "In Progress", type: "started" },
+        relations: t.relations ?? { nodes: [] },
       }));
       return new Response(
         JSON.stringify({ data: { issues: { nodes } } }),
@@ -219,6 +228,7 @@ function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
                 labels: { nodes: labelsByIssueId.get(ticket.id) ?? ticket.labels },
                 delegate: ticket.delegateId ? { id: ticket.delegateId, name: ticket.delegateName } : null,
                 team: { id: ticket.teamId },
+                relations: ticket.relations ?? { nodes: [] },
               },
             },
           }),
@@ -481,6 +491,52 @@ describe("AC1: sweep detects stranded delegations and re-dispatches", () => {
     expect(result.bootstrapHealed).toBe(0);
     expect(wakeDispatches).toHaveLength(0);
     expect(eventStore.query({ key: "linear-AI-2628", limit: 20 })).toHaveLength(0);
+    eventStore.close();
+  });
+
+  it("skips a governed verification ticket blocked by an open inbound relation", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: string[] = [];
+    const { bus } = makeTestAlertBus();
+
+    globalThis.fetch = makeReconciliationFetch({
+      governedTickets: [
+        {
+          id: "issue-inf-779",
+          identifier: "INF-779",
+          updatedAt: OLD_TIMESTAMP,
+          labels: [
+            { id: "label-wf-integration-verify", name: "wf:integration-verify" },
+            { id: "label-state-verification", name: "state:verification" },
+          ],
+          delegateId: DELEGATE_LINEAR_ID,
+          delegateName: DELEGATE_AGENT_NAME,
+          teamId: TEAM_ID,
+          state: { name: "Doing", type: "started" },
+          relations: {
+            nodes: [
+              {
+                type: "blocks",
+                issue: { id: "issue-inf-775", identifier: "INF-775", state: { name: "Doing", type: "started" } },
+                relatedIssue: { id: "issue-inf-779", identifier: "INF-779", state: { name: "Doing", type: "started" } },
+              },
+            ],
+          },
+        },
+      ],
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (_, id) => { wakeDispatches.push(id); },
+    });
+
+    expect(result.healed).toBe(0);
+    expect(result.skippedIdempotent).toBe(0);
+    expect(wakeDispatches).toHaveLength(0);
+    expect(eventStore.query({ key: "linear-INF-779", limit: 20 })).toHaveLength(0);
     eventStore.close();
   });
 });
