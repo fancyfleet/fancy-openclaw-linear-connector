@@ -21,7 +21,10 @@ import path from "node:path";
 import yaml from "js-yaml";
 import { componentLogger, createLogger } from "./logger.js";
 import { notify } from "./alerts/alert-bus.js";
-import { loadWorkflowRegistry } from "./workflow-gate.js";
+import { defaultWorkflowDefPath } from "./instance-config.js";
+import { checkDefAgainstFixture, fixturePathFor } from "./fixture-drift-core.js";
+
+export { checkDefAgainstFixture, fixturePathFor } from "./fixture-drift-core.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "fixture-drift");
 
@@ -61,82 +64,24 @@ let _status: FixtureDriftStatus = {
   total: 0,
 };
 
-// ── Fixture path resolution ────────────────────────────────────────────────
+// ── Deployed source discovery ──────────────────────────────────────────────
 
-/**
- * Resolve the canonical fixture path for a given workflow id.
- * Fixtures live in src/__fixtures__/canonical-{workflowId}.yaml.
- * The fixture dir is resolved relative to the repo root, which is two
- * directories up from the src/ directory where this file lives.
- */
-export function fixturePathFor(workflowId: string): string {
-  // In production, fixtures live at repoRoot/src/__fixtures__/canonical-{id}.yaml.
-  // We resolve relative to the module path at module load time.
-  const repoRoot = path.resolve(new URL(".", import.meta.url).pathname, "..");
-  return path.join(repoRoot, "src", "__fixtures__", `canonical-${workflowId}.yaml`);
-}
+async function deployedDefSources(): Promise<Array<{ id: string; content: string }>> {
+  const dir = process.env.WORKFLOW_DEFS_DIR || process.env.WORKFLOW_DEF_DIR || undefined;
+  const files = dir
+    ? (await fs.readdir(dir)).filter((f) => f.endsWith(".yaml")).sort().map((f) => path.join(dir, f))
+    : [process.env.WORKFLOW_DEF_PATH || defaultWorkflowDefPath()];
 
-/**
- * Parse a YAML string into a JS value, stripping comments (YAML parser
- * already does this) and normalizing for structural comparison.
- */
-function parseYamlNormalized(content: string): unknown {
-  return yaml.load(content);
-}
-
-/**
- * Check whether a deployed def and its canonical fixture match structurally.
- * Returns null if in sync, or a description of the drift.
- */
-export async function checkDefAgainstFixture(
-  deployedId: string,
-  deployedContent: string,
-): Promise<{
-  fixtureExists: boolean;
-  inSync: boolean;
-  driftDescription: string | null;
-}> {
-  const fixturePath = fixturePathFor(deployedId);
-
-  let fixtureContent: string;
-  try {
-    fixtureContent = await fs.readFile(fixturePath, "utf8");
-  } catch (err) {
-    return {
-      fixtureExists: false,
-      inSync: false,
-      driftDescription: `Canonical fixture not found at ${fixturePath}`,
-    };
+  const sources: Array<{ id: string; content: string }> = [];
+  for (const file of files) {
+    const content = await fs.readFile(file, "utf8");
+    const parsed = yaml.load(content) as Record<string, unknown> | null;
+    const id = parsed && typeof parsed.id === "string"
+      ? parsed.id
+      : path.basename(file).replace(/\.ya?ml$/i, "");
+    sources.push({ id, content });
   }
-
-  // Compare parsed YAML objects (structural equality, ignoring comment/whitespace)
-  const deployedParsed = parseYamlNormalized(deployedContent);
-  const fixtureParsed = parseYamlNormalized(fixtureContent);
-
-  const deployedStr = JSON.stringify(deployedParsed);
-  const fixtureStr = JSON.stringify(fixtureParsed);
-
-  if (deployedStr === fixtureStr) {
-    return { fixtureExists: true, inSync: true, driftDescription: null };
-  }
-
-  // Identify specific differences for the drift description
-  const differences: string[] = [];
-  if (deployedParsed && fixtureParsed && typeof deployedParsed === "object" && typeof fixtureParsed === "object") {
-    const d = deployedParsed as Record<string, unknown>;
-    const f = fixtureParsed as Record<string, unknown>;
-    for (const key of new Set([...Object.keys(d), ...Object.keys(f)])) {
-      if (JSON.stringify(d[key]) !== JSON.stringify(f[key])) {
-        differences.push(`${key}: deployed=${JSON.stringify(d[key])} fixture=${JSON.stringify(f[key])}`);
-      }
-    }
-  }
-
-  return {
-    fixtureExists: true,
-    inSync: false,
-    driftDescription: `Structural drift detected: ${differences.join("; ")}`,
-  };
+  return sources;
 }
 
 // ── Main check ─────────────────────────────────────────────────────────────
@@ -148,13 +93,10 @@ export async function checkDefAgainstFixture(
  */
 export async function runFixtureDriftCheck(): Promise<FixtureDriftStatus> {
   try {
-    const registry = await loadWorkflowRegistry();
     const entries: FixtureDriftEntry[] = [];
 
-    for (const [id, def] of registry) {
-      // Serialize the def back to YAML for comparison
-      const deployedContent = yaml.dump(def);
-      const result = await checkDefAgainstFixture(id, deployedContent);
+    for (const { id, content } of await deployedDefSources()) {
+      const result = await checkDefAgainstFixture(id, content);
       entries.push({
         workflowId: id,
         fixtureExists: result.fixtureExists,

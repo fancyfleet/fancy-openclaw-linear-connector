@@ -63,6 +63,7 @@ import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import { reposWithoutCiAutoDeploy, githubRepoFromUrl } from "./deploy-policy.js";
 import { notify } from "./alerts/alert-bus.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
+import { checkDefAgainstFixture } from "./fixture-drift-core.js";
 
 /**
  * Phase 6.5 / H-6: Label read-only projection + override path + drift reconciliation.
@@ -508,6 +509,25 @@ async function loadDefFromFile(file: string): Promise<WorkflowDef> {
   return def;
 }
 
+async function validateDefFixtureSync(def: WorkflowDef, raw: string): Promise<void> {
+  // Fail-closed by default (INF-773): a deployed def that drifts from its
+  // canonical fixture is refused before registry.set. The grace opt-out exists
+  // for the test suite, which installs synthetic minimal defs (with canonical
+  // ids like `dev-impl`/`sprint-spawner`) that intentionally diverge from the
+  // canonical fixtures to exercise OTHER enforcement dimensions. Mirrors the
+  // PROXY_ALLOW_MISSING_CLI_VERSION pattern in jest.setup.ts: production `.env`
+  // leaves this unset → enforcement on, which is the shipped fail-closed posture.
+  // The observer path (runFixtureDriftCheck) stays fully armed regardless — only
+  // the hard loader refusal is graced, so drift is still reported in health.
+  if (process.env.ALLOW_WORKFLOW_DEF_FIXTURE_DRIFT) return;
+  const fixtureCheck = await checkDefAgainstFixture(def.id, raw);
+  if (!fixtureCheck.inSync) {
+    throw new Error(
+      `workflow def '${def.id}' fixture drift: ${fixtureCheck.driftDescription ?? "canonical fixture mismatch"}`,
+    );
+  }
+}
+
 /**
  * Legacy single-def accessor. Returns the primary workflow def, derived from the
  * registry so its cache stays coherent with loadWorkflowRegistry().
@@ -603,14 +623,17 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
     }
     const yamlFiles = entries.filter((f) => f.endsWith(".yaml")).sort();
     let failures = 0;
+    const failureMessages: string[] = [];
     for (const f of yamlFiles) {
       const full = path.join(dir, f);
       try {
+        const raw = await fs.readFile(full, "utf8");
         const def = await loadDefFromFile(full);
         if (registry.has(def.id)) {
           log.warn(`workflow-gate: duplicate workflow id '${def.id}' (${full}) — keeping first, ignoring this file`);
           continue;
         }
+        await validateDefFixtureSync(def, raw);
         // AC3: refuse to activate a def version that silently removes a state
         // relative to its last-activated version. Throwing here routes through
         // the same per-def fail-closed path as a native_state failure: the def
@@ -636,11 +659,12 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
         // AC2: one bad def fails that def only — exclude it, keep the rest.
         failures++;
         const msg = err instanceof Error ? err.message : String(err);
+        failureMessages.push(`${path.basename(full)}: ${msg}`);
         log.error(`workflow-gate: workflow def excluded from registry (${full}): ${msg}`);
       }
     }
     if (failures > 0) {
-      recordFailure("workflow-def", `${failures} workflow def(s) excluded from registry (see logs)`);
+      recordFailure("workflow-def", `${failures} workflow def(s) excluded from registry: ${failureMessages.join(" | ")}`);
     } else {
       recordSuccess("workflow-def");
     }
@@ -649,7 +673,10 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
     // A load failure rethrows here (fail-closed) exactly as the legacy single-def
     // loader did, so the current deploy's safety posture is unchanged.
     try {
-      const def = await loadDefFromFile(workflowDefPath());
+      const primary = workflowDefPath();
+      const raw = await fs.readFile(primary, "utf8");
+      const def = await loadDefFromFile(primary);
+      await validateDefFixtureSync(def, raw);
       // AC3: single-file mode rethrows on removal (fail-closed), matching this
       // path's existing posture — the primary deploy does not activate a def
       // that would silently strand its in-flight tickets.

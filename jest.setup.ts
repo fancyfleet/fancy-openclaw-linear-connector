@@ -55,6 +55,17 @@ process.env.PROXY_ALLOW_MISSING_CLI_VERSION = "1";
 // floor tests set/delete this env themselves.
 process.env.PROXY_MIN_CLI_VERSION = "0.3.0";
 
+// INF-773: loadWorkflowRegistry refuses (fail-closed) any deployed def that
+// drifts from its canonical `src/__fixtures__/canonical-{id}.yaml` mirror.
+// Most fixtures in this suite install synthetic minimal defs with canonical ids
+// (dev-impl, sprint-spawner, task, …) that intentionally diverge from the
+// canonical fixtures to exercise OTHER enforcement dimensions, so a hard
+// fixture-drift refusal would falsely fail them. Grant the grace opt-out here.
+// The dedicated INF-773 test deletes this to assert the fail-closed refusal;
+// production `.env` leaves it unset → enforcement on, which is the shipped
+// posture. The observer path (runFixtureDriftCheck) is unaffected by this flag.
+process.env.ALLOW_WORKFLOW_DEF_FIXTURE_DRIFT = "1";
+
 // A live token in the container/shell env changes linear-actionable behavior
 // (previously worked around with `env -u LINEAR_OAUTH_TOKEN npm test`).
 // Deleted rather than blanked — those tests distinguish unset from empty —
