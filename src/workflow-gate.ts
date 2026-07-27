@@ -3305,7 +3305,9 @@ export async function checkWorkflowRules(
     log.error(`workflow-gate: config-health FAIL-CLOSED — rejecting '${intent}' on wf:${workflowId} ticket ${issueId} because config is degraded`);
     return (
       `[Proxy] '${intent}' blocked: config artifacts are degraded and enforcement cannot be trusted. ` +
-      `A steward can use break-glass (--break-glass flag or X-Openclaw-Break-Glass header) to bypass this check.`
+      `Only the recovery steward (workflow:break-glass) may bypass this. The --break-glass flag lives on the ` +
+      `generic transition command, not on '${intent}': re-run as ` +
+      `\`linear transition ${issueId} <move> --break-glass\` (or send the X-Openclaw-Break-Glass header).`
     );
   }
 
