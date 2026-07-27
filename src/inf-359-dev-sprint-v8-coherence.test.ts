@@ -121,9 +121,11 @@ describe("INF-359 AC3: integration-verify children for capabilities", () => {
     const raw = fs.readFileSync(path.join(REGISTERED_DEFS_DIR, "integration-verify.yaml"), "utf8");
     const def = yamlLoad(raw) as WorkflowDef;
     const intakeAccept = transition(def, "intake", "accept");
+    const verificationRevision = transition(def, "verification", "request-changes");
 
     expect(state(def, "verification").owner_role).toBe("dev");
     expect(intakeAccept.assign).toEqual({ mode: "required" });
+    expect(verificationRevision.assign).toEqual({ mode: "required" });
   });
 
   it("spawn-impl declares one integration-verify child per capability blocked by component tickets", () => {
