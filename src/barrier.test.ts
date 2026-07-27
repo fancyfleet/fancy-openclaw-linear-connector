@@ -877,6 +877,71 @@ describe("detectStalledChildren — mocked Linear API", () => {
     const stalled = await detectStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000);
     expect(stalled).toHaveLength(0);
   });
+
+  it("INF-861 AC1/AC4: skips native-terminal children even when workflow state labels are missing", async () => {
+    let activityFetches = 0;
+    globalThis.fetch = async (_url, init) => {
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(bodyText) as { query?: string };
+
+      if ((parsed.query ?? "").includes("ParentChildren")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                children: {
+                  nodes: [
+                    {
+                      identifier: "INF-687-DONE-CHILD",
+                      state: { name: "Done", type: "completed" },
+                      labels: { nodes: [{ name: "wf:dev-impl" }] },
+                    },
+                    {
+                      identifier: "INF-687-CANCELED-CHILD",
+                      state: { name: "Invalid", type: "canceled" },
+                      labels: { nodes: [{ name: "wf:dev-impl" }] },
+                    },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if ((parsed.query ?? "").includes("ChildActivity")) {
+        activityFetches++;
+      }
+      throw new Error("unexpected query: native-terminal children must not be evaluated for stalls");
+    };
+
+    const stalled = await detectStalledChildren("INF-687", "Bearer tok", 30 * 60 * 1000);
+    expect(stalled).toHaveLength(0);
+    expect(activityFetches).toBe(0);
+  });
+});
+
+describe("buildShepherdingMessage — INF-861 terminal child status", () => {
+  it("AC1/AC4: does not render terminal children with missing workflow labels as no-state gaps", () => {
+    const message = buildShepherdingMessage(
+      "INF-687",
+      [
+        {
+          identifier: "INF-687-DONE-CHILD",
+          labels: ["wf:dev-impl"],
+          isTerminal: true,
+          workflowState: null,
+          isOrphaned: false,
+        },
+      ],
+      [],
+    );
+
+    expect(message).not.toContain("INF-687-DONE-CHILD: no state");
+    expect(message).toContain("INF-687-DONE-CHILD");
+    expect(message.toLowerCase()).toContain("terminal");
+  });
 });
 
 // ── surfaceStalledChildren ─────────────────────────────────────────────────
