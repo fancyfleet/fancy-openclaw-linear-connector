@@ -24,7 +24,7 @@
 import { createLogger, componentLogger } from "./logger.js";
 import type { WorkflowDef } from "./workflow-gate.js";
 import { getWorkflowId, getCurrentState } from "./workflow-gate.js";
-import { resolveBodiesForRole } from "./escalation-gate.js";
+import { resolveBodiesForRole, roleResolutionScopeForOwnerRole } from "./escalation-gate.js";
 import type { OperationalEventInput } from "./store/operational-event-store.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "def-state-migration");
@@ -343,7 +343,10 @@ export async function runDefStateMigrationSweep(
     let wakeTarget = plan.ownerRole ?? "";
     if (plan.ownerRole) {
       try {
-        const bodies = await resolveBodiesForRole(plan.ownerRole);
+        const bodies = await resolveBodiesForRole(
+          plan.ownerRole,
+          roleResolutionScopeForOwnerRole(plan.ownerRole, def),
+        );
         if (bodies.length > 0) wakeTarget = bodies[0];
       } catch {
         /* fall back to the role name */

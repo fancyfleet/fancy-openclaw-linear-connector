@@ -39,7 +39,7 @@ import path from "node:path";
 import yaml from "js-yaml";
 import { componentLogger, createLogger, type Logger } from "./logger.js";
 import { defaultWorkflowDefPath } from "./instance-config.js";
-import { bodyHasCapability, resolveBodiesForRole, resolveBodiesWithCapability, isBodyKnown, isRoleDeclared, isSyntheticNoBodyRole, type RoleResolutionScope } from "./escalation-gate.js";
+import { bodyHasCapability, resolveBodiesForRole, resolveBodiesWithCapability, isBodyKnown, isRoleDeclared, isSyntheticNoBodyRole, roleResolutionScopeForOwnerRole, type RoleResolutionScope } from "./escalation-gate.js";
 import { probeDeployOutcome } from "./deploy-probe.js";
 import { isTerminalIssueState } from "./linear-actionable.js";
 import type { ObservationStore } from "./store/observation-store.js";
@@ -325,27 +325,8 @@ export interface WorkflowDef {
   states: WorkflowState[];
 }
 
-function concreteScopeValue(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
-}
-
-function departmentHeadScopeForDef(def: WorkflowDef): RoleResolutionScope | undefined {
-  const declared = def.department_scope ?? {};
-  const instantiated = def.instantiation ?? {};
-  const scope: RoleResolutionScope = {
-    department: concreteScopeValue(declared.department ?? instantiated.department),
-    team: concreteScopeValue(declared.team ?? instantiated.team),
-  };
-  return scope.department || scope.team ? scope : undefined;
-}
-
 async function resolveBodiesForOwnerRole(ownerRole: string, def: WorkflowDef): Promise<string[]> {
-  return resolveBodiesForRole(
-    ownerRole,
-    ownerRole === "department-head" ? departmentHeadScopeForDef(def) : undefined,
-  );
+  return resolveBodiesForRole(ownerRole, roleResolutionScopeForOwnerRole(ownerRole, def));
 }
 
 // ── Workflow def cache & registry ──────────────────────────────────────────
@@ -4528,6 +4509,7 @@ export async function checkRawMutationInterception(
   }
 
   if (!def) return null; // unknown workflow — pass-through (AI-1530)
+  const workflowDef = def;
 
   // AI-1535: a *delegate-only* raw change (delegateId changed, no state/assignee/
   // label) gets delegate-only semantics rather than the blanket block below. The
@@ -4571,13 +4553,13 @@ export async function checkRawMutationInterception(
   };
   const isClearingDelegate =
     hasDelegateChange && (varsHaveNullField(vars, "delegateId") || /\bdelegateId\s*:\s*null\b/.test(q));
-  const breakGlass = def.break_glass?.command ?? "escape";
+  const breakGlass = workflowDef.break_glass?.command ?? "escape";
   const delegateClearRejection = () =>
     `[Proxy] Direct delegate clear blocked: the current delegate may re-route ${issueId} ` +
     `but may not null the delegate field directly. ` +
     `On a governed ticket \`undelegate\` is blocked by this same guard — it is not the remedy. ` +
     `To release ownership: \`linear ${breakGlass} ${issueId}\` (break-glass; exits the workflow to ` +
-    `'${def.break_glass?.to ?? "intake"}' under the steward), or \`linear handoff-work ${issueId} <agent>\` ` +
+    `'${workflowDef.break_glass?.to ?? "intake"}' under the steward), or \`linear handoff-work ${issueId} <agent>\` ` +
     `to re-route to another agent.`;
   // AI-1857: Block delegate clears regardless of mutation shape. The combined
   // {delegateId:null, assigneeId:null} shape (partial semantic-verb application)
@@ -4615,7 +4597,7 @@ export async function checkRawMutationInterception(
       if (def) {
         const currentStateId = getCurrentState(labels);
         if (currentStateId) {
-          const stateNode = def.states.find((s) => s.id === currentStateId);
+          const stateNode = workflowDef.states.find((s) => s.id === currentStateId);
           const hasFeedbackTransition = stateNode?.transitions?.some(
             (t) => t.feedback?.required === true,
           );
@@ -4632,7 +4614,7 @@ export async function checkRawMutationInterception(
               // Fail-open: transient API failure
             }
             if (!hasVerdictComment) {
-              const breakCmd = def.break_glass?.command ?? "escape";
+              const breakCmd = workflowDef.break_glass?.command ?? "escape";
               log.warn(
                 `workflow-gate: AI-2020 verdict gate — handoff from feedback-requiring state '${currentStateId}' ` +
                 `agent=${bodyId} ticket=${issueId} — no verdict comment found`,
@@ -4773,7 +4755,7 @@ export async function checkRawMutationInterception(
   // Build per-command help strings with assignment info.
   const helpLines = await Promise.all(
     (stateNode.transitions ?? []).map(async (t) => {
-      const { bodies, mode } = await resolveTransitionTargets(t, def);
+      const { bodies, mode } = await resolveTransitionTargets(t, workflowDef);
       let cmd = `linear ${t.command} ${issueId}`;
       if (mode === "required") {
         cmd += ` <${bodies.join("|")}>`;
@@ -4781,7 +4763,7 @@ export async function checkRawMutationInterception(
       return `  - \`${cmd}\` (→ ${t.to})`;
     }),
   );
-  helpLines.push(`  - \`linear ${breakGlassCommand} ${issueId}\` (break glass → ${def.break_glass?.to ?? "escape"}, legal from any state)`);
+  helpLines.push(`  - \`linear ${breakGlassCommand} ${issueId}\` (break glass → ${workflowDef.break_glass?.to ?? "escape"}, legal from any state)`);
 
   const changedFields: string[] = [];
   if (hasStateChange) changedFields.push("status");

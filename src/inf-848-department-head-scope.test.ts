@@ -20,6 +20,7 @@ import {
   resolveTransitionTargets,
 } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
+import { checkRoleGuardEnforced } from "./routing-guard.js";
 import { checkDefAgainstFixture } from "./fixture-drift-detector.js";
 import { _resetAppliedStateStore } from "./store/applied-state-store.js";
 import type { RouteResult } from "./types.js";
@@ -122,6 +123,16 @@ let originalFetch: typeof globalThis.fetch;
 beforeAll(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-848-"));
   fs.writeFileSync(path.join(tmpDir, "capability-policy.yaml"), POLICY_WITH_SCOPED_DEPARTMENT_HEADS, "utf8");
+  fs.writeFileSync(path.join(tmpDir, "agents.json"), JSON.stringify({
+    agents: [
+      { name: "charles", linearUserId: "charles-linear-id" },
+      { name: "laren", linearUserId: "laren-linear-id" },
+      { name: "igor", linearUserId: "igor-linear-id" },
+      { name: "sage", linearUserId: "sage-linear-id" },
+      { name: "ai", linearUserId: "ai-linear-id" },
+      { name: "hanzo", linearUserId: "hanzo-linear-id" },
+    ],
+  }), "utf8");
   fs.mkdirSync(path.join(tmpDir, "guidance", "task"), { recursive: true });
   fs.mkdirSync(path.join(tmpDir, "guidance", "dept-engine"), { recursive: true });
 });
@@ -131,6 +142,8 @@ beforeEach(() => {
   process.env.CAPABILITY_POLICY_PATH = path.join(tmpDir, "capability-policy.yaml");
   process.env.WORKFLOW_DEFS_DIR = REGISTERED_DEFS_DIR;
   process.env.WORKFLOW_GUIDANCE_DIR = path.join(tmpDir, "guidance");
+  process.env.AGENTS_FILE = path.join(tmpDir, "agents.json");
+  process.env.AGENTS_PATH = path.join(tmpDir, "agents.json");
   process.env.LABEL_FETCH_MAX_RETRIES = "0";
   process.env.LABEL_FETCH_BASE_DELAY_MS = "1";
   resetPolicyCache();
@@ -143,6 +156,8 @@ afterEach(() => {
   delete process.env.CAPABILITY_POLICY_PATH;
   delete process.env.WORKFLOW_DEFS_DIR;
   delete process.env.WORKFLOW_GUIDANCE_DIR;
+  delete process.env.AGENTS_FILE;
+  delete process.env.AGENTS_PATH;
   delete process.env.LABEL_FETCH_MAX_RETRIES;
   delete process.env.LABEL_FETCH_BASE_DELAY_MS;
   resetPolicyCache();
@@ -211,6 +226,61 @@ describe("INF-848 AC3: Engineering department-engine head routing stays staffed 
     expect(message).toContain("[auto-assigns to charles]");
     expect(message).not.toContain("laren");
     expect(message).not.toContain("Workflow context unavailable");
+  });
+
+  it("routing guard corrects wrong dept-engine dispatches to the scoped Engineering head", async () => {
+    await expect(checkRoleGuardEnforced("laren", ["wf:dept-engine", "state:evaluating"])).resolves.toEqual(
+      expect.objectContaining({
+        blocked: true,
+        correctedTo: "charles",
+        legalBodies: ["charles"],
+      }),
+    );
+  });
+
+  it("workflow bootstrap seats dept-engine entry tickets with the scoped Engineering head", async () => {
+    const mutationBodies: string[] = [];
+    globalThis.fetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const body = typeof init?.body === "string" ? init.body : "";
+      if (body.includes("issueUpdate") || body.includes("ApplyAtomicTransition")) {
+        mutationBodies.push(body);
+        return jsonResponse({ data: { issueUpdate: { success: true } } });
+      }
+      if (body.includes("labels")) {
+        return jsonResponse({
+          data: {
+            team: {
+              labels: {
+                nodes: [
+                  { id: "label-wf-dept-engine", name: "wf:dept-engine" },
+                  { id: "label-state-evaluating", name: "state:evaluating" },
+                ],
+              },
+            },
+          },
+        });
+      }
+      return jsonResponse({ data: {} });
+    }) as typeof globalThis.fetch;
+
+    const { reloadAgents } = await import("./agents.js");
+    reloadAgents();
+    const { applyBootstrapToIssue } = await import("./workflow-bootstrap.js");
+
+    const result = await applyBootstrapToIssue({
+      id: "issue-inf-848",
+      teamId: "team-eng",
+      identifier: "INF-848",
+      title: "Department engine bootstrap",
+      labels: [{ id: "label-wf-dept-engine", name: "wf:dept-engine" }],
+    }, TOK);
+
+    expect(result).toEqual(expect.objectContaining({
+      action: "bootstrapped",
+      delegateAgentName: "charles",
+    }));
+    expect(mutationBodies.join("\n")).toContain("charles-linear-id");
+    expect(mutationBodies.join("\n")).not.toContain("laren-linear-id");
   });
 });
 

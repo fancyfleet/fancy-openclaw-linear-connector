@@ -22,7 +22,7 @@
 import { createLogger, componentLogger } from "./logger.js";
 import { getAccessToken } from "./agents.js";
 import { loadWorkflowDefById, getWorkflowId, getCurrentState } from "./workflow-gate.js";
-import { resolveBodiesForRole, resolveBodiesWithCapability } from "./escalation-gate.js";
+import { resolveBodiesForRole, resolveBodiesWithCapability, roleResolutionScopeForOwnerRole } from "./escalation-gate.js";
 import { notify } from "./alerts/alert-bus.js";
 
 const log = componentLogger(createLogger(), "routing-guard");
@@ -182,7 +182,7 @@ export async function checkRoleGuardEnforced(
   // 5. Resolve legal bodies for this role.
   let legalBodies: string[];
   try {
-    legalBodies = await resolveBodiesForRole(ownerRole);
+    legalBodies = await resolveBodiesForRole(ownerRole, roleResolutionScopeForOwnerRole(ownerRole, def));
   } catch (err) {
     log.warn(`routing-guard: failed to resolve bodies for role '${ownerRole}' — failing open: ${err instanceof Error ? err.message : String(err)}`);
     return { blocked: false };

@@ -16,7 +16,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { componentLogger, createLogger } from "./logger.js";
 import { loadWorkflowRegistry, type WorkflowDef } from "./workflow-gate.js";
-import { resolveBodiesForRole } from "./escalation-gate.js";
+import { resolveBodiesForRole, roleResolutionScopeForOwnerRole } from "./escalation-gate.js";
 import { findOrCreateLabel, postComment } from "./linear-helpers.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import type { LinearEvent, LinearIssueCreatedEvent, LinearIssueUpdatedEvent } from "./webhook/schema.js";
@@ -491,7 +491,7 @@ export async function applyBootstrapToIssue(
   let delegateRole = entryStateDef?.owner_role;
   if (delegateRole) {
     try {
-      let bodies = await resolveBodiesForRole(delegateRole);
+      let bodies = await resolveBodiesForRole(delegateRole, roleResolutionScopeForOwnerRole(delegateRole, def));
       // If the entry role has no bodies (e.g. synthetic "engine" role),
       // look ahead to the first transition target's owner_role.
       if (bodies.length === 0 && (entryStateDef as { transitions?: Array<{ to: string }> })?.transitions?.length) {
@@ -500,7 +500,7 @@ export async function applyBootstrapToIssue(
         );
         const nextRole = firstTransTarget?.owner_role;
         if (nextRole && nextRole !== delegateRole) {
-          bodies = await resolveBodiesForRole(nextRole);
+          bodies = await resolveBodiesForRole(nextRole, roleResolutionScopeForOwnerRole(nextRole, def));
           if (bodies.length > 0) delegateRole = nextRole;
         }
       }

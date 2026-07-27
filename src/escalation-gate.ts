@@ -268,6 +268,34 @@ export interface RoleResolutionScope {
   team?: string;
 }
 
+export interface RoleResolutionScopeSource {
+  department_scope?: RoleResolutionScope;
+  instantiation?: Record<string, unknown>;
+}
+
+function concreteScopeValue(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+export function departmentHeadScopeForDef(def: RoleResolutionScopeSource): RoleResolutionScope | undefined {
+  const declared = def.department_scope ?? {};
+  const instantiated = def.instantiation ?? {};
+  const scope: RoleResolutionScope = {
+    department: concreteScopeValue(declared.department ?? instantiated.department),
+    team: concreteScopeValue(declared.team ?? instantiated.team),
+  };
+  return scope.department || scope.team ? scope : undefined;
+}
+
+export function roleResolutionScopeForOwnerRole(
+  ownerRole: string,
+  def: RoleResolutionScopeSource,
+): RoleResolutionScope | undefined {
+  return ownerRole === "department-head" ? departmentHeadScopeForDef(def) : undefined;
+}
+
 function bodyHasDepartmentScope(body: PolicyBody): boolean {
   return Boolean((body.departments ?? []).length || (body.teams ?? []).length);
 }
