@@ -67,6 +67,7 @@ import { ProposalStore } from "./store/proposal-store.js";
 import { clearAcRecordStore } from "./ac-record-store.js";
 import { getCronStalenessMultiplierFromEnv, getRegisteredCrons, getStaleCrons } from "./cron/registry.js";
 import { evaluateCronStartupReadiness, parseCronStartupGraceMs } from "./cron/startup-readiness.js";
+import { buildRequiredCronHealth, getRequiredCronRetirements, isRequiredCron } from "./cron/required-crons.js";
 import { getRescueSweepState } from "./rescue-sweep-state.js";
 import { getDetectorState } from "./done-ticket-detector-state.js";
 import { registerFirstActionWatchdogCron } from "./first-action-watchdog.js";
@@ -413,17 +414,34 @@ export function createApp(options?: CreateAppOptions) {
   app.get("/health", async (_req: Request, res: Response) => {
     const agents = getAgents();
     const crons = getRegisteredCrons();
+    const requiredCronRetirements = getRequiredCronRetirements();
+    const activeCronsForReadiness = crons.filter((cron) => {
+      return !(isRequiredCron(cron.name) && requiredCronRetirements.has(cron.name));
+    });
     const cronReadiness = evaluateCronStartupReadiness({
-      crons,
+      crons: activeCronsForReadiness,
       bootedAt,
       now: new Date(),
       bootGraceMs: parseCronStartupGraceMs(process.env.CRON_STARTUP_GRACE_MS),
       log,
     });
     const staleCrons = getStaleCrons({ stalenessMultiplier: getCronStalenessMultiplierFromEnv() });
-    const criticalStaleCrons = staleCrons.filter(
-      (cron) => cron.overdueByMs >= parseCriticalStaleCronMs(),
-    );
+    const requiredCrons = buildRequiredCronHealth({
+      crons,
+      staleCrons,
+      retirements: requiredCronRetirements,
+    });
+    const criticalStaleCrons = staleCrons
+      .filter((cron) => {
+        if (isRequiredCron(cron.name)) {
+          return !requiredCronRetirements.has(cron.name);
+        }
+        return cron.overdueByMs >= parseCriticalStaleCronMs();
+      })
+      .map((cron) => ({
+        ...cron,
+        ...(isRequiredCron(cron.name) ? { required: true } : {}),
+      }));
     const healthy = agents.length > 0 && cronReadiness.status === "ok" && criticalStaleCrons.length === 0;
 
     // AI-2008 AC3: loud dispatch-undeliverable surfacing. Every dispatch that
@@ -452,6 +470,7 @@ export function createApp(options?: CreateAppOptions) {
       schedule: cron.schedule,
       lastRunAt: cron.lastRunAt,
       overdueByMs: cron.overdueByMs,
+      ...(cron.required === true ? { required: true } : {}),
     })));
 
     res.status(healthy ? 200 : 503).json({
@@ -483,6 +502,7 @@ export function createApp(options?: CreateAppOptions) {
       crons,
       staleCrons,
       criticalStaleCrons,
+      requiredCrons,
       cronReadiness,
       // AI-2036 AC1.6: observation write-path liveness. `wired`/`subscribed` are
       // true only because bootstrap called registerObservationWritePath() — never
