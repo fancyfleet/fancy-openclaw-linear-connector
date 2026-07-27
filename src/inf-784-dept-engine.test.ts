@@ -22,7 +22,8 @@ import { evaluateBarrier, onManagingEntry } from "./barrier.js";
 import { isDeptOwnedInfraTerminal, planDeptEngineOutputs } from "./dept-engine.js";
 import { resolveBodiesForRole, resetPolicyCache } from "./escalation-gate.js";
 import { clearFanoutOutcomeStore, recordFanoutOutcome } from "./fanout-outcome-store.js";
-import { loadWorkflowRegistry, resetWorkflowCache } from "./workflow-gate.js";
+import { loadWorkflowRegistry, resetWorkflowCache, resetNativeStateCache } from "./workflow-gate.js";
+import { applyEngagementStatus, registerEngagementNativeStateOverlay } from "./engagement-status.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -131,7 +132,21 @@ net.Server.prototype.listen = function patchedListen(...args) {
 }
 
 describe("INF-784 AC1/AC7: wf:dept-engine def registration and fixture canary", () => {
+  // AC9: load through the production registry-load path (WORKFLOW_DEFS_DIR dir-mode),
+  // the same path the connector entry point uses at bootstrap after boot-reconcile
+  // populates the dir — NOT a bare no-env default. Point it at the canonical
+  // registered-defs directory (what boot-reconcile copies into the live dir).
+  const REGISTERED_DEFS_DIR = path.dirname(REGISTERED_DEF_PATH);
+  const savedDefsDir = process.env.WORKFLOW_DEFS_DIR;
+
+  beforeEach(() => {
+    process.env.WORKFLOW_DEFS_DIR = REGISTERED_DEFS_DIR;
+    resetWorkflowCache();
+  });
+
   afterEach(() => {
+    if (savedDefsDir === undefined) delete process.env.WORKFLOW_DEFS_DIR;
+    else process.env.WORKFLOW_DEFS_DIR = savedDefsDir;
     resetWorkflowCache();
   });
 
@@ -205,6 +220,13 @@ describe("INF-784 AC1/AC7: wf:dept-engine def registration and fixture canary", 
     expect(fs.existsSync(DIST_ENTRY)).toBe(true);
 
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-784-bootstrap-"));
+    // AC9: model the production registry-load path exactly — set WORKFLOW_DEFS_DIR
+    // (as docker-compose does) to a writable dir the entry point's boot-reconcile
+    // populates from the packaged registered-defs, then loads dir-mode. This proves
+    // dept-engine registers via the *same* path production uses at bootstrap, not a
+    // bare no-env default the production connector never runs with.
+    const workflowsDir = path.join(tmpDir, "workflows");
+    fs.mkdirSync(workflowsDir, { recursive: true });
     const { preload, portFile } = writeListenPortProbe(tmpDir);
     const agentsFile = path.join(tmpDir, "agents.json");
     fs.writeFileSync(
@@ -234,6 +256,7 @@ describe("INF-784 AC1/AC7: wf:dept-engine def registration and fixture canary", 
         env: {
           ...process.env,
           AGENTS_FILE: agentsFile,
+          WORKFLOW_DEFS_DIR: workflowsDir,
           DATA_DIR: path.join(tmpDir, "data"),
           PORT: "0",
           INF784_LISTEN_PORT_FILE: portFile,
@@ -344,12 +367,24 @@ bodies:
 describe("INF-784 AC3: managing barrier scope is owned-infra only", () => {
   const oldFetch = global.fetch;
   const oldFanoutOutcomePath = process.env.FANOUT_OUTCOME_PATH;
+  // onManagingEntry derives barrier_scope from the live dept-engine def, so the
+  // registry must resolve it — via the production dir-mode path (WORKFLOW_DEFS_DIR),
+  // the same path the connector runs with, not a bare no-env default.
+  const REGISTERED_DEFS_DIR = path.dirname(REGISTERED_DEF_PATH);
+  const savedDefsDir = process.env.WORKFLOW_DEFS_DIR;
+
+  beforeEach(() => {
+    process.env.WORKFLOW_DEFS_DIR = REGISTERED_DEFS_DIR;
+    resetWorkflowCache();
+  });
 
   afterEach(() => {
     global.fetch = oldFetch;
     clearFanoutOutcomeStore();
     if (oldFanoutOutcomePath !== undefined) process.env.FANOUT_OUTCOME_PATH = oldFanoutOutcomePath;
     else delete process.env.FANOUT_OUTCOME_PATH;
+    if (savedDefsDir === undefined) delete process.env.WORKFLOW_DEFS_DIR;
+    else process.env.WORKFLOW_DEFS_DIR = savedDefsDir;
     resetWorkflowCache();
   });
 
@@ -632,5 +667,91 @@ describe("INF-784 AC5: per-department terminal predicates", () => {
       artifactType: "standards-document",
       headReview: { reviewer: "astrid", approved: true, authoredByDepartmentHead: false },
     })).toBe(false);
+  });
+});
+
+// ── AC9 companion guard: engagement overlay under a fully-loaded registry ─────
+//
+// Root-cause guard for the round-3 regression. When loadWorkflowRegistry resolves
+// the full packaged registry (the production dir-mode path via WORKFLOW_DEFS_DIR),
+// loadWorkflowDefById succeeds, so the AI-2568 native_state overlay inside
+// applyEngagementStatus becomes active. A prior revision changed the *no-env*
+// registry default to load the packaged dir, which silently activated that overlay
+// for consumers/tests that had previously fail-opened — regressing the AI-1560
+// engagement Doing flip. That default is now reverted; this pins the interaction so
+// it cannot regress again.
+//
+// Production always runs dir-mode (docker-compose sets WORKFLOW_DEFS_DIR), so these
+// assertions reflect real production behavior — not the no-def fail-open path the
+// sibling engagement-status-regression suite exercises.
+describe("INF-784 AC9 guard: engagement overlay under full dir-mode registry", () => {
+  const SEMANTIC_TO_UUID: Record<string, string> = {
+    "To Do": "state-todo-uuid",
+    Thinking: "state-thinking-uuid",
+    Doing: "state-doing-uuid",
+    Done: "state-done-uuid",
+    Invalid: "state-invalid-uuid",
+  };
+  const REGISTERED_DEFS_DIR = path.dirname(REGISTERED_DEF_PATH);
+  const savedDefsDir = process.env.WORKFLOW_DEFS_DIR;
+  const savedFetch = globalThis.fetch;
+  let updates: Array<{ id: string; stateId: string }>;
+
+  function installFetchMock(stateLabel: string): void {
+    updates = [];
+    globalThis.fetch = (async (_url: any, init: any) => {
+      const body = JSON.parse(typeof init?.body === "string" ? init.body : "{}");
+      const q: string = body.query ?? "";
+      const vars = body.variables ?? {};
+      if (q.includes("EngagementIssue")) {
+        return new Response(JSON.stringify({ data: { issue: {
+          id: "issue-uuid",
+          team: { id: "team-uuid" },
+          state: { id: SEMANTIC_TO_UUID.Thinking, name: "Thinking" },
+          labels: { nodes: [{ name: "wf:dev-impl" }, { name: stateLabel }] },
+        } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (q.includes("TeamStates")) {
+        return new Response(JSON.stringify({ data: { team: { states: { nodes:
+          Object.entries(SEMANTIC_TO_UUID).map(([name, id]) => ({ id, name,
+            type: name === "Done" ? "completed" : name === "Invalid" ? "canceled" : "started" })),
+        } } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (q.includes("issueUpdate")) {
+        updates.push({ id: String(vars.id), stateId: String(vars.stateId) });
+        return new Response(JSON.stringify({ data: { issueUpdate: { success: true } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ data: {} }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }) as typeof globalThis.fetch;
+  }
+
+  beforeEach(() => {
+    process.env.WORKFLOW_DEFS_DIR = REGISTERED_DEFS_DIR;
+    resetWorkflowCache();
+    resetNativeStateCache();
+    registerEngagementNativeStateOverlay();
+  });
+
+  afterEach(() => {
+    if (savedDefsDir === undefined) delete process.env.WORKFLOW_DEFS_DIR;
+    else process.env.WORKFLOW_DEFS_DIR = savedDefsDir;
+    globalThis.fetch = savedFetch;
+    resetWorkflowCache();
+    resetNativeStateCache();
+  });
+
+  it("still flips a native_state:doing state to Doing when the full registry resolves (Doing-flip not regressed)", async () => {
+    installFetchMock("state:doing");
+    await applyEngagementStatus("AI-9001", "doing", "test-token");
+    expect(updates.some((u) => u.stateId === SEMANTIC_TO_UUID.Doing)).toBe(true);
+    expect(updates.some((u) => u.stateId === SEMANTIC_TO_UUID["To Do"])).toBe(false);
+  });
+
+  it("resolves a native_state:todo state to its resting To Do under the loaded registry (AI-2568 overlay active — production dir-mode behavior)", async () => {
+    installFetchMock("state:write-tests");
+    await applyEngagementStatus("AI-9002", "doing", "test-token");
+    expect(updates.some((u) => u.stateId === SEMANTIC_TO_UUID["To Do"])).toBe(true);
+    expect(updates.some((u) => u.stateId === SEMANTIC_TO_UUID.Doing)).toBe(false);
   });
 });

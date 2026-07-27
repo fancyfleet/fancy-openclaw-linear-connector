@@ -115,10 +115,6 @@ function workflowDefPath(): string {
   return process.env.WORKFLOW_DEF_PATH ?? defaultWorkflowDefPath();
 }
 
-function packagedWorkflowDefsDir(): string {
-  return path.join(path.dirname(new URL(import.meta.url).pathname), "registered-defs");
-}
-
 // ── YAML schema types ──────────────────────────────────────────────────────
 
 export interface WorkflowTransition {
@@ -537,17 +533,16 @@ async function validateDefFixtureSync(def: WorkflowDef, raw: string): Promise<vo
 /**
  * Legacy single-def accessor. Returns the primary workflow def, derived from the
  * registry so its cache stays coherent with loadWorkflowRegistry().
- *   - Single-file mode (explicit WORKFLOW_DEF_PATH): the registry holds exactly
- *     that def — return it (preserving prior behavior and its fail-closed-on-load
- *     posture, which loadWorkflowRegistry rethrows).
- *   - Packaged registry mode: prefer dev-impl as the legacy primary def.
+ *   - Single-file mode (no WORKFLOW_DEFS_DIR): the registry holds exactly the
+ *     WORKFLOW_DEF_PATH def — return it (preserving prior behavior and its
+ *     fail-closed-on-load posture, which loadWorkflowRegistry rethrows).
  *   - Dir mode: return the def named by WORKFLOW_DEF_PATH if present in the
  *     registry, else the first registered def.
  */
 export async function loadWorkflowDef(): Promise<WorkflowDef> {
   const registry = await loadWorkflowRegistry();
 
-  if (process.env.WORKFLOW_DEF_PATH && !process.env.WORKFLOW_DEFS_DIR && !process.env.WORKFLOW_DEF_DIR) {
+  if (!process.env.WORKFLOW_DEFS_DIR) {
     const only = registry.values().next().value as WorkflowDef | undefined;
     if (!only) {
       const msg = `no workflow def loaded from ${workflowDefPath()}`;
@@ -555,10 +550,6 @@ export async function loadWorkflowDef(): Promise<WorkflowDef> {
       throw new Error(msg);
     }
     return only;
-  }
-
-  if (!process.env.WORKFLOW_DEFS_DIR && !process.env.WORKFLOW_DEF_DIR && registry.has("dev-impl")) {
-    return registry.get("dev-impl")!;
   }
 
   let primaryId: string | null = null;
@@ -599,10 +590,8 @@ export async function loadWorkflowDefById(workflowId: string): Promise<WorkflowD
  *
  * Directory resolution:
  *   - If WORKFLOW_DEFS_DIR is set, load every *.yaml in that directory.
- *   - Otherwise, when WORKFLOW_DEF_PATH is not explicit, load the packaged
- *     registered-defs directory shipped beside the runtime.
  *   - Otherwise (backwards-compat), load the single WORKFLOW_DEF_PATH file as a
- *     1-entry registry — preserving explicit single-def deploys exactly (AC6).
+ *     1-entry registry — preserving the current single-def deploy exactly (AC6).
  *
  * Per-def fail-closed (AC2): a def that fails native_state validation (or fails
  * to parse) is excluded from the registry and surfaced via logs + config-health,
@@ -615,10 +604,7 @@ export async function loadWorkflowDefById(workflowId: string): Promise<WorkflowD
 export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> {
   if (_registryCache) return _registryCache;
   const registry = new Map<string, WorkflowDef>();
-  const dir =
-    process.env.WORKFLOW_DEFS_DIR ||
-    process.env.WORKFLOW_DEF_DIR ||
-    (process.env.WORKFLOW_DEF_PATH ? undefined : packagedWorkflowDefsDir());
+  const dir = process.env.WORKFLOW_DEFS_DIR || process.env.WORKFLOW_DEF_DIR || undefined;
 
   // AC3 (AI-1914): the state ids active in the previous version of each def,
   // persisted to disk so this check survives a restart (where _registryCache is
