@@ -346,4 +346,34 @@ describe("INF-873 AC4/AC5: ENG remains Charles; missing or ambiguous scope fails
       reason: expect.stringMatching(/department|team|scope|metadata|enrollment/i),
     }));
   });
+
+  it("fails closed when dept-engine runtime team metadata conflicts with department scope", async () => {
+    await expect(
+      (checkRoleGuardEnforced as unknown as Function)("charles", ["wf:dept-engine", "state:evaluating"], {
+        issueIdentifier: "DSN-15",
+        teamKey: "DSN",
+        teamName: "Engineering",
+        workflowEnrollment: undefined,
+      }),
+    ).resolves.toEqual(expect.objectContaining({
+      blocked: true,
+      correctedTo: undefined,
+      legalBodies: [],
+      reason: expect.stringMatching(/unresolved|ambiguous|department|team|enrollment|Linear team/i),
+    }));
+  });
+
+  it("fails closed when dept-engine workflow enrollment has only partial department scope", async () => {
+    await expect(
+      (checkRoleGuardEnforced as unknown as Function)("charles", ["wf:dept-engine", "state:evaluating"], {
+        issueIdentifier: "DSN-15",
+        workflowEnrollment: { department: "DSN" },
+      }),
+    ).resolves.toEqual(expect.objectContaining({
+      blocked: true,
+      correctedTo: undefined,
+      legalBodies: [],
+      reason: expect.stringMatching(/unresolved|ambiguous|department|team|enrollment|Linear team/i),
+    }));
+  });
 });

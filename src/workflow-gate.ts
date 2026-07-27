@@ -6375,6 +6375,25 @@ export async function applyStateTransition(
             });
           }
           const roleBodies = await resolveBodiesForOwnerRoleInContext(destOwnerRole!, def, instanceContext);
+          if (
+            roleBodies.length === 0 &&
+            destOwnerRole === "department-head" &&
+            def.id === "dept-engine" &&
+            deriveWorkflowInstanceScope(def, instanceContext)
+          ) {
+            return await failDelegateUnresolved({
+              issueId: issue.internalId,
+              authToken,
+              detail:
+                `wf:dept-engine ${issue.identifier} has unresolved or ambiguous department/team instance scope; ` +
+                `no department-head body matches.`,
+              remedy:
+                `Repair ${issue.identifier} workflow enrollment department/team metadata or Linear team key/name ` +
+                `so exactly one department-head body matches before advancing.`,
+              from: currentStateName,
+              to: toStateName,
+            });
+          }
           if (roleBodies.length === 1) {
             const singletonResult = resolveSingletonDelegate(roleBodies, destOwnerRole!);
             if (singletonResult.resolvedDelegateId) {
