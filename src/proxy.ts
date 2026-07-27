@@ -1248,8 +1248,11 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
               if (def) {
                 const currentStateName = sourceStateOverride ?? getCurrentState(preLabels, def); // AI-2094: def-aware
                 if (currentStateName) {
+                  const breakGlassCommand = def.break_glass?.command ?? "escape";
                   const stateNode = def.states.find((s) => s.id === currentStateName);
-                  const matchedTransition = stateNode?.transitions?.find(
+                  const matchedTransition = effectiveIntent === breakGlassCommand
+                    ? { command: breakGlassCommand, to: def.break_glass?.to ?? "escape" }
+                    : stateNode?.transitions?.find(
                     (t) => t.command === effectiveIntent,
                   );
                   if (matchedTransition) {
