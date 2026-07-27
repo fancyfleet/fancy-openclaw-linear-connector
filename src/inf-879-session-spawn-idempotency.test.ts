@@ -10,16 +10,22 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "@jest/globals";
+import { afterEach, describe, expect, it, jest } from "@jest/globals";
 import {
   SessionSpawnIdempotencyStore,
   type SessionSpawnRunState,
 } from "./store/session-spawn-idempotency-store.js";
+import { deliverToAgent, type DeliveryConfig } from "./delivery/deliver.js";
+import type { RouteResult } from "./types.js";
+import type { LinearEvent } from "./webhook/schema.js";
 
 describe("INF-879 sessions_spawn task-key idempotency", () => {
   const tempDirs: string[] = [];
+  const originalFetch = globalThis.fetch;
 
   afterEach(() => {
+    globalThis.fetch = originalFetch;
+    jest.restoreAllMocks();
     for (const dir of tempDirs.splice(0)) {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -29,6 +35,59 @@ describe("INF-879 sessions_spawn task-key idempotency", () => {
     const dir = mkdtempSync(path.join(tmpdir(), "inf-879-session-spawn-"));
     tempDirs.push(dir);
     return new SessionSpawnIdempotencyStore(path.join(dir, "session-spawn-idempotency.db"));
+  }
+
+  function installFetchMock(body: Record<string, unknown> = { ok: true, runId: "hook-run-1" }): { calls: RequestInit[] } {
+    const calls: RequestInit[] = [];
+    globalThis.fetch = jest.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      calls.push(init ?? {});
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as unknown as typeof globalThis.fetch;
+    return { calls };
+  }
+
+  function makeRoute(taskKey = "implementation", agentId = "igor"): RouteResult {
+    return {
+      agentId,
+      sessionKey: "linear-INF-879",
+      taskKey,
+      priority: 0,
+      event: {
+        type: "Issue",
+        action: "update",
+        actor: { id: "actor", name: "Actor" },
+        createdAt: "2026-07-27T16:40:00.000Z",
+        data: {
+          id: "issue-id",
+          identifier: "INF-879",
+          title: "Implement sessions_spawn task-key idempotency",
+          state: { id: "state", name: "To Do", type: "unstarted" },
+          priority: 2,
+          priorityLabel: "High",
+          teamId: "team",
+          teamKey: "INF",
+          labelIds: [],
+          url: "https://linear.app/fancymatt/issue/INF-879",
+          createdAt: "2026-07-27T16:31:06.523Z",
+          updatedAt: "2026-07-27T16:40:00.000Z",
+        },
+        raw: {},
+      } as LinearEvent,
+    };
+  }
+
+  function makeConfig(runId = "hook-run-1"): DeliveryConfig {
+    installFetchMock({ ok: true, runId });
+    return {
+      nodeBin: process.execPath,
+      hooksUrl: "http://openclaw.test/hooks",
+      hooksToken: "token",
+      timeoutMs: 50,
+      runtimeStatePath: "/tmp/openclaw/sessions.json",
+    };
   }
 
   it("AC1: duplicate replay for the same ticket/task key returns the existing live run", () => {
@@ -148,5 +207,71 @@ describe("INF-879 sessions_spawn task-key idempotency", () => {
       state: "live",
       runtime_state_path: "/home/fancymatt/.openclaw/sessions/sessions.json",
     });
+  });
+
+  it("AC1/AC4: delivery path returns an existing live run without a second spawn", async () => {
+    const store = createStore();
+    const config = makeConfig("hook-run-live");
+    const first = await deliverToAgent(makeRoute("implementation"), config, undefined, undefined, store);
+
+    expect(first.dispatched).toBe(true);
+    expect(first.idempotentReplay).toBeUndefined();
+    expect(first.sessionSpawnRecord).toMatchObject({
+      ticket_id: "INF-879",
+      task_key: "implementation",
+      runtime: "openclaw-acp",
+      run_id: "hook-run-live",
+      session_id: "linear-INF-879",
+      state: "live",
+      runtime_state_path: "/tmp/openclaw/sessions.json",
+    });
+
+    const replay = await deliverToAgent(makeRoute("implementation"), config, undefined, undefined, store);
+
+    expect(replay).toMatchObject({
+      dispatched: true,
+      runId: "hook-run-live",
+      idempotentReplay: true,
+    });
+    expect(store.listByTicket("INF-879")).toHaveLength(1);
+    const evidence = store.inspect("INF-879", "implementation");
+    expect(evidence).toMatchObject({
+      run_id: "hook-run-live",
+      runtime_state_path: "/tmp/openclaw/sessions.json",
+    });
+  });
+
+  it("AC2: delivery path fans out distinct task keys for the same ticket", async () => {
+    const store = createStore();
+
+    await deliverToAgent(makeRoute("write-tests", "tdd"), makeConfig("run-tests"), undefined, undefined, store);
+    await deliverToAgent(makeRoute("implementation", "igor"), makeConfig("run-impl"), undefined, undefined, store);
+
+    expect(store.listByTicket("INF-879").map((record) => record.task_key).sort()).toEqual([
+      "implementation",
+      "write-tests",
+    ]);
+  });
+
+  it("AC3: concurrent delivery retries converge before any second transport spawn", async () => {
+    const store = createStore();
+    const { calls } = installFetchMock({ ok: true, runId: "race-run" });
+    const config: DeliveryConfig = {
+      nodeBin: process.execPath,
+      hooksUrl: "http://openclaw.test/hooks",
+      hooksToken: "token",
+      timeoutMs: 50,
+      runtimeStatePath: "/tmp/openclaw/sessions.json",
+    };
+
+    const attempts = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        deliverToAgent(makeRoute("race-fixture"), config, undefined, undefined, store),
+      ),
+    );
+
+    expect(attempts.filter((attempt) => attempt.idempotentReplay)).toHaveLength(7);
+    expect(calls).toHaveLength(1);
+    expect(store.listByTicket("INF-879").filter((record) => record.task_key === "race-fixture")).toHaveLength(1);
   });
 });
