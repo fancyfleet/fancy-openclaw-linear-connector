@@ -32,6 +32,7 @@ import {
   type WorkflowState,
   type FanoutConfig,
 } from "./workflow-gate.js";
+import { resetConfigHealth } from "./config-health.js";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -118,9 +119,11 @@ describe("AC1: registered-defs snapshot exists in-repo", () => {
 
 describe("AC2: all registered defs load through the engine loader", () => {
   let origDefsDir: string | undefined;
+  let origSnapshotPath: string | undefined;
 
   beforeAll(() => {
     origDefsDir = process.env.WORKFLOW_DEFS_DIR;
+    origSnapshotPath = process.env.WORKFLOW_DEF_STATE_SNAPSHOT_PATH;
     process.env.WORKFLOW_DEFS_DIR = REGISTERED_DEFS_DIR;
     resetWorkflowCache();
   });
@@ -128,7 +131,20 @@ describe("AC2: all registered defs load through the engine loader", () => {
   afterAll(() => {
     if (origDefsDir !== undefined) process.env.WORKFLOW_DEFS_DIR = origDefsDir;
     else delete process.env.WORKFLOW_DEFS_DIR;
+    if (origSnapshotPath !== undefined) process.env.WORKFLOW_DEF_STATE_SNAPSHOT_PATH = origSnapshotPath;
+    else delete process.env.WORKFLOW_DEF_STATE_SNAPSHOT_PATH;
     resetWorkflowCache();
+  });
+
+  beforeEach(() => {
+    resetConfigHealth();
+  });
+
+  afterEach(() => {
+    if (origSnapshotPath !== undefined) process.env.WORKFLOW_DEF_STATE_SNAPSHOT_PATH = origSnapshotPath;
+    else delete process.env.WORKFLOW_DEF_STATE_SNAPSHOT_PATH;
+    resetWorkflowCache();
+    resetConfigHealth();
   });
 
   it("loadWorkflowRegistry loads every def in src/registered-defs/", async () => {
@@ -162,6 +178,35 @@ describe("AC2: all registered defs load through the engine loader", () => {
       const def = await loadWorkflowDefById(id);
       expect(def).not.toBeNull();
       expect(def!.id).toBe(id);
+    }
+  });
+
+  it("admits every registered def when a prior live snapshot included terminal escape", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-774-registered-defs-"));
+    try {
+      process.env.WORKFLOW_DEF_STATE_SNAPSHOT_PATH = path.join(tmpDir, "snapshot.json");
+      fs.writeFileSync(
+        process.env.WORKFLOW_DEF_STATE_SNAPSHOT_PATH,
+        JSON.stringify({
+          sprint: ["escape"],
+          "sprint-arm-scope": ["escape"],
+        }),
+        "utf8",
+      );
+      resetWorkflowCache();
+
+      const registry = await loadWorkflowRegistry();
+      const shippedIds = fs
+        .readdirSync(REGISTERED_DEFS_DIR)
+        .filter((f) => f.endsWith(".yaml"))
+        .map((f) => path.basename(f, ".yaml"))
+        .sort();
+
+      expect([...registry.keys()].sort()).toEqual(shippedIds);
+      expect(registry.get("sprint")?.migrations?.escape).toBe("validating");
+      expect(registry.get("sprint-arm-scope")?.migrations?.escape).toBe("doing");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 });

@@ -19,6 +19,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import yaml from "js-yaml";
+import { resetConfigHealth } from "./config-health.js";
+import { loadWorkflowRegistry, resetWorkflowCache } from "./workflow-gate.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -245,6 +247,56 @@ describe("INF-774 boot reconcile before registry cache/listener", () => {
     },
     15_000,
   );
+});
+
+describe("INF-774 canonical registered-def admission", () => {
+  let dir: string;
+  const savedEnv: Record<string, string | undefined> = {};
+
+  function saveEnv(...keys: string[]): void {
+    for (const key of keys) savedEnv[key] = process.env[key];
+  }
+
+  beforeEach(() => {
+    saveEnv("WORKFLOW_DEFS_DIR", "WORKFLOW_DEF_PATH", "WORKFLOW_DEF_STATE_SNAPSHOT_PATH");
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-774-admission-"));
+    resetWorkflowCache();
+    resetConfigHealth();
+  });
+
+  afterEach(() => {
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    for (const key of Object.keys(savedEnv)) delete savedEnv[key];
+    resetWorkflowCache();
+    resetConfigHealth();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("canonical registered defs load when prior live snapshot still includes removed escape states", async () => {
+    const snapshotPath = path.join(dir, "def-state-snapshot.json");
+    fs.writeFileSync(
+      snapshotPath,
+      JSON.stringify({
+        sprint: ["intake", "ux-shaping", "spawning", "managing", "validating", "done", "escape"],
+        "sprint-arm-scope": ["doing", "review", "done", "escape"],
+      }),
+      "utf8",
+    );
+
+    process.env.WORKFLOW_DEFS_DIR = REGISTERED_DEFS_DIR;
+    process.env.WORKFLOW_DEF_STATE_SNAPSHOT_PATH = snapshotPath;
+    delete process.env.WORKFLOW_DEF_PATH;
+
+    const registry = await loadWorkflowRegistry();
+
+    expect(registry.has("sprint")).toBe(true);
+    expect(registry.has("sprint-arm-scope")).toBe(true);
+    const shippedCount = fs.readdirSync(REGISTERED_DEFS_DIR).filter((f) => f.endsWith(".yaml")).length;
+    expect(registry.size).toBe(shippedCount);
+  });
 });
 
 describe("INF-774 runtime packaging", () => {
