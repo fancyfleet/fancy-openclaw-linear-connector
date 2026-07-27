@@ -158,6 +158,32 @@ function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
     const parsed = body ? JSON.parse(body) as { variables?: Record<string, unknown> } : {};
     const variables = parsed.variables ?? {};
 
+    // Targeted single-ticket query used by operator redispatch.
+    if (body.includes("TargetedRedispatchIssue")) {
+      const issueId = typeof variables.issueId === "string" ? variables.issueId : undefined;
+      const ticket = allTickets.find((t) => t.identifier === issueId || t.id === issueId);
+      return new Response(
+        JSON.stringify({
+          data: {
+            issue: ticket
+              ? {
+                  id: ticket.id,
+                  identifier: ticket.identifier,
+                  updatedAt: ticket.updatedAt,
+                  title: ticket.title ?? `Ticket ${ticket.identifier}`,
+                  labels: { nodes: labelsByIssueId.get(ticket.id) ?? ticket.labels },
+                  delegate: ticket.delegateId ? { id: ticket.delegateId, name: ticket.delegateName } : null,
+                  team: { id: ticket.teamId },
+                  state: { name: ticket.stateName ?? "Doing", type: ticket.stateType ?? "started" },
+                  relations: { nodes: [] },
+                }
+              : null,
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
     // Ad-hoc delegated-tickets query (non-wf:* tickets with delegate set)
     if (body.includes("AdhocDelegationReconciliation")) {
       // INF-585: simulate a query-level failure (200-with-errors or non-2xx).
@@ -1252,6 +1278,45 @@ describe("AC5: POST /redispatch admin endpoint", () => {
     eventStore.close();
   });
 
+  it("uses a direct issue lookup for single-ticket redispatch instead of broad scans", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: string[] = [];
+    const { bus } = makeTestAlertBus();
+    const queries: string[] = [];
+    const baseFetch = makeReconciliationFetch({
+      governedTickets: [
+        {
+          id: "issue-stranded",
+          identifier: "AI-1807",
+          updatedAt: OLD_TIMESTAMP,
+          labels: [WF_LABEL, STATE_IMPLEMENTATION_LABEL],
+          delegateId: DELEGATE_LINEAR_ID,
+          delegateName: DELEGATE_AGENT_NAME,
+          teamId: TEAM_ID,
+        },
+      ],
+    });
+    const fetchFn: typeof fetch = async (url, init) => {
+      if (typeof init?.body === "string") queries.push(init.body);
+      return baseFetch(url, init);
+    };
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      ticketIdentifiers: ["AI-1807"],
+      fetchFn,
+      wakeFn: async (_, id) => { wakeDispatches.push(id); },
+    });
+
+    expect(result.healed).toBe(1);
+    expect(wakeDispatches).toEqual(["AI-1807"]);
+    expect(queries.some((q) => q.includes("TargetedRedispatchIssue"))).toBe(true);
+    expect(queries.some((q) => q.includes("issues(first:"))).toBe(false);
+    eventStore.close();
+  });
+
   it("supports time-window mode (since/until) for batch reconciliation", async () => {
     const eventStore = makeEventStore();
     const wakeDispatches: string[] = [];
@@ -2117,7 +2182,7 @@ describe("INF-332 AC1: queryGovernedTickets returns all tickets across paginated
     eventStore.close();
   });
 
-  it("single-ticket mode (ticketIdentifiers) works with paginated governed results", async () => {
+  it("single-ticket mode (ticketIdentifiers) uses direct lookup instead of paginated governed scan", async () => {
     const tickets: MockTicket[] = Array.from({ length: 10 }, (_, i) => ({
       id: `gov-ti-${i}`,
       identifier: `GOV-TI-${i}`,
@@ -2142,8 +2207,13 @@ describe("INF-332 AC1: queryGovernedTickets returns all tickets across paginated
     const eventStore = makeEventStore();
     const wakeDispatches: string[] = [];
     const { bus } = makeTestAlertBus();
+    const queries: string[] = [];
+    const baseFetch = makeReconciliationFetch({ governedTickets: tickets });
 
-    globalThis.fetch = makePaginatedGovernedFetch(tickets);
+    globalThis.fetch = async (url, init) => {
+      if (typeof init?.body === "string") queries.push(init.body);
+      return baseFetch(url, init);
+    };
 
     const result = await runDelegationReconciliationSweep({
       authToken: "Bearer test-token",
@@ -2153,10 +2223,11 @@ describe("INF-332 AC1: queryGovernedTickets returns all tickets across paginated
       wakeFn: async (_, id) => { wakeDispatches.push(id); },
     });
 
-    // All pages still fetched for client-side filter; exactly 1 target healed
     expect(result.healed).toBe(1);
     expect(wakeDispatches).toHaveLength(1);
     expect(wakeDispatches[0]).toBe("GOV-TARGET");
+    expect(queries.some((q) => q.includes("TargetedRedispatchIssue"))).toBe(true);
+    expect(queries.some((q) => q.includes("DelegationReconciliation") && q.includes("issues(first:"))).toBe(false);
     eventStore.close();
   });
 });

@@ -139,20 +139,94 @@ function hasWfLabel(labels: Array<{ name: string }>): boolean {
   return labels.some((l) => l.name.startsWith("wf:"));
 }
 
+function toReconciliationTicket(n: LinearIssueNode, plainDelegation: boolean): GovernedTicket {
+  return {
+    id: n.id,
+    identifier: n.identifier,
+    updatedAt: n.updatedAt,
+    labels: n.labels.nodes,
+    delegateId: n.delegate?.id ?? null,
+    delegateName: n.delegate?.name ?? null,
+    teamId: n.team.id,
+    plainDelegation,
+    nativeState: n.state ?? null,
+    relations: n.relations ?? null,
+  };
+}
+
 // ── Linear API query ─────────────────────────────────────────────────────────
 
 /**
- * Query Linear for wf-labeled tickets. If ticketIdentifiers are provided,
- * filters by identifier; otherwise returns all governed tickets.
+ * Query Linear directly for explicit ticket identifiers.
+ *
+ * Operator-triggered redispatch is supposed to be a narrow repair path. Keep it
+ * independent of the broad governed/ad-hoc scans so a scan rate limit does not
+ * block targeted reconciliation for the ticket the operator named.
+ */
+async function queryTargetedTickets(
+  authToken: string,
+  fetchFn: typeof fetch,
+  ticketIdentifiers: string[],
+): Promise<GovernedTicket[]> {
+  const query = `
+    query TargetedRedispatchIssue($issueId: String!) {
+      issue(id: $issueId) {
+        id
+        identifier
+        updatedAt
+        title
+        labels { nodes { id name } }
+        delegate { id name }
+        team { id }
+        state { name type }
+        relations(first: 50) {
+          nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
+        }
+      }
+    }
+  `;
+
+  const tickets: GovernedTicket[] = [];
+  for (const issueId of ticketIdentifiers) {
+    const res = await fetchFn(LINEAR_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: authToken,
+      },
+      body: JSON.stringify({ query, variables: { issueId } }),
+    });
+
+    type TargetedResp = {
+      errors?: Array<{ message: string }>;
+      data?: { issue?: LinearIssueNode | null };
+    };
+    const data = (await res.json()) as TargetedResp;
+    if (!res.ok || (data.errors && data.errors.length > 0)) {
+      const detail = data.errors?.[0]?.message ?? `HTTP ${res.status}`;
+      throw new Error(`TargetedRedispatchIssue query failed for ${issueId}: ${detail}`);
+    }
+
+    const node = data.data?.issue;
+    if (!node) continue;
+
+    const wfLabeled = hasWfLabel(node.labels.nodes);
+    if (!wfLabeled && !node.delegate) continue;
+    tickets.push(toReconciliationTicket(node, !wfLabeled));
+  }
+
+  return tickets;
+}
+
+/**
+ * Query Linear for wf-labeled tickets.
  */
 async function queryGovernedTickets(
   authToken: string,
   fetchFn: typeof fetch,
-  ticketIdentifiers?: string[],
 ): Promise<GovernedTicket[]> {
   // Always use the batch query (wf:*) — the mock layer returns
   // data.issues.nodes for any query containing "DelegationReconciliation".
-  // Filter by identifier in code if requested.
   const nodes: LinearIssueNode[] = [];
   let cursor: string | null = null;
   let hasNextPage = true;
@@ -214,25 +288,7 @@ async function queryGovernedTickets(
     if (hasNextPage && !cursor) break;
   }
 
-  // Filter by identifier if provided (AC5 single-ticket mode)
-  let filteredNodes = nodes;
-  if (ticketIdentifiers && ticketIdentifiers.length > 0) {
-    const ids = new Set(ticketIdentifiers);
-    filteredNodes = filteredNodes.filter((n) => ids.has(n.identifier));
-  }
-
-  return filteredNodes.map((n) => ({
-    id: n.id,
-    identifier: n.identifier,
-    updatedAt: n.updatedAt,
-    labels: n.labels.nodes,
-    delegateId: n.delegate?.id ?? null,
-    delegateName: n.delegate?.name ?? null,
-    teamId: n.team.id,
-    plainDelegation: false,
-    nativeState: n.state ?? null,
-    relations: n.relations ?? null,
-  }));
+  return nodes.map((n) => toReconciliationTicket(n, false));
 }
 
 /**
@@ -243,7 +299,6 @@ async function queryGovernedTickets(
 async function queryAdhocDelegatedTickets(
   authToken: string,
   fetchFn: typeof fetch,
-  ticketIdentifiers?: string[],
 ): Promise<GovernedTicket[]> {
   const nodes: LinearIssueNode[] = [];
   let cursor: string | null = null;
@@ -315,25 +370,7 @@ async function queryAdhocDelegatedTickets(
     if (hasNextPage && !cursor) break;
   }
 
-  // Filter by identifier if provided (AC5 single-ticket mode)
-  let filteredNodes = nodes;
-  if (ticketIdentifiers && ticketIdentifiers.length > 0) {
-    const ids = new Set(ticketIdentifiers);
-    filteredNodes = filteredNodes.filter((n) => ids.has(n.identifier));
-  }
-
-  return filteredNodes.map((n) => ({
-    id: n.id,
-    identifier: n.identifier,
-    updatedAt: n.updatedAt,
-    labels: n.labels.nodes,
-    delegateId: n.delegate?.id ?? null,
-    delegateName: n.delegate?.name ?? null,
-    teamId: n.team.id,
-    plainDelegation: true,
-    nativeState: n.state ?? null,
-    relations: n.relations ?? null,
-  }));
+  return nodes.map((n) => toReconciliationTicket(n, true));
 }
 
 // ── Idempotency check ─────────────────────────────────────────────────────────
@@ -496,17 +533,23 @@ export async function runDelegationReconciliationSweep(
   // ── Query ──────────────────────────────────────────────────────────────
   let tickets: GovernedTicket[];
   try {
-    const governedTickets = await queryGovernedTickets(
-      authToken,
-      fetchFn,
-      opts.ticketIdentifiers,
-    );
-    const adhocTickets = await queryAdhocDelegatedTickets(
-      authToken,
-      fetchFn,
-      opts.ticketIdentifiers,
-    );
-    tickets = [...governedTickets, ...adhocTickets];
+    if (opts.ticketIdentifiers && opts.ticketIdentifiers.length > 0) {
+      tickets = await queryTargetedTickets(
+        authToken,
+        fetchFn,
+        opts.ticketIdentifiers,
+      );
+    } else {
+      const governedTickets = await queryGovernedTickets(
+        authToken,
+        fetchFn,
+      );
+      const adhocTickets = await queryAdhocDelegatedTickets(
+        authToken,
+        fetchFn,
+      );
+      tickets = [...governedTickets, ...adhocTickets];
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     result.errors.push(`query failed: ${msg}`);
