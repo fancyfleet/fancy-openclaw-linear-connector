@@ -1,4 +1,5 @@
 import { spawn } from "child_process";
+import path from "node:path";
 import type { RouteResult } from "../types.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { buildDeliveryMessage } from "./build-message.js";
@@ -8,6 +9,11 @@ import { resolveCanonicalIdentifierFromEvent } from "../canonical-identifier.js"
 import { normalizeSessionKey } from "../session-key.js";
 import type { DispatchLeaseStore } from "../store/dispatch-lease-store.js";
 import type { DispatchInFlightStore } from "../store/dispatch-inflight-store.js";
+import type {
+  SessionSpawnIdempotencyStore,
+  SessionSpawnRunRecord,
+  SessionSpawnRuntime,
+} from "../store/session-spawn-idempotency-store.js";
 
 const log = componentLogger(createLogger(), "delivery");
 
@@ -69,6 +75,11 @@ export interface DeliveryConfig {
    * performs exactly one attempt per call.
    */
   maxRetries?: number;
+  /**
+   * Optional path recorded with task-key idempotency evidence. Defaults to the
+   * local OpenClaw session state file location when available.
+   */
+  runtimeStatePath?: string;
 }
 
 export interface DeliveryResult {
@@ -86,6 +97,10 @@ export interface DeliveryResult {
   canonVersion?: string | null;
   /** The connection was established and the request was accepted; the turn is queued. Not a failure. */
   pendingAck?: boolean;
+  /** Existing task-key run returned without minting a second worker/session. */
+  idempotentReplay?: boolean;
+  /** Persisted sessions_spawn task-key record, when idempotency is enabled. */
+  sessionSpawnRecord?: SessionSpawnRunRecord;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -113,6 +128,24 @@ function classifyFetchError(err: unknown): DeliveryResult {
   };
 }
 
+function ticketIdFromSessionKey(sessionKey: string): string {
+  const parts = sessionKey.split(":");
+  const last = parts[parts.length - 1] ?? sessionKey;
+  return last.startsWith("linear-") ? last.slice("linear-".length) : last;
+}
+
+function deliveryRuntime(config: DeliveryConfig): SessionSpawnRuntime {
+  if (config.gatewayUrl && config.gatewayToken) return "openclaw-acp";
+  if (config.hooksUrl && config.hooksToken) return "openclaw-acp";
+  return "codex";
+}
+
+function defaultRuntimeStatePath(config: DeliveryConfig): string | null {
+  if (config.runtimeStatePath) return config.runtimeStatePath;
+  const home = process.env.HOME;
+  return home ? path.join(home, ".openclaw", "sessions", "sessions.json") : null;
+}
+
 /**
  * Deliver a routed event to an OpenClaw agent.
  *
@@ -128,9 +161,55 @@ export async function deliverToAgent(
   config: DeliveryConfig,
   dispatchLeaseStore?: DispatchLeaseStore,
   inFlightStore?: DispatchInFlightStore,
+  sessionSpawnStore?: SessionSpawnIdempotencyStore,
 ): Promise<DeliveryResult> {
   const updatedAt =
     (route.event.data as Record<string, string> | undefined)?.updatedAt;
+
+  const rawToken =
+    getAccessToken(route.agentId) ??
+    process.env.LINEAR_OAUTH_TOKEN ??
+    process.env.LINEAR_API_KEY;
+  const authToken = rawToken
+    ? /^Bearer\s+/i.test(rawToken) ? rawToken : `Bearer ${rawToken}`
+    : undefined;
+
+  // INF-38: resolve UUID → live identifier so that pre- and post-move
+  // dispatches for the same issue use one sessionKey. Fail-open: if the
+  // resolve fails or the event has no UUID, route.sessionKey is unchanged.
+  const canonicalIdentifier = await resolveCanonicalIdentifierFromEvent(route.event, authToken);
+  if (canonicalIdentifier) {
+    const canonicalKey = normalizeSessionKey(`linear-${canonicalIdentifier}`);
+    const capturedKey = route.sessionKey;
+    if (canonicalKey !== capturedKey) {
+      log.info(
+        `INF-38: canonicalised sessionKey ${capturedKey} → ${canonicalKey} (issue moved teams)`,
+      );
+      route.sessionKey = canonicalKey;
+    }
+  }
+
+  const taskKey = route.taskKey ?? route.agentId;
+  const idempotency = sessionSpawnStore?.beginOrGetExisting({
+    ticketId: ticketIdFromSessionKey(route.sessionKey),
+    taskKey,
+    runtime: deliveryRuntime(config),
+    agentId: route.agentId,
+    sessionKey: route.sessionKey,
+  });
+  if (idempotency?.action === "return-existing") {
+    log.info(
+      `sessions_spawn idempotent replay: ${route.sessionKey}/${taskKey} already has ` +
+      `state=${idempotency.record.state} run=${idempotency.record.run_id ?? "pending"}`,
+    );
+    return {
+      dispatched: true,
+      runId: idempotency.record.run_id ?? undefined,
+      pendingAck: idempotency.record.state === "pending",
+      idempotentReplay: true,
+      sessionSpawnRecord: idempotency.record,
+    };
+  }
 
   // INF-413: Ticket-level in-flight guard, checked BEFORE the agent-scoped
   // lease. The lease keys on (agentId, ticketKey), so it cannot catch the same
@@ -174,29 +253,6 @@ export async function deliverToAgent(
     }
   }
 
-  const rawToken =
-    getAccessToken(route.agentId) ??
-    process.env.LINEAR_OAUTH_TOKEN ??
-    process.env.LINEAR_API_KEY;
-  const authToken = rawToken
-    ? /^Bearer\s+/i.test(rawToken) ? rawToken : `Bearer ${rawToken}`
-    : undefined;
-
-  // INF-38: resolve UUID → live identifier so that pre- and post-move
-  // dispatches for the same issue use one sessionKey. Fail-open: if the
-  // resolve fails or the event has no UUID, route.sessionKey is unchanged.
-  const canonicalIdentifier = await resolveCanonicalIdentifierFromEvent(route.event, authToken);
-  if (canonicalIdentifier) {
-    const canonicalKey = normalizeSessionKey(`linear-${canonicalIdentifier}`);
-    const capturedKey = route.sessionKey;
-    if (canonicalKey !== capturedKey) {
-      log.info(
-        `INF-38: canonicalised sessionKey ${capturedKey} → ${canonicalKey} (issue moved teams)`,
-      );
-      route.sessionKey = canonicalKey;
-    }
-  }
-
   const message = await buildDeliveryMessage(route, authToken);
   // AI-1848: stamp the canon version that was injected by buildDeliveryMessage.
   const canonVersion = getActiveCanonVersion();
@@ -206,7 +262,16 @@ export async function deliverToAgent(
     message,
     config,
   );
-  return { ...result, canonVersion };
+  if (result.dispatched && idempotency?.record) {
+    const marked = sessionSpawnStore!.markSpawned(idempotency.record.id, {
+      runId: result.runId ?? `${deliveryRuntime(config)}:${route.agentId}:${route.sessionKey}:${taskKey}`,
+      sessionId: route.sessionKey,
+      state: "live",
+      runtimeStatePath: defaultRuntimeStatePath(config),
+    });
+    return { ...result, canonVersion, sessionSpawnRecord: marked };
+  }
+  return { ...result, canonVersion, sessionSpawnRecord: idempotency?.record };
 }
 
 /** Deliver an explicit operator-authored message to an existing OpenClaw session. */

@@ -12,12 +12,14 @@
  * the first ticket's identifier is used as the key.
  */
 
+import path from "node:path";
 import { deliverMessageToAgent, type DeliveryConfig, type DeliveryResult } from "../delivery/index.js";
 import { buildWorkflowAwareDeliveryMessage } from "../delivery/build-message.js";
 import { loadUniversalCanon, formatCanonBlock, getActiveCanonVersion, type CanonLoadResult } from "../policy/universal-canon.js";
 import { normalizeSessionKey } from "../session-key.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { randomUUID } from "node:crypto";
+import type { SessionSpawnIdempotencyStore, SessionSpawnRuntime } from "../store/session-spawn-idempotency-store.js";
 
 const log = componentLogger(createLogger(), "wakeup");
 
@@ -63,6 +65,10 @@ export interface WakeUpConfig extends DeliveryConfig {
   gateway?: string;
   /** AI-2008: workflow state at dispatch time, recorded on delivery outcomes. */
   workflowState?: string;
+  /** INF-879: durable task-key guard for pending-bag sessions_spawn wake paths. */
+  sessionSpawnStore?: SessionSpawnIdempotencyStore;
+  /** INF-879: explicit task key; falls back to workflowState, then agent id. */
+  sessionSpawnTaskKey?: string;
 }
 
 export const SINGLE_TICKET_TEMPLATE =
@@ -75,6 +81,24 @@ export const MULTI_TICKET_TEMPLATE =
 // Agents should observe (not own) mention-triggered tickets.
 export const MENTION_TICKET_TEMPLATE =
   "You have been @mentioned on ticket: {tickets}. Run `linear observe-issue {tickets}` to review.";
+
+function ticketIdFromSessionKey(sessionKey: string): string {
+  const parts = sessionKey.split(":");
+  const last = parts[parts.length - 1] ?? sessionKey;
+  return last.startsWith("linear-") ? last.slice("linear-".length) : last;
+}
+
+function deliveryRuntime(config: WakeUpConfig): SessionSpawnRuntime {
+  if (config.gatewayUrl && config.gatewayToken) return "openclaw-acp";
+  if (config.hooksUrl && config.hooksToken) return "openclaw-acp";
+  return "codex";
+}
+
+function defaultRuntimeStatePath(config: WakeUpConfig): string | null {
+  if (config.runtimeStatePath) return config.runtimeStatePath;
+  const home = process.env.HOME;
+  return home ? path.join(home, ".openclaw", "sessions", "sessions.json") : null;
+}
 
 /**
  * Context from the prior delegate's handoff comment, bundled into the wake-up
@@ -180,6 +204,21 @@ export async function sendWakeUpSignal(
   // Normalize to strip any legacy prefixes and enforce uppercase.
   // Result is always exactly `linear-<TEAM>-<NUMBER>`.
   const sessionKey = normalizeSessionKey(ticketIds[0]);
+  const taskKey = config.sessionSpawnTaskKey ?? config.workflowState ?? agentId;
+  const idempotency = config.sessionSpawnStore?.beginOrGetExisting({
+    ticketId: ticketIdFromSessionKey(sessionKey),
+    taskKey,
+    runtime: deliveryRuntime(config),
+    agentId,
+    sessionKey,
+  });
+  if (idempotency?.action === "return-existing") {
+    log.info(
+      `sessions_spawn idempotent replay: wake ${sessionKey}/${taskKey} already has ` +
+      `state=${idempotency.record.state} run=${idempotency.record.run_id ?? "pending"}`,
+    );
+    return { runId: idempotency.record.run_id ?? undefined, canonVersion: canonVersion ?? undefined };
+  }
 
   log.info(`Sending wake-up signal to ${agentId}: ${ticketIds.length} ticket(s) [${ticketIds.join(", ")}]`);
 
@@ -207,12 +246,28 @@ export async function sendWakeUpSignal(
           `wake-up delivery undeliverable after ${outcome.attempts} attempt(s)`,
         );
       }
+      if (idempotency?.record) {
+        config.sessionSpawnStore!.markSpawned(idempotency.record.id, {
+          runId: `${deliveryRuntime(config)}:${agentId}:${sessionKey}:${taskKey}`,
+          sessionId: sessionKey,
+          state: "live",
+          runtimeStatePath: defaultRuntimeStatePath(config),
+        });
+      }
       return { canonVersion: canonVersion ?? undefined };
     }
 
     const result: DeliveryResult = await deliverOnce();
     if (!result.dispatched) {
       throw new Error(result.hookErrorSummary ?? "wake-up delivery was not accepted");
+    }
+    if (idempotency?.record) {
+      config.sessionSpawnStore!.markSpawned(idempotency.record.id, {
+        runId: result.runId ?? `${deliveryRuntime(config)}:${agentId}:${sessionKey}:${taskKey}`,
+        sessionId: sessionKey,
+        state: "live",
+        runtimeStatePath: defaultRuntimeStatePath(config),
+      });
     }
     return { runId: result.runId, canonVersion: canonVersion ?? undefined };
   } catch (err) {

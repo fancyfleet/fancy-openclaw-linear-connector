@@ -13,3 +13,5 @@ export { ObservationStore } from "./observation-store.js";
 export type { ReasonCode, Observation, ObservationInput, ObservationQuery, MetricRow, MetricSummary, MetricRollup } from "./observation-store.js";
 export { DispatchInFlightStore, DEFAULT_INFLIGHT_TTL_MS, MAX_INFLIGHT_TTL_MS } from "./dispatch-inflight-store.js";
 export type { InFlightRecord, InFlightAcquireResult, InFlightStoreCounters } from "./dispatch-inflight-store.js";
+export { SessionSpawnIdempotencyStore } from "./session-spawn-idempotency-store.js";
+export type { SessionSpawnBeginInput, SessionSpawnBeginResult, SessionSpawnMarkSpawnedInput, SessionSpawnRunRecord, SessionSpawnRunState, SessionSpawnRuntime } from "./session-spawn-idempotency-store.js";
