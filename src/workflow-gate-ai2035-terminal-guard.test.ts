@@ -97,6 +97,33 @@ states:
     transitions: []
 `;
 
+// INF-976 fixture equivalent for wf:dept-engine's continuous-loop shape:
+// a terminal cycle state explicitly declares a loop edge into the next
+// owner-held cycle state. This must be allowed even though undeclared terminal
+// rewrites remain blocked by AI-2035.
+const TEST_CONTINUOUS_LOOP_WORKFLOW_YAML = `
+id: dept-engine-loop
+version: 1
+archetype: continuous-loop
+entry_state: evaluating
+states:
+  - id: evaluating
+    owner_role: steward
+    kind: normal
+    native_state: thinking
+    transitions:
+      - command: complete-cycle
+        to: done
+        generic: continue
+  - id: done
+    kind: terminal
+    native_state: done
+    transitions:
+      - command: loop
+        to: evaluating
+        generic: continue
+`;
+
 const IDENTIFIER = "AI-2035";
 
 interface FetchCall {
@@ -154,6 +181,7 @@ function makeTransitionFetch(opts: {
               nodes: [
                 { id: "state-todo-uuid", name: "Todo", type: "unstarted" },
                 { id: "state-doing-uuid", name: "Doing", type: "started" },
+                { id: "state-thinking-uuid", name: "Thinking", type: "started" },
                 { id: "state-done-uuid", name: "Done", type: "completed" },
               ],
             },
@@ -230,6 +258,7 @@ describe("AI-2035: applyStateTransition terminal re-entry guard (AC2 guard A / A
   const TEAM_LABELS = [
     { id: "done-lbl", name: "state:done" },
     { id: "intake-lbl", name: "state:intake" },
+    { id: "evaluating-lbl", name: "state:evaluating" },
     { id: "implementation-lbl", name: "state:implementation" },
     { id: "ac-validate-lbl", name: "state:ac-validate" },
   ];
@@ -291,5 +320,48 @@ describe("AI-2035: applyStateTransition terminal re-entry guard (AC2 guard A / A
     expect(result.status).toBe("applied");
     expect(result.to).toBe("done");
     expect(atomicCalls(calls).length).toBe(1);
+  });
+
+  it("INF-976 AC1: allows an explicitly declared continuous-loop terminal exit from done to the next cycle owner state", async () => {
+    fs.writeFileSync(process.env.WORKFLOW_DEF_PATH!, TEST_CONTINUOUS_LOOP_WORKFLOW_YAML, "utf8");
+    resetWorkflowCache();
+    recordAppliedState(IDENTIFIER, "done");
+
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dept-engine-loop" },
+        { id: "done-lbl", name: "state:done" },
+      ],
+      teamLabels: TEAM_LABELS,
+    });
+    globalThis.fetch = mock;
+
+    const result = await applyStateTransition("loop", IDENTIFIER, "Bearer tok", {
+      sourceStateOverride: "done",
+    });
+
+    expect(result.status).toBe("applied");
+    expect(result.from).toBe("done");
+    expect(result.to).toBe("evaluating");
+    expect(atomicCalls(calls).length).toBe(1);
+  });
+});
+
+describe("INF-976 AC2/AC3: deploy verification contract for terminal loop regression", () => {
+  it("requires live deploy verification for INF-976 terminal-loop behavior and names INF-933 as the inert original defect", () => {
+    const deployScript = fs.readFileSync(
+      path.resolve(process.cwd(), "host-owned/bin/deploy-linear-connector.sh"),
+      "utf8",
+    );
+    const verificationBlockStart = deployScript.indexOf("health check");
+    const okResult = deployScript.indexOf("RESULT: OK");
+    expect(verificationBlockStart).toBeGreaterThanOrEqual(0);
+    expect(okResult).toBeGreaterThan(verificationBlockStart);
+
+    const verificationBlock = deployScript.slice(verificationBlockStart, okResult);
+    expect(verificationBlock).toMatch(/INF-976/);
+    expect(verificationBlock).toMatch(/INF-933/);
+    expect(verificationBlock).toMatch(/terminal[-_ ]loop|done[^]*evaluating|state:done[^]*state:evaluating/i);
+    expect(verificationBlock).toMatch(/live|behavior|probe|connector/i);
   });
 });

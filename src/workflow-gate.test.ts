@@ -46,6 +46,7 @@ import { clearAcRecordStore, getAcRecord } from "./ac-record-store.js";
 import { resetConfigHealth } from "./config-health.js";
 import { defStateSnapshotPath } from "./store/def-state-snapshot-store.js";
 import { clearImplementerStore } from "./implementer-store.js";
+import { clearAppliedState, recordAppliedState } from "./store/applied-state-store.js";
 
 // Resolved from the project root (jest cwd) so it works under both the
 // ESM tsc build and the CommonJS ts-jest transpile.
@@ -1407,6 +1408,75 @@ describe("applyStateTransition — normal state advance", () => {
     globalThis.fetch = mock;
     // AI-1809: no throw, but the failure is machine-readable, not silent.
     await expect(applyStateTransition("submit", "issue-uuid", "Bearer tok")).resolves.toMatchObject({ status: "failed", code: "atomic-mutation-failed" });
+  });
+});
+
+describe("INF-976: declared terminal loop transitions", () => {
+  let originalFetch: typeof globalThis.fetch;
+  const savedDefsDir = process.env.WORKFLOW_DEFS_DIR;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    process.env.WORKFLOW_DEFS_DIR = path.resolve(process.cwd(), "src/registered-defs");
+    resetWorkflowCache();
+    clearAppliedState("ENG-5");
+    clearAppliedState("INF-933");
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    if (savedDefsDir === undefined) delete process.env.WORKFLOW_DEFS_DIR;
+    else process.env.WORKFLOW_DEFS_DIR = savedDefsDir;
+    resetWorkflowCache();
+    clearAppliedState("ENG-5");
+    clearAppliedState("INF-933");
+  });
+
+  it("AC1/INF-933: applies wf:dept-engine's declared done -> evaluating loop edge from ENG-5's terminal applied state", async () => {
+    recordAppliedState("ENG-5", "done");
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dept-engine" },
+        { id: "done-lbl", name: "state:done" },
+      ],
+      teamLabels: [{ id: "evaluating-lbl", name: "state:evaluating" }],
+    });
+    globalThis.fetch = mock;
+
+    const result = await applyStateTransition("loop", "ENG-5", "Bearer tok");
+
+    expect(result).toMatchObject({
+      status: "applied",
+      from: "done",
+      to: "evaluating",
+    });
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+    const vars = updateCall!.body.variables as { labelIds: string[]; stateId?: string; delegateId?: string | null };
+    expect(vars.labelIds).toContain("wf-lbl");
+    expect(vars.labelIds).toContain("evaluating-lbl");
+    expect(vars.labelIds).not.toContain("done-lbl");
+    expect(vars.stateId).toBe("state-thinking-uuid");
+    expect(vars.delegateId).toBeDefined();
+  });
+
+  it("AC2/INF-933: preserves the AI-2035 guard for terminal writes with no declared workflow edge", async () => {
+    recordAppliedState("INF-933", "done");
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dept-engine" },
+        { id: "done-lbl", name: "state:done" },
+      ],
+      teamLabels: [{ id: "evaluating-lbl", name: "state:evaluating" }],
+    });
+    globalThis.fetch = mock;
+
+    await expect(applyStateTransition("complete-cycle", "INF-933", "Bearer tok")).resolves.toMatchObject({
+      status: "blocked",
+      code: "terminal-reentry-guard",
+      from: "done",
+    });
+    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"))).toBe(false);
   });
 });
 
