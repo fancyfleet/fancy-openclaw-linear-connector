@@ -322,6 +322,11 @@ describe("INF-916 governed xfn reseat regression", () => {
   beforeEach(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-916-"));
     process.env.ADMIN_SECRET = ADMIN_SECRET;
+    // AC4+AC5 posts an intentionally UNSIGNED webhook; if a prior test in the same
+    // jest worker leaked a webhook secret, the ingress would reject it 400. Clear
+    // both so this test is isolation-robust regardless of file ordering.
+    delete process.env.LINEAR_WEBHOOK_SECRET;
+    delete process.env.LINEAR_WEBHOOK_SECRETS;
     writeAgents(dir);
     writePolicy(dir);
     writeWorkflow(dir);
