@@ -143,6 +143,57 @@ describe("buildSnapshot", () => {
     expect(snapshot.lastAssistantMessage).toBeNull();
     expect(snapshot.linearTicket.identifier).toBe("AI-1010");
   });
+
+  test("INF-909: resolves containerized agent session index and derives host-visible jsonl path", () => {
+    const openclawHome = fs.mkdtempSync(path.join(os.tmpdir(), "stale-container-snapshot-"));
+    const hostSessionsDir = path.join(openclawHome, "agents", "charles", "sessions");
+    const containerSessionsDir = path.join(openclawHome, "containers", "code-review", "config", "agents", "charles", "sessions");
+    fs.mkdirSync(hostSessionsDir, { recursive: true });
+    fs.mkdirSync(containerSessionsDir, { recursive: true });
+
+    fs.writeFileSync(path.join(hostSessionsDir, "sessions.json"), "{}", "utf8");
+    fs.writeFileSync(
+      path.join(containerSessionsDir, "live.jsonl"),
+      JSON.stringify({
+        type: "message",
+        timestamp: "2026-07-28T00:00:00.000Z",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", name: "exec", arguments: {} }],
+          stopReason: "tool_use",
+        },
+      }) + "\n",
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(containerSessionsDir, "sessions.json"),
+      JSON.stringify({
+        "agent:charles:linear-INF-909": {
+          sessionId: "live",
+          sessionFile: "/home/node/.openclaw/agents/charles/sessions/live.jsonl",
+          status: "working",
+        },
+      }),
+      "utf8",
+    );
+
+    const snapshot = buildSnapshot(
+      {
+        agentId: "charles",
+        sessionKey: "linear-INF-909",
+        startedAt: Date.now() - 30 * 60 * 1000,
+        timeoutMs: 25 * 60 * 1000,
+        pendingTickets: [],
+      },
+      { openclawHome },
+    );
+
+    expect(snapshot.metadata.sessionFile).toBe(path.join(containerSessionsDir, "live.jsonl"));
+    expect(snapshot.toolCallSummary.totalCalls).toBe(1);
+    expect(snapshot.classification).not.toBe("C4");
+
+    fs.rmSync(openclawHome, { recursive: true, force: true });
+  });
 });
 
 // ── writeSnapshot ──────────────────────────────────────────────────────────
@@ -741,6 +792,57 @@ describe("INF-859 recovery routing — same-key collision and capped reviewer C4
         expect.objectContaining({ sessionKey: "agent:igor:hook:linear-INF-665", totalCalls: 0, assistantTurns: 0, claimError: expect.stringContaining("CronSessionLifecycleClaimError"), status: "claim-collision-husk" }),
       ]),
     );
+  });
+
+  test("INF-909: same-key replay reads container indexes and ignores container-internal sessionFile paths", () => {
+    const openclawHome = fs.mkdtempSync(path.join(os.tmpdir(), "stale-container-replay-"));
+    const hostSessionsDir = path.join(openclawHome, "agents", "hanzo", "sessions");
+    const devSessionsDir = path.join(openclawHome, "containers", "dev", "config", "agents", "hanzo", "sessions");
+    const mergeGateSessionsDir = path.join(openclawHome, "containers", "merge-gate", "config", "agents", "hanzo", "sessions");
+    fs.mkdirSync(hostSessionsDir, { recursive: true });
+    fs.mkdirSync(devSessionsDir, { recursive: true });
+    fs.mkdirSync(mergeGateSessionsDir, { recursive: true });
+
+    fs.writeFileSync(path.join(hostSessionsDir, "sessions.json"), "{}", "utf8");
+    fs.writeFileSync(path.join(devSessionsDir, "sessions.json"), "{}", "utf8");
+    fs.writeFileSync(
+      path.join(mergeGateSessionsDir, "live.jsonl"),
+      JSON.stringify({
+        type: "message",
+        timestamp: "2026-07-28T00:00:00.000Z",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", name: "exec", arguments: {} }],
+          stopReason: "tool_use",
+        },
+      }) + "\n",
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(mergeGateSessionsDir, "sessions.json"),
+      JSON.stringify({
+        "agent:hanzo:linear-LIF-337": {
+          sessionId: "live",
+          sessionFile: "/home/node/.openclaw/agents/hanzo/sessions/live.jsonl",
+          status: "active",
+        },
+      }),
+      "utf8",
+    );
+
+    const replay = collectSameKeySessionReplay("hanzo", "linear-LIF-337", { openclawHome });
+
+    expect(replay).toEqual([
+      expect.objectContaining({
+        sessionKey: "agent:hanzo:linear-LIF-337",
+        sessionFile: path.join(mergeGateSessionsDir, "live.jsonl"),
+        totalCalls: 1,
+        assistantTurns: 1,
+        status: "active",
+      }),
+    ]);
+
+    fs.rmSync(openclawHome, { recursive: true, force: true });
   });
 
   test("INF-859/INF-665: true C4 with no competing live owner still recovers as a first-stall re-poke and counts once", async () => {

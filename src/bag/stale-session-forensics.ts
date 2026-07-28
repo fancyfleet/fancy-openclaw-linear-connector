@@ -185,6 +185,107 @@ interface SessionIndexEntry {
   status?: string;
 }
 
+interface SessionIndexMatch {
+  entry: Record<string, unknown>;
+  indexKey: string;
+  sessionsDir: string;
+  indexMtimeMs: number;
+}
+
+function getCandidateSessionDirs(openclawHome: string, openclawAgentName: string): string[] {
+  const dirs = [
+    path.join(openclawHome, "agents", openclawAgentName, "sessions"),
+  ];
+  const containersDir = path.join(openclawHome, "containers");
+
+  try {
+    for (const containerName of fs.readdirSync(containersDir)) {
+      dirs.push(path.join(containersDir, containerName, "config", "agents", openclawAgentName, "sessions"));
+    }
+  } catch {
+    // Container mounts are optional; bare-metal agents only have the host dir.
+  }
+
+  return dirs;
+}
+
+function findEntryInIndex(
+  index: Record<string, Record<string, unknown>>,
+  openclawAgentName: string,
+  sessionKey: string,
+): [string, Record<string, unknown>] | null {
+  const openclawKey = `agent:${openclawAgentName}:${sessionKey}`;
+  const entry = index[openclawKey];
+  if (entry && typeof entry === "object") return [openclawKey, entry];
+
+  const hookKey = `agent:${openclawAgentName}:hook:${sessionKey}`;
+  const hookEntry = index[hookKey];
+  if (hookEntry && typeof hookEntry === "object") return [hookKey, hookEntry];
+
+  for (const [key, val] of Object.entries(index)) {
+    if (key.toLowerCase().includes(sessionKey.toLowerCase()) && typeof val === "object" && val.sessionId) {
+      return [key, val];
+    }
+  }
+
+  return null;
+}
+
+function sessionJsonlPathFromEntry(entry: Record<string, unknown>, sessionsDir: string): string | null {
+  if (typeof entry.sessionId === "string" && entry.sessionId.length > 0) {
+    return path.join(sessionsDir, `${entry.sessionId}.jsonl`);
+  }
+  if (typeof entry.sessionFile === "string" && entry.sessionFile.length > 0) {
+    const basename = path.basename(entry.sessionFile);
+    return path.join(sessionsDir, basename);
+  }
+  return null;
+}
+
+function toSessionIndexEntry(match: SessionIndexMatch): SessionIndexEntry | null {
+  const sessionFile = sessionJsonlPathFromEntry(match.entry, match.sessionsDir);
+  if (!sessionFile) return null;
+
+  return {
+    sessionId: String(match.entry.sessionId ?? path.basename(sessionFile, ".jsonl")),
+    sessionFile,
+    sessionStartedAt: typeof match.entry.sessionStartedAt === "number" ? match.entry.sessionStartedAt : undefined,
+    status: typeof match.entry.status === "string" ? match.entry.status : undefined,
+  };
+}
+
+function collectSessionIndexMatches(
+  agentId: string,
+  sessionKey: string,
+  openclawHome: string,
+): SessionIndexMatch[] {
+  const openclawAgentName = getOpenclawAgentName(agentId);
+  const matches: SessionIndexMatch[] = [];
+
+  for (const sessionsDir of getCandidateSessionDirs(openclawHome, openclawAgentName)) {
+    const indexPath = path.join(sessionsDir, "sessions.json");
+    try {
+      if (!fs.existsSync(indexPath)) continue;
+      const raw = fs.readFileSync(indexPath, "utf8");
+      const index = JSON.parse(raw) as Record<string, Record<string, unknown>>;
+      const match = findEntryInIndex(index, openclawAgentName, sessionKey);
+      if (match) {
+        const [indexKey, entry] = match;
+        matches.push({
+          entry,
+          indexKey,
+          sessionsDir,
+          indexMtimeMs: fs.statSync(indexPath).mtimeMs,
+        });
+      }
+    } catch (err) {
+      log.warn(`Failed to read sessions index: ${indexPath}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  return matches.sort((a, b) => b.indexMtimeMs - a.indexMtimeMs);
+}
+
 /**
  * Find the session file for a given (agentId, sessionKey) by reading
  * OpenClaw's sessions.json index.
@@ -194,61 +295,12 @@ function findSessionFile(
   sessionKey: string,
   openclawHome: string,
 ): SessionIndexEntry | null {
-  const openclawAgentName = getOpenclawAgentName(agentId);
-  const sessionsDir = path.join(openclawHome, "agents", openclawAgentName, "sessions");
-  const indexPath = path.join(sessionsDir, "sessions.json");
-
-  try {
-    if (!fs.existsSync(indexPath)) {
-      log.debug(`Sessions index not found: ${indexPath}`);
-      return null;
-    }
-
-    const raw = fs.readFileSync(indexPath, "utf8");
-    const index = JSON.parse(raw) as Record<string, Record<string, unknown>>;
-
-    // Try exact match: agent:<agentId>:<sessionKey>
-    const openclawKey = `agent:${openclawAgentName}:${sessionKey}`;
-    const entry = index[openclawKey];
-    if (entry && typeof entry === "object") {
-      return {
-        sessionId: String(entry.sessionId ?? ""),
-        sessionFile: String(entry.sessionFile ?? path.join(sessionsDir, `${entry.sessionId}.jsonl`)),
-        sessionStartedAt: typeof entry.sessionStartedAt === "number" ? entry.sessionStartedAt : undefined,
-        status: typeof entry.status === "string" ? entry.status : undefined,
-      };
-    }
-
-    // Fallback: try with hook prefix
-    const hookKey = `agent:${openclawAgentName}:hook:${sessionKey}`;
-    const hookEntry = index[hookKey];
-    if (hookEntry && typeof hookEntry === "object") {
-      return {
-        sessionId: String(hookEntry.sessionId ?? ""),
-        sessionFile: String(hookEntry.sessionFile ?? path.join(sessionsDir, `${hookEntry.sessionId}.jsonl`)),
-        sessionStartedAt: typeof hookEntry.sessionStartedAt === "number" ? hookEntry.sessionStartedAt : undefined,
-        status: typeof hookEntry.status === "string" ? hookEntry.status : undefined,
-      };
-    }
-
-    // Fallback: scan keys for a match containing the sessionKey
-    for (const [key, val] of Object.entries(index)) {
-      if (key.includes(sessionKey.toLowerCase()) && typeof val === "object" && val.sessionId) {
-        return {
-          sessionId: String(val.sessionId),
-          sessionFile: String(val.sessionFile ?? path.join(sessionsDir, `${val.sessionId}.jsonl`)),
-          sessionStartedAt: typeof val.sessionStartedAt === "number" ? val.sessionStartedAt : undefined,
-          status: typeof val.status === "string" ? val.status : undefined,
-        };
-      }
-    }
-
-    log.debug(`No session found in index for ${openclawKey}`);
-    return null;
-  } catch (err) {
-    log.warn(`Failed to read sessions index: ${err instanceof Error ? err.message : String(err)}`);
+  const match = collectSessionIndexMatches(agentId, sessionKey, openclawHome)[0];
+  if (!match) {
+    log.debug(`No session found in any host-visible index for ${agentId} [${sessionKey}]`);
     return null;
   }
+  return toSessionIndexEntry(match);
 }
 
 // ── Session JSONL parsing ───────────────────────────────────────────────────
@@ -314,43 +366,40 @@ export function collectSameKeySessionReplay(
 ): SameKeySessionReplayEntry[] {
   const openclawHome = config.openclawHome ?? path.join(os.homedir(), ".openclaw");
   const openclawAgentName = getOpenclawAgentName(agentId);
-  const sessionsDir = path.join(openclawHome, "agents", openclawAgentName, "sessions");
-  const indexPath = path.join(sessionsDir, "sessions.json");
+  const replay: SameKeySessionReplayEntry[] = [];
 
-  try {
-    if (!fs.existsSync(indexPath)) return [];
-    const raw = fs.readFileSync(indexPath, "utf8");
-    const index = JSON.parse(raw) as Record<string, Record<string, unknown>>;
+  for (const sessionsDir of getCandidateSessionDirs(openclawHome, openclawAgentName)) {
+    const indexPath = path.join(sessionsDir, "sessions.json");
+    try {
+      if (!fs.existsSync(indexPath)) continue;
+      const raw = fs.readFileSync(indexPath, "utf8");
+      const index = JSON.parse(raw) as Record<string, Record<string, unknown>>;
 
-    return Object.entries(index)
-      .filter(([key]) => sameNormalizedSessionKey(key, sessionKey))
-      .map(([key, entry]) => {
-        const sessionId = typeof entry.sessionId === "string" ? entry.sessionId : "";
-        const sessionFile = typeof entry.sessionFile === "string"
-          ? entry.sessionFile
-          : sessionId
-            ? path.join(sessionsDir, `${sessionId}.jsonl`)
-            : null;
-        const events = sessionFile ? readSessionJsonl(sessionFile) : [];
+      for (const [key, entry] of Object.entries(index)) {
+        if (!sameNormalizedSessionKey(key, sessionKey)) continue;
+        const sessionFile = sessionJsonlPathFromEntry(entry, sessionsDir);
+        const events = sessionFile !== null ? readSessionJsonl(sessionFile) : [];
         const errors = extractErrors(events);
         const claimError = errors.find((err) =>
           /CronSessionLifecycleClaimError|lifecycle claim already held/i.test(err),
         ) ?? null;
         const toolCalls = extractToolCallSummary(events);
 
-        return {
+        replay.push({
           sessionKey: typeof entry.sessionKey === "string" ? entry.sessionKey : key,
           sessionFile,
           totalCalls: toolCalls.totalCalls,
           assistantTurns: countAssistantTurns(events),
           claimError,
           status: typeof entry.status === "string" ? entry.status : null,
-        };
-      });
-  } catch (err) {
-    log.warn(`Failed to collect same-key session replay for ${agentId} [${sessionKey}]: ${err instanceof Error ? err.message : String(err)}`);
-    return [];
+        });
+      }
+    } catch (err) {
+      log.warn(`Failed to collect same-key session replay for ${agentId} [${sessionKey}] from ${indexPath}: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
+
+  return replay;
 }
 
 // ── Snapshot builder ────────────────────────────────────────────────────────
