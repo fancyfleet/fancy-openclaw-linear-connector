@@ -29,6 +29,7 @@ import { autoEnrollPlainDelegation } from "./workflow-gate.js";
 import { isBlockedByOpenIssue, isTerminalIssueState, type LinearIssueRelation } from "./linear-actionable.js";
 import { getAgentIdForLinearUserId, getOpenclawAgentName } from "./agents.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
+import { getRateLimitClient } from "./linear-rate-limit-client.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
 import { OperationalEventStore, type OperationalEventStore as OperationalEventStoreType } from "./store/operational-event-store.js";
 import type { SessionTracker } from "./bag/session-tracker.js";
@@ -556,8 +557,12 @@ export async function runDelegationReconciliationSweep(
   // INF-683: resolve the token at pass time (getter) so the boot/~20h token
   // refresh can't strand a value captured at registration.
   const authToken = typeof opts.authToken === "function" ? opts.authToken() : opts.authToken;
-  const fetchFn = opts.fetchFn ?? globalThis.fetch;
   const alertBus = opts.alertBus;
+  // INF-923 AC2: route every Linear query through the shared rate-limit-aware
+  // client. On sustained 429s the breaker trips (one escalation) and this
+  // wrapped fetch throws RateLimitBreakerOpenError before issuing any further
+  // request, so reconciliation query storms halt until the budget recovers.
+  const fetchFn = getRateLimitClient(alertBus).wrap(opts.fetchFn ?? globalThis.fetch);
   const operationalEventStore = opts.operationalEventStore;
   const wakeFn = opts.wakeFn;
   const sessionTracker = opts.sessionTracker;

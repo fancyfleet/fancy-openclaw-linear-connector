@@ -30,6 +30,7 @@ import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js"
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
 import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
+import { getRateLimitClient } from "./linear-rate-limit-client.js";
 
 const log = componentLogger(
   createLogger(process.env.LOG_LEVEL ?? "info"),
@@ -224,8 +225,15 @@ export async function runStalePlainDelegateSweep(
   // INF-683: resolve the token at pass time (getter) so the boot/~20h token
   // refresh can't strand a value captured at registration.
   const authToken = typeof opts.authToken === "function" ? opts.authToken() : opts.authToken;
-  const fetchFn = opts.fetchFn ?? globalThis.fetch;
   const staleTimeoutMs = opts.staleTimeoutMs ?? DEFAULT_STALE_TIMEOUT_MS;
+
+  // INF-923: route every Linear query through the rate-limit-aware client so
+  // the sweep reads live remaining-budget headers and a 429 (throttle) aborts
+  // the pass without redispatching or touching the C4 cap. The re-dispatch loop
+  // below caps its volume at the client's per-sweep budget, which collapses to
+  // zero as the remaining budget approaches the floor (AC1/AC3).
+  const rateLimitClient = getRateLimitClient(alertBus);
+  const fetchFn = rateLimitClient.wrap(opts.fetchFn ?? globalThis.fetch);
 
   const result: StalePlainDelegateResult = {
     scanned: 0,
@@ -257,6 +265,12 @@ export async function runStalePlainDelegateSweep(
     });
     return result;
   }
+
+  // INF-923 AC1: cap re-dispatch volume at the live per-sweep budget. The query
+  // above observed the remaining-budget headers into the client; when remaining
+  // is at/below the floor this is 0, so a false-C4 storm backs off entirely
+  // instead of exhausting the API.
+  const redispatchBudget = rateLimitClient.redispatchBudget();
 
   for (const ticket of tickets) {
     result.scanned++;
@@ -323,6 +337,18 @@ export async function runStalePlainDelegateSweep(
         detail: { ticket: ticketId, delegate: agentName, state: ticket.state.name, attemptCount },
       });
 
+      continue;
+    }
+
+    // INF-923 AC1: rate-limit backoff. Once this sweep's re-dispatch budget is
+    // spent, stop re-dispatching — the ticket stays detected-as-stale (so it is
+    // picked up again next pass) but issues no new Linear-API-driven wake while
+    // the budget is near the floor.
+    if (result.redispatched >= redispatchBudget) {
+      log.warn(
+        `stale-plain-delegate: rate-limit backoff — re-dispatch budget (${redispatchBudget}) spent, ` +
+        `deferring ${ticketId} (${agentName})`,
+      );
       continue;
     }
 
