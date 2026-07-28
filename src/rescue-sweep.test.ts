@@ -193,16 +193,36 @@ function makeLinearMock(opts: {
     }
 
     // Delegate update or label update
-    if (query.includes("UpdateDelegate") || query.includes("issueUpdate")) {
+    if (query.includes("UpdateDelegate") || query.includes("WriteDelegate") || query.includes("issueUpdate")) {
       const vars = parsed.variables as Record<string, unknown> ?? {};
-      const issId = vars["id"] as string ?? "";
-      if (query.includes("delegateId")) delegateUpdateCalls.push(issId);
+      const issId = (vars["issueId"] as string) ?? (vars["id"] as string) ?? "";
+      if (query.includes("delegateId")) {
+        delegateUpdateCalls.push(issId);
+        // INF-1002: model persistence so the writeDelegate read-back sees the write.
+        const iss = (opts.issues ?? []).find((i) => i.id === issId);
+        if (iss) {
+          iss.delegateId = query.includes("delegateId: null")
+            ? null
+            : ((vars["delegateId"] as string) ?? iss.delegateId);
+        }
+      }
       if (query.includes("labelIds")) {
         labelUpdateCalls.push(issId);
         capturedLabelIds.set(issId, (vars["labelIds"] as string[]) ?? []);
       }
       return new Response(
         JSON.stringify({ data: { issueUpdate: { success: opts.updateDelegate?.success ?? true } } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    // INF-1002: writeDelegate read-back verification query.
+    if (query.includes("VerifyDelegate")) {
+      const vars = (parsed.variables as Record<string, unknown>) ?? {};
+      const id = (vars["issueId"] as string) ?? (vars["id"] as string) ?? "";
+      const iss = (opts.issues ?? []).find((i) => i.id === id);
+      return new Response(
+        JSON.stringify({ data: { issue: iss ? { delegate: iss.delegateId ? { id: iss.delegateId } : null } : null } }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }

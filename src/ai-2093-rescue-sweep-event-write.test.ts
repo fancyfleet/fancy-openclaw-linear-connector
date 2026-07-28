@@ -98,7 +98,25 @@ function makeMock(issues: Array<{ id: string; identifier: string; labels: string
     }
 
     if (query.includes("issueUpdate") && query.includes("delegateId")) {
+      // INF-1002: model persistence so the writeDelegate read-back sees the write.
+      const vars = parsed.variables ?? {};
+      const issId = String(vars["issueId"] ?? vars["id"] ?? "");
+      const iss = issues.find((i) => i.id === issId);
+      if (iss) {
+        iss.delegateId = query.includes("delegateId: null") ? null : (String(vars["delegateId"] ?? iss.delegateId));
+      }
       return new Response(JSON.stringify({ data: { issueUpdate: { success: true } } }), { status: 200 });
+    }
+
+    // INF-1002: writeDelegate read-back verification query.
+    if (query.includes("VerifyDelegate")) {
+      const vars = parsed.variables ?? {};
+      const issId = String(vars["issueId"] ?? vars["id"] ?? "");
+      const iss = issues.find((i) => i.id === issId);
+      return new Response(
+        JSON.stringify({ data: { issue: iss ? { delegate: iss.delegateId ? { id: iss.delegateId } : null } : null } }),
+        { status: 200 },
+      );
     }
 
     throw new Error(`ai2093-test: unexpected query: ${query.slice(0, 80)}`);

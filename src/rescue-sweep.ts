@@ -18,6 +18,7 @@
  */
 
 import fs from "node:fs";
+import { writeDelegate } from "./delegate-write.js";
 import yaml from "js-yaml";
 import { createLogger, componentLogger } from "./logger.js";
 import { defaultCapabilityPolicyPath } from "./instance-config.js";
@@ -324,32 +325,6 @@ async function fetchTeamLabelMap(teamId: string, authToken: string): Promise<Map
   }
 }
 
-async function setDelegate(ticketId: string, delegateId: string, authToken: string): Promise<boolean> {
-  const mutation = `
-    mutation UpdateDelegate($id: String!, $delegateId: String) {
-      issueUpdate(id: $id, input: { delegateId: $delegateId }) { success }
-    }
-  `;
-  try {
-    const res = await fetch(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({ query: mutation, variables: { id: ticketId, delegateId } }),
-    });
-    type Resp = { data?: { issueUpdate?: { success: boolean } }; errors?: Array<{ message: string }> };
-    const data = (await res.json()) as Resp;
-    // GraphQL errors come back HTTP 200 with an `errors` array and no data — log them so the
-    // per-ticket failure reason (e.g. "delegateId must be a UUID") is visible in journald.
-    if (data.errors?.length) {
-      log.error(`setDelegate failed for ${ticketId} (delegateId=${delegateId}): ${data.errors.map((e) => e.message).join("; ")}`);
-    }
-    return data.data?.issueUpdate?.success ?? false;
-  } catch (err) {
-    log.error(`setDelegate failed for ${ticketId}: ${err instanceof Error ? err.message : String(err)}`);
-    return false;
-  }
-}
-
 /** Terminal workflow-label prefixes — a ticket carrying one is lifecycle-finished
  *  and must NEVER have a delegate seated on it (INF-717 fix A / LSO-20). Mirrors
  *  the canonical set in classifyTicket and delegation-reconciliation-sweep.ts. */
@@ -635,7 +610,7 @@ async function rescueMalformed(
   let actionDesc: string;
 
   if (candidates.length === 1) {
-    const delegateOk = await setDelegate(ticket.id, candidates[0], authToken);
+    const delegateOk = (await writeDelegate(ticket.id, candidates[0], authToken)).ok;
     outcome = labelOk && delegateOk ? "rescued" : "failed";
     actionDesc = `bootstrap: applied state:${entryState} (entry state) label and delegated to ${candidates[0]}`;
   } else if (candidates.length > 1) {
@@ -680,7 +655,7 @@ async function rescueDormant(
         outcome: "ambiguous",
       };
     }
-    const ok = await setDelegate(ticket.id, candidates[0], authToken);
+    const ok = (await writeDelegate(ticket.id, candidates[0], authToken)).ok;
     return {
       ticketId: ticket.id,
       identifier: ticket.identifier,
@@ -732,7 +707,7 @@ async function rescueDrifted(
         outcome: "ambiguous",
       };
     }
-    const ok = await setDelegate(ticket.id, candidates[0], authToken);
+    const ok = (await writeDelegate(ticket.id, candidates[0], authToken)).ok;
     return {
       ticketId: ticket.id,
       identifier: ticket.identifier,

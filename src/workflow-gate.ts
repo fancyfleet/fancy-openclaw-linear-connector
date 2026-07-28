@@ -7449,46 +7449,6 @@ async function issueUpdateLabels(
 }
 
 /**
-/**
- * Update only the delegate (for cases where the atomic label+delegate path
- * is not needed). Delegates to issueUpdateAtomic with empty label behavior.
- * Used by the auto-delegate assignment logic (AI-1463) after a state transition
- * to ensure the new state's owner body becomes the delegate.
- * Fail-open: returns false on any error, never throws.
- */
-async function issueUpdateDelegateOnly(
-  internalId: string,
-  delegateLinearUserId: string,
-  authToken: string,
-): Promise<boolean> {
-  const mutation = `
-    mutation UpdateDelegate($issueId: String!, $delegateId: String!) {
-      issueUpdate(id: $issueId, input: { delegateId: $delegateId }) {
-        success
-      }
-    }
-  `;
-  try {
-    const res = await fetch(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({ query: mutation, variables: { issueId: internalId, delegateId: delegateLinearUserId } }),
-    });
-    type Resp = { data?: { issueUpdate?: { success: boolean } } };
-    const data = (await res.json()) as Resp;
-    if (!data.data?.issueUpdate?.success) {
-      log.warn(`workflow-gate: delegate-only issueUpdate returned non-success for ${internalId}`);
-      return false;
-    }
-    return true;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    log.warn(`workflow-gate: delegate-only issueUpdate failed for ${internalId}: ${msg}`);
-    return false;
-  }
-}
-
-/**
  * AI-1584: Enrollment gap repair.
  *
  * Detects and heals the dead-on-arrival condition where a ticket carries a `wf:*`

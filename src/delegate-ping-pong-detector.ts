@@ -28,6 +28,7 @@
  */
 
 import { createLogger, componentLogger } from "./logger.js";
+import { writeDelegate } from "./delegate-write.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import { getAccessToken, getLinearUserIdForAgent } from "./agents.js";
 import { resolveAgentIdentifiersForRole } from "./escalation-gate.js";
@@ -320,7 +321,7 @@ export async function fireEscalation(
 
   const stewardUserId = getLinearUserIdForAgent("ai");
   const delegateChanged = stewardUserId
-    ? await updateDelegate(issueId, stewardUserId, authHeader)
+    ? (await writeDelegate(issueId, stewardUserId, authHeader)).ok
     : false;
 
   if (!stewardUserId) {
@@ -383,32 +384,6 @@ async function postComment(
     return data.data?.commentCreate?.success === true;
   } catch (err) {
     log.error(`ping-pong escalation: comment post failed for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
-    return false;
-  }
-}
-
-async function updateDelegate(
-  issueId: string,
-  delegateId: string,
-  authHeader: string,
-): Promise<boolean> {
-  const mutation = `
-    mutation UpdateDelegate($issueId: String!, $delegateId: String!) {
-      issueUpdate(id: $issueId, input: { delegateId: $delegateId }) {
-        success
-      }
-    }
-  `;
-  try {
-    const res = await fetch(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: authHeader },
-      body: JSON.stringify({ query: mutation, variables: { issueId, delegateId } }),
-    });
-    const data = (await res.json()) as { data?: { issueUpdate?: { success: boolean } } };
-    return Boolean(data.data?.issueUpdate?.success);
-  } catch (err) {
-    log.error(`ping-pong escalation: delegate update failed for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
     return false;
   }
 }

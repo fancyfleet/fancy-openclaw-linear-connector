@@ -304,6 +304,11 @@ function makeSilentDropLinear(initialDelegate: string | null = null): {
       return json({ data: { commentCreate: { success: true, comment: { id: "comment-1" } } } });
     }
 
+    // INF-1002: writeDelegate read-back verification query.
+    if (query.includes("VerifyDelegate")) {
+      return json({ data: { issue: { delegate: delegateId ? { id: delegateId } : null } } });
+    }
+
     return json({ data: {} });
   };
 
@@ -365,7 +370,7 @@ describe("INF-916 governed xfn reseat regression", () => {
       },
     });
 
-    const seatWrites = fakeLinear.calls.filter((call) => call.query.includes("SeatRoleOwnerDelegate"));
+    const seatWrites = fakeLinear.calls.filter((call) => call.query.includes("WriteDelegate"));
     expect(first.seated).toBe(1);
     expect(fakeLinear.currentDelegate()).toBe(IGOR_LINEAR_ID);
     expect(seatWrites[0]?.query).toMatch(/assigneeId/);
