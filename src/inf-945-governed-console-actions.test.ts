@@ -16,12 +16,19 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { jest } from "@jest/globals";
 import request from "supertest";
 import { createApp } from "./index.js";
 import { reloadAgents } from "./agents.js";
+import { _setTransitionWritePolicyForTests } from "./workflow-gate.js";
 
 const ADMIN_SECRET = "inf-945-admin-secret";
 const TICKET = "INF-945";
+const INTERNAL_ID = "issue-inf-945";
+const TEAM_ID = "team-inf";
+const TODO_STATE_ID = "state-todo";
+const BACKLOG_STATE_ID = "state-backlog";
+const IGOR_LINEAR_ID = "user-igor-12345678";
 
 function tempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "inf-945-"));
@@ -60,14 +67,142 @@ function changedSourceFiles(): Array<{ file: string; text: string }> {
 describe("INF-945 scoped admin API routes", () => {
   let dir: string;
   let appState: ReturnType<typeof createApp>;
+  let fetchMock: jest.Mock;
+  let wakeCalls: Array<{ agentId: string; ticketIds: string[] }>;
+
+  function json(data: unknown) {
+    return { json: async () => data } as Response;
+  }
+
+  function installLinearMock() {
+    let lastIssueUpdate: Record<string, unknown> | null = null;
+    fetchMock = jest.fn(async (_url: string, init?: RequestInit) => {
+      const payload = JSON.parse(String(init?.body ?? "{}")) as { query?: string; variables?: Record<string, unknown> };
+      const query = payload.query ?? "";
+      const variables = payload.variables ?? {};
+
+      if (query.includes("IssueWithLabels")) {
+        return json({
+          data: {
+            issue: {
+              id: INTERNAL_ID,
+              identifier: TICKET,
+              team: { id: TEAM_ID },
+              labels: {
+                nodes: [
+                  { id: "label-wf-dev-impl", name: "wf:dev-impl" },
+                  { id: "label-state-implementation", name: "state:implementation" },
+                  { id: "label-cross-functional", name: "cross-functional-request" },
+                ],
+              },
+            },
+          },
+        });
+      }
+      if (query.includes("TeamLabels")) {
+        return json({
+          data: {
+            team: {
+              labels: {
+                nodes: [
+                  { id: "label-state-intake", name: "state:intake", team: { id: TEAM_ID } },
+                  { id: "label-state-implementation", name: "state:implementation", team: { id: TEAM_ID } },
+                ],
+              },
+            },
+          },
+        });
+      }
+      if (query.includes("TeamStates")) {
+        return json({
+          data: {
+            team: {
+              states: {
+                nodes: [
+                  { id: TODO_STATE_ID, name: "To Do", type: "unstarted" },
+                  { id: BACKLOG_STATE_ID, name: "Backlog", type: "backlog" },
+                ],
+              },
+            },
+          },
+        });
+      }
+      if (query.includes("ApplyAtomicTransition")) {
+        lastIssueUpdate = variables;
+        return json({ data: { issueUpdate: { success: true } } });
+      }
+      if (query.includes("VerifyTransitionWrite")) {
+        const updatedLabels = Array.isArray(lastIssueUpdate?.labelIds) ? lastIssueUpdate.labelIds : [];
+        const expectedState = updatedLabels.includes("label-state-intake") ? "state:intake" : "state:implementation";
+        const expectedDelegate =
+          lastIssueUpdate && "delegateId" in lastIssueUpdate
+            ? (lastIssueUpdate.delegateId ? { id: String(lastIssueUpdate.delegateId) } : null)
+            : { id: IGOR_LINEAR_ID };
+        return json({
+          data: {
+            issue: {
+              labels: { nodes: [{ name: expectedState }] },
+              delegate: expectedDelegate,
+              state: { id: lastIssueUpdate?.stateId ?? TODO_STATE_ID },
+            },
+          },
+        });
+      }
+      if (query.includes("DelegationReconciliation")) {
+        return json({
+          data: {
+            issues: {
+              nodes: [{
+                id: INTERNAL_ID,
+                identifier: TICKET,
+                updatedAt: "2026-07-28T09:00:00.000Z",
+                labels: { nodes: [{ id: "label-wf-dev-impl", name: "wf:dev-impl" }, { id: "label-state-implementation", name: "state:implementation" }] },
+                delegate: { id: IGOR_LINEAR_ID, name: "igor" },
+                team: { id: TEAM_ID },
+              }],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        });
+      }
+      if (query.includes("AdhocDelegationReconciliation")) {
+        return json({ data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } });
+      }
+      if (query.includes("TicketDelegateHistory")) {
+        return json({
+          data: {
+            issue: {
+              history: {
+                nodes: [{ __typename: "IssueHistory", createdAt: "2026-07-28T08:55:00.000Z", toAssignee: { id: IGOR_LINEAR_ID }, fromAssignee: null }],
+              },
+            },
+          },
+        });
+      }
+      return json({ data: {} });
+    });
+    global.fetch = fetchMock;
+  }
+
+  function issueUpdateInputs() {
+    return fetchMock.mock.calls
+      .map(([, init]) => JSON.parse(String((init as RequestInit)?.body ?? "{}")))
+      .filter((payload) => String(payload.query ?? "").includes("ApplyAtomicTransition"))
+      .map((payload) => payload.variables);
+  }
 
   beforeEach(() => {
     dir = tempDir();
     process.env.ADMIN_SECRET = ADMIN_SECRET;
     process.env.AGENTS_FILE = writeAgents(dir);
-    delete process.env.LINEAR_API_KEY;
+    process.env.LINEAR_API_KEY = "Bearer inf-945-linear-token";
+    process.env.WORKFLOW_DEFS_DIR = path.join(process.cwd(), "src/registered-defs");
+    delete process.env.WORKFLOW_DEF_PATH;
     delete process.env.LINEAR_OAUTH_TOKEN;
     reloadAgents();
+    _setTransitionWritePolicyForTests({ maxAttempts: 1, retryDelayMs: 0 });
+    installLinearMock();
+    wakeCalls = [];
     appState = createApp({
       bagDbPath: path.join(dir, "bag.db"),
       agentQueueDbPath: path.join(dir, "queue.db"),
@@ -82,27 +217,33 @@ describe("INF-945 scoped admin API routes", () => {
       proposalsDbPath: path.join(dir, "proposals.db"),
       livenessDispatchDbPath: path.join(dir, "liveness.db"),
       deadLetterQueueDbPath: path.join(dir, "deadletters.db"),
+      sendWakeUp: async (agentId, ticketIds) => {
+        wakeCalls.push({ agentId, ticketIds });
+      },
     });
   });
 
   afterEach(() => {
-    appState.bag.close();
-    appState.sessionTracker.close();
-    appState.agentQueue.close();
-    appState.operationalEventStore.close();
-    appState.observationStore.close();
-    appState.enrolledTicketsStore.close();
-    appState.managingStateStore.close();
-    appState.mutationAuditStore.close();
-    appState.idempotencyStore.close();
-    appState.proposalStore.close();
-    appState.dispatchLeaseStore.close();
-    appState.dispatchInFlightStore.close();
-    appState.livenessDispatchStore.close();
+    appState?.bag.close();
+    appState?.sessionTracker.close();
+    appState?.agentQueue.close();
+    appState?.operationalEventStore.close();
+    appState?.observationStore.close();
+    appState?.enrolledTicketsStore.close();
+    appState?.managingStateStore.close();
+    appState?.mutationAuditStore.close();
+    appState?.idempotencyStore.close();
+    appState?.proposalStore.close();
+    appState?.dispatchLeaseStore.close();
+    appState?.dispatchInFlightStore.close();
+    appState?.livenessDispatchStore.close();
     delete process.env.ADMIN_SECRET;
     delete process.env.AGENTS_FILE;
     delete process.env.LINEAR_API_KEY;
     delete process.env.LINEAR_OAUTH_TOKEN;
+    delete process.env.WORKFLOW_DEFS_DIR;
+    _setTransitionWritePolicyForTests();
+    jest.restoreAllMocks();
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -161,6 +302,17 @@ describe("INF-945 scoped admin API routes", () => {
       });
       expect(records[0].newValue).toBe(c.expectedNewValue);
     }
+
+    expect(issueUpdateInputs().map((vars) => ({
+      labelIds: vars.labelIds,
+      delegateId: vars.delegateId,
+      assigneeId: vars.assigneeId,
+      stateId: vars.stateId,
+    }))).toEqual([
+      { labelIds: ["label-wf-dev-impl", "label-cross-functional", "label-state-implementation"], delegateId: IGOR_LINEAR_ID, assigneeId: null, stateId: TODO_STATE_ID },
+      { labelIds: ["label-wf-dev-impl", "label-cross-functional", "label-state-implementation"], delegateId: null, assigneeId: null, stateId: TODO_STATE_ID },
+      { labelIds: ["label-wf-dev-impl", "label-cross-functional", "label-state-implementation"], delegateId: undefined, assigneeId: undefined, stateId: TODO_STATE_ID },
+    ]);
   });
 
   test("C1 delegate-set: per-action capability denial happens before mutation or audit", async () => {
@@ -202,6 +354,8 @@ describe("INF-945 scoped admin API routes", () => {
       governance: { tier: "T1", capability: "governed-console:force-redispatch" },
       auditReceipt: { ticketId: TICKET, action: "force-redispatch", mutationCount: 1 },
     });
+    expect(res.body).toMatchObject({ scanned: 1, healed: 1 });
+    expect(wakeCalls).toEqual([{ agentId: "igor", ticketIds: [TICKET] }]);
     expect(appState.mutationAuditStore.byTicket(TICKET)).toEqual([
       expect.objectContaining({
         source: "proxy",
@@ -225,7 +379,8 @@ describe("INF-945 scoped admin API routes", () => {
     expect(promote.body).toMatchObject({
       ok: true,
       action: "promote",
-      from: "Backlog",
+      from: "implementation",
+      to: "intake",
       governance: { tier: "T1", capability: "governed-console:promote" },
       auditReceipt: { action: "promote", mutationCount: 1 },
     });
@@ -250,10 +405,21 @@ describe("INF-945 scoped admin API routes", () => {
     expect(park.body).toMatchObject({
       ok: true,
       action: "park",
+      from: "implementation",
       to: "Backlog",
       governance: { tier: "T2", capability: "governed-console:park" },
       auditReceipt: { action: "park", mutationCount: 1 },
     });
+
+    expect(issueUpdateInputs().map((vars) => ({
+      labelIds: vars.labelIds,
+      delegateId: vars.delegateId,
+      assigneeId: vars.assigneeId,
+      stateId: vars.stateId,
+    }))).toEqual([
+      { labelIds: ["label-wf-dev-impl", "label-cross-functional", "label-state-intake"], delegateId: undefined, assigneeId: undefined, stateId: TODO_STATE_ID },
+      { labelIds: ["label-cross-functional"], delegateId: null, assigneeId: null, stateId: BACKLOG_STATE_ID },
+    ]);
 
     const audit = appState.mutationAuditStore.byTicket(TICKET);
     expect(audit.filter((r) => r.opName === "governed-console.promote")).toHaveLength(1);

@@ -16,7 +16,7 @@ import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import type { ObservationStore, ReasonCode, MetricSummary } from "./store/observation-store.js";
 import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forensics.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
-import { setStateAtomic, loadWorkflowRegistry, resetWorkflowCache, reloadWorkflowDefs } from "./workflow-gate.js";
+import { fetchIssueWorkflowSnapshot, parkIssueToBacklog, setStateAtomic, loadWorkflowRegistry, resetWorkflowCache, reloadWorkflowDefs } from "./workflow-gate.js";
 import { runFixtureDriftCheck } from "./fixture-drift-detector.js";
 import { instanceConfigRoot } from "./instance-config.js";
 import { retryApply } from "./proposal/apply-pipeline.js";
@@ -65,6 +65,8 @@ interface AdminDeps {
   mutationAuditStore?: MutationAuditStore;
   /** AI-2039: learning-loop proposal queue + apply-outcome store (C4/C5 console). */
   proposalStore?: ProposalStore;
+  /** Test hook for governed redispatch; production uses sendWakeUpSignal. */
+  reconciliationWakeFn?: (agentId: string, ticketId: string) => Promise<void>;
 }
 
 type Severity = "green" | "yellow" | "red" | "gray";
@@ -1256,6 +1258,42 @@ export function createAdminRouter(deps: AdminDeps): Router {
         return;
       }
 
+      const agents = getAgents();
+      const authToken =
+        (agents.length > 0 ? getAccessToken(agents[0].name) : undefined) ??
+        process.env.LINEAR_OAUTH_TOKEN ??
+        process.env.LINEAR_API_KEY;
+      if (!authToken) {
+        res.status(503).json({ ok: false, error: "no Linear auth token available" });
+        return;
+      }
+
+      const snapshot = await fetchIssueWorkflowSnapshot(ticketId, authToken);
+      if (!snapshot?.currentState) {
+        res.status(422).json({ ok: false, error: "could not resolve current workflow state for delegate-set" });
+        return;
+      }
+
+      const sendWakeUp = deps.wakeConfigForAgent
+        ? async (agentId: string, ticketIdentifier: string) => {
+            const config = deps.wakeConfigForAgent!(agentId);
+            await sendWakeUpSignal(agentId, [ticketIdentifier], config);
+          }
+        : undefined;
+      const delegate =
+        delegateMode === "clear" ? null :
+        delegateMode === "leave" ? undefined :
+        String(newValue);
+      const result = await setStateAtomic(ticketId, snapshot.currentState, delegate, authToken, {
+        sendWakeUp,
+        operationalEventStore: deps.operationalEventStore,
+        force: true,
+      });
+      if (!result.ok) {
+        res.status(422).json(result);
+        return;
+      }
+
       deps.mutationAuditStore?.append({
         source: "proxy",
         ticket: ticketId,
@@ -1468,6 +1506,42 @@ export function createAdminRouter(deps: AdminDeps): Router {
       }
       if (!requireGovernedConsoleAction(body, "force-redispatch", res)) return;
 
+      const agents = getAgents();
+      const authToken =
+        (agents.length > 0 ? getAccessToken(agents[0].name) : undefined) ??
+        process.env.LINEAR_OAUTH_TOKEN ??
+        process.env.LINEAR_API_KEY;
+      if (!authToken) {
+        res.status(503).json({ success: false, error: "no Linear auth token available" });
+        return;
+      }
+      if (!deps.operationalEventStore) {
+        res.status(503).json({ success: false, error: "operational event store not configured" });
+        return;
+      }
+      if (!deps.wakeConfigForAgent && !deps.reconciliationWakeFn) {
+        res.status(503).json({ success: false, error: "redispatch wake mechanism not configured" });
+        return;
+      }
+
+      const wakeFn = deps.reconciliationWakeFn
+        ? deps.reconciliationWakeFn
+        : async (agentId: string, ticketIdentifier: string) => {
+            await sendWakeUpSignal(agentId, [ticketIdentifier], deps.wakeConfigForAgent!(agentId));
+          };
+      const result = await runDelegationReconciliationSweep({
+        authToken,
+        operationalEventStore: deps.operationalEventStore,
+        alertBus: getAlertBus(),
+        wakeFn,
+        ticketIdentifiers: [ticketId],
+        enrolledTicketsStore: deps.enrolledTicketsStore,
+      });
+      if (result.errors.length > 0) {
+        res.status(500).json({ success: false, action: "force-redispatch", ticketId, shellPath: false, ...result });
+        return;
+      }
+
       deps.mutationAuditStore?.append({
         source: "proxy",
         ticket: ticketId,
@@ -1484,6 +1558,7 @@ export function createAdminRouter(deps: AdminDeps): Router {
         action: "force-redispatch",
         ticketId,
         shellPath: false,
+        ...result,
         governance: { tier: policy.tier, capability: policy.capability },
         auditReceipt: governedConsoleAuditReceipt(ticketId, "force-redispatch"),
       });
@@ -1530,7 +1605,7 @@ export function createAdminRouter(deps: AdminDeps): Router {
   });
 
   function handleGovernedBacklog(action: "promote" | "park") {
-    return (req: Request, res: Response) => {
+    return async (req: Request, res: Response) => {
       const body = parseJsonBody(req);
       if (body === null && (Buffer.isBuffer(req.body) || typeof req.body === "string")) {
         res.status(400).json({ ok: false, error: "Malformed JSON body" });
@@ -1553,13 +1628,47 @@ export function createAdminRouter(deps: AdminDeps): Router {
       }
       if (!requireGovernedConsoleAction(body, action, res)) return;
 
+      const agents = getAgents();
+      const authToken =
+        (agents.length > 0 ? getAccessToken(agents[0].name) : undefined) ??
+        process.env.LINEAR_OAUTH_TOKEN ??
+        process.env.LINEAR_API_KEY;
+      if (!authToken) {
+        res.status(503).json({ ok: false, error: "no Linear auth token available" });
+        return;
+      }
+
+      const mutationResult = action === "promote"
+        ? await (async () => {
+            const snapshot = await fetchIssueWorkflowSnapshot(ticketId, authToken);
+            if (!snapshot?.entryState) {
+              return { ok: false, ticketId, from: snapshot?.currentState ?? null, to: "", error: "could not resolve workflow entry state for promote" };
+            }
+            const sendWakeUp = deps.wakeConfigForAgent
+              ? async (agentId: string, ticketIdentifier: string) => {
+                  const config = deps.wakeConfigForAgent!(agentId);
+                  await sendWakeUpSignal(agentId, [ticketIdentifier], config);
+                }
+              : undefined;
+            return setStateAtomic(ticketId, snapshot.entryState, undefined, authToken, {
+              sendWakeUp,
+              operationalEventStore: deps.operationalEventStore,
+              force: true,
+            });
+          })()
+        : await parkIssueToBacklog(ticketId, authToken);
+      if (!mutationResult.ok) {
+        res.status(422).json(mutationResult);
+        return;
+      }
+
       deps.mutationAuditStore?.append({
         source: "proxy",
         ticket: ticketId,
         changeType: "state",
         field: "backlog",
-        oldValue: action === "promote" ? "Backlog" : null,
-        newValue: action === "promote" ? "active" : "Backlog",
+        oldValue: mutationResult.from,
+        newValue: mutationResult.to,
         actorId: invoker,
         opName: `governed-console.${action}`,
         intent: reason,
@@ -1570,7 +1679,8 @@ export function createAdminRouter(deps: AdminDeps): Router {
         ok: true,
         action,
         ticketId,
-        ...(action === "promote" ? { from: "Backlog" } : { to: "Backlog" }),
+        from: mutationResult.from,
+        to: mutationResult.to,
         governance: { tier: policy.tier, capability: policy.capability },
         auditReceipt: governedConsoleAuditReceipt(ticketId, action),
       });
