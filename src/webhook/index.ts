@@ -12,6 +12,7 @@ import type { MutationAuditStore } from "../store/mutation-audit-store.js";
 import type { DispatchIdempotencyStore } from "../store/dispatch-idempotency-store.js";
 import type { DispatchLeaseStore } from "../store/dispatch-lease-store.js";
 import type { DispatchInFlightStore } from "../store/dispatch-inflight-store.js";
+import type { SessionSpawnIdempotencyStore } from "../store/session-spawn-idempotency-store.js";
 import { extractWebhookMutations } from "./mutation-extraction.js";
 import { routeEvent, routeEventAll, unresolvedRoutingCandidates } from "../router.js";
 import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
@@ -433,10 +434,11 @@ async function deliverWithSlot(
   throttle?: DeliveryThrottle,
   dispatchLeaseStore?: DispatchLeaseStore,
   dispatchInFlightStore?: DispatchInFlightStore,
+  sessionSpawnStore?: SessionSpawnIdempotencyStore,
 ): Promise<Awaited<ReturnType<typeof deliverToAgent>>> {
   if (throttle) await throttle.acquireSlot();
   try {
-    return await deliverToAgent(route, config, dispatchLeaseStore, dispatchInFlightStore);
+    return await deliverToAgent(route, config, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore);
   } finally {
     if (throttle) throttle.releaseSlot();
   }
@@ -460,6 +462,7 @@ export function createWebhookRouter(
   dispatchLeaseStore?: DispatchLeaseStore,
   livenessDispatchStore?: Pick<DispatchRecordStore, "recordDispatch" | "recordAck" | "getDispatch">,
   dispatchInFlightStore?: DispatchInFlightStore,
+  sessionSpawnStore?: SessionSpawnIdempotencyStore,
 ): Router {
   const router = Router();
   const delegatePingPongDetector = new DelegatePingPongDetector(undefined, undefined, operationalEventStore);
@@ -881,7 +884,7 @@ export function createWebhookRouter(
                   await throttle.wait(wakeRoute.agentId);
                   throttle.record(wakeRoute.agentId);
                 }
-                const wakeResult = await deliverWithSlot(wakeRoute, wakeDeliveryConfig, throttle, dispatchLeaseStore, dispatchInFlightStore);
+                const wakeResult = await deliverWithSlot(wakeRoute, wakeDeliveryConfig, throttle, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore);
                 log.info(
                   `Bootstrap wake delivered to ${bootstrapResult.delegateAgentName} for ${bootstrapResult.ticketIdentifier} (runId=${wakeResult.runId ?? "ok"})`,
                 );
@@ -1538,7 +1541,10 @@ export function createWebhookRouter(
         const staleSessions = sessionTracker.cleanupStale();
         for (const stale of staleSessions) {
           log.info(`Webhook stale-session drain: re-signaling ${stale.agentId} for ${stale.pendingTickets.length} ticket(s)`);
-          await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfigForAgent(stale.agentId), { markActive: true, onDispatched });
+          await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, {
+            ...wakeConfigForAgent(stale.agentId),
+            sessionSpawnStore,
+          }, { markActive: true, onDispatched });
         }
 
         if (sessionTracker.isActiveForTicket(agentName, normalizedTicketId)) {
@@ -1551,7 +1557,7 @@ export function createWebhookRouter(
               await throttle.wait(route.agentId);
               throttle.record(route.agentId);
             }
-            const sameTicketResult = await deliverWithSlot(route, wakeConfigForAgent(route.agentId), throttle, dispatchLeaseStore, dispatchInFlightStore);
+            const sameTicketResult = await deliverWithSlot(route, wakeConfigForAgent(route.agentId), throttle, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore);
             bag.removeTicket(agentName, normalizedTicketId);
             appendOperationalEvent(operationalEventStore, {
               outcome: sameTicketResult.runId ? "dispatch-accepted" : "delivered",
@@ -1573,7 +1579,10 @@ export function createWebhookRouter(
         const pending = bag.getPendingTickets(agentName);
         const pendingIds = pending.map((e) => e.ticketId);
         log.info(`Bag: sending wake-up signal(s) to ${agentName} with ${pendingIds.length} ticket(s)`);
-        const dispatchResults = await resignalPendingTickets(agentName, pendingIds, bag, sessionTracker, wakeConfigForAgent(agentName), { markActive: true, onDispatched });
+        const dispatchResults = await resignalPendingTickets(agentName, pendingIds, bag, sessionTracker, {
+          ...wakeConfigForAgent(agentName),
+          sessionSpawnStore,
+        }, { markActive: true, onDispatched });
         const dispatched = dispatchResults.filter(r => r.dispatched).length;
         const firstRunId = dispatchResults.find(r => r.runId)?.runId ?? null;
         const firstCanonVersion = dispatchResults.find(r => r.canonVersion)?.canonVersion ?? null;
@@ -1637,7 +1646,7 @@ export function createWebhookRouter(
           await throttle.wait(route.agentId);
           throttle.record(route.agentId);
         }
-        const directResult = await deliverWithSlot(route, deliveryConfig, throttle, dispatchLeaseStore, dispatchInFlightStore);
+        const directResult = await deliverWithSlot(route, deliveryConfig, throttle, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore);
         appendOperationalEvent(operationalEventStore, { outcome: directResult.runId ? "dispatch-accepted" : "delivered", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1, runId: directResult.runId ?? null, wakeId, plane: "connector", detail: directResult.canonVersion ? { canonVersion: directResult.canonVersion } : undefined });
         // Direct deliveries (incl. comment-routed wakes into an existing
         // session) must register the dispatch and flip engagement → Thinking
@@ -1659,7 +1668,7 @@ export function createWebhookRouter(
                 await throttle.wait(route.agentId);
                 throttle.record(route.agentId);
               }
-              const drainResult = await deliverWithSlot(next, deliveryConfig, throttle, dispatchLeaseStore, dispatchInFlightStore);
+              const drainResult = await deliverWithSlot(next, deliveryConfig, throttle, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore);
               appendOperationalEvent(operationalEventStore, { outcome: drainResult.runId ? "dispatch-accepted" : "delivered", type: next.event.type, agent: route.agentId, key: next.sessionKey, sessionKey: next.sessionKey, deliveryMode: "agent-queue-drain", attemptCount: 1, runId: drainResult.runId ?? null, detail: drainResult.canonVersion ? { canonVersion: drainResult.canonVersion } : undefined });
             } catch (err) {
               log.error(`Agent queue: failed to deliver promoted task for ${route.agentId}: ${err instanceof Error ? err.message : String(err)}`);

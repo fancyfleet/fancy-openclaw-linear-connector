@@ -63,6 +63,7 @@ import { MutationAuditStore } from "./store/mutation-audit-store.js";
 import { DispatchIdempotencyStore } from "./store/dispatch-idempotency-store.js";
 import { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import { DispatchInFlightStore } from "./store/dispatch-inflight-store.js";
+import { SessionSpawnIdempotencyStore } from "./store/session-spawn-idempotency-store.js";
 import { ProposalStore } from "./store/proposal-store.js";
 import { clearAcRecordStore } from "./ac-record-store.js";
 import { getCronStalenessMultiplierFromEnv, getRegisteredCrons, getStaleCrons } from "./cron/registry.js";
@@ -237,6 +238,8 @@ export interface CreateAppOptions {
   dispatchLeaseDbPath?: string;
   /** Override DispatchInFlightStore database path (for testing). INF-413. */
   dispatchInFlightDbPath?: string;
+  /** Override SessionSpawnIdempotencyStore database path (for testing). INF-879. */
+  sessionSpawnIdempotencyDbPath?: string;
   /** Override ProposalStore database path (for testing). AI-2039. */
   proposalsDbPath?: string;
   /** Override liveness dispatch record database path (for testing). INF-316. */
@@ -681,6 +684,7 @@ export function createApp(options?: CreateAppOptions) {
   // INF-413: ticket-level in-flight guard — prevents the same ticket being
   // dispatched to two concurrent workers regardless of agent/session.
   const dispatchInFlightStore = new DispatchInFlightStore(options?.dispatchInFlightDbPath);
+  const sessionSpawnStore = new SessionSpawnIdempotencyStore(options?.sessionSpawnIdempotencyDbPath);
   const livenessDispatchStore = new DispatchRecordStore(
     options?.livenessDispatchDbPath ??
       (options?.bagDbPath
@@ -731,6 +735,7 @@ export function createApp(options?: CreateAppOptions) {
       // scheduler declared below is safe.
       deliveryScheduler: dispatchDeliveryScheduler,
       gateway: cfg?.host ?? "local",
+      sessionSpawnStore,
     };
   };
   const resignalOptions = {
@@ -1489,6 +1494,7 @@ export function createApp(options?: CreateAppOptions) {
     dispatchLeaseStore,
     livenessDispatchStore,
     dispatchInFlightStore,
+    sessionSpawnStore,
   ));
 
   // ── v1.1: Session-end callback endpoint ──────────────────────────────
@@ -1769,7 +1775,7 @@ export function createApp(options?: CreateAppOptions) {
   registerTtlInvalidationCron(ttlCache, 60_000);
   log.info("INF-193: TTL cache invalidation cron registered (every 60s)");
 
-  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, dispatchInFlightStore, livenessDispatchStore, transcriptRedactionHealth: getTranscriptRedactionHealth() });
+  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore, livenessDispatchStore, transcriptRedactionHealth: getTranscriptRedactionHealth() });
 }
 
 /**

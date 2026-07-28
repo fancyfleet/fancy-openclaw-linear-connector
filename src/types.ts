@@ -8,6 +8,12 @@ import type { LinearEvent } from "./webhook/schema.js";
 export interface RouteResult {
   agentId: string;
   sessionKey: string;
+  /**
+   * Optional idempotency unit within the ticket/session.
+   * When omitted, delivery falls back to the agent id so existing ticket-level
+   * routing keeps its current one-worker-per-agent behavior.
+   */
+  taskKey?: string;
   priority: number;
   event: LinearEvent;
   routingReason?: "delegate" | "assignee" | "mention" | "body-mention" | "department-prefix" | "steward-escalation";
@@ -27,5 +33,4 @@ export interface ConnectorConfig {
   openclawGatewayUrl: string;
   logLevel: "debug" | "info" | "warn" | "error";
 }
-
 
