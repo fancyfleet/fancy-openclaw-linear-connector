@@ -222,7 +222,12 @@ function makeSilentDropLinear(initialDelegate: string | null = null): {
       });
     }
 
-    if (query.includes("IssueContextSweep") || query.includes("IssueContext") || query.includes("IssueWithLabels")) {
+    if (
+      query.includes("IssueContextSweep") ||
+      query.includes("IssueContext") ||
+      query.includes("IssueRouting") ||
+      query.includes("IssueWithLabels")
+    ) {
       return json({
         data: {
           issue: {
