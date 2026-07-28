@@ -26,7 +26,7 @@ type DialogKind = GovernedAction | "set-state" | "recapture-ac" | null;
 
 const GOVERNED_ACTIONS: Record<GovernedAction, { label: string; tier: GovernedTier; capability: `governed-console:${GovernedAction}` }> = {
   "delegate-set": { label: "Delegate Set", tier: "T1", capability: "governed-console:delegate-set" },
-  "force-redispatch": { label: "Force Redispatch", tier: "T1", capability: "governed-console:force-redispatch" },
+  "force-redispatch": { label: "Force Dispatch", tier: "T1", capability: "governed-console:force-redispatch" },
   promote: { label: "Promote", tier: "T1", capability: "governed-console:promote" },
   park: { label: "Park", tier: "T2", capability: "governed-console:park" },
   probe: { label: "Probe", tier: "T0", capability: "governed-console:probe" },
