@@ -248,7 +248,7 @@ export async function checkLinearIssueRouting(
         authorization: linearAuthorizationHeader(token),
       },
       body: JSON.stringify({
-        query: `query IssueRouting($id: String!) {
+        query: `query IssueContextRouting($id: String!) {
           issue(id: $id) {
             id identifier
             delegate { id name app }

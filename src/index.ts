@@ -76,7 +76,7 @@ import { getFirstActionWatchdogState } from "./first-action-watchdog-state.js";
 import { classifyCrossCheckIssue, type CrossCheckIssue } from "./first-action-crosscheck.js";
 import { StallReasonCode, type StallReason, type WakeFailureDiagnostic } from "./wake-observability/index.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
-import { getCapabilityPolicy } from "./escalation-gate.js";
+import { getCapabilityPolicy, resolveBodiesForRole, roleResolutionScopeForOwnerRole } from "./escalation-gate.js";
 import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
 import { onAlert as onConfigHealthAlert } from "./config-health.js";
 import { getRegistryPolicyStatus, startRegistryPolicyCheck } from "./registry-policy.js";
@@ -170,6 +170,75 @@ function parseJsonBody<T extends object>(req: Request): T | null {
     return req.body as T;
   }
   return null;
+}
+
+type GovernedReseatIssue = {
+  id: string;
+  identifier: string;
+  title: string;
+  team: { id: string; key?: string; name?: string } | null;
+  state: { id: string; name: string; type?: string } | null;
+  labels: { nodes: Array<{ id?: string; name: string }> };
+  delegate: { id: string } | null;
+  assignee?: { id: string } | null;
+};
+
+function bearerToken(raw: string | undefined): string | null {
+  if (!raw) return null;
+  return /^Bearer\s+/i.test(raw) ? raw : `Bearer ${raw}`;
+}
+
+async function fetchGovernedReseatIssue(
+  issueId: string,
+  authToken: string,
+  fetchFn: typeof fetch = fetch,
+): Promise<GovernedReseatIssue | null> {
+  const query = `
+    query GovernedReseatIssueContext($issueId: String!) {
+      issue(id: $issueId) {
+        id
+        identifier
+        title
+        team { id key name }
+        state { id name type }
+        labels { nodes { id name } }
+        delegate { id }
+        assignee { id }
+      }
+    }
+  `;
+  const res = await fetchFn(LINEAR_API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: authToken },
+    body: JSON.stringify({ query, variables: { issueId } }),
+  });
+  type Resp = { data?: { issue?: GovernedReseatIssue | null } };
+  const data = (await res.json()) as Resp;
+  return data.data?.issue ?? null;
+}
+
+async function writeGovernedReseatDelegate(
+  issueId: string,
+  delegateId: string,
+  authToken: string,
+  fetchFn: typeof fetch = fetch,
+): Promise<boolean> {
+  const mutation = `
+    mutation GovernedReseatDelegate($issueId: String!, $delegateId: String!, $assigneeId: String) {
+      issueUpdate(id: $issueId, input: { delegateId: $delegateId, assigneeId: $assigneeId }) {
+        success
+        issue { id identifier }
+      }
+    }
+  `;
+  const res = await fetchFn(LINEAR_API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: authToken },
+    body: JSON.stringify({ query: mutation, variables: { issueId, delegateId, assigneeId: null } }),
+  });
+  type Resp = { data?: { issueUpdate?: { success?: boolean } } };
+  const data = (await res.json()) as Resp;
+  return data.data?.issueUpdate?.success === true;
 }
 
 /**
@@ -274,6 +343,11 @@ export function createApp(options?: CreateAppOptions) {
   const app = express();
   app.set("trust proxy", true);
   const bootedAt = new Date();
+  const governedXfnReseat = {
+    reseatEndpointMounted: false,
+    demoteGuardActive: false,
+    dispatchPath: "unmounted",
+  };
 
   // Create stores early — needed before route registration.
   const observationStore = new ObservationStore(options?.observationsDbPath);
@@ -601,6 +675,10 @@ export function createApp(options?: CreateAppOptions) {
       matrixApprovalGate: getMatrixApprovalGateLiveness(),
       // AI-2542: auto-enroll liveness and demote/escape suppression counters.
       autoEnroll: getAutoEnrollLiveness(),
+      // INF-916: governed cross-functional reseat liveness. These flags are set
+      // at the bootstrap sites where the admin route and webhook dispatch path
+      // are mounted, so ac-validate can see the fix without a live webhook.
+      governedXfnReseat,
       // INF-695 AC2.5: commitment activity observer liveness. registered=true
       // only when createWebhookRouter wires the production webhook consumer.
       commitmentGate: getCommitmentGateLiveness(),
@@ -1436,6 +1514,117 @@ export function createApp(options?: CreateAppOptions) {
   // Management console (Phase 3): React SPA + JSON API, session or secret auth.
   app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, ackTracker, deploymentName: DEPLOYMENT_NAME, enrolledTicketsStore, forensicsDiagnosticsDir: options?.forensicsDiagnosticsDir, mutationAuditStore, wakeConfigForAgent, proposalStore }));
 
+  app.post("/admin/api/governed/reseat", async (req: express.Request, res: express.Response) => {
+    if (!requireAdminSecret(req, res)) return;
+
+    let body: { issueId?: unknown; expectedWorkflow?: unknown; expectedState?: unknown };
+    try {
+      body = parseJsonBody(req) ?? {};
+    } catch (err) {
+      res.status(400).json({ ok: false, error: `invalid JSON body: ${err instanceof Error ? err.message : String(err)}` });
+      return;
+    }
+
+    const issueId = typeof body.issueId === "string" ? body.issueId.trim() : "";
+    const expectedWorkflow = typeof body.expectedWorkflow === "string" ? body.expectedWorkflow.trim() : "";
+    const expectedState = typeof body.expectedState === "string" ? body.expectedState.trim() : "";
+    if (!issueId || !expectedWorkflow || !expectedState) {
+      res.status(400).json({ ok: false, error: "issueId, expectedWorkflow, and expectedState are required" });
+      return;
+    }
+
+    const authToken =
+      bearerToken(getAccessToken("astrid")) ??
+      bearerToken(process.env.LINEAR_OAUTH_TOKEN) ??
+      bearerToken(process.env.LINEAR_API_KEY);
+    if (!authToken) {
+      res.status(503).json({ ok: false, error: "No Linear auth token is configured for governed reseat" });
+      return;
+    }
+
+    try {
+      const issue = await fetchGovernedReseatIssue(issueId, authToken);
+      if (!issue) {
+        res.status(404).json({ ok: false, error: `Issue ${issueId} was not found` });
+        return;
+      }
+
+      const labelNames = issue.labels.nodes.map((label) => label.name);
+      if (!labelNames.includes(`wf:${expectedWorkflow}`) || !labelNames.includes(`state:${expectedState}`)) {
+        res.status(409).json({
+          ok: false,
+          error: "Issue is not in the expected governed workflow state",
+          labels: labelNames,
+        });
+        return;
+      }
+
+      const registry = await loadWorkflowRegistry();
+      const def = registry.get(expectedWorkflow);
+      const stateDef = def?.states.find((state) => state.id === expectedState);
+      if (!def || !stateDef?.owner_role || stateDef.kind === "terminal") {
+        res.status(409).json({
+          ok: false,
+          error: "Expected workflow state does not declare an actionable owner role",
+          workflow: expectedWorkflow,
+          state: expectedState,
+        });
+        return;
+      }
+
+      const bodies = await resolveBodiesForRole(stateDef.owner_role, roleResolutionScopeForOwnerRole(stateDef.owner_role, def));
+      const bodyId = bodies[0];
+      const delegateLinearUserId = bodyId ? getLinearUserIdForAgent(bodyId) : undefined;
+      if (!bodyId || !delegateLinearUserId) {
+        res.status(409).json({
+          ok: false,
+          error: "No Linear-backed body resolves for the state's owner role",
+          ownerRole: stateDef.owner_role,
+        });
+        return;
+      }
+
+      const updated = await writeGovernedReseatDelegate(issue.id, delegateLinearUserId, authToken);
+      if (!updated) {
+        res.status(502).json({ ok: false, error: "Linear issueUpdate did not report success" });
+        return;
+      }
+
+      const persisted = await fetchGovernedReseatIssue(issue.id, authToken);
+      const persistedDelegate = persisted?.delegate?.id ?? null;
+      if (persistedDelegate !== delegateLinearUserId) {
+        res.status(502).json({
+          ok: false,
+          error: "Delegate write did not persist",
+          issue: issue.identifier,
+          delegate: bodyId,
+          expectedDelegateId: delegateLinearUserId,
+          actualDelegateId: persistedDelegate,
+        });
+        return;
+      }
+
+      operationalEventStore.append({
+        outcome: "enrollment-healed",
+        agent: bodyId,
+        key: issue.identifier,
+        sessionKey: normalizeSessionKey(issue.identifier),
+        detail: {
+          workflow: expectedWorkflow,
+          state: expectedState,
+          ownerRole: stateDef.owner_role,
+          delegateLinearUserId,
+        },
+      });
+      res.json({ ok: true, issue: issue.identifier, delegate: bodyId, persisted: true });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.error(`governed reseat failed for ${issueId}: ${msg}`);
+      res.status(500).json({ ok: false, error: msg });
+    }
+  });
+  governedXfnReseat.reseatEndpointMounted = true;
+
   // INF-193 AC3: cache-flush endpoint for emergency invalidation. ADMIN_SECRET-gated.
   app.post("/admin/api/cache/flush", (req: express.Request, res: express.Response) => {
     if (!requireAdminSecret(req, res)) return;
@@ -1446,6 +1635,8 @@ export function createApp(options?: CreateAppOptions) {
   // Mark the flush route as mounted for /health.cache liveness proof (AC4).
   markCacheFlushRouteMounted();
 
+  governedXfnReseat.demoteGuardActive = true;
+  governedXfnReseat.dispatchPath = "webhook dispatch path (createWebhookRouter)";
   app.use("/", createWebhookRouter(
     eventStore,
     nudgeStore,
