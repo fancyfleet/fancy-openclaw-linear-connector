@@ -337,6 +337,50 @@ async function resolveBodiesForOwnerRole(ownerRole: string, def: WorkflowDef): P
   return resolveBodiesForRole(ownerRole, roleResolutionScopeForOwnerRole(ownerRole, def));
 }
 
+export interface WorkflowInstanceContext {
+  issueIdentifier?: string;
+  teamKey?: string;
+  teamName?: string;
+  workflowEnrollment?: {
+    department?: string;
+    team?: string;
+    charterRef?: string;
+  };
+}
+
+export function deriveWorkflowInstanceScope(
+  def: WorkflowDef,
+  context?: WorkflowInstanceContext,
+): RoleResolutionScope | undefined {
+  if (def.id !== "dept-engine") {
+    return roleResolutionScopeForOwnerRole("department-head", def);
+  }
+
+  const department = context?.workflowEnrollment?.department ?? context?.teamKey;
+  const team = context?.workflowEnrollment?.team ?? context?.teamName;
+  return department || team ? { department, team } : undefined;
+}
+
+export function describeMissingInstanceScope(def: WorkflowDef, context?: WorkflowInstanceContext): string | undefined {
+  if (def.id !== "dept-engine") return undefined;
+  const issue = context?.issueIdentifier ? ` for ${context.issueIdentifier}` : "";
+  return (
+    `wf:dept-engine${issue} is missing department/team instance scope metadata from workflow enrollment ` +
+    `or Linear team context; refusing to fall back to static ENG defaults.`
+  );
+}
+
+async function resolveBodiesForOwnerRoleInContext(
+  ownerRole: string,
+  def: WorkflowDef,
+  context?: WorkflowInstanceContext,
+): Promise<string[]> {
+  const scope = ownerRole === "department-head"
+    ? deriveWorkflowInstanceScope(def, context)
+    : roleResolutionScopeForOwnerRole(ownerRole, def);
+  return resolveBodiesForRole(ownerRole, scope);
+}
+
 // ── Workflow def cache & registry ──────────────────────────────────────────
 // AI-1530: a single registry cache is the sole source of truth. loadWorkflowDef
 // (the legacy single-def accessor) derives its def from the same registry so the
@@ -1504,6 +1548,8 @@ async function fetchIssueWithLabels(
   internalId: string;
   identifier: string;
   teamId: string;
+  teamKey?: string;
+  teamName?: string;
   labels: LabelNode[];
   delegateId: string | null;
   assigneeId: string | null;
@@ -1514,7 +1560,7 @@ async function fetchIssueWithLabels(
       issue(id: $id) {
         id
         identifier
-        team { id }
+        team { id key name }
         labels { nodes { id name } }
         delegate { id }
         assignee { id }
@@ -1533,7 +1579,7 @@ async function fetchIssueWithLabels(
         issue?: {
           id: string;
           identifier: string;
-          team: { id: string };
+          team: { id: string; key?: string; name?: string };
           labels: { nodes: LabelNode[] };
           delegate?: { id: string } | null;
           assignee?: { id: string } | null;
@@ -1548,6 +1594,8 @@ async function fetchIssueWithLabels(
       internalId: issue.id,
       identifier: issue.identifier,
       teamId: issue.team.id,
+      teamKey: issue.team.key,
+      teamName: issue.team.name,
       labels: issue.labels.nodes,
       delegateId: issue.delegate?.id ?? null,
       assigneeId: issue.assignee?.id ?? null,
@@ -1861,13 +1909,16 @@ async function findOrCreateLabel(
 export async function resolveTransitionTargets(
   transition: WorkflowTransition,
   def: WorkflowDef,
+  context?: WorkflowInstanceContext,
 ): Promise<{ bodies: string[]; mode: 'auto' | 'required' | 'none' }> {
   const destState = def.states.find((s) => s.id === transition.to);
   const ownerRole = destState?.owner_role;
   if (!ownerRole || destState?.kind === 'terminal') {
     return { bodies: [], mode: 'none' };
   }
-  const bodies = await resolveBodiesForOwnerRole(ownerRole, def);
+  const scope = ownerRole === "department-head" ? deriveWorkflowInstanceScope(def, context) : undefined;
+  if (describeMissingInstanceScope(def, context) && !scope) return { bodies: [], mode: 'none' };
+  const bodies = await resolveBodiesForOwnerRoleInContext(ownerRole, def, context);
   if (bodies.length === 0) return { bodies: [], mode: 'none' };
   if (bodies.length === 1) return { bodies, mode: 'auto' };
   return { bodies, mode: 'required' };
@@ -1897,6 +1948,7 @@ export async function resolveTransitionDelegate(
   def: WorkflowDef,
   issueId: string,
   cliTarget?: string,
+  context?: WorkflowInstanceContext,
 ): Promise<string | null | undefined> {
   const destStateNode = def.states.find((s) => s.id === toStateName);
   if (!destStateNode) return undefined;
@@ -1927,7 +1979,7 @@ export async function resolveTransitionDelegate(
 
   // (3) Role-based resolution (singleton only).
   try {
-    const roleBodies = await resolveBodiesForOwnerRole(destOwnerRole, def);
+    const roleBodies = await resolveBodiesForOwnerRoleInContext(destOwnerRole, def, context);
     if (roleBodies.length === 1) {
       const agent = getAgent(roleBodies[0]);
       if (agent?.linearUserId) {
@@ -5293,6 +5345,12 @@ export async function applyStateTransition(
 
   if (!def) return { status: "noop", code: "unknown-workflow", detail: `no definition for wf:${workflowId}` }; // unknown workflow — no-op (AI-1530)
 
+  const instanceContext: WorkflowInstanceContext = {
+    issueIdentifier: issue.identifier,
+    teamKey: issue.teamKey,
+    teamName: issue.teamName,
+  };
+
   // AI-1498 fix: prefer the captured pre-forward state. The CLI advances the
   // state:* label inside its own forwarded mutation, so by now `labelNames`
   // already reflects the destination; using it as the transition source makes
@@ -6212,7 +6270,7 @@ export async function applyStateTransition(
           typeof matchedTransition?.assign?.selection_criteria === "string" &&
           matchedTransition.assign.selection_criteria.trim().length > 0;
         if (enforcesSelectionCriteria) {
-          const legalTargets = await resolveBodiesForOwnerRole(destOwnerRole!, def);
+          const legalTargets = await resolveBodiesForOwnerRoleInContext(destOwnerRole!, def, instanceContext);
           const roleDeclared = legalTargets.length > 0 || await isRoleDeclared(destOwnerRole!);
           if ((legalTargets.length > 1 || legalTargets.length === 0 && roleDeclared) && !legalTargets.includes(explicitTarget)) {
             log.error(
@@ -6288,7 +6346,7 @@ export async function applyStateTransition(
           ? def.states.find((s) => s.id === currentStateName)?.owner_role
           : undefined;
         if (sourceOwnerRole && sourceOwnerRole === destOwnerRole) {
-          const legalBodies = await resolveBodiesForOwnerRole(destOwnerRole!, def);
+          const legalBodies = await resolveBodiesForOwnerRoleInContext(destOwnerRole!, def, instanceContext);
           const seatedAgent = getAgents().find((a) => a.linearUserId === issue.delegateId);
           if (seatedAgent?.name && legalBodies.includes(seatedAgent.name)) {
             resolvedDelegateId = issue.delegateId;
@@ -6303,7 +6361,39 @@ export async function applyStateTransition(
       // Role-based resolution (singleton auto-assign, multi-body skip).
       if (resolvedDelegateId === undefined) {
         try {
-          const roleBodies = await resolveBodiesForOwnerRole(destOwnerRole!, def);
+          const missingScopeReason = describeMissingInstanceScope(def, instanceContext);
+          if (missingScopeReason && destOwnerRole === "department-head" && !deriveWorkflowInstanceScope(def, instanceContext)) {
+            return await failDelegateUnresolved({
+              issueId: issue.internalId,
+              authToken,
+              detail: missingScopeReason,
+              remedy:
+                `Re-enroll or repair ${issue.identifier} so wf:dept-engine has department/team scope metadata ` +
+                `from workflow enrollment or Linear team context before advancing.`,
+              from: currentStateName,
+              to: toStateName,
+            });
+          }
+          const roleBodies = await resolveBodiesForOwnerRoleInContext(destOwnerRole!, def, instanceContext);
+          if (
+            roleBodies.length === 0 &&
+            destOwnerRole === "department-head" &&
+            def.id === "dept-engine" &&
+            deriveWorkflowInstanceScope(def, instanceContext)
+          ) {
+            return await failDelegateUnresolved({
+              issueId: issue.internalId,
+              authToken,
+              detail:
+                `wf:dept-engine ${issue.identifier} has unresolved or ambiguous department/team instance scope; ` +
+                `no department-head body matches.`,
+              remedy:
+                `Repair ${issue.identifier} workflow enrollment department/team metadata or Linear team key/name ` +
+                `so exactly one department-head body matches before advancing.`,
+              from: currentStateName,
+              to: toStateName,
+            });
+          }
           if (roleBodies.length === 1) {
             const singletonResult = resolveSingletonDelegate(roleBodies, destOwnerRole!);
             if (singletonResult.resolvedDelegateId) {

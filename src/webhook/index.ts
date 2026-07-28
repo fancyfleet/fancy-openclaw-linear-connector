@@ -29,7 +29,7 @@ import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgent
 import { checkAgentLiveness, type LivenessConfig } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
 import { checkRoleGuardAndBlock, type LinearUserIdResolver } from "../routing-guard.js";
-import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, autoEnrollPlainDelegation, markAutoEnrollRegistered, markCommitmentActivityObserverRegistered, applyStateTransition } from "../workflow-gate.js";
+import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, autoEnrollPlainDelegation, markAutoEnrollRegistered, markCommitmentActivityObserverRegistered, applyStateTransition, type WorkflowInstanceContext } from "../workflow-gate.js";
 import { checkLabelSyncForTicket, emitLabelSyncWarning } from "../transition-audit.js";
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/index.js";
@@ -51,6 +51,30 @@ const log = componentLogger(createLogger(), "webhook");
 export type { LinearEvent } from "./schema.js";
 export { verifyLinearSignature } from "./signature.js";
 export { normalizeLinearEvent } from "./normalize.js";
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" ? value as Record<string, unknown> : undefined;
+}
+
+function deriveWorkflowInstanceContextFromRoute(route: RouteResult, issueIdentifier: string): WorkflowInstanceContext {
+  const data = asRecord(route.event.data) ?? {};
+  const sessionData = asRecord(data.agentSession);
+  const issueData = asRecord(data.issue ?? sessionData?.issue ?? data) ?? {};
+  const team = asRecord(issueData.team);
+  const enrollment = asRecord(issueData.workflowEnrollment);
+  return {
+    issueIdentifier,
+    teamKey: typeof team?.key === "string" ? team.key : undefined,
+    teamName: typeof team?.name === "string" ? team.name : undefined,
+    workflowEnrollment: enrollment
+      ? {
+          department: typeof enrollment.department === "string" ? enrollment.department : undefined,
+          team: typeof enrollment.team === "string" ? enrollment.team : undefined,
+          charterRef: typeof enrollment.charterRef === "string" ? enrollment.charterRef : undefined,
+        }
+      : undefined,
+  };
+}
 
 function signatureRejectedDetail(rawBody: Buffer | undefined, secretCount: number): Record<string, unknown> {
   return {
@@ -1398,7 +1422,13 @@ export function createWebhookRouter(
             );
             return (agent as { linearUserId?: string } | undefined)?.linearUserId ?? null;
           };
-          const guardResult = await checkRoleGuardAndBlock(route.agentId, issueIdentifier, guardLabels, linearUserIdResolver);
+          const guardResult = await checkRoleGuardAndBlock(
+            route.agentId,
+            issueIdentifier,
+            guardLabels,
+            linearUserIdResolver,
+            deriveWorkflowInstanceContextFromRoute(route, issueIdentifier),
+          );
           if (guardResult.blocked) {
             log.warn(
               `routing-guard: dispatch blocked for ${route.agentId} [${issueIdentifier}] — ${guardResult.reason ?? "role mismatch"}; ` +

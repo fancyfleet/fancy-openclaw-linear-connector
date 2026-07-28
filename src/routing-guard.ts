@@ -21,7 +21,14 @@
 
 import { createLogger, componentLogger } from "./logger.js";
 import { getAccessToken } from "./agents.js";
-import { loadWorkflowDefById, getWorkflowId, getCurrentState } from "./workflow-gate.js";
+import {
+  deriveWorkflowInstanceScope,
+  describeMissingInstanceScope,
+  loadWorkflowDefById,
+  getWorkflowId,
+  getCurrentState,
+  type WorkflowInstanceContext,
+} from "./workflow-gate.js";
 import { resolveBodiesForRole, resolveBodiesWithCapability, roleResolutionScopeForOwnerRole } from "./escalation-gate.js";
 import { notify } from "./alerts/alert-bus.js";
 
@@ -111,6 +118,7 @@ export function checkRoleGuard(
 export async function checkRoleGuardEnforced(
   targetAgentId: string,
   ticketLabels: string[],
+  context?: WorkflowInstanceContext,
 ): Promise<RoleGuardResult> {
   // 1. No workflow label → pass-through.
   const workflowId = getWorkflowId(ticketLabels);
@@ -181,14 +189,47 @@ export async function checkRoleGuardEnforced(
 
   // 5. Resolve legal bodies for this role.
   let legalBodies: string[];
+  let scopeApplied = false;
+  let unresolvedScopeReason: string | undefined;
   try {
-    legalBodies = await resolveBodiesForRole(ownerRole, roleResolutionScopeForOwnerRole(ownerRole, def));
+    const scope = ownerRole === "department-head"
+      ? deriveWorkflowInstanceScope(def, context)
+      : roleResolutionScopeForOwnerRole(ownerRole, def);
+    scopeApplied = ownerRole === "department-head" && def.id === "dept-engine" && Boolean(scope);
+    const missingScopeReason = describeMissingInstanceScope(def, context);
+    if (missingScopeReason && ownerRole === "department-head" && !scope) {
+      return {
+        blocked: true,
+        reason: missingScopeReason,
+        correctedTo: undefined,
+        legalBodies: [],
+      };
+    }
+    legalBodies = await resolveBodiesForRole(ownerRole, scope);
+    if (scopeApplied && legalBodies.length === 0) {
+      const issue = context?.issueIdentifier ? ` for ${context.issueIdentifier}` : "";
+      const department = context?.workflowEnrollment?.department ?? context?.teamKey ?? "unknown";
+      const team = context?.workflowEnrollment?.team ?? context?.teamName ?? "unknown";
+      unresolvedScopeReason =
+        `wf:dept-engine${issue} has unresolved or ambiguous department/team instance scope ` +
+        `(department=${department}, team=${team}); no department-head body matches. ` +
+        `Repair workflow enrollment department/team metadata or the Linear team key/name before routing.`;
+    }
   } catch (err) {
     log.warn(`routing-guard: failed to resolve bodies for role '${ownerRole}' — failing open: ${err instanceof Error ? err.message : String(err)}`);
     return { blocked: false };
   }
 
   if (legalBodies.length === 0) {
+    if (unresolvedScopeReason) {
+      log.warn(`routing-guard: BLOCKED dispatch — ${unresolvedScopeReason}`);
+      return {
+        blocked: true,
+        reason: unresolvedScopeReason,
+        correctedTo: undefined,
+        legalBodies: [],
+      };
+    }
     // No registered bodies for this role → fail open; system is misconfigured
     // but we shouldn't drop work silently.
     log.warn(`routing-guard: no bodies registered for role '${ownerRole}' in state '${currentState}' — failing open`);
@@ -262,8 +303,9 @@ export async function checkRoleGuardAndBlock(
   issueIdentifier: string,
   ticketLabels: string[],
   delegateLinearUserIdResolver?: LinearUserIdResolver,
+  context?: WorkflowInstanceContext,
 ): Promise<RoleGuardResult> {
-  const result = await checkRoleGuardEnforced(targetAgentId, ticketLabels);
+  const result = await checkRoleGuardEnforced(targetAgentId, ticketLabels, context);
 
   if (!result.blocked || !result.reason) {
     return result;
@@ -385,8 +427,9 @@ export async function checkRoleGuardAndWarn(
   issueIdentifier: string,
   ticketLabels: string[],
   delegateLinearUserIdResolver?: LinearUserIdResolver,
+  context?: WorkflowInstanceContext,
 ): Promise<RoleGuardResult> {
-  return checkRoleGuardAndBlock(targetAgentId, issueIdentifier, ticketLabels, delegateLinearUserIdResolver);
+  return checkRoleGuardAndBlock(targetAgentId, issueIdentifier, ticketLabels, delegateLinearUserIdResolver, context);
 }
 
 // ── Internal helpers ────────────────────────────────────────────────────────
