@@ -4,13 +4,25 @@ import { createLogger, componentLogger } from "./logger.js";
 const log = componentLogger(createLogger(), "delegate-write");
 
 export interface WriteDelegateResult {
-  /** True iff the delegate write was verified persisted by a read-back. */
+  /**
+   * Safe to treat the write as applied. True when the write reported success AND
+   * either the read-back confirmed it OR verification was unavailable (INF-984 —
+   * a failed *read* must not be reported as a failed *write*). False only on a
+   * definite failure: the write was rejected, or a successful read-back proved a
+   * silent revert.
+   */
   ok: boolean;
-  /** The delegate id actually on the issue after the write (null = unset). */
+  /** True iff a read-back actually confirmed the current delegate. False when verification was unavailable. */
+  verified: boolean;
+  /** The delegate id the read-back observed (null = unset, or verification unavailable). */
   persistedDelegateId: string | null;
-  /** Populated on failure with the reason (loudly logged as well). */
+  /** Populated on failure or unverified with the reason (loudly logged as well). */
   error?: string;
 }
+
+/** Read-back retry budget. Reads fail transiently under API stress (INF-984). */
+const VERIFY_ATTEMPTS = 3;
+const VERIFY_RETRY_MS = 150;
 
 /**
  * INF-1002 — the single chokepoint for writing an issue's delegate.
@@ -75,35 +87,69 @@ export async function writeDelegate(
     if (data.errors?.length) {
       const msg = data.errors.map((e) => e.message).join("; ");
       log.error(`writeDelegate: issueUpdate errored for ${issueId} (delegateId=${delegateId ?? "null"}): ${msg}`);
-      return { ok: false, persistedDelegateId: null, error: msg };
+      return { ok: false, verified: false, persistedDelegateId: null, error: msg };
     }
     if (data.data?.issueUpdate?.success !== true) {
       log.error(`writeDelegate: issueUpdate did not report success for ${issueId} (delegateId=${delegateId ?? "null"})`);
-      return { ok: false, persistedDelegateId: null, error: "issueUpdate did not report success" };
+      return { ok: false, verified: false, persistedDelegateId: null, error: "issueUpdate did not report success" };
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log.error(`writeDelegate: issueUpdate failed for ${issueId} (delegateId=${delegateId ?? "null"}): ${msg}`);
-    return { ok: false, persistedDelegateId: null, error: msg };
+    return { ok: false, verified: false, persistedDelegateId: null, error: msg };
   }
 
   // Read-back. `success: true` is NOT proof of persistence — Linear silently
   // reverts app-user delegate writes. Verify what actually stuck.
-  let persisted: string | null;
-  try {
-    const query = `query VerifyDelegate($issueId: String!) { issue(id: $issueId) { delegate { id } } }`;
-    const res = await fetchFn(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: authToken },
-      body: JSON.stringify({ query, variables: { issueId } }),
-    });
-    type QResp = { data?: { issue?: { delegate?: { id: string } | null } | null } };
-    const data = (await res.json()) as QResp;
-    persisted = data.data?.issue?.delegate?.id ?? null;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    log.error(`writeDelegate: read-back failed for ${issueId}: ${msg}`);
-    return { ok: false, persistedDelegateId: null, error: `read-back failed: ${msg}` };
+  //
+  // INF-984 hardening: a *read* failure must NOT be reported as a failed *write*.
+  // Single-issue reads fail under API stress, and this helper now sits on every
+  // delegate write — asserting non-persistence on a read error would false-fail
+  // fleet-wide during a read storm and make callers churn on good writes. So we
+  // retry the read, and only on a *confirmed* read do we compare; a read that
+  // never confirms returns an explicit UNVERIFIED result, trusting the write's
+  // own success rather than asserting it reverted.
+  let persisted: string | null = null;
+  let readConfirmed = false;
+  let lastReadErr = "read-back unavailable";
+  for (let attempt = 1; attempt <= VERIFY_ATTEMPTS; attempt++) {
+    try {
+      const query = `query VerifyDelegate($issueId: String!) { issue(id: $issueId) { delegate { id } } }`;
+      const res = await fetchFn(LINEAR_API_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: authToken },
+        body: JSON.stringify({ query, variables: { issueId } }),
+      });
+      type QResp = {
+        data?: { issue?: { delegate?: { id: string } | null } | null };
+        errors?: Array<{ message: string }>;
+      };
+      const data = (await res.json()) as QResp;
+      if (data.errors?.length) {
+        lastReadErr = data.errors.map((e) => e.message).join("; ");
+      } else if (data.data && data.data.issue) {
+        // A real issue object came back — this read is authoritative.
+        persisted = data.data.issue.delegate?.id ?? null;
+        readConfirmed = true;
+        break;
+      } else {
+        lastReadErr = "read-back returned no issue";
+      }
+    } catch (err) {
+      lastReadErr = err instanceof Error ? err.message : String(err);
+    }
+    if (attempt < VERIFY_ATTEMPTS) await new Promise((r) => setTimeout(r, VERIFY_RETRY_MS));
+  }
+
+  if (!readConfirmed) {
+    // Could not READ the delegate back (not a mismatch — a read failure). Do NOT
+    // assert non-persistence. Trust the write's reported success, but mark it
+    // unverified and loud so it is auditable. (INF-984.)
+    log.warn(
+      `writeDelegate: could not verify persistence for ${issueId} after ${VERIFY_ATTEMPTS} attempts ` +
+        `(${lastReadErr}); the write reported success — returning UNVERIFIED, not asserting non-persistence (INF-984).`,
+    );
+    return { ok: true, verified: false, persistedDelegateId: null, error: `unverified: ${lastReadErr}` };
   }
 
   if (persisted !== delegateId) {
@@ -111,8 +157,8 @@ export async function writeDelegate(
       `writeDelegate: delegate did not persist on ${issueId} — expected ${delegateId ?? "null"}, ` +
         `got ${persisted ?? "null"} (AI-1395/INF-973 silent app-user delegate revert)`,
     );
-    return { ok: false, persistedDelegateId: persisted, error: "delegate write did not persist" };
+    return { ok: false, verified: true, persistedDelegateId: persisted, error: "delegate write did not persist" };
   }
 
-  return { ok: true, persistedDelegateId: persisted };
+  return { ok: true, verified: true, persistedDelegateId: persisted };
 }

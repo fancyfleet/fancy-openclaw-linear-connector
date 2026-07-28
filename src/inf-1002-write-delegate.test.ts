@@ -9,6 +9,8 @@ function mockFetch(opts: {
   writeSuccess?: boolean;
   writeErrors?: string[];
   readBackDelegateId?: string | null;
+  readBackThrows?: boolean;
+  readBackErrors?: string[];
   capture?: Array<{ query: string; variables: Record<string, unknown> }>;
 }): typeof fetch {
   return (async (_url: unknown, init: { body: string }) => {
@@ -19,6 +21,8 @@ function mockFetch(opts: {
       return jsonResponse({ data: { issueUpdate: { success: opts.writeSuccess ?? true } } });
     }
     // read-back query
+    if (opts.readBackThrows) throw new Error("read-back network error (INF-984)");
+    if (opts.readBackErrors) return jsonResponse({ errors: opts.readBackErrors.map((message) => ({ message })) });
     const id = opts.readBackDelegateId;
     return jsonResponse({ data: { issue: { delegate: id == null ? null : { id } } } });
   }) as unknown as typeof fetch;
@@ -37,11 +41,26 @@ describe("INF-1002: writeDelegate chokepoint (INF-973/AI-1395 root-cause close)"
     expect(capture.some((c) => /VerifyDelegate/.test(c.query))).toBe(true);
   });
 
-  it("fails loud (ok:false) when the write silently reverts — read-back mismatch", async () => {
+  it("fails loud (ok:false, verified) when the write silently reverts — read-back mismatch", async () => {
     const r = await writeDelegate("issue-1", "user-1", "Bearer x", mockFetch({ writeSuccess: true, readBackDelegateId: "someone-else" }));
     expect(r.ok).toBe(false);
+    expect(r.verified).toBe(true); // the read succeeded; the delegate is genuinely wrong
     expect(r.persistedDelegateId).toBe("someone-else");
     expect(r.error).toMatch(/did not persist/);
+  });
+
+  it("INF-984: a read-back FAILURE returns unverified (ok:true), NOT a false 'did not persist'", async () => {
+    // The write reported success; the verify read throws (single-issue reads fail under stress).
+    const r = await writeDelegate("issue-1", "user-1", "Bearer x", mockFetch({ writeSuccess: true, readBackThrows: true }));
+    expect(r.ok).toBe(true); // do NOT churn callers on a read failure
+    expect(r.verified).toBe(false);
+    expect(r.error).toMatch(/unverified/);
+  });
+
+  it("INF-984: read-back GraphQL errors also yield unverified (ok:true), not non-persist", async () => {
+    const r = await writeDelegate("issue-1", "user-1", "Bearer x", mockFetch({ writeSuccess: true, readBackErrors: ["Rate limit exceeded"] }));
+    expect(r.ok).toBe(true);
+    expect(r.verified).toBe(false);
   });
 
   it("clears the delegate WITHOUT touching assigneeId (preserves a human assignee)", async () => {
