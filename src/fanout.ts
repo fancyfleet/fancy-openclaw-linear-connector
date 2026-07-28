@@ -548,9 +548,31 @@ export function extractSpecFindings(
   /**
    * AI-2199: regex for per-entry child workflow marker in spec bullet titles.
    * Matches: [wf:sprint-arm-ux → signe] or [wf:sprint-arm-ux]
-   * The arrow (→ or ->) separates workflow id from optional delegate.
+   * The arrow separates workflow id from optional delegate.
+   *
+   * INF-890: the arrow may be a unicode arrow (→), an ASCII arrow (->), a bare
+   * angle (>), or a smart dash (— / –). The pre-INF-890 pattern modeled the
+   * separator as a single-character class [→>-], which cannot represent the
+   * two-character ASCII "->" a human naturally types. That produced two live
+   * defects on LIF-327's hand-authored spawn spec:
+   *   1. `[wf:sprint-arm-ux -> signe]` (spaced) matched NOTHING — the whole
+   *      marker was dropped, so the child fell back to the fan-out config
+   *      default (wf:sprint-arm-scope / initial_delegate astrid). Every arm
+   *      minted as a scope arm delegated to Astrid regardless of its marker.
+   *   2. `[wf:sprint-arm-design->laren]` (unspaced) absorbed the leading '-'
+   *      into the workflow id, minting the malformed label
+   *      wf:sprint-arm-design->laren with no delegate.
+   * The unicode arrow → happened to work (single distinct char), which is why
+   * the AI-2199 suite — authored entirely with → — stayed green over the bug.
+   *
+   * Fix: the workflow-id group excludes the separator characters (> → — –) and
+   * is non-greedy, and the separator is an explicit alternation that matches the
+   * two-char "->" before any single char. The ASCII hyphen stays legal INSIDE
+   * an id (sprint-arm-ux) because a lone '-' is no longer a separator — only
+   * "->" / "→" / ">" / "—" / "–" are.
    */
-  const PER_ENTRY_MARKER_RE = /^\\?\[wf:([^\s\\\]]+)(?:\s*[→>-]\s*([^\s\\\]]+))?\\?\]\s*/;
+  const PER_ENTRY_MARKER_RE =
+    /^\\?\[\s*wf:\s*([^\s\\\]>→—–]+?)(?:\s*(?:->|→|—|–|>)\s*([^\s\\\]]+))?\s*\\?\]\s*/;
 
   if (sectionMatch) {
     // INF-730: one entry per TOP-LEVEL bullet — a multi-paragraph structured
