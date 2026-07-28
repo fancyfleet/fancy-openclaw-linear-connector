@@ -1244,7 +1244,16 @@ export function createApp(options?: CreateAppOptions) {
           : 30_000,
     },
   );
-  watchdog.start();
+  // QUIESCE (Matt/Astrid directive 2026-07-28, INF-925 self-DoS): env-gated muzzle for
+  // the dispatch-watchdog resignal treadmill + its 3-min Linear poll. Inert unless
+  // QUIESCE_DISPATCH_WATCHDOG=1 (set only in the deploy .env during a quiesce window).
+  // Gate the start rather than WATCHDOG_MAX_RESIGNALS=0, which is a no-op (parseEnvInt
+  // coerces <=0 back to the default). Revert this block when the quiesce is fully lifted.
+  if (process.env.QUIESCE_DISPATCH_WATCHDOG !== "1") {
+    watchdog.start();
+  } else {
+    log.warn("[quiesce] dispatch-watchdog NOT started (QUIESCE_DISPATCH_WATCHDOG=1)");
+  }
 
   const noActivityDetector = new NoActivityDetector(
     {
@@ -1997,22 +2006,30 @@ if (isEntryPoint) {
     });
   };
 
-  registerBootstrapReconciliationCron({
-    authToken: resolveReconciliationAuthToken,
-    wakeFn: reconciliationWakeFn,
-    dispatchAckTracker: ackTracker,
-  });
+  // QUIESCE (Matt/Astrid directive 2026-07-28, INF-925 self-DoS): env-gated muzzle for
+  // the two hardcoded-5m reconciliation sweeps (the biggest Linear-API burners). Inert
+  // unless QUIESCE_RECONCILIATION_SWEEPS=1 (set only in the deploy .env during a quiesce
+  // window). Revert this wrapper when the quiesce is fully lifted.
+  if (process.env.QUIESCE_RECONCILIATION_SWEEPS !== "1") {
+    registerBootstrapReconciliationCron({
+      authToken: resolveReconciliationAuthToken,
+      wakeFn: reconciliationWakeFn,
+      dispatchAckTracker: ackTracker,
+    });
 
-  // AI-1807: delegation reconciliation sweep — detect and heal stranded
-  // delegation wakes caused by webhook-ingress gaps. Complements AI-1775
-  // (bootstrap sweep) and the rescue/stuck-delegate/no-activity detectors.
-  registerDelegationReconciliationCron({
-    authToken: resolveReconciliationAuthToken,
-    operationalEventStore,
-    wakeFn: reconciliationWakeFn,
-    dispatchLeaseStore,
-    enrolledTicketsStore,
-  });
+    // AI-1807: delegation reconciliation sweep — detect and heal stranded
+    // delegation wakes caused by webhook-ingress gaps. Complements AI-1775
+    // (bootstrap sweep) and the rescue/stuck-delegate/no-activity detectors.
+    registerDelegationReconciliationCron({
+      authToken: resolveReconciliationAuthToken,
+      operationalEventStore,
+      wakeFn: reconciliationWakeFn,
+      dispatchLeaseStore,
+      enrolledTicketsStore,
+    });
+  } else {
+    log.warn("[quiesce] reconciliation sweeps NOT registered (QUIESCE_RECONCILIATION_SWEEPS=1)");
+  }
 
   // INF-168: stale-plain-delegate sweep — detect and re-dispatch plain
   // (non-wf) tickets with a delegate set that have been sitting in Thinking/
