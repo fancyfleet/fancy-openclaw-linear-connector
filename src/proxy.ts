@@ -41,7 +41,7 @@ import type { OperationalEventStore } from "./store/operational-event-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import type { MutationAuditStore, MutationAuditInput, ChangeType } from "./store/mutation-audit-store.js";
 import { isTerminalState } from "./barrier.js";
-import { getAgent, getAgentByProxyToken } from "./agents.js";
+import { getAgent, getAgentByProxyToken, getAgentIdForLinearUserId } from "./agents.js";
 import type { NoActivityDetector } from "./bag/no-activity-detector.js";
 import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
 import type { DispatchRecordStore } from "./liveness-channel/dispatch-record-store.js";
@@ -308,7 +308,13 @@ type XfnDemotionNotification = {
 
 type TeamState = { id: string; name: string; type: string };
 
-async function fetchIssueTeamId(issueId: string, authToken: string): Promise<string | null> {
+type IssueContext = {
+  teamId: string | null;
+  stateType: string | null;
+  labelNames: string[];
+};
+
+async function fetchIssueContext(issueId: string, authToken: string): Promise<IssueContext | null> {
   const res = await fetch(LINEAR_API_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: authToken },
@@ -328,8 +334,24 @@ async function fetchIssueTeamId(issueId: string, authToken: string): Promise<str
     }),
   });
   if (!res.ok) return null;
-  const data = (await res.json()) as { data?: { issue?: { team?: { id?: string } | null } | null } };
-  return data.data?.issue?.team?.id ?? null;
+  const data = (await res.json()) as {
+    data?: {
+      issue?: {
+        team?: { id?: string } | null;
+        state?: { type?: string } | null;
+        labels?: { nodes?: { name?: string }[] } | null;
+      } | null;
+    };
+  };
+  const issue = data.data?.issue;
+  if (!issue) return null;
+  return {
+    teamId: issue.team?.id ?? null,
+    stateType: issue.state?.type ?? null,
+    labelNames: (issue.labels?.nodes ?? [])
+      .map((n) => n.name)
+      .filter((n): n is string => typeof n === "string"),
+  };
 }
 
 async function fetchTeamStates(teamId: string, authToken: string): Promise<TeamState[]> {
@@ -359,6 +381,25 @@ async function requesterDimension(agentId: string): Promise<string> {
 async function defaultSteward(): Promise<string> {
   const policy = await getCapabilityPolicy();
   return policy.bodies.find((b) => (b.fills_roles ?? []).includes("steward"))?.id ?? "steward";
+}
+
+// INF-930: the capability that marks a body as a sprint-spawner designated
+// approver (Ai, per INF-629 / the sprint-spawner def's `requires_capability`).
+// A cross-functional bridge delegated to such a body is a governed sign-off
+// dispatch and must not be demoted into dispatch-skipped Backlog.
+const SIGNOFF_CAPABILITY = "sprint:signoff";
+
+async function delegatesToDesignatedApprover(input: Record<string, unknown>): Promise<boolean> {
+  const delegateUserId = typeof input.delegateId === "string" ? input.delegateId : null;
+  if (!delegateUserId) return false;
+  const delegateBody = getAgentIdForLinearUserId(delegateUserId);
+  if (!delegateBody) return false;
+  try {
+    return await bodyHasCapability(delegateBody, SIGNOFF_CAPABILITY);
+  } catch {
+    // Fail closed to the existing behaviour (demote) if the policy is unavailable.
+    return false;
+  }
 }
 
 function mergeLabelIds(input: Record<string, unknown>, ids: string[]): void {
@@ -398,10 +439,33 @@ async function maybeDemoteCrossFunctionalRequest(
   const requestedStateId = typeof input.stateId === "string" ? input.stateId : null;
   if (!requestedStateId) return null;
 
+  // INF-930: a cross-functional bridge delegated to a designated approver (a body
+  // holding `sprint:signoff` — the sprint-spawner's Ai sign-off bridge) is a
+  // sanctioned dispatch, not an ad-hoc board injection. Demoting it strips the
+  // delegate and parks it in dispatch-skipped Backlog, so the approver is never
+  // woken and the parent spawner stalls at its launch gate (incident INF-929 →
+  // INF-196). Let it through to its requested active state, delegate intact.
+  if (await delegatesToDesignatedApprover(input)) return null;
+
+  // INF-930: fetch team + current state/labels in one call so the update path can
+  // both resolve the team and honour an existing steward promotion (AC4 below).
+  let issueCtx: IssueContext | null = null;
   const teamId = isIssueCreateMutation(body)
     ? (typeof input.teamId === "string" ? input.teamId : null)
-    : (issueId ? await fetchIssueTeamId(issueId, authToken) : null);
+    : (issueId ? (issueCtx = await fetchIssueContext(issueId, authToken))?.teamId ?? null : null);
   if (!teamId) return null;
+
+  // INF-930 AC4: idempotent intake. If this ticket is already a demoted
+  // cross-functional request that a steward has since promoted out of Backlog,
+  // a replayed active-state write must not re-demote it and undo the promotion.
+  if (
+    issueCtx &&
+    issueCtx.stateType !== null &&
+    issueCtx.stateType !== "backlog" &&
+    issueCtx.labelNames.includes("cross-functional-request")
+  ) {
+    return null;
+  }
 
   const states = await fetchTeamStates(teamId, authToken);
   const requestedState = states.find((s) => s.id === requestedStateId);
