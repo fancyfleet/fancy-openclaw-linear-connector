@@ -51,6 +51,7 @@ import { registerDelegationReconciliationCron, runDelegationReconciliationSweep 
 import { registerStalePlainDelegateCron } from "./stale-plain-delegate-sweep.js";
 import { registerRegistryIntegrityCron } from "./registry-integrity-cron.js";
 import { getAlertBus } from "./alerts/alert-bus.js";
+import { getRateLimitClient } from "./linear-rate-limit-client.js";
 import { registerSlaSweepCron } from "./sla-sweep.js";
 import { registerValidationWatchdogCron } from "./validation-sla-watchdog.js";
 import { registerLabelSyncAuditCron } from "./cron/label-sync-audit.js";
@@ -288,6 +289,15 @@ export function createApp(options?: CreateAppOptions) {
   // concurrency, dedup, and recovery-rate guard.
   const backlogController = createBacklogController();
 
+  // INF-923: rate-limit-aware Linear API client + 429 breaker, constructed and
+  // held at bootstrap so the re-dispatch/reconciliation query path and the
+  // reconciliation crons (which resolve it from this same AlertBus) route
+  // through one shared breaker. Registered here so /health.linearApiRateLimit
+  // and /admin/api/ratelimit report breaker state + remaining budget at
+  // ac-validate without waiting for a real 429 (AC4/AC5/AC6).
+  const linearRateLimitClient = getRateLimitClient(getAlertBus());
+  linearRateLimitClient.markRegistered();
+
   // AI-2036 AC1.5/AC1.6: register the observation write path here, on the same
   // code path that hands the store to the proxy's transition options below.
   // The registry entry — surfaced at /health.observations — therefore exists if
@@ -492,6 +502,12 @@ export function createApp(options?: CreateAppOptions) {
         ...dispatchDeliveryScheduler.liveness(),
         undeliverable: undeliverable.length,
       },
+      // INF-923 AC5/AC6: rate-limit-aware client + 429 breaker liveness.
+      // `registered` is true only because bootstrap constructed + held the
+      // client (never hardcoded); `gatedConsumers`/`cronConsumers` name the
+      // re-dispatch/reconciliation paths + crons routed through it, and
+      // `breaker`/`remaining` are observable without waiting for a real 429.
+      linearApiRateLimit: linearRateLimitClient.liveness(),
       service: "fancy-openclaw-linear-connector",
       deployment: DEPLOYMENT_NAME,
       commit: getStartupCommit(),
@@ -1446,6 +1462,13 @@ export function createApp(options?: CreateAppOptions) {
   // Mark the flush route as mounted for /health.cache liveness proof (AC4).
   markCacheFlushRouteMounted();
 
+  // INF-923 AC4: operator visibility into the live Linear API budget + breaker
+  // state, so exhaustion is observable before it cascades. ADMIN_SECRET-gated.
+  app.get("/admin/api/ratelimit", (req: express.Request, res: express.Response) => {
+    if (!requireAdminSecret(req, res)) return;
+    res.json({ ok: true, linearApi: linearRateLimitClient.liveness() });
+  });
+
   app.use("/", createWebhookRouter(
     eventStore,
     nudgeStore,
@@ -1775,7 +1798,7 @@ export function createApp(options?: CreateAppOptions) {
   registerTtlInvalidationCron(ttlCache, 60_000);
   log.info("INF-193: TTL cache invalidation cron registered (every 60s)");
 
-  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore, livenessDispatchStore, transcriptRedactionHealth: getTranscriptRedactionHealth() });
+  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore, livenessDispatchStore, linearRateLimitClient, transcriptRedactionHealth: getTranscriptRedactionHealth() });
 }
 
 /**
