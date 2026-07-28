@@ -62,6 +62,7 @@ jest.unstable_mockModule("./transition-audit.js", () => ({
 jest.unstable_mockModule("./agents.js", () => ({
   getAgent: jest.fn(),
   getAgentByProxyToken: jest.fn(),
+  getAgentIdForLinearUserId: jest.fn(),
 }));
 
 jest.unstable_mockModule("./session-key.js", () => ({
