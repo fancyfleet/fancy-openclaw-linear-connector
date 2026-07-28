@@ -1210,6 +1210,83 @@ describe("defaultFetchStuckCandidates — retired-entity guard (INF-572)", () =>
   });
 });
 
+// ── INF-964: Managing stewardship-lane guard ─────────────────────────────────
+// A ticket parked in the native Managing state (long-running steward lane, type
+// `started`) can retain a residual non-terminal `state:*` label. getCurrentState()
+// then reports e.g. `doing`, and with a steward comment on every managing wake and
+// no transition since, the fetcher matches the stuck pattern and would re-prompt the
+// delegate to `linear submit` → code-review — wrongly yanking a correctly-parked
+// monitoring lane into review (BBS-1 misfired 4+ times this way). The authoritative
+// workflow state is the NATIVE Linear state, not the residual label: a Managing
+// ticket must never surface as a stuck candidate.
+describe("defaultFetchStuckCandidates — Managing stewardship-lane guard (INF-964)", () => {
+  const DELEGATE_ID = "grover-user-uuid";
+
+  const agent = {
+    name: "grover",
+    linearUserId: DELEGATE_ID,
+  } as unknown as AgentConfig;
+
+  /** Build a BBS-1-shaped node: residual state:doing label, settable native state. */
+  function issueNode(nativeStateType: string, nativeStateName: string) {
+    return {
+      identifier: "BBS-1",
+      labels: { nodes: [{ name: "wf:task" }, { name: "state:doing" }] },
+      delegate: { id: DELEGATE_ID },
+      updatedAt: "2026-07-28T02:00:00.000Z",
+      state: { name: nativeStateName, type: nativeStateType },
+      children: { nodes: [] },
+      // A steward comment AFTER state entry with no transition verb since — the
+      // exact pattern the detector treats as "stuck".
+      comments: {
+        nodes: [
+          {
+            id: "c1",
+            createdAt: "2026-07-28T01:00:00.000Z",
+            body: "Managing wake — monitoring cadence check, nothing to action.",
+            user: { id: DELEGATE_ID, name: "Grover" },
+          },
+        ],
+      },
+      history: {
+        nodes: [
+          { __typename: "IssueHistory", createdAt: "2026-07-28T00:00:00.000Z", actor: { id: DELEGATE_ID } },
+        ],
+      },
+    };
+  }
+
+  function fakeFetch(node: ReturnType<typeof issueNode>): typeof fetch {
+    return (async () =>
+      ({
+        ok: true,
+        status: 200,
+        json: async () => ({ data: { issues: { nodes: [node] } } }),
+      })) as unknown as typeof fetch;
+  }
+
+  const deps = (node: ReturnType<typeof issueNode>) => ({
+    getToken: () => "test-token",
+    fetchImpl: fakeFetch(node),
+  });
+
+  it("excludes a Managing-state ticket whose residual state:* label is still non-terminal", async () => {
+    const candidates = await defaultFetchStuckCandidates(agent, deps(issueNode("started", "Managing")));
+    expect(candidates).toHaveLength(0);
+  });
+
+  it("still surfaces a genuinely stuck doing ticket (native Doing, not Managing) as a candidate", async () => {
+    const candidates = await defaultFetchStuckCandidates(agent, deps(issueNode("started", "Doing")));
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].identifier).toBe("BBS-1");
+    expect(candidates[0].currentState).toBe("doing");
+    // The stuck shape is intact — proving the guard excludes on the native
+    // Managing name alone, not by breaking detection for real `started` states.
+    expect(candidates[0].delegateComments).toHaveLength(1);
+    expect(candidates[0].transitionsAfterEntry).toHaveLength(0);
+  });
+});
+
 // ── INF-861: false-positive suppression at detector boundary ────────────────
 
 describe("defaultFetchStuckCandidates — INF-861 blocker suppression", () => {

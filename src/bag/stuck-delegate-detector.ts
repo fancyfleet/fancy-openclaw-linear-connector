@@ -192,6 +192,15 @@ function parseEnvInt(name: string, defaultVal: number): number {
 const TERMINAL_CHILD_STATES = new Set(["done", "escape"]);
 /** Native Linear state types that count as terminal (issue closed). */
 const TERMINAL_NATIVE_STATE_TYPES = new Set(["completed", "canceled"]);
+/**
+ * INF-964: Native Linear state name for the long-running stewardship lane. A
+ * ticket parked here is periodically re-woken by the ManagingPoller on its own
+ * cadence — it is legitimately terminal for stuck-delegate purposes and has no
+ * `doing → submit/handoff/escape` transition for the delegate to run. Matched by
+ * native state NAME (not the `state:*` label), because the whole failure mode is
+ * a residual label lying about the authoritative workflow state.
+ */
+const MANAGING_NATIVE_STATE_NAME = "Managing";
 
 /**
  * Is a child issue in a terminal state? A child satisfies the parent barrier if
@@ -760,6 +769,28 @@ export async function defaultFetchStuckCandidates(
           `Stuck-delegate: skipping ${issue.identifier} — Linear entity is natively terminal ` +
           `(state.type='${issue.state?.type ?? "null"}', label state:${currentState}); ` +
           `no legal transition exists on a retired issue`,
+        );
+        continue;
+      }
+
+      // INF-964: Skip tickets parked in the native Managing stewardship lane.
+      // `manage` moves a ticket to the native "Managing" state (type `started`)
+      // where the ManagingPoller re-wakes the steward on a cadence; there is no
+      // `doing → submit/handoff/escape` transition for the delegate to run. But a
+      // ticket parked in Managing can retain a residual non-terminal `state:*`
+      // label (e.g. `state:doing`) — `getCurrentState()` then reports `doing`, and
+      // with a steward comment on every managing wake and no transition since, the
+      // ticket matches the stuck pattern and is re-prompted to `linear submit` →
+      // code-review, wrongly yanking a correctly-parked monitoring lane into review
+      // (BBS-1 misfired 4+ times this way, bouncing Woz → Grover → Laren → Astrid).
+      // The authoritative workflow state is the NATIVE Linear state, not the
+      // residual label — mirror the INF-572 native-terminal guard and treat
+      // Managing as terminal-for-detection regardless of the `state:*` label.
+      if (issue.state?.name === MANAGING_NATIVE_STATE_NAME) {
+        log.info(
+          `Stuck-delegate: skipping ${issue.identifier} — native state is Managing ` +
+          `(stewardship lane; residual label state:${currentState}); ` +
+          `ManagingPoller owns the cadence, no delegate transition applies`,
         );
         continue;
       }
