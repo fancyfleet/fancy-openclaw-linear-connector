@@ -1985,7 +1985,13 @@ describe("proxy — Phase 6.5 fail-closed (AI-1476)", () => {
   }
 
   // AC1: With a missing workflow definition, a workflow command is refused.
-  // The first failed load reports the registry-load failure; subsequent gates see degraded config health.
+  // Two fail-closed reasons can surface for the same missing-def condition and
+  // which one the request sees is timing-dependent: the config-health poller
+  // started by createApp may record the load failure (→ "config artifacts are
+  // degraded") before the request's own registry load reaches the try/catch
+  // (→ "workflow definition could not be loaded"). Both are the same fail-closed
+  // posture with a break-glass hint, so assert the contract, not the racing
+  // reason. (INF-854: this assertion was pinned to a single reason and flaked CI.)
   it("rejects workflow commands when config is degraded (config-load fail-closed §16.0)", async () => {
     // Point the workflow def to a non-existent file so loadWorkflowDef fails
     process.env.WORKFLOW_DEF_PATH = path.join(dir, "nonexistent-workflow.yaml");
@@ -2004,7 +2010,7 @@ describe("proxy — Phase 6.5 fail-closed (AI-1476)", () => {
     expect(res.status).toBe(200);
     expect(res.body.errors).toBeDefined();
     expect(res.body.errors[0].message).toContain("[Proxy]");
-    expect(res.body.errors[0].message).toContain("could not be loaded");
+    expect(res.body.errors[0].message).toMatch(/could not be loaded|config artifacts are degraded/);
     expect(res.body.errors[0].message).toContain("break-glass");
   });
 
