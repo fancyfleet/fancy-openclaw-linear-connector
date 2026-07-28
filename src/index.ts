@@ -1518,6 +1518,7 @@ export function createApp(options?: CreateAppOptions) {
     livenessDispatchStore,
     dispatchInFlightStore,
     sessionSpawnStore,
+    noActivityDetector,
   ));
 
   // ── v1.1: Session-end callback endpoint ──────────────────────────────
@@ -1606,16 +1607,22 @@ export function createApp(options?: CreateAppOptions) {
       }
     }
     // Re-arm any tickets that were deferred because the agent was at capacity.
-    noActivityDetector.checkDeferredOnSessionEnd(agentId).catch((err) => {
+    let capacityRearmedTickets: string[] = [];
+    try {
+      capacityRearmedTickets = await noActivityDetector.checkDeferredOnSessionEnd(agentId);
+    } catch (err) {
       log.error(`checkDeferredOnSessionEnd failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
-    });
+    }
     // Acknowledge dispatches for this agent — the session completed (even briefly).
     ackTracker.acknowledge(agentId);
     // Clear no-activity warnings for any sessions that just ended.
     noActivityDetector.clearWarned(agentId, "*");
     // Also drain any dispatched-but-unconfirmed bag entries for this agent.
     // These were dispatched on HTTP 200 but not confirmed as processed.
-    const bagTickets = bag.getPendingTickets(agentId).map(e => e.ticketId);
+    const endedKeySet = new Set(endedKeys.map((key) => normalizeSessionKey(key)));
+    const bagTickets = bag.getPendingTickets(agentId)
+      .map(e => e.ticketId)
+      .filter((ticketId) => !endedKeySet.has(normalizeSessionKey(ticketId)));
     if (bagTickets.length > 0) bag.clearAgent(agentId);
     // Normalize queued tickets so dedup works correctly vs already-normalized bag IDs.
     const queuedNormalized = (queuedTickets ?? []).map(t => normalizeSessionKey(t));
@@ -1623,7 +1630,9 @@ export function createApp(options?: CreateAppOptions) {
 
     // AI-1533: Compute hold-retry tickets that aren't already in regular pending.
     const holdIds = holdCandidates.map((key) => normalizeSessionKey(key));
-    const newHoldIds = holdIds.filter((id) => !regularPending.includes(id));
+    const newHoldIds = capacityRearmedTickets.length > 0
+      ? []
+      : holdIds.filter((id) => !regularPending.includes(id));
     if (newHoldIds.length > 0) {
       for (const holdId of newHoldIds) {
         const attempt = holdRetryTracker.incrementHoldAttempt(agentId, holdId);
@@ -1661,7 +1670,7 @@ export function createApp(options?: CreateAppOptions) {
     const allPending = [...new Set([...regularPending, ...newHoldIds, ...coalescedTickets])];
     operationalEventStore.append({
       outcome: "session-ended", agent: agentId, deliveryMode: "session-end-callback",
-      detail: { queuedTickets: queuedTickets ?? [], bagTickets, regularPending, holdRetry: newHoldIds, coalescedTickets, allPending }
+      detail: { queuedTickets: queuedTickets ?? [], bagTickets, regularPending, holdRetry: newHoldIds, capacityRearmedTickets, coalescedTickets, allPending }
     });
 
     if (regularPending.length > 0) {

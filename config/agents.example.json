@@ -1,0 +1,13 @@
+{
+  "agents": [
+    {
+      "name": "charles",
+      "displayName": "Charles",
+      "linearUserId": "replace-with-charles-linear-user-id",
+      "accessToken": "replace-with-charles-access-token",
+      "refreshToken": "replace-with-charles-refresh-token",
+      "openclawAgent": "charles",
+      "maxConcurrent": 1
+    }
+  ]
+}
