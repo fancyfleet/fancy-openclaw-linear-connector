@@ -5464,7 +5464,31 @@ export async function applyStateTransition(
     const resolvedSourceNode = resolvedSource
       ? def.states.find((s) => s.id === resolvedSource)
       : undefined;
-    if (resolvedSourceNode?.kind === "terminal") {
+    // INF-933: exempt definition-declared terminal-exit transitions. A
+    // continuous-loop workflow (archetype: continuous-loop) declares an
+    // outgoing edge on its terminal state — the `loop` command — that
+    // deliberately re-enters the cycle from `done` to start the next iteration.
+    // That is exactly the shape this guard was built to REFUSE (a write off a
+    // terminal source), so without this carve-out a continuous-loop instance is
+    // one-shot: it reaches `done` and can never start cycle 2 (the observed
+    // ENG dept-engine wall — INF-933). The distinction that keeps the guard's
+    // teeth: the Done→Doing bounce the guard exists to stop (AI-2035) is an
+    // UNDECLARED re-entrant write — its intent matches a forward edge off the
+    // stale PRE-terminal state, and the terminal state never lists that command
+    // among its own `transitions`. A declared terminal-exit, by contrast, is an
+    // edge the terminal state itself declares. So: if the terminal source node
+    // declares an outgoing transition whose command IS this intent, let it
+    // through (it will be matched and applied by the normal resolution below);
+    // otherwise the refusal stands for undeclared re-entrant writes.
+    const declaredTerminalExit = resolvedSourceNode?.transitions?.some(
+      (t) => t.command === intent,
+    );
+    if (resolvedSourceNode?.kind === "terminal" && declaredTerminalExit) {
+      log.info(
+        `workflow-gate: INF-933: terminal-exit exemption — allowing declared transition '${intent}' ` +
+          `off terminal state '${resolvedSource}' on ${issueId} (continuous-loop re-entry)`,
+      );
+    } else if (resolvedSourceNode?.kind === "terminal") {
       log.warn(
         `workflow-gate: AI-2035: terminal re-entry guard — refusing '${intent}' on ${issueId}; ` +
           `applied source state '${resolvedSource}' is terminal` +
