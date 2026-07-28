@@ -31,6 +31,7 @@
  */
 
 import { componentLogger, createLogger } from "./logger.js";
+import { writeDelegate } from "./delegate-write.js";
 import {
   fetchIssueContext,
   applyBootstrapToIssue,
@@ -416,33 +417,6 @@ function isTerminalStateLabel(labels: Array<{ name: string }>): boolean {
  * missing owner). Mirrors the raw `issueUpdate` delegate write the webhook
  * bootstrap path uses (INF-728 confirmed this path persists app-user delegates).
  */
-async function seatRoleOwnerDelegate(
-  issueId: string,
-  delegateLinearUserId: string,
-  authToken: string,
-  fetchFn: typeof fetch,
-): Promise<boolean> {
-  const mutation = `
-    mutation SeatRoleOwnerDelegate($issueId: String!, $delegateId: String!, $assigneeId: String) {
-      issueUpdate(id: $issueId, input: { delegateId: $delegateId, assigneeId: $assigneeId }) {
-        success
-      }
-    }
-  `;
-  try {
-    const res = await fetchFn(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({ query: mutation, variables: { issueId, delegateId: delegateLinearUserId, assigneeId: null } }),
-    });
-    type MResp = { data?: { issueUpdate?: { success: boolean } } };
-    const data = (await res.json()) as MResp;
-    return data.data?.issueUpdate?.success ?? false;
-  } catch {
-    return false;
-  }
-}
-
 /**
  * Reconcile an enrolled ticket whose workflow label is terminal-done but whose
  * native Linear state is still active (INF-497 / the INF-496 shape).
@@ -1046,7 +1020,7 @@ export async function runBootstrapReconciliationSweep(
         continue;
       }
 
-      const seated = await seatRoleOwnerDelegate(ticket.id, delegateLinearUserId, authToken, fetchFn);
+      const seated = (await writeDelegate(ticket.id, delegateLinearUserId, authToken, fetchFn)).ok;
       if (!seated) {
         result.errors.push(`mode-1 auto-seat mutation failed for ${ticket.identifier}`);
         log.warn(`bootstrap-reconciliation: Mode 1 seat mutation returned false for ${ticket.identifier}`);

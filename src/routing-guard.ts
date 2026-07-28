@@ -20,6 +20,7 @@
  */
 
 import { createLogger, componentLogger } from "./logger.js";
+import { writeDelegate } from "./delegate-write.js";
 import { getAccessToken } from "./agents.js";
 import {
   deriveWorkflowInstanceScope,
@@ -379,7 +380,7 @@ export async function checkRoleGuardAndBlock(
   if (result.correctedTo && delegateLinearUserIdResolver) {
     const newDelegateLinearId = delegateLinearUserIdResolver(result.correctedTo);
     if (newDelegateLinearId) {
-      const corrected = await updateDelegate(internalId, newDelegateLinearId, authHeader);
+      const corrected = (await writeDelegate(internalId, newDelegateLinearId, authHeader)).ok;
       if (corrected) {
         log.info(`routing-guard: delegate corrected for ${issueIdentifier}: ${targetAgentId} → ${result.correctedTo}`);
       } else {
@@ -392,7 +393,7 @@ export async function checkRoleGuardAndBlock(
     if (currentDelegateId) {
       // Multiple legal targets — clear the illegal delegate so the ticket
       // surfaces for manual routing, rather than leaving it on the wrong body.
-      const cleared = await clearDelegate(internalId, authHeader);
+      const cleared = (await writeDelegate(internalId, null, authHeader)).ok;
       if (cleared) {
         log.info(`routing-guard: delegate cleared for ${issueIdentifier} (illegal delegate; multiple legal targets; requires manual routing)`);
       } else {
@@ -515,65 +516,5 @@ async function fetchCurrentDelegate(
   } catch (err) {
     log.error(`routing-guard: delegate read failed for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
     return { ok: false, delegateId: null };
-  }
-}
-
-async function updateDelegate(
-  issueId: string,
-  delegateLinearUserId: string,
-  authHeader: string,
-): Promise<boolean> {
-  // Linear uses `subscriberIds` for delegate-adjacent fields, but the actual
-  // delegate is set via the undocumented `delegateId` on issueUpdate.
-  const delegateMutation = `
-    mutation UpdateDelegate($issueId: String!, $delegateId: String!) {
-      issueUpdate(id: $issueId, input: { delegateId: $delegateId }) {
-        success
-        issue { id }
-      }
-    }
-  `;
-  try {
-    const res = await fetch(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: authHeader },
-      body: JSON.stringify({
-        query: delegateMutation,
-        variables: { issueId, delegateId: delegateLinearUserId },
-      }),
-    });
-    type Resp = { data?: { issueUpdate?: { success: boolean } } };
-    const data = (await res.json()) as Resp;
-    return data.data?.issueUpdate?.success === true;
-  } catch (err) {
-    log.error(`routing-guard: delegate update failed for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
-    return false;
-  }
-}
-
-async function clearDelegate(
-  issueId: string,
-  authHeader: string,
-): Promise<boolean> {
-  const mutation = `
-    mutation ClearDelegate($issueId: String!) {
-      issueUpdate(id: $issueId, input: { delegateId: null }) {
-        success
-        issue { id }
-      }
-    }
-  `;
-  try {
-    const res = await fetch(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: authHeader },
-      body: JSON.stringify({ query: mutation, variables: { issueId } }),
-    });
-    type Resp = { data?: { issueUpdate?: { success: boolean } } };
-    const data = (await res.json()) as Resp;
-    return data.data?.issueUpdate?.success === true;
-  } catch (err) {
-    log.error(`routing-guard: delegate clear failed for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
-    return false;
   }
 }

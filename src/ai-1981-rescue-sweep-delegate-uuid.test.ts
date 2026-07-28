@@ -113,7 +113,21 @@ function makeMock(issues: Array<{ id: string; identifier: string; labels: string
           { status: 200 },
         );
       }
+      // INF-1002: model persistence so the writeDelegate read-back sees the write.
+      const issId = String((parsed.variables ?? {})["issueId"] ?? (parsed.variables ?? {})["id"] ?? "");
+      const iss = issues.find((i) => i.id === issId);
+      if (iss) iss.delegateId = delegateId;
       return new Response(JSON.stringify({ data: { issueUpdate: { success: true } } }), { status: 200 });
+    }
+
+    // INF-1002: writeDelegate read-back verification query.
+    if (query.includes("VerifyDelegate")) {
+      const issId = String((parsed.variables ?? {})["issueId"] ?? (parsed.variables ?? {})["id"] ?? "");
+      const iss = issues.find((i) => i.id === issId);
+      return new Response(
+        JSON.stringify({ data: { issue: iss ? { delegate: iss.delegateId ? { id: iss.delegateId } : null } : null } }),
+        { status: 200 },
+      );
     }
 
     throw new Error(`ai1981-test: unexpected query: ${query.slice(0, 80)}`);

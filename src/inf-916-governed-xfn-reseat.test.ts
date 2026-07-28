@@ -304,6 +304,11 @@ function makeSilentDropLinear(initialDelegate: string | null = null): {
       return json({ data: { commentCreate: { success: true, comment: { id: "comment-1" } } } });
     }
 
+    // INF-1002: writeDelegate read-back verification query.
+    if (query.includes("VerifyDelegate")) {
+      return json({ data: { issue: { delegate: delegateId ? { id: delegateId } : null } } });
+    }
+
     return json({ data: {} });
   };
 
@@ -317,6 +322,11 @@ describe("INF-916 governed xfn reseat regression", () => {
   beforeEach(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-916-"));
     process.env.ADMIN_SECRET = ADMIN_SECRET;
+    // AC4+AC5 posts an intentionally UNSIGNED webhook; if a prior test in the same
+    // jest worker leaked a webhook secret, the ingress would reject it 400. Clear
+    // both so this test is isolation-robust regardless of file ordering.
+    delete process.env.LINEAR_WEBHOOK_SECRET;
+    delete process.env.LINEAR_WEBHOOK_SECRETS;
     writeAgents(dir);
     writePolicy(dir);
     writeWorkflow(dir);
@@ -365,7 +375,7 @@ describe("INF-916 governed xfn reseat regression", () => {
       },
     });
 
-    const seatWrites = fakeLinear.calls.filter((call) => call.query.includes("SeatRoleOwnerDelegate"));
+    const seatWrites = fakeLinear.calls.filter((call) => call.query.includes("WriteDelegate"));
     expect(first.seated).toBe(1);
     expect(fakeLinear.currentDelegate()).toBe(IGOR_LINEAR_ID);
     expect(seatWrites[0]?.query).toMatch(/assigneeId/);

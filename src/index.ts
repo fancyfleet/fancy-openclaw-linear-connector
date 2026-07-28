@@ -1,4 +1,5 @@
 import './bootstrap-env.js'; // AI-2263: load .env + seed state-dir defaults before any store module reads them
+import { writeDelegate } from "./delegate-write.js";
 import express, { Request, Response, NextFunction } from "express";
 import { createWebhookRouter } from "./webhook/index.js";
 import { handleProxyRequest } from "./proxy.js";
@@ -216,30 +217,6 @@ async function fetchGovernedReseatIssue(
   type Resp = { data?: { issue?: GovernedReseatIssue | null } };
   const data = (await res.json()) as Resp;
   return data.data?.issue ?? null;
-}
-
-async function writeGovernedReseatDelegate(
-  issueId: string,
-  delegateId: string,
-  authToken: string,
-  fetchFn: typeof fetch = fetch,
-): Promise<boolean> {
-  const mutation = `
-    mutation GovernedReseatDelegate($issueId: String!, $delegateId: String!, $assigneeId: String) {
-      issueUpdate(id: $issueId, input: { delegateId: $delegateId, assigneeId: $assigneeId }) {
-        success
-        issue { id identifier }
-      }
-    }
-  `;
-  const res = await fetchFn(LINEAR_API_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: authToken },
-    body: JSON.stringify({ query: mutation, variables: { issueId, delegateId, assigneeId: null } }),
-  });
-  type Resp = { data?: { issueUpdate?: { success?: boolean } } };
-  const data = (await res.json()) as Resp;
-  return data.data?.issueUpdate?.success === true;
 }
 
 /**
@@ -1620,7 +1597,7 @@ export function createApp(options?: CreateAppOptions) {
         return;
       }
 
-      const updated = await writeGovernedReseatDelegate(issue.id, delegateLinearUserId, authToken);
+      const updated = (await writeDelegate(issue.id, delegateLinearUserId, authToken)).ok;
       if (!updated) {
         res.status(502).json({ ok: false, error: "Linear issueUpdate did not report success" });
         return;
