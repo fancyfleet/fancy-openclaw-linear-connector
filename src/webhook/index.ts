@@ -32,7 +32,7 @@ import { checkRoleGuardAndBlock, type LinearUserIdResolver } from "../routing-gu
 import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, autoEnrollPlainDelegation, markAutoEnrollRegistered, markCommitmentActivityObserverRegistered, applyStateTransition, type WorkflowInstanceContext } from "../workflow-gate.js";
 import { checkLabelSyncForTicket, emitLabelSyncWarning } from "../transition-audit.js";
 import { AgentQueue } from "../queue/index.js";
-import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/index.js";
+import { PendingWorkBag, SessionTracker, resignalPendingTickets, type NoActivityDetector } from "../bag/index.js";
 import { type WakeUpConfig } from "../bag/wake-up.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { checkLinearIssueRouting, isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
@@ -463,6 +463,7 @@ export function createWebhookRouter(
   livenessDispatchStore?: Pick<DispatchRecordStore, "recordDispatch" | "recordAck" | "getDispatch">,
   dispatchInFlightStore?: DispatchInFlightStore,
   sessionSpawnStore?: SessionSpawnIdempotencyStore,
+  noActivityDetector?: Pick<NoActivityDetector, "recordAdmissionDeferral">,
 ): Router {
   const router = Router();
   const delegatePingPongDetector = new DelegatePingPongDetector(undefined, undefined, operationalEventStore);
@@ -1455,15 +1456,6 @@ export function createWebhookRouter(
         }
       }
 
-      // Delivery is now committed: the event routed to a delegate that passed
-      // the stale-route, liveness, and role-guard checks. Register a pending
-      // dispatch expectation BEFORE the actual send so that if the delivery is
-      // later swallowed (nudge-dedup) or sent through a path that records no
-      // ack, the watchdog still sees an unacknowledged dispatch and re-signals
-      // it (AI-1538). ensurePending uses attempt_count=0 + ON CONFLICT DO
-      // NOTHING, so the happy path's counter is unchanged.
-      onDeliveryCommitted?.(agentName, ticketId);
-
       // ── 10. Create agent session + emit thought ───────────────────────────
       const data = event.data as Record<string, unknown> | null;
       const issueId = data?.id as string | undefined;
@@ -1498,6 +1490,24 @@ export function createWebhookRouter(
           }
         }
         appendOperationalEvent(operationalEventStore, { outcome: "bag-added", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "pending-bag", wakeId, plane: "connector" });
+
+        const agentConfig = getAgent(agentName);
+        const maxConcurrent = agentConfig?.maxConcurrent;
+        if (typeof maxConcurrent === "number" && maxConcurrent > 0) {
+          const activeCount = sessionTracker.getActiveSessionKeys(agentName).length;
+          if (activeCount >= maxConcurrent) {
+            noActivityDetector?.recordAdmissionDeferral(agentName, normalizedTicketId, {
+              activeCount,
+              maxConcurrent,
+            });
+            return;
+          }
+        }
+
+        // Delivery is now admitted. Register a pending dispatch expectation
+        // before the actual send so a swallowed delivery self-heals, but only
+        // after capacity deferral has had a chance to keep overflow local.
+        onDeliveryCommitted?.(agentName, ticketId);
 
         const wakeConfig: WakeUpConfig = {
           nodeBin: process.execPath,
@@ -1597,6 +1607,8 @@ export function createWebhookRouter(
       }
 
       // ── v1.0 fallback: Agent queue with ticket-level coalescing ─────────
+      onDeliveryCommitted?.(agentName, ticketId);
+
       if (agentQueue) {
         const queueResult = agentQueue.enqueueOrCoalesce(route);
         if (queueResult.action === "active-busy") {
