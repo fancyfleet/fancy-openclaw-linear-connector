@@ -423,8 +423,8 @@ async function seatRoleOwnerDelegate(
   fetchFn: typeof fetch,
 ): Promise<boolean> {
   const mutation = `
-    mutation SeatRoleOwnerDelegate($issueId: String!, $delegateId: String!) {
-      issueUpdate(id: $issueId, input: { delegateId: $delegateId }) {
+    mutation SeatRoleOwnerDelegate($issueId: String!, $delegateId: String!, $assigneeId: String) {
+      issueUpdate(id: $issueId, input: { delegateId: $delegateId, assigneeId: $assigneeId }) {
         success
       }
     }
@@ -433,7 +433,7 @@ async function seatRoleOwnerDelegate(
     const res = await fetchFn(LINEAR_API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({ query: mutation, variables: { issueId, delegateId: delegateLinearUserId } }),
+      body: JSON.stringify({ query: mutation, variables: { issueId, delegateId: delegateLinearUserId, assigneeId: null } }),
     });
     type MResp = { data?: { issueUpdate?: { success: boolean } } };
     const data = (await res.json()) as MResp;
