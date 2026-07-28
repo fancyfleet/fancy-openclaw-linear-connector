@@ -979,6 +979,8 @@ type FetchCall = {
 function makeTransitionFetch(opts: {
   issueLabels: Array<{ id: string; name: string }>;
   teamId?: string;
+  teamKey?: string;
+  teamName?: string;
   teamLabels?: Array<{ id: string; name: string }>;
   issueUpdateSuccess?: boolean;
   /** Override to simulate a fetch error for the issue fetch. */
@@ -991,6 +993,8 @@ function makeTransitionFetch(opts: {
 }): { fetch: typeof globalThis.fetch; calls: FetchCall[] } {
   const calls: FetchCall[] = [];
   const teamId = opts.teamId ?? "team-uuid";
+  const teamKey = opts.teamKey ?? "ENG";
+  const teamName = opts.teamName ?? "Engineering";
   const teamLabels = opts.teamLabels ?? [];
   const issueUpdateSuccess = opts.issueUpdateSuccess ?? true;
   // Default: branch pushed + PR exists (gate passes)
@@ -1017,7 +1021,7 @@ function makeTransitionFetch(opts: {
           data: {
             issue: {
               id: "internal-uuid",
-              team: { id: teamId },
+              team: { id: teamId, key: teamKey, name: teamName },
               labels: { nodes: opts.issueLabels },
             },
           },

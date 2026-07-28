@@ -358,12 +358,10 @@ export function deriveWorkflowInstanceScope(
 
   const department =
     context?.workflowEnrollment?.department ??
-    context?.teamKey ??
-    (typeof def.instantiation?.department === "string" ? def.instantiation.department : undefined);
+    context?.teamKey;
   const team =
     context?.workflowEnrollment?.team ??
-    context?.teamName ??
-    (typeof def.instantiation?.team === "string" ? def.instantiation.team : undefined);
+    context?.teamName;
   return department || team ? { department, team } : undefined;
 }
 
