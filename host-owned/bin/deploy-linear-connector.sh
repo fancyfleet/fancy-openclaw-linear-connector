@@ -476,6 +476,12 @@ fi
         echo "        Check /health.fixtureDrift and connector fixture sync before treating this deploy as complete."
         exit 4
       fi
+      # INF-976 deploy verification contract: after this health check proves the
+      # live connector is serving the deployed commit, the release owner must run
+      # a live behavior probe for the terminal-loop regression: ENG-5 (wf:dept-engine)
+      # must leave state:done via the declared loop edge and enter state:evaluating.
+      # INF-933 is the inert original defect record; INF-976 is the active
+      # dev-impl path for this done -> evaluating live connector probe.
       echo "RESULT: OK — deployed $DEPLOY_REF @ $DEPLOY_COMMIT, healthy after $((i*2))s ($(date -Is))"
       echo "        verified: /health reports commit $LIVE_COMMIT"
       echo "        verified: /health.fixtureDrift.healthy and /health.fixtureDrift.gate.healthy are true"

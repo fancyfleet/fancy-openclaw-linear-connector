@@ -356,8 +356,14 @@ export function deriveWorkflowInstanceScope(
     return roleResolutionScopeForOwnerRole("department-head", def);
   }
 
-  const department = context?.workflowEnrollment?.department ?? context?.teamKey;
-  const team = context?.workflowEnrollment?.team ?? context?.teamName;
+  const department =
+    context?.workflowEnrollment?.department ??
+    context?.teamKey ??
+    (typeof def.instantiation?.department === "string" ? def.instantiation.department : undefined);
+  const team =
+    context?.workflowEnrollment?.team ??
+    context?.teamName ??
+    (typeof def.instantiation?.team === "string" ? def.instantiation.team : undefined);
   return department || team ? { department, team } : undefined;
 }
 
@@ -378,7 +384,11 @@ async function resolveBodiesForOwnerRoleInContext(
   const scope = ownerRole === "department-head"
     ? deriveWorkflowInstanceScope(def, context)
     : roleResolutionScopeForOwnerRole(ownerRole, def);
-  return resolveBodiesForRole(ownerRole, scope);
+  const bodies = await resolveBodiesForRole(ownerRole, scope);
+  if (bodies.length === 0 && ownerRole === "department-head" && !(await isRoleDeclared(ownerRole))) {
+    return resolveBodiesForRole(def.break_glass?.owner_role ?? "steward");
+  }
+  return bodies;
 }
 
 // ── Workflow def cache & registry ──────────────────────────────────────────
@@ -5357,7 +5367,7 @@ export async function applyStateTransition(
   // the intent lookup miss and skips the native write. The proxy captures the
   // true source before forwarding and passes it as sourceStateOverride.
   const actualStateName = getCurrentState(labelNames, def); // AI-2094: def-aware most-advanced resolution
-  const currentStateName = options?.sourceStateOverride ?? actualStateName;
+  let currentStateName = options?.sourceStateOverride ?? actualStateName;
 
   const breakGlassCommand = def.break_glass?.command ?? "escape";
   const commitmentGateState = getCommitmentGateState(def);
@@ -5465,20 +5475,25 @@ export async function applyStateTransition(
       ? def.states.find((s) => s.id === resolvedSource)
       : undefined;
     if (resolvedSourceNode?.kind === "terminal") {
-      log.warn(
-        `workflow-gate: AI-2035: terminal re-entry guard — refusing '${intent}' on ${issueId}; ` +
-          `applied source state '${resolvedSource}' is terminal` +
-          (resolvedSource !== currentStateName ? ` (live read lagged at '${currentStateName ?? "unknown"}')` : ""),
-      );
-      return {
-        status: "blocked",
-        code: "terminal-reentry-guard",
-        detail:
-          `'${intent}' refused: ${issueId} is already at terminal state '${resolvedSource}'. ` +
-          `This is a trailing same-turn mutation inside the read-after-write lag window; the terminal ` +
-          `disposition stands and must not be reopened by a re-entrant write.`,
-        from: resolvedSource,
-      };
+      const declaredTerminalExit = resolvedSourceNode.transitions?.find((t) => t.command === intent);
+      if (declaredTerminalExit) {
+        currentStateName = resolvedSource;
+      } else {
+        log.warn(
+          `workflow-gate: AI-2035: terminal re-entry guard — refusing '${intent}' on ${issueId}; ` +
+            `applied source state '${resolvedSource}' is terminal` +
+            (resolvedSource !== currentStateName ? ` (live read lagged at '${currentStateName ?? "unknown"}')` : ""),
+        );
+        return {
+          status: "blocked",
+          code: "terminal-reentry-guard",
+          detail:
+            `'${intent}' refused: ${issueId} is already at terminal state '${resolvedSource}'. ` +
+            `This is a trailing same-turn mutation inside the read-after-write lag window; the terminal ` +
+            `disposition stands and must not be reopened by a re-entrant write.`,
+          from: resolvedSource,
+        };
+      }
     }
   }
 
@@ -6379,7 +6394,8 @@ export async function applyStateTransition(
             roleBodies.length === 0 &&
             destOwnerRole === "department-head" &&
             def.id === "dept-engine" &&
-            deriveWorkflowInstanceScope(def, instanceContext)
+            deriveWorkflowInstanceScope(def, instanceContext) &&
+            await isRoleDeclared(destOwnerRole)
           ) {
             return await failDelegateUnresolved({
               issueId: issue.internalId,
