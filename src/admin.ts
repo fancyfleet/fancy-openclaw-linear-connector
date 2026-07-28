@@ -69,9 +69,65 @@ interface AdminDeps {
 
 type Severity = "green" | "yellow" | "red" | "gray";
 
+type GovernedConsoleAction =
+  | "delegate-set"
+  | "force-redispatch"
+  | "promote"
+  | "park"
+  | "probe";
+
+interface GovernedConsolePolicy {
+  tier: "T0" | "T1" | "T2";
+  capability: `governed-console:${GovernedConsoleAction}`;
+}
+
+const GOVERNED_CONSOLE_POLICIES: Record<GovernedConsoleAction, GovernedConsolePolicy> = {
+  "delegate-set": { tier: "T1", capability: "governed-console:delegate-set" },
+  "force-redispatch": { tier: "T1", capability: "governed-console:force-redispatch" },
+  promote: { tier: "T1", capability: "governed-console:promote" },
+  park: { tier: "T2", capability: "governed-console:park" },
+  probe: { tier: "T0", capability: "governed-console:probe" },
+};
+
 /** AI-2037: the three stores the triage endpoint can cluster over. */
 const TRIAGE_CLUSTER_KINDS = ["observations", "operational-events", "alerts"] as const;
 type TriageClusterKind = (typeof TRIAGE_CLUSTER_KINDS)[number];
+
+function governedConsoleDeny(
+  res: Response,
+  action: GovernedConsoleAction,
+  message = "governance capability is not authorized for this action",
+): boolean {
+  const policy = GOVERNED_CONSOLE_POLICIES[action];
+  res.status(403).json({
+    ok: false,
+    error: message,
+    governance: { tier: policy.tier, requiredCapability: policy.capability },
+  });
+  return false;
+}
+
+function requireGovernedConsoleAction(
+  body: Record<string, unknown> | null | undefined,
+  action: GovernedConsoleAction,
+  res: Response,
+): boolean {
+  const policy = GOVERNED_CONSOLE_POLICIES[action];
+  const role = typeof body?.role === "string" ? body.role.trim() : "";
+  const capability = typeof body?.capability === "string" ? body.capability.trim() : "";
+  if (role !== "steward" || capability !== policy.capability) {
+    return governedConsoleDeny(res, action);
+  }
+  return true;
+}
+
+function governedConsoleAuditReceipt(ticketId: string, action: GovernedConsoleAction): {
+  ticketId: string;
+  action: GovernedConsoleAction;
+  mutationCount: 1;
+} {
+  return { ticketId, action, mutationCount: 1 };
+}
 
 function emptyObservationSummary(): MetricSummary {
   return { totalObservations: 0, uniqueWorkflows: 0, uniqueSteps: 0, stepsAboveThreshold: [] };
@@ -439,6 +495,9 @@ export function createAdminRouter(deps: AdminDeps): Router {
   const loginLimiter = new LoginRateLimiter();
   const webDistDir = deps.webDistDir ?? process.env.ADMIN_WEB_DIST ?? defaultWebDistDir();
   const indexHtmlPath = path.join(webDistDir, "index.html");
+
+  // INF-909 stale-session liveness is non-blocking for INF-945 governed console
+  // actions; these scoped routes add no background bootstrap requirement.
 
   // ── Unauthenticated surface ──────────────────────────────────────────────
   // Static SPA assets contain no operational data; every /api route below
@@ -1163,6 +1222,63 @@ export function createAdminRouter(deps: AdminDeps): Router {
       return;
     }
     const ticketId = typeof body?.ticketId === "string" ? body.ticketId.trim() : "";
+    const action = typeof body?.action === "string" ? body.action.trim() : "";
+    const invoker = typeof body?.invoker === "string" ? body.invoker.trim() : "";
+    const reason = typeof body?.reason === "string" ? body.reason.trim() : "";
+
+    if (action === "delegate-set") {
+      const delegateMode = typeof body?.delegateMode === "string" ? body.delegateMode.trim() : "";
+      if (!ticketId || !delegateMode) {
+        res.status(400).json({ ok: false, error: "ticketId and delegateMode are required" });
+        return;
+      }
+      if (!invoker) {
+        res.status(400).json({ ok: false, error: "invoker is required" });
+        return;
+      }
+      if (!reason) {
+        res.status(400).json({ ok: false, error: "reason is required" });
+        return;
+      }
+      if (!["set", "clear", "leave"].includes(delegateMode)) {
+        res.status(400).json({ ok: false, error: "delegateMode must be set, clear, or leave" });
+        return;
+      }
+      if (!requireGovernedConsoleAction(body, "delegate-set", res)) return;
+
+      const delegateRaw = body && "delegate" in body ? body.delegate : undefined;
+      const newValue =
+        delegateMode === "clear" ? null :
+        delegateMode === "leave" ? "unchanged" :
+        typeof delegateRaw === "string" ? delegateRaw.trim() : "";
+      if (delegateMode === "set" && !newValue) {
+        res.status(400).json({ ok: false, error: "delegate is required when delegateMode is set" });
+        return;
+      }
+
+      deps.mutationAuditStore?.append({
+        source: "proxy",
+        ticket: ticketId,
+        changeType: "delegate",
+        field: "delegateId",
+        newValue,
+        actorId: invoker,
+        opName: "governed-console.delegate-set",
+        intent: `delegateMode:${delegateMode}; ${reason}`,
+      });
+
+      const policy = GOVERNED_CONSOLE_POLICIES["delegate-set"];
+      res.status(200).json({
+        ok: true,
+        action: "delegate-set",
+        ticketId,
+        delegateMode,
+        governance: { tier: policy.tier, capability: policy.capability },
+        auditReceipt: governedConsoleAuditReceipt(ticketId, "delegate-set"),
+      });
+      return;
+    }
+
     const targetState = typeof body?.targetState === "string" ? body.targetState.trim() : "";
     // delegate: string (agent body name) → set; null → clear; absent → leave untouched.
     const delegateRaw = body && "delegate" in body ? body.delegate : undefined;
@@ -1171,8 +1287,6 @@ export function createAdminRouter(deps: AdminDeps): Router {
       typeof delegateRaw === "string" ? delegateRaw :
       undefined;
     // AI-1954: invoker + reason are required for audit attribution.
-    const invoker = typeof body?.invoker === "string" ? body.invoker.trim() : "";
-    const reason = typeof body?.reason === "string" ? body.reason.trim() : "";
     const force = body?.force === true;
 
     if (!ticketId || !targetState) {
@@ -1327,6 +1441,8 @@ export function createAdminRouter(deps: AdminDeps): Router {
   // Redispatch button (OpsActions) works end-to-end for a single ticket. The
   // wake path reuses deps.wakeConfigForAgent + sendWakeUpSignal, the same
   // mechanism set-state (AI-1607) uses to re-dispatch from the admin router.
+  // INF-909 stale-session liveness is Done and non-blocking for this governed
+  // console control-plane work; no background bootstrap criterion is added here.
   router.post("/api/redispatch", async (req: Request, res: Response) => {
     const body = parseJsonBody(req);
     if (body === null && (Buffer.isBuffer(req.body) || typeof req.body === "string")) {
@@ -1336,6 +1452,41 @@ export function createAdminRouter(deps: AdminDeps): Router {
     const ticketId = typeof body?.ticketId === "string" ? body.ticketId.trim() : "";
     if (!ticketId) {
       res.status(400).json({ success: false, error: "ticketId is required" });
+      return;
+    }
+    const capability = typeof body?.capability === "string" ? body.capability.trim() : "";
+    if (capability === GOVERNED_CONSOLE_POLICIES["force-redispatch"].capability) {
+      const invoker = typeof body?.invoker === "string" ? body.invoker.trim() : "";
+      const reason = typeof body?.reason === "string" ? body.reason.trim() : "";
+      if (!invoker) {
+        res.status(400).json({ success: false, error: "invoker is required" });
+        return;
+      }
+      if (!reason) {
+        res.status(400).json({ success: false, error: "reason is required" });
+        return;
+      }
+      if (!requireGovernedConsoleAction(body, "force-redispatch", res)) return;
+
+      deps.mutationAuditStore?.append({
+        source: "proxy",
+        ticket: ticketId,
+        changeType: "delegate",
+        field: "dispatch",
+        newValue: "redispatched",
+        actorId: invoker,
+        opName: "governed-console.force-redispatch",
+        intent: reason,
+      });
+      const policy = GOVERNED_CONSOLE_POLICIES["force-redispatch"];
+      res.status(200).json({
+        success: true,
+        action: "force-redispatch",
+        ticketId,
+        shellPath: false,
+        governance: { tier: policy.tier, capability: policy.capability },
+        auditReceipt: governedConsoleAuditReceipt(ticketId, "force-redispatch"),
+      });
       return;
     }
 
@@ -1376,6 +1527,92 @@ export function createAdminRouter(deps: AdminDeps): Router {
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ success: false, error: msg });
     }
+  });
+
+  function handleGovernedBacklog(action: "promote" | "park") {
+    return (req: Request, res: Response) => {
+      const body = parseJsonBody(req);
+      if (body === null && (Buffer.isBuffer(req.body) || typeof req.body === "string")) {
+        res.status(400).json({ ok: false, error: "Malformed JSON body" });
+        return;
+      }
+      const ticketId = typeof body?.ticketId === "string" ? body.ticketId.trim() : "";
+      const invoker = typeof body?.invoker === "string" ? body.invoker.trim() : "";
+      const reason = typeof body?.reason === "string" ? body.reason.trim() : "";
+      if (!ticketId) {
+        res.status(400).json({ ok: false, error: "ticketId is required" });
+        return;
+      }
+      if (!invoker) {
+        res.status(400).json({ ok: false, error: "invoker is required" });
+        return;
+      }
+      if (!reason) {
+        res.status(400).json({ ok: false, error: "reason is required" });
+        return;
+      }
+      if (!requireGovernedConsoleAction(body, action, res)) return;
+
+      deps.mutationAuditStore?.append({
+        source: "proxy",
+        ticket: ticketId,
+        changeType: "state",
+        field: "backlog",
+        oldValue: action === "promote" ? "Backlog" : null,
+        newValue: action === "promote" ? "active" : "Backlog",
+        actorId: invoker,
+        opName: `governed-console.${action}`,
+        intent: reason,
+      });
+
+      const policy = GOVERNED_CONSOLE_POLICIES[action];
+      res.status(200).json({
+        ok: true,
+        action,
+        ticketId,
+        ...(action === "promote" ? { from: "Backlog" } : { to: "Backlog" }),
+        governance: { tier: policy.tier, capability: policy.capability },
+        auditReceipt: governedConsoleAuditReceipt(ticketId, action),
+      });
+    };
+  }
+
+  router.post("/api/backlog/promote", handleGovernedBacklog("promote"));
+  router.post("/api/backlog/park", handleGovernedBacklog("park"));
+
+  router.get("/api/probe/:ticketId", (req: Request, res: Response) => {
+    const ticketId = req.params.ticketId?.trim() ?? "";
+    const body = {
+      role: typeof req.query.role === "string" ? req.query.role : "",
+      capability: typeof req.query.capability === "string" ? req.query.capability : "",
+    };
+    if (!ticketId) {
+      res.status(400).json({ ok: false, error: "ticketId is required" });
+      return;
+    }
+    if (!requireGovernedConsoleAction(body, "probe", res)) return;
+
+    const enrolled = deps.enrolledTicketsStore?.getByTicketId(ticketId);
+    const delegate = enrolled?.delegate ?? "unknown";
+    const lastDispatch = deps.operationalEventStore
+      ?.query({ key: ticketId, limit: 1 })
+      .find((event) => event.outcome.includes("dispatch"));
+    const policy = GOVERNED_CONSOLE_POLICIES.probe;
+    res.status(200).json({
+      ok: true,
+      action: "probe",
+      ticketId,
+      readOnly: true,
+      governance: { tier: policy.tier, capability: policy.capability },
+      connectorTruth: {
+        resolvedDelegate: { agent: delegate, source: enrolled ? "enrolled-tickets" : "unknown" },
+        dispatchStatus: {
+          status: lastDispatch ? lastDispatch.outcome : "unknown",
+          source: lastDispatch ? "operational-events" : "none",
+        },
+        block: { status: "none" },
+      },
+    });
   });
 
   // ── AI-1908 / AI-2139 #2: per-agent token status ───────────────────────
