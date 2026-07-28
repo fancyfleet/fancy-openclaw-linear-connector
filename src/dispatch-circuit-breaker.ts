@@ -35,6 +35,36 @@ const log = componentLogger(createLogger(), "dispatch-circuit-breaker");
 /** Default max consecutive wakes before tripping the breaker. */
 const DEFAULT_MAX_WAKES = 3;
 
+/**
+ * INF-956: Hard ceiling on total wakes that only ever REVISIT states this
+ * ticket has already occupied, tripping even when the state:* label churns
+ * between arrivals.
+ *
+ * The consecutive-same-state counter (`DEFAULT_MAX_WAKES`) resets on any state
+ * change, so it cannot catch a *dead-dispatch loop* that cycles through a small
+ * ring of already-seen states without advancing — e.g. a `task` ticket scoped
+ * to the wrong department head, re-stranded and re-dispatched as it churns
+ * doing → intake → routing → doing. Each arrival lands on a different label, so
+ * the consecutive counter is perpetually reset and the breaker never trips: the
+ * observed pathology is 18+ dead dispatches against a nominal cap of 3.
+ *
+ * This second counter increments on every wake that lands on a *previously
+ * seen* state and is reset ONLY by genuine forward progress (reaching a state
+ * this ticket has never occupied) or an explicit steward reset. A healthy
+ * ticket advances to new states (review → merge → sign-off → done) and stops
+ * being dispatched at its terminal; a ticket cycling its history trips. Set
+ * comfortably above a normal revision loop (review ⇄ doing) so ordinary
+ * bounce-backs do not trip. Env-overridable via `DISPATCH_STATE_REVISIT_CAP`.
+ *
+ * Default 10: a normal revision cycle (review → doing → review) is 2 revisits,
+ * so 10 tolerates ~5 revision bounces before tripping — comfortably above any
+ * healthy ticket, comfortably below the observed 18x dead-loop.
+ */
+const DEFAULT_MAX_STATE_REVISITS = (() => {
+  const raw = parseInt(process.env.DISPATCH_STATE_REVISIT_CAP ?? "", 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 10;
+})();
+
 // ---------------------------------------------------------------------------
 // Legacy state types
 // ---------------------------------------------------------------------------
@@ -50,6 +80,20 @@ export interface TicketBreakerState {
   tripped: boolean;
   /** ISO timestamp when the breaker tripped. */
   trippedAt: string | null;
+  /**
+   * INF-956: distinct state:* labels this ticket has occupied across its wake
+   * history. A wake landing on a label already in this set is a *revisit* (no
+   * forward progress); a new label is a genuine advance that resets the churn
+   * counter. Absent (undefined) on states seeded before this field existed —
+   * treated as an empty history.
+   */
+  seenStates?: string[];
+  /**
+   * INF-956: wakes that landed on an already-seen state without reaching new
+   * territory. Reset only by a genuinely-new state or a steward reset — NOT by
+   * ordinary label churn. Trips the breaker at `DEFAULT_MAX_STATE_REVISITS`.
+   */
+  revisitCount?: number;
 }
 
 /** Snapshot for /health exposure. */
@@ -59,6 +103,8 @@ export interface CircuitBreakerHealth {
   trippedCount: number;
   config: {
     maxWakes: number;
+    /** INF-956: hard ceiling on wakes revisiting already-seen states. */
+    maxStateRevisits: number;
   };
 }
 
@@ -322,10 +368,31 @@ export class DispatchCircuitBreaker {
 // ---------------------------------------------------------------------------
 
 /**
+ * INF-956: whether `stateLabel` is a state this ticket has already occupied.
+ * `seenStates` is optional (undefined on pre-INF-956 seeded state) — an absent
+ * history means nothing has been seen, so nothing is a revisit yet.
+ */
+function isRevisit(existing: TicketBreakerState, stateLabel: string): boolean {
+  return (existing.seenStates ?? []).includes(stateLabel);
+}
+
+/** INF-956: append a state to the seen-history without duplicates. */
+function withSeenState(existing: TicketBreakerState | undefined, stateLabel: string): string[] {
+  const prior = existing?.seenStates ?? (existing?.lastStateLabel ? [existing.lastStateLabel] : []);
+  return prior.includes(stateLabel) ? prior : [...prior, stateLabel];
+}
+
+/**
  * Record a dispatch attempt and update the circuit breaker state.
  *
  * INF-94: If stateLabel is null (ad-hoc ticket, no wf:* workflow label), the
  * ticket has no workflow transitions to stall — never trip the breaker.
+ *
+ * INF-956: Two independent trip conditions. (1) `wakeCount` — consecutive wakes
+ * on the SAME state, reset by any state change. (2) `revisitCount` — wakes that
+ * land on an already-seen state, reset ONLY by reaching a genuinely-new state.
+ * The second catches dead-dispatch loops that churn a ring of seen states so the
+ * consecutive counter never accumulates (the 18x-vs-cap-3 pathology).
  *
  * @returns The updated breaker state.
  */
@@ -333,6 +400,7 @@ export function recordDispatch(
   ticketId: string,
   stateLabel: string | null,
   maxWakes: number = DEFAULT_MAX_WAKES,
+  maxRevisits: number = DEFAULT_MAX_STATE_REVISITS,
 ): TicketBreakerState {
   // INF-94: Null stateLabel means this ticket has no workflow state to measure
   // progress against. Ad-hoc tickets (no wf:* label) always have null stateLabel.
@@ -344,6 +412,8 @@ export function recordDispatch(
       wakeCount: 0,
       tripped: false,
       trippedAt: null,
+      seenStates: [],
+      revisitCount: 0,
     };
     breakerState.set(ticketId, fresh);
     return fresh;
@@ -359,53 +429,71 @@ export function recordDispatch(
       wakeCount: 0,
       tripped: false,
       trippedAt: null,
+      seenStates: [stateLabel],
+      revisitCount: 0,
     };
     breakerState.set(ticketId, fresh);
     log.debug(`Circuit breaker: first dispatch for ${ticketId} → state=${stateLabel}`);
     return fresh;
   }
 
-  // If the breaker is tripped, a state advance resets it.
+  // INF-956: forward progress is reaching a state this ticket has NEVER
+  // occupied — not merely a label that differs from the last one. A churn-return
+  // to a prior state is a revisit, not an advance, and must not reset counters.
+  const isNewState = !isRevisit(existing, stateLabel);
+
+  // If the breaker is tripped, only genuine forward progress un-trips it.
+  // A churn-return to an already-seen state keeps it open (INF-956) — otherwise
+  // the same loop that tripped it would immediately clear it on its next hop.
   if (existing.tripped) {
-    if (existing.lastStateLabel !== stateLabel && stateLabel !== null) {
-      // State advance un-trips the breaker.
+    if (isNewState) {
       const updated: TicketBreakerState = {
         lastStateLabel: stateLabel,
         lastDispatchAt: new Date().toISOString(),
         wakeCount: 0,
         tripped: false,
         trippedAt: null,
+        seenStates: withSeenState(existing, stateLabel),
+        revisitCount: 0,
       };
       breakerState.set(ticketId, updated);
       log.info(
-        `Circuit breaker: state advanced (un-trip) for ${ticketId}: ${existing.lastStateLabel ?? "none"} → ${stateLabel} — breaker reset`,
+        `Circuit breaker: forward progress (un-trip) for ${ticketId}: reached new state ${stateLabel} — breaker reset`,
       );
       return updated;
     }
-    // State unchanged while tripped — stay tripped.
-    return existing;
+    // Revisiting a seen state (or unchanged) while tripped — stay tripped.
+    return { ...existing, lastStateLabel: stateLabel, lastDispatchAt: new Date().toISOString() };
   }
 
-  // State changed since last dispatch → reset the counter (ticket progressed).
-  if (existing.lastStateLabel !== stateLabel) {
+  // Genuine forward progress → reset BOTH counters (ticket advanced to new
+  // territory) and record the new state in the history.
+  if (isNewState) {
     const updated: TicketBreakerState = {
       lastStateLabel: stateLabel,
       lastDispatchAt: new Date().toISOString(),
       wakeCount: 0,
       tripped: false,
       trippedAt: null,
+      seenStates: withSeenState(existing, stateLabel),
+      revisitCount: 0,
     };
     breakerState.set(ticketId, updated);
     log.info(
-      `Circuit breaker: state advanced for ${ticketId}: ${existing.lastStateLabel ?? "none"} → ${stateLabel ?? "none"} — counter reset`,
+      `Circuit breaker: forward progress for ${ticketId}: ${existing.lastStateLabel ?? "none"} → ${stateLabel} (new state) — counters reset`,
     );
     return updated;
   }
 
-  // State is the same as last dispatch — this is a repeat wake on the same
-  // state. Increment the counter and trip if threshold reached.
-  const newCount = (existing.wakeCount ?? 0) + 1;
-  const shouldTrip = newCount >= maxWakes;
+  // Revisit: the wake landed on an already-seen state. The consecutive-same
+  // counter (`wakeCount`) still resets when the label differs from the last
+  // dispatch, but the churn counter (`revisitCount`) always climbs.
+  const sameAsLast = existing.lastStateLabel === stateLabel;
+  const newCount = sameAsLast ? (existing.wakeCount ?? 0) + 1 : 0;
+  const newRevisit = (existing.revisitCount ?? 0) + 1;
+  const consecutiveTrip = sameAsLast && newCount >= maxWakes;
+  const revisitTrip = newRevisit >= maxRevisits;
+  const shouldTrip = consecutiveTrip || revisitTrip;
 
   const updated: TicketBreakerState = {
     lastStateLabel: stateLabel,
@@ -413,28 +501,37 @@ export function recordDispatch(
     wakeCount: newCount,
     tripped: shouldTrip,
     trippedAt: shouldTrip ? new Date().toISOString() : null,
+    seenStates: existing.seenStates ?? withSeenState(existing, stateLabel),
+    revisitCount: newRevisit,
   };
   breakerState.set(ticketId, updated);
 
   if (shouldTrip) {
-    log.warn(
-      `Circuit breaker TRIPPED for ${ticketId}: ${newCount} consecutive wakes, state=${stateLabel ?? "unknown"}`,
-    );
+    const reason = revisitTrip
+      ? `${newRevisit} wakes revisiting seen states (${(updated.seenStates ?? []).join(" → ")}), no forward progress`
+      : `${newCount} consecutive wakes, state=${stateLabel}`;
+    log.warn(`Circuit breaker TRIPPED for ${ticketId}: ${reason}`);
     notify({
       severity: "warning",
       source: "dispatch-circuit-breaker",
-      title: `transition-stuck: ${ticketId.replace(/^linear-/, "")} ${stateLabel ?? "unknown"} — ${newCount} wakes, no progress`,
+      title: revisitTrip
+        ? `dead-dispatch-loop: ${ticketId.replace(/^linear-/, "")} — ${newRevisit} wakes cycling seen states, no progress`
+        : `transition-stuck: ${ticketId.replace(/^linear-/, "")} ${stateLabel} — ${newCount} wakes, no progress`,
       detail: {
         ticketId,
         stateLabel,
         wakeCount: newCount,
+        revisitCount: newRevisit,
+        seenStates: updated.seenStates,
+        trippedBy: revisitTrip ? "state-revisit-cap" : "consecutive-wake-cap",
         trippedAt: updated.trippedAt,
       },
       ticket: ticketId,
     });
-  } else if (newCount > 1) {
+  } else if (newCount > 1 || newRevisit > 1) {
     log.info(
-      `Circuit breaker: state unchanged for ${ticketId} (${newCount}/${maxWakes} wakes, state=${stateLabel ?? "unknown"})`,
+      `Circuit breaker: ${ticketId} no progress (${newCount}/${maxWakes} consecutive, ` +
+      `${newRevisit}/${maxRevisits} revisits, state=${stateLabel})`,
     );
   }
 
@@ -475,6 +572,10 @@ export function recordFailedWake(
     wakeCount: newCount,
     tripped: shouldTrip,
     trippedAt: shouldTrip ? new Date().toISOString() : null,
+    // INF-956: preserve the churn history; this path only fires on same-state
+    // repeats, so revisitCount is not advanced here (recordDispatch owns it).
+    seenStates: existing.seenStates ?? withSeenState(existing, effectiveLabel),
+    revisitCount: existing.revisitCount ?? 0,
   });
 
   if (shouldTrip) {
@@ -616,6 +717,7 @@ export function getCircuitBreakerHealth(): CircuitBreakerHealth {
     trippedCount,
     config: {
       maxWakes: DEFAULT_MAX_WAKES,
+      maxStateRevisits: DEFAULT_MAX_STATE_REVISITS,
     },
   };
 }
