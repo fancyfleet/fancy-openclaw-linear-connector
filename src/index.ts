@@ -1247,7 +1247,18 @@ export function createApp(options?: CreateAppOptions) {
   watchdog.start();
 
   const noActivityDetector = new NoActivityDetector(
-    { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, wakeConfigForAgent, resignalOptions, postLinearComment, getFailMsForTicket: (_agentId: string, ticketId: string) => getTicketNoActivityTimeoutMs(ticketId) },
+    {
+      sessionTracker,
+      ackTracker,
+      bag,
+      operationalEventStore,
+      wakeConfig,
+      wakeConfigForAgent,
+      resignalOptions,
+      postLinearComment,
+      getAgentConfig: getAgent,
+      getFailMsForTicket: (_agentId: string, ticketId: string) => getTicketNoActivityTimeoutMs(ticketId),
+    },
   );
   noActivityDetector.start();
 
@@ -1673,7 +1684,7 @@ export function createApp(options?: CreateAppOptions) {
       detail: { queuedTickets: queuedTickets ?? [], bagTickets, regularPending, holdRetry: newHoldIds, capacityRearmedTickets, coalescedTickets, allPending }
     });
 
-    if (regularPending.length > 0) {
+    if (regularPending.length > 0 && capacityRearmedTickets.length === 0) {
       // Re-signal: agent has work waiting. Send one signal per ticket so each
       // issue is delivered into its own canonical per-ticket session key.
       try {

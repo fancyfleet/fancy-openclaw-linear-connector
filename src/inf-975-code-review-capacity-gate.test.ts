@@ -356,6 +356,57 @@ describe("INF-975 Charles/code-review admission-time capacity gate", () => {
       closeApp(ctx);
     }
   });
+
+  test("AC2 regression: re-arm admits only one deferred code-review ticket per freed Charles slot", async () => {
+    const ctx = createApp({
+      bagDbPath: path.join(dir, "bag-rearm-burst.db"),
+      operationalEventsDbPath: path.join(dir, "events-rearm-burst.db"),
+      idempotencyDbPath: path.join(dir, "idempotency-rearm-burst.db"),
+      dispatchLeaseDbPath: path.join(dir, "dispatch-leases-rearm-burst.db"),
+      dispatchInFlightDbPath: path.join(dir, "inflight-rearm-burst.db"),
+      sessionSpawnIdempotencyDbPath: path.join(dir, "spawn-rearm-burst.db"),
+      livenessDispatchDbPath: path.join(dir, "liveness-rearm-burst.db"),
+    });
+    try {
+      await postWebhook(ctx.app, codeReviewIssueUpdate("INF-9771"));
+      await waitFor(() => deliveries.length === 1);
+      await postWebhook(ctx.app, codeReviewIssueUpdate("INF-9772"));
+      await postWebhook(ctx.app, codeReviewIssueUpdate("INF-9773"));
+
+      expect(deliveries.map((d) => d.sessionKey)).toEqual(["linear-INF-9771"]);
+      await waitFor(() => ctx.operationalEventStore.query({ outcome: "deferred-at-capacity" }).length === 2);
+
+      const firstEnd = await request(ctx.app)
+        .post("/session-end")
+        .set("x-session-end-secret", SESSION_END_SECRET)
+        .set("content-type", "application/json")
+        .send(JSON.stringify({ agentId: "charles" }));
+
+      expect(firstEnd.status).toBe(200);
+      await waitFor(() => deliveries.length === 2);
+      expect(deliveries.map((d) => d.sessionKey)).toEqual(["linear-INF-9771", "linear-INF-9772"]);
+      expect(ctx.sessionTracker.getActiveSessionKeys("charles")).toEqual(["linear-INF-9772"]);
+      expect(ctx.operationalEventStore.query({ outcome: "deferred-capacity-rearm" })).toHaveLength(1);
+
+      const secondEnd = await request(ctx.app)
+        .post("/session-end")
+        .set("x-session-end-secret", SESSION_END_SECRET)
+        .set("content-type", "application/json")
+        .send(JSON.stringify({ agentId: "charles" }));
+
+      expect(secondEnd.status).toBe(200);
+      await waitFor(() => deliveries.length === 3);
+      expect(deliveries.map((d) => d.sessionKey)).toEqual([
+        "linear-INF-9771",
+        "linear-INF-9772",
+        "linear-INF-9773",
+      ]);
+      expect(ctx.sessionTracker.getActiveSessionKeys("charles")).toEqual(["linear-INF-9773"]);
+      expect(ctx.operationalEventStore.query({ outcome: "deferred-capacity-rearm" })).toHaveLength(2);
+    } finally {
+      closeApp(ctx);
+    }
+  });
 });
 
 describe("INF-975 no-activity regression boundary", () => {

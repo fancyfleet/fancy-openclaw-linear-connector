@@ -258,12 +258,13 @@ export class NoActivityDetector {
     const set = this.deferredAtCapacity.get(agentId);
     if (!set || set.size === 0) return [];
 
-    const activeCount = sessionTracker.getActiveSessionKeys(agentId).length;
     const maxConcurrent = this.getAgentMaxConcurrentValue(agentId);
-    if (activeCount >= maxConcurrent) return [];
 
     const rearmed: string[] = [];
     for (const ticketId of [...set]) {
+      const activeCount = sessionTracker.getActiveSessionKeys(agentId).length;
+      if (activeCount >= maxConcurrent) break;
+
       set.delete(ticketId);
 
       // End the stale session so resignalPendingTickets can open a fresh one.
