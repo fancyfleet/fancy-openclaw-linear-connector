@@ -51,6 +51,7 @@ import { registerDelegationReconciliationCron, runDelegationReconciliationSweep 
 import { registerStalePlainDelegateCron } from "./stale-plain-delegate-sweep.js";
 import { registerRegistryIntegrityCron } from "./registry-integrity-cron.js";
 import { getAlertBus } from "./alerts/alert-bus.js";
+import { getRateLimitClient } from "./linear-rate-limit-client.js";
 import { registerSlaSweepCron } from "./sla-sweep.js";
 import { registerValidationWatchdogCron } from "./validation-sla-watchdog.js";
 import { registerLabelSyncAuditCron } from "./cron/label-sync-audit.js";
@@ -362,6 +363,15 @@ export function createApp(options?: CreateAppOptions) {
   // concurrency, dedup, and recovery-rate guard.
   const backlogController = createBacklogController();
 
+  // INF-923: rate-limit-aware Linear API client + 429 breaker, constructed and
+  // held at bootstrap so the re-dispatch/reconciliation query path and the
+  // reconciliation crons (which resolve it from this same AlertBus) route
+  // through one shared breaker. Registered here so /health.linearApiRateLimit
+  // and /admin/api/ratelimit report breaker state + remaining budget at
+  // ac-validate without waiting for a real 429 (AC4/AC5/AC6).
+  const linearRateLimitClient = getRateLimitClient(getAlertBus());
+  linearRateLimitClient.markRegistered();
+
   // AI-2036 AC1.5/AC1.6: register the observation write path here, on the same
   // code path that hands the store to the proxy's transition options below.
   // The registry entry — surfaced at /health.observations — therefore exists if
@@ -566,6 +576,12 @@ export function createApp(options?: CreateAppOptions) {
         ...dispatchDeliveryScheduler.liveness(),
         undeliverable: undeliverable.length,
       },
+      // INF-923 AC5/AC6: rate-limit-aware client + 429 breaker liveness.
+      // `registered` is true only because bootstrap constructed + held the
+      // client (never hardcoded); `gatedConsumers`/`cronConsumers` name the
+      // re-dispatch/reconciliation paths + crons routed through it, and
+      // `breaker`/`remaining` are observable without waiting for a real 429.
+      linearApiRateLimit: linearRateLimitClient.liveness(),
       service: "fancy-openclaw-linear-connector",
       deployment: DEPLOYMENT_NAME,
       commit: getStartupCommit(),
@@ -1309,7 +1325,18 @@ export function createApp(options?: CreateAppOptions) {
   watchdog.start();
 
   const noActivityDetector = new NoActivityDetector(
-    { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, wakeConfigForAgent, resignalOptions, postLinearComment, getFailMsForTicket: (_agentId: string, ticketId: string) => getTicketNoActivityTimeoutMs(ticketId) },
+    {
+      sessionTracker,
+      ackTracker,
+      bag,
+      operationalEventStore,
+      wakeConfig,
+      wakeConfigForAgent,
+      resignalOptions,
+      postLinearComment,
+      getAgentConfig: getAgent,
+      getFailMsForTicket: (_agentId: string, ticketId: string) => getTicketNoActivityTimeoutMs(ticketId),
+    },
   );
   noActivityDetector.start();
 
@@ -1635,6 +1662,13 @@ export function createApp(options?: CreateAppOptions) {
   // Mark the flush route as mounted for /health.cache liveness proof (AC4).
   markCacheFlushRouteMounted();
 
+  // INF-923 AC4: operator visibility into the live Linear API budget + breaker
+  // state, so exhaustion is observable before it cascades. ADMIN_SECRET-gated.
+  app.get("/admin/api/ratelimit", (req: express.Request, res: express.Response) => {
+    if (!requireAdminSecret(req, res)) return;
+    res.json({ ok: true, linearApi: linearRateLimitClient.liveness() });
+  });
+
   governedXfnReseat.demoteGuardActive = true;
   governedXfnReseat.dispatchPath = "webhook dispatch path (createWebhookRouter)";
   app.use("/", createWebhookRouter(
@@ -1686,6 +1720,7 @@ export function createApp(options?: CreateAppOptions) {
     livenessDispatchStore,
     dispatchInFlightStore,
     sessionSpawnStore,
+    noActivityDetector,
   ));
 
   // ── v1.1: Session-end callback endpoint ──────────────────────────────
@@ -1774,16 +1809,22 @@ export function createApp(options?: CreateAppOptions) {
       }
     }
     // Re-arm any tickets that were deferred because the agent was at capacity.
-    noActivityDetector.checkDeferredOnSessionEnd(agentId).catch((err) => {
+    let capacityRearmedTickets: string[] = [];
+    try {
+      capacityRearmedTickets = await noActivityDetector.checkDeferredOnSessionEnd(agentId);
+    } catch (err) {
       log.error(`checkDeferredOnSessionEnd failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
-    });
+    }
     // Acknowledge dispatches for this agent — the session completed (even briefly).
     ackTracker.acknowledge(agentId);
     // Clear no-activity warnings for any sessions that just ended.
     noActivityDetector.clearWarned(agentId, "*");
     // Also drain any dispatched-but-unconfirmed bag entries for this agent.
     // These were dispatched on HTTP 200 but not confirmed as processed.
-    const bagTickets = bag.getPendingTickets(agentId).map(e => e.ticketId);
+    const endedKeySet = new Set(endedKeys.map((key) => normalizeSessionKey(key)));
+    const bagTickets = bag.getPendingTickets(agentId)
+      .map(e => e.ticketId)
+      .filter((ticketId) => !endedKeySet.has(normalizeSessionKey(ticketId)));
     if (bagTickets.length > 0) bag.clearAgent(agentId);
     // Normalize queued tickets so dedup works correctly vs already-normalized bag IDs.
     const queuedNormalized = (queuedTickets ?? []).map(t => normalizeSessionKey(t));
@@ -1791,7 +1832,9 @@ export function createApp(options?: CreateAppOptions) {
 
     // AI-1533: Compute hold-retry tickets that aren't already in regular pending.
     const holdIds = holdCandidates.map((key) => normalizeSessionKey(key));
-    const newHoldIds = holdIds.filter((id) => !regularPending.includes(id));
+    const newHoldIds = capacityRearmedTickets.length > 0
+      ? []
+      : holdIds.filter((id) => !regularPending.includes(id));
     if (newHoldIds.length > 0) {
       for (const holdId of newHoldIds) {
         const attempt = holdRetryTracker.incrementHoldAttempt(agentId, holdId);
@@ -1829,10 +1872,10 @@ export function createApp(options?: CreateAppOptions) {
     const allPending = [...new Set([...regularPending, ...newHoldIds, ...coalescedTickets])];
     operationalEventStore.append({
       outcome: "session-ended", agent: agentId, deliveryMode: "session-end-callback",
-      detail: { queuedTickets: queuedTickets ?? [], bagTickets, regularPending, holdRetry: newHoldIds, coalescedTickets, allPending }
+      detail: { queuedTickets: queuedTickets ?? [], bagTickets, regularPending, holdRetry: newHoldIds, capacityRearmedTickets, coalescedTickets, allPending }
     });
 
-    if (regularPending.length > 0) {
+    if (regularPending.length > 0 && capacityRearmedTickets.length === 0) {
       // Re-signal: agent has work waiting. Send one signal per ticket so each
       // issue is delivered into its own canonical per-ticket session key.
       try {
@@ -1966,7 +2009,7 @@ export function createApp(options?: CreateAppOptions) {
   registerTtlInvalidationCron(ttlCache, 60_000);
   log.info("INF-193: TTL cache invalidation cron registered (every 60s)");
 
-  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore, livenessDispatchStore, transcriptRedactionHealth: getTranscriptRedactionHealth() });
+  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore, livenessDispatchStore, linearRateLimitClient, transcriptRedactionHealth: getTranscriptRedactionHealth() });
 }
 
 /**

@@ -24,6 +24,7 @@ import {
   resolveTransitionTargets,
   resolveStakesLevel,
   type WorkflowDef,
+  type WorkflowInstanceContext,
   type StakesLevel,
 } from "../workflow-gate.js";
 import { getAcRecord } from "../ac-record-store.js";
@@ -34,6 +35,30 @@ import { loadUniversalCanon, formatCanonBlock } from "../policy/universal-canon.
 import { remediateAgentToken } from "../agents.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "build-message");
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" ? value as Record<string, unknown> : undefined;
+}
+
+function deriveMessageInstanceContext(
+  issueIdentifier: string,
+  issueData: Record<string, unknown> | undefined,
+): WorkflowInstanceContext {
+  const team = asRecord(issueData?.team);
+  const enrollment = asRecord(issueData?.workflowEnrollment);
+  return {
+    issueIdentifier,
+    teamKey: typeof team?.key === "string" ? team.key : undefined,
+    teamName: typeof team?.name === "string" ? team.name : undefined,
+    workflowEnrollment: enrollment
+      ? {
+          department: typeof enrollment.department === "string" ? enrollment.department : undefined,
+          team: typeof enrollment.team === "string" ? enrollment.team : undefined,
+          charterRef: typeof enrollment.charterRef === "string" ? enrollment.charterRef : undefined,
+        }
+      : undefined,
+  };
+}
 
 /**
  * Root for instance-local step guidance files (C5 / AI-1381).
@@ -144,6 +169,7 @@ export async function buildDeliveryMessage(route: RouteResult, authToken?: strin
   const data = (route.event.data ?? {}) as Record<string, unknown>;
   const sessionData = data.agentSession as Record<string, unknown> | undefined;
   const issueData = (data.issue ?? sessionData?.issue ?? data) as Record<string, unknown>;
+  const instanceContext = deriveMessageInstanceContext(identifier, issueData);
   const title = String(
     issueData?.title ?? (data as Record<string, unknown>).issueTitle ?? "",
   );
@@ -158,7 +184,7 @@ export async function buildDeliveryMessage(route: RouteResult, authToken?: strin
   if (reason === "mention" || reason === "body-mention") {
     message = buildMentionMessage(actorName, identifier, title);
   } else {
-    message = await buildDelegationMessage(reason, identifier, title, authToken, eventKnowsTicketIsPlain(route), route.agentId);
+    message = await buildDelegationMessage(reason, identifier, title, authToken, eventKnowsTicketIsPlain(route), route.agentId, instanceContext);
   }
 
   // Inject the canon block after the hook line (before per-step guidance).
@@ -187,8 +213,18 @@ export async function buildWorkflowAwareDeliveryMessage(
   agentId?: string,
   actionText = `You have a pending ticket: ${identifier}`,
 ): Promise<string | null> {
-  const query = `query IssueTitle($id: String!) { issue(id: $id) { title labels { nodes { name } } } }`;
+  const query = `
+    query IssueTitle($id: String!) {
+      issue(id: $id) {
+        title
+        team { key name }
+        workflowEnrollment { department team charterRef }
+        labels { nodes { name } }
+      }
+    }
+  `;
   let title = "";
+  let instanceContext: WorkflowInstanceContext | undefined;
   try {
     const res = await fetch("https://api.linear.app/graphql", {
       method: "POST",
@@ -207,6 +243,7 @@ export async function buildWorkflowAwareDeliveryMessage(
     } else {
       const json = (await res.json()) as { data?: { issue?: { title?: string; labels?: { nodes: Array<{ name: string }> } } } };
       title = json.data?.issue?.title ?? "";
+      instanceContext = deriveMessageInstanceContext(identifier, json.data?.issue as Record<string, unknown> | undefined);
     }
   } catch (err) {
     // AI-1708: Network error on title fetch — don't silently return null.
@@ -219,7 +256,7 @@ export async function buildWorkflowAwareDeliveryMessage(
   }
   // AI-1848: load canon and inject into the workflow-aware message too.
   const canon = await loadUniversalCanon();
-  const wfMessage = await tryBuildWorkflowMessage(actionText, identifier, title, authToken, agentId);
+  const wfMessage = await tryBuildWorkflowMessage(actionText, identifier, title, authToken, agentId, instanceContext);
   return wfMessage !== null ? withCanonBlock(wfMessage, canon) : null;
 }
 
@@ -230,6 +267,7 @@ async function buildDelegationMessage(
   authToken: string | undefined,
   knownPlainTicket = false,
   agentId?: string,
+  instanceContext?: WorkflowInstanceContext,
 ): Promise<string> {
   const actionText =
     reason === "delegate"
@@ -244,6 +282,7 @@ async function buildDelegationMessage(
       title,
       authToken,
       agentId,
+      instanceContext,
     );
     if (workflowMessage !== null) return workflowMessage;
   }
@@ -311,6 +350,7 @@ export async function tryBuildWorkflowMessage(
   title: string,
   authToken: string,
   agentId?: string,
+  instanceContext?: WorkflowInstanceContext,
 ): Promise<string | null> {
   let labels: string[];
   try {
@@ -378,7 +418,7 @@ export async function tryBuildWorkflowMessage(
       if (isBarrierState && t.generic !== 'continue' && t.generic !== 'revision') {
         return `- (advances automatically → ${t.to} when the child barrier is satisfied; no steward command needed)`;
       }
-      const { bodies, mode } = await resolveTransitionTargets(t, def);
+      const { bodies, mode } = await resolveTransitionTargets(t, def, instanceContext);
 
       // Use the generic command name when available (Matt's directive: guidance always
       // uses generic transitions so agents don't need workflow-specific command names).

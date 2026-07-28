@@ -29,10 +29,10 @@ import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgent
 import { checkAgentLiveness, type LivenessConfig } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
 import { checkRoleGuardAndBlock, type LinearUserIdResolver } from "../routing-guard.js";
-import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, autoEnrollPlainDelegation, markAutoEnrollRegistered, markCommitmentActivityObserverRegistered, applyStateTransition } from "../workflow-gate.js";
+import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, autoEnrollPlainDelegation, markAutoEnrollRegistered, markCommitmentActivityObserverRegistered, applyStateTransition, type WorkflowInstanceContext } from "../workflow-gate.js";
 import { checkLabelSyncForTicket, emitLabelSyncWarning } from "../transition-audit.js";
 import { AgentQueue } from "../queue/index.js";
-import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/index.js";
+import { PendingWorkBag, SessionTracker, resignalPendingTickets, type NoActivityDetector } from "../bag/index.js";
 import { type WakeUpConfig } from "../bag/wake-up.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { checkLinearIssueRouting, isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
@@ -51,6 +51,30 @@ const log = componentLogger(createLogger(), "webhook");
 export type { LinearEvent } from "./schema.js";
 export { verifyLinearSignature } from "./signature.js";
 export { normalizeLinearEvent } from "./normalize.js";
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" ? value as Record<string, unknown> : undefined;
+}
+
+function deriveWorkflowInstanceContextFromRoute(route: RouteResult, issueIdentifier: string): WorkflowInstanceContext {
+  const data = asRecord(route.event.data) ?? {};
+  const sessionData = asRecord(data.agentSession);
+  const issueData = asRecord(data.issue ?? sessionData?.issue ?? data) ?? {};
+  const team = asRecord(issueData.team);
+  const enrollment = asRecord(issueData.workflowEnrollment);
+  return {
+    issueIdentifier,
+    teamKey: typeof team?.key === "string" ? team.key : undefined,
+    teamName: typeof team?.name === "string" ? team.name : undefined,
+    workflowEnrollment: enrollment
+      ? {
+          department: typeof enrollment.department === "string" ? enrollment.department : undefined,
+          team: typeof enrollment.team === "string" ? enrollment.team : undefined,
+          charterRef: typeof enrollment.charterRef === "string" ? enrollment.charterRef : undefined,
+        }
+      : undefined,
+  };
+}
 
 function signatureRejectedDetail(rawBody: Buffer | undefined, secretCount: number): Record<string, unknown> {
   return {
@@ -439,6 +463,7 @@ export function createWebhookRouter(
   livenessDispatchStore?: Pick<DispatchRecordStore, "recordDispatch" | "recordAck" | "getDispatch">,
   dispatchInFlightStore?: DispatchInFlightStore,
   sessionSpawnStore?: SessionSpawnIdempotencyStore,
+  noActivityDetector?: Pick<NoActivityDetector, "recordAdmissionDeferral">,
 ): Router {
   const router = Router();
   const delegatePingPongDetector = new DelegatePingPongDetector(undefined, undefined, operationalEventStore);
@@ -1398,7 +1423,13 @@ export function createWebhookRouter(
             );
             return (agent as { linearUserId?: string } | undefined)?.linearUserId ?? null;
           };
-          const guardResult = await checkRoleGuardAndBlock(route.agentId, issueIdentifier, guardLabels, linearUserIdResolver);
+          const guardResult = await checkRoleGuardAndBlock(
+            route.agentId,
+            issueIdentifier,
+            guardLabels,
+            linearUserIdResolver,
+            deriveWorkflowInstanceContextFromRoute(route, issueIdentifier),
+          );
           if (guardResult.blocked) {
             log.warn(
               `routing-guard: dispatch blocked for ${route.agentId} [${issueIdentifier}] — ${guardResult.reason ?? "role mismatch"}; ` +
@@ -1424,15 +1455,6 @@ export function createWebhookRouter(
           log.warn(`Role-guard check failed for ${issueIdentifier}: ${err instanceof Error ? err.message : String(err)} — continuing`);
         }
       }
-
-      // Delivery is now committed: the event routed to a delegate that passed
-      // the stale-route, liveness, and role-guard checks. Register a pending
-      // dispatch expectation BEFORE the actual send so that if the delivery is
-      // later swallowed (nudge-dedup) or sent through a path that records no
-      // ack, the watchdog still sees an unacknowledged dispatch and re-signals
-      // it (AI-1538). ensurePending uses attempt_count=0 + ON CONFLICT DO
-      // NOTHING, so the happy path's counter is unchanged.
-      onDeliveryCommitted?.(agentName, ticketId);
 
       // ── 10. Create agent session + emit thought ───────────────────────────
       const data = event.data as Record<string, unknown> | null;
@@ -1468,6 +1490,24 @@ export function createWebhookRouter(
           }
         }
         appendOperationalEvent(operationalEventStore, { outcome: "bag-added", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "pending-bag", wakeId, plane: "connector" });
+
+        const agentConfig = getAgent(agentName);
+        const maxConcurrent = agentConfig?.maxConcurrent;
+        if (typeof maxConcurrent === "number" && maxConcurrent > 0) {
+          const activeCount = sessionTracker.getActiveSessionKeys(agentName).length;
+          if (activeCount >= maxConcurrent) {
+            noActivityDetector?.recordAdmissionDeferral(agentName, normalizedTicketId, {
+              activeCount,
+              maxConcurrent,
+            });
+            return;
+          }
+        }
+
+        // Delivery is now admitted. Register a pending dispatch expectation
+        // before the actual send so a swallowed delivery self-heals, but only
+        // after capacity deferral has had a chance to keep overflow local.
+        onDeliveryCommitted?.(agentName, ticketId);
 
         const wakeConfig: WakeUpConfig = {
           nodeBin: process.execPath,
@@ -1567,6 +1607,8 @@ export function createWebhookRouter(
       }
 
       // ── v1.0 fallback: Agent queue with ticket-level coalescing ─────────
+      onDeliveryCommitted?.(agentName, ticketId);
+
       if (agentQueue) {
         const queueResult = agentQueue.enqueueOrCoalesce(route);
         if (queueResult.action === "active-busy") {

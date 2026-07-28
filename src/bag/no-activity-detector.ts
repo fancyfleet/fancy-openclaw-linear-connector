@@ -218,31 +218,58 @@ export class NoActivityDetector {
     set.add(ticketId);
   }
 
+  public recordAdmissionDeferral(
+    agentId: string,
+    ticketId: string,
+    detail?: { activeCount?: number; maxConcurrent?: number },
+  ): void {
+    const sessionKey = tryNormalizeSessionKey(ticketId) ?? ticketId;
+    const activeCount = detail?.activeCount ?? this.deps.sessionTracker.getActiveSessionKeys(agentId).length;
+    const maxConcurrent = detail?.maxConcurrent ?? this.getAgentMaxConcurrentValue(agentId);
+
+    log.info(
+      `No-activity: admission deferring ${agentId} [${sessionKey}] — at capacity ` +
+      `(${activeCount}/${maxConcurrent} sessions). Re-arm when a slot frees.`,
+    );
+    this.deps.operationalEventStore.append({
+      outcome: "deferred-at-capacity",
+      agent: agentId,
+      key: sessionKey,
+      sessionKey,
+      deliveryMode: "admission-capacity-gate",
+      attemptCount: 0,
+      detail: { activeCount, maxConcurrent },
+    });
+
+    let set = this.deferredAtCapacity.get(agentId);
+    if (!set) {
+      set = new Set();
+      this.deferredAtCapacity.set(agentId, set);
+    }
+    set.add(sessionKey);
+  }
+
   /**
    * Re-arm deferred at-capacity tickets when a session slot frees.
    * Call this after sessionTracker.endSession() for an agent.
    */
-  public async checkDeferredOnSessionEnd(agentId: string): Promise<void> {
+  public async checkDeferredOnSessionEnd(agentId: string): Promise<string[]> {
     const { sessionTracker, bag, operationalEventStore, wakeConfig, wakeConfigForAgent } = this.deps;
     const set = this.deferredAtCapacity.get(agentId);
-    if (!set || set.size === 0) return;
+    if (!set || set.size === 0) return [];
 
-    const activeCount = sessionTracker.getActiveSessionKeys(agentId).length;
     const maxConcurrent = this.getAgentMaxConcurrentValue(agentId);
-    if (activeCount >= maxConcurrent) return;
 
-    const isTicketActionable = this.deps.resignalOptions?.isTicketActionable ?? isLinearIssueActionable;
+    const rearmed: string[] = [];
     for (const ticketId of [...set]) {
+      const activeCount = sessionTracker.getActiveSessionKeys(agentId).length;
+      if (activeCount >= maxConcurrent) break;
+
       set.delete(ticketId);
 
       // End the stale session so resignalPendingTickets can open a fresh one.
       sessionTracker.endSession(agentId, ticketId);
       this.clearWarned(agentId, ticketId);
-
-      if (!(await isTicketActionable(ticketId, agentId))) {
-        log.info(`No-activity: deferred ticket ${ticketId} no longer actionable — skipping`);
-        continue;
-      }
 
       const pendingIds = bag.getPendingTickets(agentId).map((e) => e.ticketId);
       if (!pendingIds.includes(ticketId)) {
@@ -260,6 +287,7 @@ export class NoActivityDetector {
       );
 
       if (results.some((r) => r.dispatched)) {
+        rearmed.push(ticketId);
         operationalEventStore.append({
           outcome: "deferred-capacity-rearm",
           agent: agentId,
@@ -275,6 +303,7 @@ export class NoActivityDetector {
     if (set.size === 0) {
       this.deferredAtCapacity.delete(agentId);
     }
+    return rearmed;
   }
 
   /**
@@ -352,9 +381,15 @@ export class NoActivityDetector {
 
       if (ageMs >= effectiveFailMs) {
         // Check capacity before deciding: at-capacity → defer; hard-down → escalate
-        const activeCount = sessionTracker.getActiveSessionKeys(agentId).length;
+        const activeKeys = sessionTracker.getActiveSessionKeys(agentId);
+        const otherActiveCount = activeKeys.filter((key) => key !== sessionKey).length;
         const maxConcurrent = this.getAgentMaxConcurrentValue(agentId);
-        if (activeCount >= maxConcurrent) {
+        const configCap = normalizeSerializeCap(this.deps.getAgentConfig?.(agentId)?.maxConcurrent);
+        const selfOnlyExplicitConfigCap =
+          configCap !== undefined &&
+          activeKeys.length === 1 &&
+          activeKeys[0] === sessionKey;
+        if (!selfOnlyExplicitConfigCap && otherActiveCount >= maxConcurrent - 1) {
           await this.handleAtCapacity(entry, sessionKey);
           result.deferredAtCapacity++;
           continue;

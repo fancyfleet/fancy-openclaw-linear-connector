@@ -38,6 +38,7 @@ import {
 import { loadWorkflowRegistry, type WorkflowDef } from "./workflow-gate.js";
 import { isTerminalIssueState } from "./linear-actionable.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
+import { getRateLimitClient } from "./linear-rate-limit-client.js";
 import { registerCron, markCronRun, formatIntervalMs } from "./cron/registry.js";
 import { buildAgentMap, getLinearUserIdForAgent, getOpenclawAgentName } from "./agents.js";
 import { resolveBodiesForRole } from "./escalation-gate.js";
@@ -626,11 +627,13 @@ export async function runBootstrapReconciliationSweep(
   const authToken = typeof opts.authToken === "function" ? opts.authToken() : opts.authToken;
   const graceWindowMs = opts.graceWindowMs ?? DEFAULT_GRACE_WINDOW_MS;
   const nowMs = opts.nowMs ?? Date.now();
-  const fetchFn = opts.fetchFn ?? globalThis.fetch;
   // Default to the global alert bus singleton so the prod cron path always
   // emits alerts even when the caller (index.ts) doesn't inject one.
   // Tests inject their own bus to assert alert behavior.
   const alertBus = opts.alertBus ?? getAlertBus();
+  // INF-923: route the reconciliation query path through the shared rate-limit
+  // breaker so this cron consumer halts under sustained 429s alongside the rest.
+  const fetchFn = getRateLimitClient(alertBus).wrap(opts.fetchFn ?? globalThis.fetch);
   const wakeFn = opts.wakeFn;
   const workflowRegistry = await loadDispatchWorkflowRegistry(opts, wakeFn);
 

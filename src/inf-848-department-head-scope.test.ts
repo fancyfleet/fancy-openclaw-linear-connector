@@ -102,7 +102,11 @@ function makeLabelFetch(labels: string[]): typeof globalThis.fetch {
     })) as unknown as typeof globalThis.fetch;
 }
 
-function makeRoute(identifier: string, title: string): RouteResult {
+function makeRoute(
+  identifier: string,
+  title: string,
+  scope?: { teamKey?: string; teamName?: string; department?: string; team?: string },
+): RouteResult {
   return {
     agentId: "charles",
     sessionKey: `linear-${identifier}`,
@@ -112,7 +116,14 @@ function makeRoute(identifier: string, title: string): RouteResult {
       type: "Issue",
       action: "update",
       actor: { id: "u1", name: "Ai", type: "user" },
-      data: { identifier, title },
+      data: {
+        identifier,
+        title,
+        team: scope ? { key: scope.teamKey, name: scope.teamName } : undefined,
+        workflowEnrollment: scope
+          ? { department: scope.department, team: scope.team, charterRef: "engineering-department-charter" }
+          : undefined,
+      },
     } as unknown as RouteResult["event"],
   };
 }
@@ -209,7 +220,12 @@ describe("INF-848 AC3: Engineering department-engine head routing stays staffed 
     const evaluating = def!.states.find((s) => s.id === "evaluating");
     const proposeTheme = evaluating!.transitions?.find((t) => t.command === "propose-theme");
 
-    await expect(resolveTransitionTargets(proposeTheme!, def!)).resolves.toEqual({
+    await expect(resolveTransitionTargets(proposeTheme!, def!, {
+      issueIdentifier: "ENG-848",
+      teamKey: "ENG",
+      teamName: "Engineering",
+      workflowEnrollment: { department: "ENG", team: "Engineering" },
+    })).resolves.toEqual({
       bodies: ["charles"],
       mode: "auto",
     });
@@ -219,7 +235,12 @@ describe("INF-848 AC3: Engineering department-engine head routing stays staffed 
     globalThis.fetch = makeLabelFetch(["wf:dept-engine", "state:evaluating"]);
     const { buildDeliveryMessage } = await import("./delivery/build-message.js");
 
-    const message = await buildDeliveryMessage(makeRoute("ENG-848", "Engineering department engine"), TOK);
+    const message = await buildDeliveryMessage(makeRoute("ENG-848", "Engineering department engine", {
+      teamKey: "ENG",
+      teamName: "Engineering",
+      department: "ENG",
+      team: "Engineering",
+    }), TOK);
 
     expect(message).toContain("This is a [dept-engine] managed workflow ticket");
     expect(message).toContain("linear continue-workflow ENG-848");
@@ -229,7 +250,12 @@ describe("INF-848 AC3: Engineering department-engine head routing stays staffed 
   });
 
   it("routing guard corrects wrong dept-engine dispatches to the scoped Engineering head", async () => {
-    await expect(checkRoleGuardEnforced("laren", ["wf:dept-engine", "state:evaluating"])).resolves.toEqual(
+    await expect(checkRoleGuardEnforced("laren", ["wf:dept-engine", "state:evaluating"], {
+      issueIdentifier: "ENG-848",
+      teamKey: "ENG",
+      teamName: "Engineering",
+      workflowEnrollment: { department: "ENG", team: "Engineering" },
+    })).resolves.toEqual(
       expect.objectContaining({
         blocked: true,
         correctedTo: "charles",
