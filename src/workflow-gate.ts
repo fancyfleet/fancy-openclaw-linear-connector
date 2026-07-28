@@ -4727,10 +4727,31 @@ export async function checkRawMutationInterception(
       );
     }
     if (callerLinearUserId && delegateId && callerLinearUserId !== delegateId) {
+      // INF-953: break-glass steward carve-out. This raw delegate-only guard
+      // otherwise blocks a workflow steward from taking over a ticket that has a
+      // *live wrong* delegate. Its sibling guards — escape (§4.4), refuse-work
+      // (AI-1460/AI-1574) and the no-current-delegate first-delegate branch below
+      // (AI-1570) — all carve out the steward (break_glass.owner_role), but this
+      // branch did not: a steward could establish a delegate on an *empty*-delegate
+      // ticket yet was blocked from re-routing one whose delegate was live-but-wrong.
+      // Mirror the sibling carve-outs. Scope is a non-null re-route (takeover): a
+      // null self-clear is already caught by the isClearingDelegate guard above and
+      // remains an escape/break-glass concern, so the steward cannot use this path to
+      // clear the field — only to hand it to a correct owner.
+      const stewardRole = def.break_glass?.owner_role;
+      if (stewardRole) {
+        const stewards = await resolveBodiesForRole(stewardRole);
+        if (bodyId && stewards.includes(bodyId)) {
+          log.warn(
+            `workflow-gate: raw delegate-only steward-takeover ALLOW agent=${bodyId} ticket=${issueId} (break-glass carve-out; re-routing a live wrong delegate)`,
+          );
+          return null;
+        }
+      }
       log.warn(`workflow-gate: raw delegate-only block agent=${bodyId} ticket=${issueId} (not current delegate)`);
       return (
         `[Proxy] Direct delegate change blocked: ${bodyId} is not the current delegate for ${issueId}. ` +
-        `Only the ticket delegate may re-route it (use handoff-work as the delegate, or advance via a workflow transition verb).`
+        `Only the ticket delegate or the workflow steward may re-route it (use handoff-work as the delegate, or advance via a workflow transition verb).`
       );
     }
     // AI-1570: no current delegate, but the ticket is governed. The old code
