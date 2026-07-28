@@ -162,7 +162,7 @@ describe("INF-753 D1: Pass 5 must NEVER seat when the LIVE label raced to termin
     });
 
     expect(result.seated).toBe(0);
-    expect(mutationCalls.filter((b) => b.includes("SeatRoleOwnerDelegate"))).toHaveLength(0);
+    expect(mutationCalls.filter((b) => b.includes("WriteDelegate"))).toHaveLength(0);
   });
 
   it("still seats normally when the live label is unchanged (guard is not over-broad)", async () => {
@@ -188,7 +188,7 @@ describe("INF-753 D1: Pass 5 must NEVER seat when the LIVE label raced to termin
     });
 
     expect(result.seated).toBe(1);
-    expect(mutationCalls.filter((b) => b.includes("SeatRoleOwnerDelegate"))).toHaveLength(1);
+    expect(mutationCalls.filter((b) => b.includes("WriteDelegate"))).toHaveLength(1);
   });
 });
 
@@ -227,7 +227,7 @@ describe("INF-753 D2: Mode 2 heals a MIS-SEATED terminal ticket", () => {
     expect(result.healed).toBeGreaterThanOrEqual(1);
 
     // The mis-seat must NOT be re-created by Pass 5 in the same sweep.
-    expect(mutationCalls.filter((b) => b.includes("SeatRoleOwnerDelegate"))).toHaveLength(0);
+    expect(mutationCalls.filter((b) => b.includes("WriteDelegate"))).toHaveLength(0);
 
     const healAlerts = alerts.filter((a) => JSON.stringify(a.detail ?? {}).includes("mode-2-misseat-heal"));
     expect(healAlerts.length).toBeGreaterThanOrEqual(1);

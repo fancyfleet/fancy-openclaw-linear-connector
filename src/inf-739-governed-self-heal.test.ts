@@ -151,7 +151,7 @@ describe("INF-739 Mode 1: auto-seat role owner on actionable null-delegate ticke
     expect(opts.resolveBodiesForRole).toHaveBeenCalledWith("dev");
 
     // Exactly one seat mutation, setting the resolved delegate and nothing else.
-    const seatMutations = mutationCalls.filter((b) => b.includes("SeatRoleOwnerDelegate"));
+    const seatMutations = mutationCalls.filter((b) => b.includes("WriteDelegate"));
     expect(seatMutations).toHaveLength(1);
     expect(seatMutations[0]).toContain("igor-linear-uuid");
     expect(seatMutations[0]).not.toContain("stateId");
@@ -190,7 +190,7 @@ describe("INF-739 Mode 1: auto-seat role owner on actionable null-delegate ticke
     });
 
     expect(result.seated).toBe(0);
-    expect(mutationCalls.filter((b) => b.includes("SeatRoleOwnerDelegate"))).toHaveLength(0);
+    expect(mutationCalls.filter((b) => b.includes("WriteDelegate"))).toHaveLength(0);
     expect(opts.resolveBodiesForRole).not.toHaveBeenCalled();
   });
 
@@ -219,7 +219,7 @@ describe("INF-739 Mode 1: auto-seat role owner on actionable null-delegate ticke
     });
 
     expect(result.seated).toBe(0);
-    expect(mutationCalls.filter((b) => b.includes("SeatRoleOwnerDelegate"))).toHaveLength(0);
+    expect(mutationCalls.filter((b) => b.includes("WriteDelegate"))).toHaveLength(0);
   });
 
   it("NEVER seats a delegate on a terminal-labeled ticket (the LSO-20 bug / INF-717 fix A)", async () => {
@@ -248,7 +248,7 @@ describe("INF-739 Mode 1: auto-seat role owner on actionable null-delegate ticke
     // Mode 1 must not fire at all — not even resolve the role.
     expect(result.seated).toBe(0);
     expect(opts.resolveBodiesForRole).not.toHaveBeenCalled();
-    expect(mutationCalls.filter((b) => b.includes("SeatRoleOwnerDelegate"))).toHaveLength(0);
+    expect(mutationCalls.filter((b) => b.includes("WriteDelegate"))).toHaveLength(0);
   });
 });
 
@@ -288,7 +288,7 @@ describe("INF-739 Mode 2 regression: terminal-label desync reconciles native→D
     const reconcile = mutationCalls.filter((b) => b.includes("ReconcileTerminalNativeState"));
     expect(reconcile).toHaveLength(1);
     expect(reconcile[0]).toContain(DONE_STATE_ID);
-    expect(mutationCalls.filter((b) => b.includes("SeatRoleOwnerDelegate"))).toHaveLength(0);
+    expect(mutationCalls.filter((b) => b.includes("WriteDelegate"))).toHaveLength(0);
 
     const reconcileAlerts = alerts.filter((a) => a.title.includes("reconciled terminal-label"));
     expect(reconcileAlerts).toHaveLength(1);

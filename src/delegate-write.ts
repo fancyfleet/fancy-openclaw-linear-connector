@@ -20,9 +20,6 @@ export interface WriteDelegateResult {
   error?: string;
 }
 
-/** Read-back retry budget. Reads fail transiently under API stress (INF-984). */
-const VERIFY_ATTEMPTS = 3;
-const VERIFY_RETRY_MS = 150;
 
 /**
  * INF-1002 — the single chokepoint for writing an issue's delegate.
@@ -106,39 +103,35 @@ export async function writeDelegate(
   // Single-issue reads fail under API stress, and this helper now sits on every
   // delegate write — asserting non-persistence on a read error would false-fail
   // fleet-wide during a read storm and make callers churn on good writes. So we
-  // retry the read, and only on a *confirmed* read do we compare; a read that
-  // never confirms returns an explicit UNVERIFIED result, trusting the write's
-  // own success rather than asserting it reverted.
+  // compare only on a *confirmed* read; a read that fails (throw / GraphQL errors
+  // / no issue) returns an explicit UNVERIFIED result, trusting the write's own
+  // reported success rather than asserting it reverted.
   let persisted: string | null = null;
   let readConfirmed = false;
   let lastReadErr = "read-back unavailable";
-  for (let attempt = 1; attempt <= VERIFY_ATTEMPTS; attempt++) {
-    try {
-      const query = `query VerifyDelegate($issueId: String!) { issue(id: $issueId) { delegate { id } } }`;
-      const res = await fetchFn(LINEAR_API_URL, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: authToken },
-        body: JSON.stringify({ query, variables: { issueId } }),
-      });
-      type QResp = {
-        data?: { issue?: { delegate?: { id: string } | null } | null };
-        errors?: Array<{ message: string }>;
-      };
-      const data = (await res.json()) as QResp;
-      if (data.errors?.length) {
-        lastReadErr = data.errors.map((e) => e.message).join("; ");
-      } else if (data.data && data.data.issue) {
-        // A real issue object came back — this read is authoritative.
-        persisted = data.data.issue.delegate?.id ?? null;
-        readConfirmed = true;
-        break;
-      } else {
-        lastReadErr = "read-back returned no issue";
-      }
-    } catch (err) {
-      lastReadErr = err instanceof Error ? err.message : String(err);
+  try {
+    const query = `query VerifyDelegate($issueId: String!) { issue(id: $issueId) { delegate { id } } }`;
+    const res = await fetchFn(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: authToken },
+      body: JSON.stringify({ query, variables: { issueId } }),
+    });
+    type QResp = {
+      data?: { issue?: { delegate?: { id: string } | null } | null };
+      errors?: Array<{ message: string }>;
+    };
+    const data = (await res.json()) as QResp;
+    if (data.errors?.length) {
+      lastReadErr = data.errors.map((e) => e.message).join("; ");
+    } else if (data.data && data.data.issue) {
+      // A real issue object came back — this read is authoritative.
+      persisted = data.data.issue.delegate?.id ?? null;
+      readConfirmed = true;
+    } else {
+      lastReadErr = "read-back returned no issue";
     }
-    if (attempt < VERIFY_ATTEMPTS) await new Promise((r) => setTimeout(r, VERIFY_RETRY_MS));
+  } catch (err) {
+    lastReadErr = err instanceof Error ? err.message : String(err);
   }
 
   if (!readConfirmed) {
@@ -146,7 +139,7 @@ export async function writeDelegate(
     // assert non-persistence. Trust the write's reported success, but mark it
     // unverified and loud so it is auditable. (INF-984.)
     log.warn(
-      `writeDelegate: could not verify persistence for ${issueId} after ${VERIFY_ATTEMPTS} attempts ` +
+      `writeDelegate: could not verify persistence for ${issueId} ` +
         `(${lastReadErr}); the write reported success — returning UNVERIFIED, not asserting non-persistence (INF-984).`,
     );
     return { ok: true, verified: false, persistedDelegateId: null, error: `unverified: ${lastReadErr}` };

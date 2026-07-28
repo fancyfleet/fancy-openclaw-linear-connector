@@ -208,7 +208,7 @@ describe("AI-2044: role-guard never evicts a legal in-flight delegate", () => {
 
     expect(result.blocked).toBe(true);
     expect(result.delegatePreserved).toBeUndefined();
-    const clears = fetchCalls.filter((c) => c.query.includes("ClearDelegate"));
+    const clears = fetchCalls.filter((c) => c.query.includes("delegateId: null"));
     expect(clears).toHaveLength(1);
     const comments = fetchCalls.filter((c) => c.query.includes("commentCreate"));
     expect(comments).toHaveLength(1);
@@ -224,7 +224,7 @@ describe("AI-2044: role-guard never evicts a legal in-flight delegate", () => {
 
     expect(result.blocked).toBe(true);
     expect(result.correctedTo).toBe("sage");
-    const updates = fetchCalls.filter((c) => c.query.includes("UpdateDelegate"));
+    const updates = fetchCalls.filter((c) => c.query.includes("WriteDelegate") && "delegateId" in (c.variables ?? {}));
     expect(updates).toHaveLength(1);
     expect(updates[0].variables).toMatchObject({ delegateId: LINEAR_IDS.sage });
   });
