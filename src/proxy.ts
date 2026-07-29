@@ -1527,7 +1527,8 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
                       def,
                       issueId,
                       target ?? undefined,
-                      agentId,
+                      undefined, // context — not available in proxy pre-resolve path
+                      agentId, // callerBodyId
                     );
                     if (resolved !== undefined) {
                       delegateOverride = resolved;
