@@ -1,4 +1,4 @@
-import { normalizeSessionKey } from "../session-key.js";
+import { makeFreshSessionKey, normalizeSessionKey } from "../session-key.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { sendWakeUpSignal, MENTION_TICKET_TEMPLATE, type WakeUpConfig } from "./wake-up.js";
 import { PendingWorkBag } from "./pending-work-bag.js";
@@ -36,6 +36,22 @@ export interface ResignalOptions {
    * Has no effect when isTicketActionable is provided (custom override bypasses this logic).
    */
   failOpenBehavior?: "dispatch" | "defer";
+  /**
+   * INF-982: map of (agentId → [ticketId → freshRecoveryKey]) used for stale-session
+   * re-dispatch. When a stale-session recovery transitions a C2/C4 ticket back to
+   * To Do and re-dispatches, the new dispatch should use a session key that does NOT
+   * match the stale session, so that the stale-session forensics module reads the NEW
+   * session's data (not the old zero-output stale data) on the next timeout.
+   *
+   * The key is a versioned form like `linear-INF-982:r1` which the delivery layer
+   * passes through to the gateway as the session label, creating a fresh OpenClaw
+   * session. The stale-forensics `findSessionFile` searches by the session key;
+   * the versioned key only matches the new dispatch's session, not any old stale ones.
+   *
+   * Internal tracking (sessionTracker, bag, ackTracker) uses the normalized base key
+   * (`linear-INF-982`), so dedup and tracking remain coherent across version boundaries.
+   */
+  staleRecoveryKeys?: Map<string, Map<string, string>>;
 }
 
 /**
@@ -140,7 +156,16 @@ export async function resignalPendingTickets(
       // when markActive is set, so no second startSession is needed here.
       bag.recordSignal();
 
-      const wakeResult = await sendWakeUp(agentId, [ticketId], ticketWakeConfig);
+      // INF-982: when a stale-recovery fresh key is registered for this (agent, ticket),
+      // pass the versioned key to the delivery layer instead of the normalized base key.
+      // This creates a new OpenClaw session label so the stale-session forensics module
+      // doesn't read the old zero-output session data on the next timeout.
+      const freshRecoveryKey = options.staleRecoveryKeys
+        ?.get(agentId)
+        ?.get(ticketId);
+      const dispatchTicketIds = freshRecoveryKey ? [freshRecoveryKey] : [ticketId];
+
+      const wakeResult = await sendWakeUp(agentId, dispatchTicketIds, ticketWakeConfig);
       const wakeRunId = (wakeResult as { runId?: string; canonVersion?: string } | void | undefined)?.runId;
 
       // INF-1026: the active-session slot was claimed optimistically BEFORE delivery

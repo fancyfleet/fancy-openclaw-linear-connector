@@ -38,6 +38,7 @@ import type { SessionTracker } from "./session-tracker.js";
 import type { PendingWorkBag } from "./pending-work-bag.js";
 import type { OperationalEventStore } from "../store/operational-event-store.js";
 import type { WakeUpConfig } from "./wake-up.js";
+import type { GlobalRedispatchBudget } from "./global-redispatch-budget.js";
 import { resignalPendingTickets, type ResignalOptions } from "./resignal.js";
 import { isLinearIssueActionable } from "../linear-actionable.js";
 import { tryNormalizeSessionKey } from "../session-key.js";
@@ -87,6 +88,11 @@ export interface NoActivityDeps {
    *  for this ticket. Return undefined to fall back to the global default.
    *  Populated by workflow-gate after each state transition. */
   getFailMsForTicket?: (agentId: string, ticketId: string) => number | undefined;
+  /**
+   * INF-982: shared global redispatch budget. When provided, used instead of the
+   * per-detector attemptCount from the ack tracker, so all detectors share one cap.
+   */
+  globalRedispatchBudget?: GlobalRedispatchBudget;
 }
 
 export interface NoActivityCycleResult {
@@ -532,16 +538,25 @@ export class NoActivityDetector {
     const maxResignals = parseInt(process.env.WATCHDOG_MAX_RESIGNALS ?? "3", 10);
     const maxDeliveryFailures = parseInt(process.env.WATCHDOG_MAX_DELIVERY_FAILURES ?? "3", 10);
 
+    // INF-982: when a global redispatch budget is shared across all detectors,
+    // use IT instead of the per-detector ack-tracker attempt count for the cap check.
+    const effectiveAttemptCount = this.deps.globalRedispatchBudget
+      ? this.deps.globalRedispatchBudget.consume(ticketId)
+      : attemptCount;
+    const effectiveMax = this.deps.globalRedispatchBudget
+      ? this.deps.globalRedispatchBudget.maxAttempts
+      : maxResignals;
+
     // 2. Retries exhausted (agent repeatedly accepts wakes but never works).
     // Escalate BEFORE re-dispatching or commenting — no "attempt N" noise.
     // "Manual intervention required" must actually reach a human — the 🔴 comment
     // only helps if someone reads that ticket (audit #14: hours of re-dispatch
     // loops before anyone notices a broken agent).
-    if (attemptCount >= maxResignals) {
+    if (effectiveAttemptCount >= effectiveMax) {
       await this.escalate(
         entry,
         sessionKey,
-        `${attemptCount} attempt(s) exhausted — the gateway accepted the dispatch but the agent never produced any activity (model down? auth token expired?)`,
+        `${effectiveAttemptCount} attempt(s) exhausted (cap: ${effectiveMax}) — the gateway accepted the dispatch but the agent never produced any activity (model down? auth token expired?)`,
       );
       return false;
     }

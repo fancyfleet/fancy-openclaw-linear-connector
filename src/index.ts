@@ -19,7 +19,7 @@ import { ManagingStateStore } from "./store/managing-state-store.js";
 import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent, deliverMessageToAgent, type DeliveryConfig, DeliveryThrottle, DispatchDeliveryScheduler } from "./delivery/index.js";
 import { buildWorkflowAwareDeliveryMessage } from "./delivery/build-message.js";
-import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, StuckDelegateDetector, HoldRetryTracker, resignalPendingTickets, replayPendingBag, ManagingPoller } from "./bag/index.js";
+import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, StuckDelegateDetector, HoldRetryTracker, GlobalRedispatchBudget, resignalPendingTickets, replayPendingBag, ManagingPoller } from "./bag/index.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 import { reconciliationWakeFn as reconciliationWakeWithLeaseCheck } from "./bag/reconciliation-wake.js";
 import { getAutoEnrollLiveness, getCommitmentGateLiveness, getTicketNoActivityTimeoutMs, getWorkflowRegistryLiveness, loadWorkflowRegistry } from "./workflow-gate.js";
@@ -27,7 +27,7 @@ import { getFanoutPreviewCreateLiveness, registerFanoutPreviewCreate } from "./f
 import { getDefStateMigrationLiveness, registerDefStateMigrationRunner } from "./def-state-migration.js";
 import { getFixtureDriftLiveness, runFixtureDriftCheck } from "./fixture-drift-detector.js";
 import { registerTranscriptRedaction, getTranscriptRedactionHealth } from "./transcript-redaction.js";
-import { normalizeSessionKey } from "./session-key.js";
+import { makeFreshSessionKey, normalizeSessionKey } from "./session-key.js";
 import { applyEngagementStatus, registerEngagementNativeStateOverlay } from "./engagement-status.js";
 import { createAdminRouter } from "./admin.js";
 import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, collectSameKeySessionReplay, STALE_CLASS_NAMES, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
@@ -810,6 +810,10 @@ export function createApp(options?: CreateAppOptions) {
       sessionSpawnStore,
     };
   };
+  // INF-982: shared global redispatch budget across all detectors (stale-session forensics,
+  // no-activity-detector, dispatch-watchdog). Ensures all three use the same cap.
+  const globalRedispatchBudget = new GlobalRedispatchBudget();
+
   const resignalOptions = {
     sendWakeUp: options?.sendWakeUp
       ? (agentId: string, ticketIds: string[]) => options.sendWakeUp!(agentId, ticketIds)
@@ -817,6 +821,11 @@ export function createApp(options?: CreateAppOptions) {
     // When a test sendWakeUp is provided, also bypass the Linear API routing check.
     ...(options?.sendWakeUp ? { isTicketActionable: () => true as boolean | Promise<boolean> } : {}),
   };
+  // INF-982: cache of fresh recovery keys (agentId → ticketId → versioned session key)
+  // produced by processStaleSession. Stored as a mutable map accessible from the
+  // closure so buildRecoveryFreshKey can write and processStaleSession can read.
+  const recoveryFreshKeys = new Map<string, Map<string, string>>();
+
   const forensicsConfig: ForensicsConfig = {
     diagnosticsDir: process.env.STALE_SESSION_DIAGNOSTICS_DIR,
     openclawHome: process.env.OPENCLAW_HOME,
@@ -828,6 +837,23 @@ export function createApp(options?: CreateAppOptions) {
     infraOwnerLinearId:
       process.env.STALE_INFRA_OWNER_LINEAR_ID ??
       getLinearUserIdForAgent(process.env.STALE_INFRA_OWNER_AGENT ?? "grover"),
+    // INF-982: share the global redispatch budget so stale-session forensics
+    // doesn't use its independent StaleRedispatchCounter.
+    globalRedispatchBudget,
+    // INF-982: when a stale C4/C2 hits the cap, build a fresh session key for
+    // the re-dispatch so the next stale-session recovery reads new session data,
+    // not the old stale session's JSONL.
+    onFreshKeyNeeded(agentId, ticketId, attemptNumber) {
+      const freshKey = makeFreshSessionKey(ticketId, attemptNumber);
+      let agentKeys = recoveryFreshKeys.get(agentId);
+      if (!agentKeys) {
+        agentKeys = new Map();
+        recoveryFreshKeys.set(agentId, agentKeys);
+      }
+      agentKeys.set(ticketId, freshKey);
+      log.info(`[INF-982] Fresh recovery key for ${ticketId}: ${freshKey} (agent=${agentId}, attempt=${attemptNumber})`);
+      return freshKey;
+    },
   };
 
   function buildSameKeySessionReplay(stale: StaleSessionDetail): NonNullable<ForensicsConfig["sameKeySessionReplay"]> {
@@ -995,8 +1021,15 @@ export function createApp(options?: CreateAppOptions) {
 
     // 7. Re-signal pending tickets (if any)
     if (stale.pendingTickets.length > 0) {
+      // INF-982: include fresh recovery keys so re-dispatched sessions use a
+      // versioned key that prevents the stale-session forensics from matching
+      // old stale sessions.
+      const agentFreshKeys = recoveryFreshKeys.get(stale.agentId);
+      const staleRecoveryKeys = agentFreshKeys && agentFreshKeys.size > 0
+        ? new Map([[stale.agentId, new Map(agentFreshKeys)]])
+        : undefined;
       log.info(`Stale session drain: re-signaling ${stale.agentId} for ${stale.pendingTickets.length} ticket(s)`);
-      const sent = await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfigForAgent(stale.agentId), { markActive: true, ...resignalOptions });
+      const sent = await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfigForAgent(stale.agentId), { markActive: true, staleRecoveryKeys, ...resignalOptions });
       operationalEventStore.append({
         outcome: "stale-resignaled",
         agent: stale.agentId,
@@ -1292,6 +1325,9 @@ export function createApp(options?: CreateAppOptions) {
       linearResolveCheck,
       delegateCheck,
       workflowStateCheck,
+      // INF-982: share the global redispatch budget so the watchdog doesn't
+      // use its independent ack-tracker attempt count.
+      globalRedispatchBudget,
     },
     {
       exponentialBackoffMs:
@@ -1323,6 +1359,9 @@ export function createApp(options?: CreateAppOptions) {
       postLinearComment,
       getAgentConfig: getAgent,
       getFailMsForTicket: (_agentId: string, ticketId: string) => getTicketNoActivityTimeoutMs(ticketId),
+      // INF-982: share the global redispatch budget so the no-activity detector
+      // doesn't use its independent ack-tracker attempt count.
+      globalRedispatchBudget,
     },
   );
   noActivityDetector.start();
@@ -2016,7 +2055,7 @@ export function createApp(options?: CreateAppOptions) {
   registerTtlInvalidationCron(ttlCache, 60_000);
   log.info("INF-193: TTL cache invalidation cron registered (every 60s)");
 
-  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore, livenessDispatchStore, linearRateLimitClient, transcriptRedactionHealth: getTranscriptRedactionHealth() });
+  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore, livenessDispatchStore, linearRateLimitClient, globalRedispatchBudget, transcriptRedactionHealth: getTranscriptRedactionHealth() });
 }
 
 /**

@@ -16,7 +16,7 @@ import path from "node:path";
 import { deliverMessageToAgent, type DeliveryConfig, type DeliveryResult } from "../delivery/index.js";
 import { buildWorkflowAwareDeliveryMessage } from "../delivery/build-message.js";
 import { loadUniversalCanon, formatCanonBlock, getActiveCanonVersion, type CanonLoadResult } from "../policy/universal-canon.js";
-import { normalizeSessionKey } from "../session-key.js";
+import { normalizeSessionKey, stripRecoveryVersion } from "../session-key.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { randomUUID } from "node:crypto";
 import { TERMINAL_STOP_ROTATION_REASON, type SessionSpawnIdempotencyStore, type SessionSpawnRuntime } from "../store/session-spawn-idempotency-store.js";
@@ -174,7 +174,10 @@ export async function sendWakeUpSignal(
   let canonVersion: string | null = null;
 
   if (ticketIds.length === 1 && config.linearAuthToken) {
-    const plainId = ticketIds[0].replace(/^linear-/i, "");
+    // INF-982: strip recovery version suffix before building the workflow-aware
+    // message, so the Linear query uses the clean ticket identifier.
+    const rawTicketId = ticketIds[0].replace(/:r\d+$/i, "");
+    const plainId = rawTicketId.replace(/^linear-/i, "");
     const rich = await buildWorkflowAwareDeliveryMessage(plainId, config.linearAuthToken, agentId);
     if (rich) {
       // buildWorkflowAwareDeliveryMessage already injects the canon via withCanonBlock.
@@ -204,14 +207,22 @@ export async function sendWakeUpSignal(
 
   // Normalize to strip any legacy prefixes and enforce uppercase.
   // Result is always exactly `linear-<TEAM>-<NUMBER>`.
-  const sessionKey = normalizeSessionKey(ticketIds[0]);
+  const baseKey = ticketIds[0];
+  // INF-982: when a stale-recovery fresh key (linear-INF-982:rN) is passed in,
+  // use it DIRECTLY as the gateway session label so OpenClaw creates a new session
+  // that doesn't match old stale sessions. The normalized key is used for internal
+  // tracking (idempotency, bag, ackTracker) via stripRecoveryVersion.
+  const sessionKey = baseKey.includes(":r")
+    ? baseKey
+    : normalizeSessionKey(baseKey);
+  const normalizedKey = normalizeSessionKey(baseKey);
   const taskKey = config.sessionSpawnTaskKey ?? config.workflowState ?? agentId;
   const idempotency = config.sessionSpawnStore?.beginOrGetExisting({
-    ticketId: ticketIdFromSessionKey(sessionKey),
+    ticketId: ticketIdFromSessionKey(normalizedKey),
     taskKey,
     runtime: deliveryRuntime(config),
     agentId,
-    sessionKey,
+    sessionKey: normalizedKey,
   });
   // INF-1003: terminal-session rotation guard on the pending-bag re-dispatch
   // path. Mirrors deliverToAgent — a bound session whose last transcript turn

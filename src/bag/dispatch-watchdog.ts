@@ -28,6 +28,7 @@ import type { PendingWorkBag } from "./pending-work-bag.js";
 import type { SessionTracker } from "./session-tracker.js";
 import type { DispatchAckTracker } from "./dispatch-ack-tracker.js";
 import type { OperationalEventStore } from "../store/operational-event-store.js";
+import type { GlobalRedispatchBudget } from "./global-redispatch-budget.js";
 import { resignalPendingTickets, type ResignalOptions } from "./resignal.js";
 import type { WakeUpConfig } from "./wake-up.js";
 import { normalizeSessionKey } from "../session-key.js";
@@ -72,6 +73,11 @@ export interface WatchdogDeps {
   /** AI-2116: precondition guard — check if ticket is in a workflow with a resolvable
    *  forward verb before emitting a "run pending transition" wake. */
   workflowStateCheck?: (ticketId: string) => Promise<{ inWorkflow: boolean; resolvableVerb: string | null }>;
+  /**
+   * INF-982: shared global redispatch budget. When provided, used instead of the
+   * per-detector attemptCount from the ack tracker, so all detectors share one cap.
+   */
+  globalRedispatchBudget?: GlobalRedispatchBudget;
 }
 
 export interface WatchdogCycleResult {
@@ -242,7 +248,16 @@ export class DispatchWatchdog {
         }
       }
 
-      if (attemptCount > this.config.maxResignals) {
+      // INF-982: when a global redispatch budget is shared across all detectors,
+      // use IT instead of the per-detector ack-tracker attempt count.
+      const effectiveAttemptCount = this.deps.globalRedispatchBudget
+        ? this.deps.globalRedispatchBudget.consume(ticketId)
+        : attemptCount;
+      const effectiveMax = this.deps.globalRedispatchBudget
+        ? this.deps.globalRedispatchBudget.maxAttempts
+        : this.config.maxResignals;
+
+      if (effectiveAttemptCount > effectiveMax) {
         ackTracker.markEscalated(agentId, ticketId);
         escalated++;
         operationalEventStore.append({
@@ -250,11 +265,11 @@ export class DispatchWatchdog {
           agent: agentId,
           key: ticketId,
           sessionKey: ticketId,
-          attemptCount,
-          detail: { maxResignals: this.config.maxResignals },
+          attemptCount: effectiveAttemptCount,
+          detail: { maxResignals: effectiveMax },
         });
         log.error(
-          `Watchdog escalation: ${agentId} [${ticketId}] — ${attemptCount} attempts, max is ${this.config.maxResignals}`,
+          `Watchdog escalation: ${agentId} [${ticketId}] — ${effectiveAttemptCount} attempts, max is ${effectiveMax}`,
         );
         continue;
       }

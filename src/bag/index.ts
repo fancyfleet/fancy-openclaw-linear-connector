@@ -11,3 +11,4 @@ export { ManagingPoller, parseManagingInterval, isDue, type ManagingPollerConfig
 export { buildManagingWakeMessage, sendManagingWakeSignal, type ManagingWakeTicket } from "./managing-wake.js";
 export { HoldRetryTracker, type HoldRetryConfig } from "./hold-retry-tracker.js";
 export { DoneTicketDetector, type DoneTicketDetectorConfig, type DoneTicketDetectorDeps, type DoneTicketCycleResult, type LinearApi, type GitApi, type LinearIssue, type LinearCreateIssueInput } from "./done-ticket-detector.js";
+export { GlobalRedispatchBudget, type RedispatchBudgetConfig } from "./global-redispatch-budget.js";
