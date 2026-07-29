@@ -57,7 +57,7 @@ import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./co
 import { captureAc, extractAcFromDescription, removeAcRecord } from "./ac-record-store.js";
 import { validateDefStateRemovals } from "./def-state-migration.js";
 import { readDefStateSnapshot, writeDefStateSnapshot } from "./store/def-state-snapshot-store.js";
-import { recordImplementer, getImplementer, removeImplementer } from "./implementer-store.js";
+import { recordImplementer, getImplementer, removeImplementer, getBinding, recordBinding } from "./implementer-store.js";
 import { recordAppliedState, clearAppliedState, getAppliedState } from "./store/applied-state-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import { reposWithoutCiAutoDeploy, githubRepoFromUrl } from "./deploy-policy.js";
@@ -1973,6 +1973,20 @@ export async function resolveTransitionDelegate(
     const targetAgent = getAgent(cliTarget);
     if (targetAgent?.linearUserId) {
       return targetAgent.linearUserId;
+    }
+  }
+
+  // (1.5) INF-996: bound-role resolution. If the destination state is
+  // `owner_binding: bound` and a body is already pinned for this ticket+role,
+  // the pin is authoritative — return it, NEVER re-resolve from the pool. This
+  // is the pre-compute mirror of the same step in applyStateTransition.
+  if (destStateNode.owner_binding === 'bound' && destOwnerRole) {
+    const boundBody = await getBinding(issueId, destOwnerRole);
+    if (boundBody) {
+      const agent = getAgent(boundBody);
+      if (agent?.linearUserId) {
+        return agent.linearUserId;
+      }
     }
   }
 
@@ -6337,6 +6351,23 @@ export async function applyStateTransition(
         }
       }
 
+      // (a.5) INF-996: bound-role resolution. If the destination state is
+      // `owner_binding: bound` and a body is pinned for this ticket+role, the pin
+      // is authoritative — use it, NEVER re-resolve from the role pool. This is
+      // what freezes a chore's named implementer/reviewer from being re-pooled.
+      if (resolvedDelegateId === undefined && destStateNode?.owner_binding === 'bound' && destOwnerRole) {
+        const boundBody = await getBinding(issueId, destOwnerRole);
+        if (boundBody) {
+          const agent = getAgent(boundBody);
+          if (agent?.linearUserId) {
+            resolvedDelegateId = agent.linearUserId;
+            log.info(
+              `workflow-gate: B2 apply: ${issueId} ${intent} → ${toStateName}, bound ${destOwnerRole} '${boundBody}' (pinned, not re-pooled)`,
+            );
+          }
+        }
+      }
+
       // (b) Deterministic prior-implementer routing (def-driven).
       if (resolvedDelegateId === undefined && wantsPriorImplementer) {
         const priorImplementer = await getImplementer(issueId);
@@ -6516,6 +6547,18 @@ export async function applyStateTransition(
           });
         }
       }
+    }
+  }
+
+  // INF-996: capture the bound-role binding on entry to a bound state, so
+  // downstream transitions (and the reconciliation/routing-guard freeze in PR-C)
+  // read the pin rather than re-resolving from the pool. Idempotent — re-entering
+  // a bound state re-writes the same body.
+  if (destStateNode?.owner_binding === 'bound' && destOwnerRole && resolvedDelegateId) {
+    const boundAgent = getAgents().find(a => a.linearUserId === resolvedDelegateId);
+    if (boundAgent) {
+      await recordBinding(issueId, destOwnerRole, boundAgent.name, workflowId);
+      log.info(`workflow-gate: B2 apply: bound ${destOwnerRole} '${boundAgent.name}' for ${issueId}`);
     }
   }
 
