@@ -246,6 +246,16 @@ export interface FanoutConfig {
 export interface WorkflowState {
   id: string;
   owner_role?: string;
+  /** INF-996: role-binding mode for this state's `owner_role`.
+   *  - `"static"` (default, omitted): resolve the body from the capability-policy
+   *    role pool on every pass — today's dev-impl / task behavior.
+   *  - `"bound"`: the body is pinned onto the ticket at capture (intake) and read
+   *    back from the binding store (implementer-store) thereafter — NEVER
+   *    re-resolved from the pool. Reconciliation and the routing-guard must not
+   *    re-derive a bound seat (the "freeze"). This is what gives wf:chore its
+   *    "named implementer, never re-pooled" property. Inert unless a state opts in.
+   *    Resolution (PR-B) and freeze (PR-C) consume this; PR-A only declares it. */
+  owner_binding?: "static" | "bound";
   kind?: string;
   commitment_gate?: {
     exits?: Record<string, { to?: string }>;
