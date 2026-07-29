@@ -13,21 +13,14 @@ export type SessionSpawnRuntime = "codex" | "openclaw-acp" | string;
 export type SessionSpawnRunState = "pending" | "live" | "completed" | "failed" | "blocked" | string;
 
 /**
- * INF-1003: session states that mean the bound transcript is dead and will
- * produce no further turns. Re-dispatching onto such a binding resumes a frozen
- * session (the LIF-338 C3 silent-completion loop), so the re-dispatch path
- * rotates to a fresh session instead of replaying. `stop` is the codex-mirrored
- * `stopReason: stop` terminal turn seen in the INF-958 incident.
+ * INF-1003: canonical `rotation_reason` recorded when the re-dispatch guard
+ * rotates away from a terminal bound session. Terminal-ness is NOT read from the
+ * `state` column above — that column's production domain is only `pending`/`live`
+ * and never carries `stop`. The real signal is the bound session's last-assistant
+ * `stopReason: stop`, probed from the live transcript by `probeBoundSessionTerminal`
+ * in `bag/stale-session-forensics.ts`.
  */
-const TERMINAL_SESSION_STATES = new Set<SessionSpawnRunState>(["stop"]);
-
-/**
- * INF-1003: if `state` is terminal, return the rotation reason to record on the
- * fresh binding (`rotation_reason`); otherwise null (idempotent replay stands).
- */
-export function terminalRotationReason(state: SessionSpawnRunState): string | null {
-  return TERMINAL_SESSION_STATES.has(state) ? "terminal-stop" : null;
-}
+export const TERMINAL_STOP_ROTATION_REASON = "terminal-stop";
 
 export interface SessionSpawnBeginInput {
   ticketId: string;

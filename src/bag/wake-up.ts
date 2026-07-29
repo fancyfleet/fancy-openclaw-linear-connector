@@ -19,7 +19,8 @@ import { loadUniversalCanon, formatCanonBlock, getActiveCanonVersion, type Canon
 import { normalizeSessionKey } from "../session-key.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { randomUUID } from "node:crypto";
-import { terminalRotationReason, type SessionSpawnIdempotencyStore, type SessionSpawnRuntime } from "../store/session-spawn-idempotency-store.js";
+import { TERMINAL_STOP_ROTATION_REASON, type SessionSpawnIdempotencyStore, type SessionSpawnRuntime } from "../store/session-spawn-idempotency-store.js";
+import { probeBoundSessionTerminal } from "./stale-session-forensics.js";
 
 const log = componentLogger(createLogger(), "wakeup");
 
@@ -213,24 +214,30 @@ export async function sendWakeUpSignal(
     sessionKey,
   });
   // INF-1003: terminal-session rotation guard on the pending-bag re-dispatch
-  // path. Mirrors deliverToAgent — a terminal bound session (e.g. `stopReason:
-  // stop`) is not replayed (that is the LIF-338 C3 loop); we fall through to
-  // mint a fresh session and record the old→new rotation on the binding below.
+  // path. Mirrors deliverToAgent — a bound session whose last transcript turn
+  // ended with `stopReason: stop` (codex-mirror-frozen) is not replayed (that is
+  // the LIF-338 C3 loop); we fall through to mint a fresh session and record the
+  // old→new rotation on the binding below. Terminal-ness comes from the live
+  // transcript, not the dispatch-lifecycle `state` column (which never carries
+  // `stop`), so the guard fires on the real signal here.
   let rotation: { fromSessionId: string | null; reason: string } | undefined;
   if (idempotency?.action === "return-existing") {
-    const reason = terminalRotationReason(idempotency.record.state);
-    if (!reason) {
+    const probe = probeBoundSessionTerminal(agentId, sessionKey, config.openclawHome);
+    if (!probe.terminal) {
       log.info(
         `sessions_spawn idempotent replay: wake ${sessionKey}/${taskKey} already has ` +
         `state=${idempotency.record.state} run=${idempotency.record.run_id ?? "pending"}`,
       );
       return { runId: idempotency.record.run_id ?? undefined, canonVersion: canonVersion ?? undefined };
     }
-    rotation = { fromSessionId: idempotency.record.session_id, reason };
+    rotation = {
+      fromSessionId: probe.sessionId ?? idempotency.record.session_id,
+      reason: TERMINAL_STOP_ROTATION_REASON,
+    };
     log.info(
       `INF-1003 terminal-session rotation: wake ${sessionKey}/${taskKey} bound session ` +
-      `${idempotency.record.session_id ?? "?"} is terminal (state=${idempotency.record.state}) — ` +
-      `minting a fresh session instead of replaying the dead transcript`,
+      `${probe.sessionId ?? idempotency.record.session_id ?? "?"} is terminal ` +
+      `(stopReason=${probe.stopReason}) — minting a fresh session instead of replaying the dead transcript`,
     );
   }
 
