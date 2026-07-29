@@ -23,6 +23,7 @@ import yaml from "js-yaml";
 import { createLogger, componentLogger } from "./logger.js";
 import { defaultCapabilityPolicyPath } from "./instance-config.js";
 import { getLinearUserIdForAgent } from "./agents.js";
+import { boundSeatFor } from "./implementer-store.js";
 import type { OperationalEventInput } from "./store/operational-event-store.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "rescue-sweep");
@@ -116,7 +117,7 @@ export interface RescueSweepOptions {
 type WorkflowDef = {
   id?: string;
   entry_state?: string;
-  states: Array<{ id: string; owner_role?: string }>;
+  states: Array<{ id: string; owner_role?: string; owner_binding?: string }>;
 };
 
 interface PolicyBody {
@@ -150,7 +151,7 @@ interface FetchedTicket extends SweepTicket {
 export function classifyTicket(
   labels: string[],
   delegateId: string | null,
-  workflowDef: { entry_state?: string; states: Array<{ id: string; owner_role?: string }> },
+  workflowDef: { entry_state?: string; states: Array<{ id: string; owner_role?: string; owner_binding?: string }> },
   roleBodiesForRole: (roleId: string) => string[],
 ): TicketClassification {
   const stateLabel = labels.find((l) => l.startsWith("state:"));
@@ -502,6 +503,28 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
     const wfDef = workflowRegistry.get(wfId)!;
     const classification = classifyTicket(ticket.labels, ticket.delegateId, wfDef, roleBodiesForRole);
     byClassification[classification] = (byClassification[classification] ?? 0) + 1;
+
+    // INF-996 freeze: a bound-role (owner_binding: 'bound') seat is intentional.
+    // classifyTicket compares the delegate against the STATIC role pool and would
+    // call a pinned body "drifted" (a bound body need not fill the pool). Correcting
+    // it is exactly the INF-943 re-pool. If the current state is bound and a body is
+    // bound for this ticket, the seat is healthy — never rescued/re-derived.
+    if (classification === "drifted") {
+      const stateId = ticket.labels
+        .find((l) => l.startsWith("state:"))
+        ?.slice("state:".length);
+      const stateDef = wfDef.states.find((s) => s.id === stateId);
+      const boundBody = await boundSeatFor(stateDef, ticket.id);
+      if (boundBody) {
+        byClassification["drifted"] = (byClassification["drifted"] ?? 1) - 1;
+        byClassification["healthy"] = (byClassification["healthy"] ?? 0) + 1;
+        log.info(
+          `rescue-sweep: ${ticket.identifier} state '${stateId}' is bound → seat pinned to '${boundBody}', ` +
+            `not drifted (freeze; not re-pooled)`,
+        );
+        continue;
+      }
+    }
 
     // Terminal and healthy tickets need no rescue
     if (classification === "terminal" || classification === "healthy") continue;

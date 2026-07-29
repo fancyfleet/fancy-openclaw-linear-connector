@@ -43,6 +43,7 @@ import { getRateLimitClient } from "./linear-rate-limit-client.js";
 import { registerCron, markCronRun, formatIntervalMs } from "./cron/registry.js";
 import { buildAgentMap, getLinearUserIdForAgent, getOpenclawAgentName } from "./agents.js";
 import { resolveBodiesForRole } from "./escalation-gate.js";
+import { boundSeatFor } from "./implementer-store.js";
 import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "bootstrap-reconciliation");
@@ -996,19 +997,29 @@ export async function runBootstrapReconciliationSweep(
         continue;
       }
 
-      const bodies = await resolveOwnerBodies(ownerRole);
-      if (bodies.length === 0) {
-        result.errors.push(
-          `mode-1 auto-seat: role '${ownerRole}' has no body to seat on ${ticket.identifier}`,
-        );
-        log.warn(
-          `bootstrap-reconciliation: Mode 1 could not seat ${ticket.identifier} — role '${ownerRole}' resolves to zero bodies`,
-        );
-        continue;
+      // INF-996 freeze: a bound-role (owner_binding: 'bound') seat is the PINNED
+      // body, never a pool pick. If the ticket has a binding for this role, restore
+      // THAT body (same owner) rather than re-deriving from the role pool — this is
+      // the exact re-seat that bounced INF-943 when the role was a 23-body pool.
+      const boundBody = await boundSeatFor(stateDef, ticket.id);
+      let bodyId: string;
+      if (boundBody) {
+        bodyId = boundBody;
+      } else {
+        const bodies = await resolveOwnerBodies(ownerRole);
+        if (bodies.length === 0) {
+          result.errors.push(
+            `mode-1 auto-seat: role '${ownerRole}' has no body to seat on ${ticket.identifier}`,
+          );
+          log.warn(
+            `bootstrap-reconciliation: Mode 1 could not seat ${ticket.identifier} — role '${ownerRole}' resolves to zero bodies`,
+          );
+          continue;
+        }
+        // single → concrete; multi → first candidate (mirrors resolveBodiesForRole
+        // usage across the gate; a multi-body role seats its first filler).
+        bodyId = bodies[0];
       }
-      // single → concrete; multi → first candidate (mirrors resolveBodiesForRole
-      // usage across the gate; a multi-body role seats its first filler).
-      const bodyId = bodies[0];
       const delegateLinearUserId = linearUserIdForBody(bodyId);
       if (!delegateLinearUserId) {
         result.errors.push(
