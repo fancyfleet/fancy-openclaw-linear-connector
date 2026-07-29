@@ -109,17 +109,50 @@ export class SessionSpawnIdempotencyStore {
   }
 
   /**
+   * INF-1026: a `live`/`pending` spawn record whose last update predates this
+   * window is treated as a DEAD session. The runtime times out (~26 min) without
+   * clearing its record and nothing else moves a record out of `live`, so without
+   * this bound the first session's record short-circuits every future wake and the
+   * (ticket, task) becomes permanently un-wakeable — the agent goes dark forever,
+   * across restarts (the record is persisted). Set safely beyond the runtime
+   * timeout so a genuinely in-flight session is never double-spawned.
+   */
+  private static readonly STALE_INFLIGHT_MS = 30 * 60 * 1000;
+
+  private isStaleInFlight(r: SessionSpawnRunRecord): boolean {
+    if (r.state !== "live" && r.state !== "pending") return false;
+    const lastIso = r.updated_at || r.spawned_at || r.requested_at;
+    const last = lastIso ? Date.parse(lastIso) : NaN;
+    if (Number.isNaN(last)) return false;
+    return Date.now() - last > SessionSpawnIdempotencyStore.STALE_INFLIGHT_MS;
+  }
+
+  /**
    * Atomically reserve a run for (ticketId, taskKey), or return the existing
    * pending/live/completed record to the replaying caller.
    */
   beginOrGetExisting(input: SessionSpawnBeginInput): SessionSpawnBeginResult {
     const run = this.db.transaction((): SessionSpawnBeginResult => {
       const existing = this.inspect(input.ticketId, input.taskKey);
-      if (existing) {
+      if (existing && !this.isStaleInFlight(existing)) {
         return { action: "return-existing", record: existing, existing };
       }
 
       const requestedAt = input.requestedAt ?? nowIso();
+
+      if (existing) {
+        // INF-1026: the prior in-flight record is stale (its session died without
+        // clearing it). Reset it to `pending` and re-run the spawn instead of
+        // short-circuiting on a corpse — this is what lets a dark agent re-wake.
+        this.db.prepare(
+          `UPDATE session_spawn_runs
+             SET state = 'pending', run_id = NULL, session_id = NULL,
+                 requested_at = ?, spawned_at = NULL, updated_at = ?
+           WHERE id = ?`,
+        ).run(requestedAt, requestedAt, existing.id);
+        return { action: "start-new", record: this.rowById(existing.id), existing: null };
+      }
+
       const result = this.db.prepare(
         `INSERT INTO session_spawn_runs
            (ticket_id, task_key, runtime, agent_id, session_key, state, requested_at, updated_at)
