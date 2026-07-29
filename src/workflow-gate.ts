@@ -7996,6 +7996,59 @@ async function dispatchWithRetry(
   return { ok: false, error: lastError };
 }
 
+export interface IssueWorkflowSnapshot {
+  internalId: string;
+  identifier: string;
+  teamId: string;
+  labels: LabelNode[];
+  workflowId: string | null;
+  currentState: string | null;
+  entryState: string | null;
+}
+
+export async function fetchIssueWorkflowSnapshot(
+  ticketIdentifier: string,
+  authToken: string,
+): Promise<IssueWorkflowSnapshot | null> {
+  const issue = await fetchIssueWithLabels(ticketIdentifier, authToken);
+  if (!issue) return null;
+  const labelNames = issue.labels.map((l) => l.name);
+  const workflowId = getWorkflowId(labelNames);
+  let entryState: string | null = null;
+  if (workflowId) {
+    const def = await loadWorkflowDefById(workflowId);
+    entryState = def?.entry_state ?? null;
+  }
+  return {
+    ...issue,
+    workflowId,
+    currentState: getCurrentState(labelNames),
+    entryState,
+  };
+}
+
+export async function parkIssueToBacklog(
+  ticketIdentifier: string,
+  authToken: string,
+): Promise<{ ok: boolean; ticketId: string; from: string | null; to: "Backlog"; internalId?: string; error?: string }> {
+  const snapshot = await fetchIssueWorkflowSnapshot(ticketIdentifier, authToken);
+  if (!snapshot) {
+    return { ok: false, ticketId: ticketIdentifier, from: null, to: "Backlog", error: `could not fetch issue '${ticketIdentifier}'` };
+  }
+  const backlogStateId = await resolveNativeStateId(snapshot.teamId, "backlog", authToken);
+  if (!backlogStateId) {
+    return { ok: false, ticketId: ticketIdentifier, from: snapshot.currentState, to: "Backlog", error: "could not resolve native Backlog state" };
+  }
+  const keepLabelIds = snapshot.labels
+    .filter((l) => !l.name.startsWith("state:") && !l.name.startsWith("wf:"))
+    .map((l) => l.id);
+  const applied = await issueUpdateAtomic(snapshot.internalId, keepLabelIds, authToken, null, backlogStateId);
+  if (!applied) {
+    return { ok: false, ticketId: ticketIdentifier, from: snapshot.currentState, to: "Backlog", error: "Backlog issueUpdate mutation failed" };
+  }
+  return { ok: true, ticketId: ticketIdentifier, from: snapshot.currentState, to: "Backlog", internalId: snapshot.internalId };
+}
+
 /**
  * Atomically re-establish the full workflow triple (state:* label, native Linear
  * state, delegate) on any governed ticket, including tickets in a terminal state.

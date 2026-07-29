@@ -1526,7 +1526,23 @@ export function createApp(options?: CreateAppOptions) {
   });
 
   // Management console (Phase 3): React SPA + JSON API, session or secret auth.
-  app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, ackTracker, deploymentName: DEPLOYMENT_NAME, enrolledTicketsStore, forensicsDiagnosticsDir: options?.forensicsDiagnosticsDir, mutationAuditStore, wakeConfigForAgent, proposalStore }));
+  app.use("/admin", createAdminRouter({
+    agentQueue,
+    bag,
+    sessionTracker,
+    operationalEventStore,
+    observationStore,
+    ackTracker,
+    deploymentName: DEPLOYMENT_NAME,
+    enrolledTicketsStore,
+    forensicsDiagnosticsDir: options?.forensicsDiagnosticsDir,
+    mutationAuditStore,
+    wakeConfigForAgent,
+    reconciliationWakeFn: options?.sendWakeUp
+      ? async (agentId: string, ticketId: string) => options.sendWakeUp!(agentId, [ticketId])
+      : undefined,
+    proposalStore,
+  }));
 
   app.post("/admin/api/governed/reseat", async (req: express.Request, res: express.Response) => {
     if (!requireAdminSecret(req, res)) return;

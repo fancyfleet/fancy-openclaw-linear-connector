@@ -6,7 +6,7 @@
  * AC5: deploy button present; disabled-with-reason (deploy-policy ci_auto_deploy:false).
  */
 import { useState } from "react";
-import { apiPost, UnauthorizedError } from "../api";
+import { apiGet, apiPost, UnauthorizedError } from "../api";
 
 export interface OpsActionsProps {
   ticketId: string;
@@ -20,18 +20,51 @@ export interface OpsActionsProps {
   variant?: "full" | "redispatch";
 }
 
-type DialogKind = "redispatch" | "set-state" | "recapture-ac" | null;
+type GovernedTier = "T0" | "T1" | "T2";
+type GovernedAction = "delegate-set" | "force-redispatch" | "promote" | "park" | "probe";
+type DialogKind = GovernedAction | "set-state" | "recapture-ac" | null;
+
+const GOVERNED_ACTIONS: Record<GovernedAction, { label: string; tier: GovernedTier; capability: `governed-console:${GovernedAction}` }> = {
+  "delegate-set": { label: "Delegate Set", tier: "T1", capability: "governed-console:delegate-set" },
+  "force-redispatch": { label: "Force Dispatch", tier: "T1", capability: "governed-console:force-redispatch" },
+  promote: { label: "Promote", tier: "T1", capability: "governed-console:promote" },
+  park: { label: "Park", tier: "T2", capability: "governed-console:park" },
+  probe: { label: "Probe", tier: "T0", capability: "governed-console:probe" },
+};
+
+function GovernedControl({ action, onClick }: { action: GovernedAction; onClick: () => void }) {
+  const meta = GOVERNED_ACTIONS[action];
+  return (
+    <button type="button" data-tier={meta.tier} data-capability={meta.capability} onClick={onClick}>
+      {meta.label}
+    </button>
+  );
+}
+
+function AuditReceipt({ receipt }: { receipt: { action?: string; mutationCount?: number } | null }) {
+  if (!receipt) return null;
+  return <p data-kind="audit-receipt">AuditReceipt {receipt.action} {receipt.mutationCount}</p>;
+}
+
+function ProbePanel({ result }: { result: unknown }) {
+  if (!result) return null;
+  return <pre data-kind="probe-panel">ProbePanel {JSON.stringify(result, null, 2)}</pre>;
+}
 
 export function OpsActions({ ticketId, invoker, variant = "full" }: OpsActionsProps) {
   const [dialog, setDialog] = useState<DialogKind>(null);
   const [targetState, setTargetState] = useState("");
+  const [delegate, setDelegate] = useState("");
   const [reason, setReason] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [auditReceipt, setAuditReceipt] = useState<{ action?: string; mutationCount?: number } | null>(null);
+  const [probeResult, setProbeResult] = useState<unknown>(null);
 
   function openDialog(kind: DialogKind) {
     setDialog(kind);
     setTargetState("");
+    setDelegate("");
     setReason("");
     setError(null);
   }
@@ -47,8 +80,26 @@ export function OpsActions({ ticketId, invoker, variant = "full" }: OpsActionsPr
     setLoading(true);
     setError(null);
     try {
+      const governed = dialog && dialog in GOVERNED_ACTIONS ? GOVERNED_ACTIONS[dialog as GovernedAction] : null;
       if (dialog === "redispatch") {
         await apiPost("/admin/api/redispatch", { ticketId });
+      } else if (dialog === "force-redispatch" && governed) {
+        const res = await apiPost<{ auditReceipt?: { action?: string; mutationCount?: number } }>("/admin/api/redispatch", {
+          ticketId, invoker, reason, role: "steward", capability: governed.capability,
+        });
+        setAuditReceipt(res.auditReceipt ?? null);
+      } else if (dialog === "delegate-set" && governed) {
+        const res = await apiPost<{ auditReceipt?: { action?: string; mutationCount?: number } }>("/admin/api/set-state", {
+          action: "delegate-set", ticketId, delegateMode: delegate ? "set" : "leave", delegate, invoker, reason, role: "steward", capability: governed.capability,
+        });
+        setAuditReceipt(res.auditReceipt ?? null);
+      } else if ((dialog === "promote" || dialog === "park") && governed) {
+        const res = await apiPost<{ auditReceipt?: { action?: string; mutationCount?: number } }>(`/admin/api/backlog/${dialog}`, {
+          ticketId, invoker, reason, role: "steward", capability: governed.capability,
+        });
+        setAuditReceipt(res.auditReceipt ?? null);
+      } else if (dialog === "probe" && governed) {
+        setProbeResult(await apiGet(`/admin/api/probe/${ticketId}?invoker=${encodeURIComponent(invoker)}&role=steward&capability=${encodeURIComponent(governed.capability)}`));
       } else if (dialog === "set-state") {
         await apiPost("/admin/api/set-state", { ticketId, invoker, reason, targetState });
       } else if (dialog === "recapture-ac") {
@@ -71,6 +122,11 @@ export function OpsActions({ ticketId, invoker, variant = "full" }: OpsActionsPr
       <button type="button" onClick={() => openDialog("redispatch")}>Redispatch</button>
       {variant === "full" && (
         <>
+          <GovernedControl action="delegate-set" onClick={() => openDialog("delegate-set")} />
+          <GovernedControl action="force-redispatch" onClick={() => openDialog("force-redispatch")} />
+          <GovernedControl action="promote" onClick={() => openDialog("promote")} />
+          <GovernedControl action="park" onClick={() => openDialog("park")} />
+          <GovernedControl action="probe" onClick={() => openDialog("probe")} />
           <button type="button" onClick={() => openDialog("set-state")}>Set State</button>
           <button
             type="button"
@@ -107,7 +163,19 @@ export function OpsActions({ ticketId, invoker, variant = "full" }: OpsActionsPr
             </div>
           )}
 
-          {(dialog === "set-state" || dialog === "recapture-ac") && (
+          {dialog === "delegate-set" && (
+            <div>
+              <label htmlFor="ops-delegate">Delegate</label>
+              <input
+                id="ops-delegate"
+                type="text"
+                value={delegate}
+                onChange={(e) => setDelegate(e.target.value)}
+              />
+            </div>
+          )}
+
+          {(dialog === "set-state" || dialog === "recapture-ac" || dialog === "delegate-set" || dialog === "force-redispatch" || dialog === "promote" || dialog === "park") && (
             <div>
               <label htmlFor="ops-reason">Reason</label>
               <input
@@ -129,6 +197,8 @@ export function OpsActions({ ticketId, invoker, variant = "full" }: OpsActionsPr
           </button>
         </div>
       )}
+      <AuditReceipt receipt={auditReceipt} />
+      <ProbePanel result={probeResult} />
     </div>
   );
 }
