@@ -9,17 +9,23 @@
  * inside `task`. Observed live on INF-585 (PR #512 approved, then merge+deploy
  * hand-orchestrated out-of-band).
  *
- * Fix (Astrid triage, candidate 1): an advisory routing lint at bootstrap —
- * when a ticket enters `task` carrying a PR/branch reference (the fingerprint
- * of a code change), post a single suggestion to re-route through `dev-impl`.
- * Advisory, not blocking.
+ * Fix (Astrid triage, candidate 1) was an advisory routing lint at bootstrap —
+ * a nudge suggesting `dev-impl` while still admitting the code fix to `task`.
  *
- * AC-to-test mapping:
- *   AC1: PR-URL-bearing ticket entering `task` → advisory comment posted
- *   AC2: "PR #512"-bearing ticket entering `task` → advisory comment posted
- *   AC3: branch-name-bearing ticket entering `task` → advisory comment posted
- *   AC4: clean (no PR/branch) `task` ticket → NO advisory comment
- *   AC5: PR-bearing ticket entering `dev-impl` → NO advisory (guard scoped to task)
+ * SUPERSEDED by INF-1023 (parent decision INF-1022, fix #2a): the advisory nudge
+ * is replaced by a hard intake guardrail — a code-signaled `wf:task` request is
+ * redirected to `dev-impl` at bootstrap instead of entering the Design track and
+ * being nudged. This suite is updated to the redirect contract; the code-signal
+ * detection (`referencesCodeChange`) that INF-594 introduced still lives on and
+ * is exercised in AC6. Full redirect/refusal coverage lives in
+ * `inf-1023-wf-task-code-guardrail.test.ts`.
+ *
+ * AC-to-test mapping (post-INF-1023):
+ *   AC1: PR-URL-bearing ticket into `task` → redirected to `dev-impl`, no advisory
+ *   AC2: "PR #512"-bearing ticket into `task` → redirected to `dev-impl`, no advisory
+ *   AC3: branch-name-bearing ticket into `task` → redirected to `dev-impl`, no advisory
+ *   AC4: clean (no code signal) `task` ticket → stays on `task`, NO redirect/comment
+ *   AC5: PR-bearing ticket entering `dev-impl` directly → unchanged (guard is task-scoped)
  *   AC6: referencesCodeChange() unit coverage of each signal + negative
  */
 
@@ -229,10 +235,13 @@ afterEach(() => {
   globalThis.fetch = savedFetch;
 });
 
-// ── AC1–AC3: PR/branch-bearing ticket into `task` → advisory posted ─────────
+// ── AC1–AC3: PR/branch-bearing ticket into `task` → redirected to dev-impl ───
+// Post-INF-1023: the advisory nudge is superseded by a hard redirect. A code-
+// signaled `wf:task` intake now bootstraps as `dev-impl` (not `task`) and posts
+// no advisory — the loud, non-dropping outcome is the workflow swap itself.
 
-describe("INF-594 AC1–AC3: PR/branch-bearing ticket entering `task` gets the routing advisory", () => {
-  it("AC1: a GitHub PR URL in the description triggers the advisory (INF-585 shape)", async () => {
+describe("INF-594 AC1–AC3 (post-INF-1023): PR/branch-bearing `task` intake is redirected to dev-impl", () => {
+  it("AC1: a GitHub PR URL in the description redirects to dev-impl (INF-585 shape)", async () => {
     installFetch();
     const issue = makeIssue({
       workflowLabelId: WF_TASK_LABEL_ID,
@@ -244,15 +253,11 @@ describe("INF-594 AC1–AC3: PR/branch-bearing ticket entering `task` gets the r
     const result = await applyBootstrapToIssue(issue, "test-token");
 
     expect(result?.action).toBe("bootstrapped");
-    expect(result?.workflowId).toBe("task");
-    const comment = advisoryComment();
-    expect(comment).toBeDefined();
-    expect(comment).toContain("INF-594");
-    expect(comment).toContain("dev-impl");
-    expect(comment).toContain("INF-585");
+    expect(result?.workflowId).toBe("dev-impl");
+    expect(advisoryComment()).toBeUndefined();
   });
 
-  it("AC2: a bare 'PR #512' mention triggers the advisory", async () => {
+  it("AC2: a bare 'PR #512' mention redirects to dev-impl", async () => {
     installFetch();
     const issue = makeIssue({
       workflowLabelId: WF_TASK_LABEL_ID,
@@ -260,12 +265,13 @@ describe("INF-594 AC1–AC3: PR/branch-bearing ticket entering `task` gets the r
       description: "Approved fix on PR #512 — needs merge + deploy.",
     });
 
-    await applyBootstrapToIssue(issue, "test-token");
+    const result = await applyBootstrapToIssue(issue, "test-token");
 
-    expect(advisoryComment()).toBeDefined();
+    expect(result?.workflowId).toBe("dev-impl");
+    expect(advisoryComment()).toBeUndefined();
   });
 
-  it("AC3: a conventional branch name triggers the advisory", async () => {
+  it("AC3: a conventional branch name redirects to dev-impl", async () => {
     installFetch();
     const issue = makeIssue({
       workflowLabelId: WF_TASK_LABEL_ID,
@@ -273,16 +279,17 @@ describe("INF-594 AC1–AC3: PR/branch-bearing ticket entering `task` gets the r
       description: "Landed on feature/INF-585-null-guard; ready for review.",
     });
 
-    await applyBootstrapToIssue(issue, "test-token");
+    const result = await applyBootstrapToIssue(issue, "test-token");
 
-    expect(advisoryComment()).toBeDefined();
+    expect(result?.workflowId).toBe("dev-impl");
+    expect(advisoryComment()).toBeUndefined();
   });
 });
 
-// ── AC4: clean `task` ticket → no advisory ──────────────────────────────────
+// ── AC4: clean `task` ticket → no redirect, no advisory ─────────────────────
 
-describe("INF-594 AC4: a non-code `task` ticket is not nagged", () => {
-  it("does NOT post the advisory when there is no PR/branch reference", async () => {
+describe("INF-594 AC4: a non-code `task` ticket stays on `task` and is not nagged", () => {
+  it("does NOT redirect or comment when there is no code signal", async () => {
     installFetch();
     const issue = makeIssue({
       workflowLabelId: WF_TASK_LABEL_ID,
@@ -294,6 +301,7 @@ describe("INF-594 AC4: a non-code `task` ticket is not nagged", () => {
     const result = await applyBootstrapToIssue(issue, "test-token");
 
     expect(result?.action).toBe("bootstrapped");
+    expect(result?.workflowId).toBe("task");
     expect(advisoryComment()).toBeUndefined();
   });
 });
