@@ -9,11 +9,13 @@ import { resolveCanonicalIdentifierFromEvent } from "../canonical-identifier.js"
 import { normalizeSessionKey } from "../session-key.js";
 import type { DispatchLeaseStore } from "../store/dispatch-lease-store.js";
 import type { DispatchInFlightStore } from "../store/dispatch-inflight-store.js";
-import type {
-  SessionSpawnIdempotencyStore,
-  SessionSpawnRunRecord,
-  SessionSpawnRuntime,
+import {
+  TERMINAL_STOP_ROTATION_REASON,
+  type SessionSpawnIdempotencyStore,
+  type SessionSpawnRunRecord,
+  type SessionSpawnRuntime,
 } from "../store/session-spawn-idempotency-store.js";
+import { probeBoundSessionTerminal } from "../bag/stale-session-forensics.js";
 
 const log = componentLogger(createLogger(), "delivery");
 
@@ -80,6 +82,12 @@ export interface DeliveryConfig {
    * local OpenClaw session state file location when available.
    */
   runtimeStatePath?: string;
+  /**
+   * INF-1003: OpenClaw home (`~/.openclaw`) used by the terminal-session
+   * rotation guard to resolve the bound session's live transcript. Defaults to
+   * `$HOME/.openclaw` when omitted (`probeBoundSessionTerminal`).
+   */
+  openclawHome?: string;
 }
 
 export interface DeliveryResult {
@@ -197,18 +205,39 @@ export async function deliverToAgent(
     agentId: route.agentId,
     sessionKey: route.sessionKey,
   });
+  // INF-1003: terminal-session rotation guard. A bound session whose last turn
+  // ended with `stopReason: stop` (the codex-mirror-frozen tail) produces no new
+  // turn on wake, so replaying it resumes a dead transcript — the LIF-338 C3
+  // silent-completion loop. Terminal-ness is read from the live transcript (not
+  // the dispatch-lifecycle `state` column, which never carries `stop`) so the
+  // guard fires on the real signal at this production entry point. When the
+  // bound session is terminal we DO NOT return the idempotent replay; we fall
+  // through to mint a fresh session and record the old→new rotation below.
+  let rotation: { fromSessionId: string | null; reason: string } | undefined;
   if (idempotency?.action === "return-existing") {
-    log.info(
-      `sessions_spawn idempotent replay: ${route.sessionKey}/${taskKey} already has ` +
-      `state=${idempotency.record.state} run=${idempotency.record.run_id ?? "pending"}`,
-    );
-    return {
-      dispatched: true,
-      runId: idempotency.record.run_id ?? undefined,
-      pendingAck: idempotency.record.state === "pending",
-      idempotentReplay: true,
-      sessionSpawnRecord: idempotency.record,
+    const probe = probeBoundSessionTerminal(route.agentId, route.sessionKey, config.openclawHome);
+    if (!probe.terminal) {
+      log.info(
+        `sessions_spawn idempotent replay: ${route.sessionKey}/${taskKey} already has ` +
+        `state=${idempotency.record.state} run=${idempotency.record.run_id ?? "pending"}`,
+      );
+      return {
+        dispatched: true,
+        runId: idempotency.record.run_id ?? undefined,
+        pendingAck: idempotency.record.state === "pending",
+        idempotentReplay: true,
+        sessionSpawnRecord: idempotency.record,
+      };
+    }
+    rotation = {
+      fromSessionId: probe.sessionId ?? idempotency.record.session_id,
+      reason: TERMINAL_STOP_ROTATION_REASON,
     };
+    log.info(
+      `INF-1003 terminal-session rotation: ${route.sessionKey}/${taskKey} bound session ` +
+      `${probe.sessionId ?? idempotency.record.session_id ?? "?"} is terminal ` +
+      `(stopReason=${probe.stopReason}) — minting a fresh session instead of replaying the dead transcript`,
+    );
   }
 
   // INF-413: Ticket-level in-flight guard, checked BEFORE the agent-scoped
@@ -268,6 +297,8 @@ export async function deliverToAgent(
       sessionId: route.sessionKey,
       state: "live",
       runtimeStatePath: defaultRuntimeStatePath(config),
+      rotationFromSessionId: rotation?.fromSessionId,
+      rotationReason: rotation?.reason,
     });
     return { ...result, canonVersion, sessionSpawnRecord: marked };
   }

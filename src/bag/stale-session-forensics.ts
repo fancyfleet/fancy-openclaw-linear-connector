@@ -303,6 +303,58 @@ function findSessionFile(
   return toSessionIndexEntry(match);
 }
 
+/** INF-1003: default OpenClaw home, mirroring the resolution used by buildSnapshot. */
+export function defaultOpenclawHome(): string {
+  return path.join(os.homedir(), ".openclaw");
+}
+
+export interface BoundSessionTerminalProbe {
+  /** True only when a terminal turn was positively observed on the bound session. */
+  terminal: boolean;
+  /** The bound session's id resolved from the live index (null when unresolved). */
+  sessionId: string | null;
+  /** Normalized stop reason of the last assistant turn (null when none observed). */
+  stopReason: LastAssistantMessage["stopReason"] | null;
+}
+
+/**
+ * INF-1003: probe whether the per-ticket session currently bound to
+ * (`agentId`, `sessionKey`) is TERMINAL — its last assistant turn ended with
+ * `stopReason: stop` (the codex-app-server-mirror-frozen tail from the INF-958
+ * incident; `stop` and `end_turn` both normalize to `end_turn`). Waking such a
+ * conversation appends no new turn (INF-965), so the re-dispatch guard must
+ * rotate to a fresh session instead of replaying the dead transcript.
+ *
+ * This reads the SAME live transcript that stale-session forensics reads, so the
+ * rotation guard consults the real terminal signal at the production re-dispatch
+ * entry point (AC5 / AI-1808) rather than a dispatch-lifecycle column that never
+ * carries `stop`. It is deliberately conservative on a live dispatch path:
+ * `terminal` is false whenever the session cannot be resolved or has produced no
+ * assistant turn yet, so only a positively-observed terminal turn rotates and
+ * every other case preserves the existing idempotent replay (AC3).
+ */
+export function probeBoundSessionTerminal(
+  agentId: string,
+  sessionKey: string,
+  openclawHome: string = defaultOpenclawHome(),
+): BoundSessionTerminalProbe {
+  const entry = findSessionFile(agentId, sessionKey, openclawHome);
+  if (!entry) return { terminal: false, sessionId: null, stopReason: null };
+
+  const last = extractLastAssistantMessage(readSessionJsonl(entry.sessionFile));
+  if (!last) return { terminal: false, sessionId: entry.sessionId, stopReason: null };
+
+  // `stop`/`end_turn` normalize to "end_turn" — a cleanly-ended turn with no
+  // pending tool call, i.e. the frozen tail that produces nothing on re-wake.
+  // A still-working session's last turn is `tool_use` (or has no assistant
+  // message yet) and is left untouched.
+  return {
+    terminal: last.stopReason === "end_turn",
+    sessionId: entry.sessionId,
+    stopReason: last.stopReason,
+  };
+}
+
 // ── Session JSONL parsing ───────────────────────────────────────────────────
 
 interface JsonlEvent {
