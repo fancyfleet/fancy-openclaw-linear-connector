@@ -7942,6 +7942,10 @@ export interface SetStateAtomicResult {
   error?: string;
   /** Body name that received the re-dispatch after the state write, if any. */
   redispatched?: string;
+  /** Observable wake path used after the state write. */
+  wakePath?: "delegate-owner-role" | "migrate-state-owner-role";
+  /** Caller-supplied transition source for recovery/audit observability. */
+  transitionSource?: string;
   /** Machine-readable dispatch failure when re-dispatch fallback was needed. */
   dispatchFailure?: { reasonCode: string; error?: string };
   /** Linear internal UUID of the issue (set on success). AI-1954 attribution. */
@@ -7973,6 +7977,8 @@ export interface SetStateAtomicOptions {
   nativeStateOverride?: string;
   /** Exact native Linear state UUID to write when preserving an existing terminal state. */
   nativeStateIdOverride?: string;
+  /** Observable source for redispatch-capable state repairs. */
+  transitionSource?: string;
 }
 
 async function dispatchWithRetry(
@@ -8207,6 +8213,7 @@ export async function setStateAtomic(
   // Step 9: Re-dispatch to the new state's owner (AI-1607).
   // Fail-open: errors are logged but never block the set-state result.
   let redispatched: string | undefined;
+  let wakePath: SetStateAtomicResult["wakePath"] | undefined;
   let dispatchFailure: SetStateAtomicResult["dispatchFailure"] | undefined;
   if (def && options?.sendWakeUp) {
     const destNode = def.states.find((s) => s.id === targetState);
@@ -8220,6 +8227,9 @@ export async function setStateAtomic(
           const outcome = await dispatchWithRetry(options.sendWakeUp, targetBody, ticketIdentifier);
           if (outcome.ok) {
             redispatched = targetBody;
+            wakePath = options.transitionSource === "migrate-state"
+              ? "migrate-state-owner-role"
+              : "delegate-owner-role";
             log.info(
               `workflow-gate: set-state: re-dispatched ${ticketIdentifier} to '${targetBody}' (role '${ownerRole}') after advancing to '${targetState}'`,
             );
@@ -8235,6 +8245,9 @@ export async function setStateAtomic(
               );
             }
             redispatched = "ai";
+            wakePath = options.transitionSource === "migrate-state"
+              ? "migrate-state-owner-role"
+              : "delegate-owner-role";
             log.warn(
               `workflow-gate: set-state: re-dispatch to '${targetBody}' failed after retry for ${ticketIdentifier}; falling back to ai`,
             );
@@ -8251,6 +8264,9 @@ export async function setStateAtomic(
               const outcome = await dispatchWithRetry(options.sendWakeUp, delegateBody, ticketIdentifier);
               if (outcome.ok) {
                 redispatched = delegateBody;
+                wakePath = options.transitionSource === "migrate-state"
+                  ? "migrate-state-owner-role"
+                  : "delegate-owner-role";
                 log.info(
                   `workflow-gate: set-state: re-dispatched ${ticketIdentifier} to '${delegateBody}' (role '${ownerRole}') after advancing to '${targetState}' — delegate pre-set for multi-body role`,
                 );
@@ -8266,6 +8282,9 @@ export async function setStateAtomic(
                   );
                 }
                 redispatched = "ai";
+                wakePath = options.transitionSource === "migrate-state"
+                  ? "migrate-state-owner-role"
+                  : "delegate-owner-role";
                 log.warn(
                   `workflow-gate: set-state: re-dispatch to '${delegateBody}' failed after retry for ${ticketIdentifier}; falling back to ai`,
                 );
@@ -8299,6 +8318,8 @@ export async function setStateAtomic(
     to: targetState,
     internalId: issue.internalId,
     ...(redispatched ? { redispatched } : {}),
+    ...(wakePath ? { wakePath } : {}),
+    ...(options?.transitionSource ? { transitionSource: options.transitionSource } : {}),
     ...(dispatchFailure ? { dispatchFailure } : {}),
   };
 }

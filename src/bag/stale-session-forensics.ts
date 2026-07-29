@@ -1191,6 +1191,10 @@ export async function recoverTicket(
       );
     }
 
+    const effectiveTargetStateName = needsHuman
+      ? (process.env.STALE_RECOVERY_NEEDS_HUMAN_STATE ?? "Needs Human")
+      : targetStateName;
+
     // Build combined update input: ownership (always) + optional state transition.
     // Using a single issueUpdate mutation instead of two sequential calls avoids the
     // race where the state-change webhook arrives at the connector before the delegate-clear
@@ -1202,25 +1206,26 @@ export async function recoverTicket(
     };
 
     let stateTransitioned = false;
-    if (targetStateName && teamId) {
+    if (effectiveTargetStateName && teamId) {
       const states = await fetchWorkflowStates(teamId, agentId);
-      // Resolve by exact name first; teams differ on the precise label ("To Do"
-      // vs "Todo" vs "Backlog"), so fall back to the canonical re-dispatch target
-      // by state TYPE (unstarted, then backlog) when the name doesn't match. This
-      // keeps recovery working across teams instead of silently no-op'ing when the
-      // hardcoded name is wrong (the "Todo" vs "To Do" bug).
+      // Resolve by exact name first. Human/blocker recovery must not fall back
+      // to the dispatchable unstarted lane; normal C2/C4 redispatch may.
       const targetState =
-        states.find((s) => s.name === targetStateName) ??
-        states.find((s) => s.name.toLowerCase() === targetStateName.toLowerCase()) ??
-        states.find((s) => s.type === "unstarted") ??
-        states.find((s) => s.type === "backlog");
+        states.find((s) => s.name === effectiveTargetStateName) ??
+        states.find((s) => s.name.toLowerCase() === effectiveTargetStateName.toLowerCase()) ??
+        (needsHuman
+          ? states.find((s) => /needs[-\s]?human|blocked|triage/i.test(`${s.name} ${s.type}`))
+          : undefined) ??
+        (!needsHuman || !isRedispatchCapped
+          ? states.find((s) => s.type === "unstarted") ?? states.find((s) => s.type === "backlog")
+          : undefined);
       if (targetState) {
         updateInput.stateId = targetState.id;
-        if (targetState.name !== targetStateName) {
-          log.info(`Recovery for ${identifier}: target "${targetStateName}" resolved to "${targetState.name}" (type=${targetState.type})`);
+        if (targetState.name !== effectiveTargetStateName) {
+          log.info(`Recovery for ${identifier}: target "${effectiveTargetStateName}" resolved to "${targetState.name}" (type=${targetState.type})`);
         }
       } else {
-        log.warn(`Target state "${targetStateName}" not found in team ${teamId} workflow (no name or unstarted/backlog type match)`);
+        log.warn(`Target state "${effectiveTargetStateName}" not found in team ${teamId} workflow`);
       }
     }
 
@@ -1245,14 +1250,14 @@ export async function recoverTicket(
       : needsHuman ? (humanId ? "+needs-human(assignee+delegate-cleared)" : "+delegate-cleared") : "+delegate-cleared";
     log.info(
       `Recovery for ${identifier}: class=${snapshot.classification} (${className}), ` +
-      `comment posted, state ${stateTransitioned ? "transitioned to " + targetStateName : "unchanged"}, ${ownershipTag}`,
+      `comment posted, state ${stateTransitioned ? "transitioned to " + effectiveTargetStateName : "unchanged"}, ${ownershipTag}`,
     );
 
     return {
       success: true,
       action: isInfraCapacityEscalation
-        ? `infra-escalation classify=${snapshot.classification} comment+${stateTransitioned ? "state(" + targetStateName + ")" : "comment-only"}${ownershipTag}`
-        : `classify=${snapshot.classification} comment+${stateTransitioned ? "state(" + targetStateName + ")" : "comment-only"}${ownershipTag}`,
+        ? `infra-escalation classify=${snapshot.classification} comment+${stateTransitioned ? "state(" + effectiveTargetStateName + ")" : "comment-only"}${ownershipTag}`
+        : `classify=${snapshot.classification} comment+${stateTransitioned ? "state(" + effectiveTargetStateName + ")" : "comment-only"}${ownershipTag}`,
       detail: isInfraCapacityEscalation
         ? `reviewer capacity — ${comment.slice(0, 200)}`
         : `${className} — ${comment.slice(0, 200)}`,
@@ -1292,7 +1297,7 @@ export function buildRecoveryComment(snapshot: StaleSnapshot, attempt?: number, 
         `\n\n`;
       if (isCapped) {
         return base +
-          `Max re-dispatch attempts reached (**${attempt}/${maxAttempts}**). Escalating to human review.` +
+          `Max re-dispatch attempts reached (**${attempt}/${maxAttempts}**). Escalating to human review. Applying needs-human recovery.` +
           (diagPath ? `\n\n📝 Diagnostics: \`${diagPath}\`` : "");
       }
       const attemptSuffix = attempt !== undefined && maxAttempts !== undefined
@@ -1316,7 +1321,7 @@ export function buildRecoveryComment(snapshot: StaleSnapshot, attempt?: number, 
         `Session timed out after ${duration} minutes. The agent session was spawned but produced no output.\n\n`;
       if (isCapped) {
         return base +
-          `Max re-dispatch attempts reached (**${attempt}/${maxAttempts}**). Escalating to human review.` +
+          `Max re-dispatch attempts reached (**${attempt}/${maxAttempts}**). Escalating to human review. Applying needs-human recovery.` +
           (diagPath ? `\n\n📝 Diagnostics: \`${diagPath}\`` : "");
       }
       const attemptSuffix = attempt !== undefined && maxAttempts !== undefined
