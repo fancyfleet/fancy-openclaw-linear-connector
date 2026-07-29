@@ -1,0 +1,99 @@
+# chore — INF-996: single-implementer generic work, direct-assignment, no role pool.
+# owner: steward
+#
+# Retires wf:task for operational/mechanical single-owner work. The implementer is
+# BOUND at intake and never re-pooled (`owner_binding: bound`) — the entire fix for
+# the INF-943 bounce class: if the named implementer's session is down, the chore
+# WAITS on that owner; it is never re-seated to another body. The reviewer reuses the
+# steward (bound per-ticket), so it is always != the implementer — the implementer
+# never closes/reviews their own chore (closing rule preserved).
+#
+# States: intake -> implementation -> review -> done, plus a governed `park` hold and
+# a working `escape` -> intake valve (both gaps learned in INF-994). Break-glass escape
+# re-enters at intake (the AI-2095 proven model, never a terminal roach-motel), and the
+# escape path clears the ticket's bindings so re-intake re-binds fresh (the deregistered-
+# owner recovery Astrid flagged).
+
+id: chore
+version: 1
+archetype: single-task
+entry_state: intake
+
+break_glass:
+  command: escape
+  to: intake
+  owner_role: steward
+
+states:
+
+  - id: intake
+    owner_role: steward           # the steward/creator names the single implementer
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: assign
+        to: implementation
+        assign:
+          mode: required          # the named implementer becomes the bound owner
+      - command: park
+        to: parked
+      - command: demote
+        to: __ad_hoc__
+
+  - id: implementation
+    owner_role: implementer       # BOUND: the named body, pinned for the ticket's life
+    owner_binding: bound
+    kind: normal
+    native_state: doing
+    transitions:
+      - command: submit
+        to: review
+        generic: continue
+        assign: { mode: auto }    # review reuses the steward (singleton) — auto-seated then pinned
+      - command: park
+        to: parked
+      - command: demote
+        to: __ad_hoc__
+
+  - id: review
+    owner_role: steward           # the steward reviews; BOUND per-ticket => always != implementer
+    owner_binding: bound
+    kind: normal
+    native_state: todo
+    sla: 24h
+    transitions:
+      - command: approve
+        to: done
+        generic: continue
+      - command: request-changes
+        to: implementation
+        generic: revision
+        assign:
+          default: prior-implementer   # back to the SAME bound implementer, never re-pooled
+        feedback:
+          required: true
+          category_enum:
+            - incomplete
+            - off-brief
+            - quality
+            - scope-creep
+            - correctness
+      - command: park
+        to: parked
+
+  - id: parked
+    owner_role: steward           # governed, reversible hold (INF-994)
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: unpark
+        to: implementation
+        assign:
+          default: prior-implementer   # restore the bound implementer from the pin
+      - command: demote
+        to: __ad_hoc__
+
+  - id: done
+    kind: terminal
+    native_state: done
+    satisfies_parent_barrier: true

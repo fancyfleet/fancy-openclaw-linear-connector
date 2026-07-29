@@ -57,7 +57,7 @@ import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./co
 import { captureAc, extractAcFromDescription, removeAcRecord } from "./ac-record-store.js";
 import { validateDefStateRemovals } from "./def-state-migration.js";
 import { readDefStateSnapshot, writeDefStateSnapshot } from "./store/def-state-snapshot-store.js";
-import { recordImplementer, getImplementer, removeImplementer, getBinding, recordBinding } from "./implementer-store.js";
+import { recordImplementer, getImplementer, removeImplementer, getBinding, recordBinding, clearTicketBindings } from "./implementer-store.js";
 import { recordAppliedState, clearAppliedState, getAppliedState } from "./store/applied-state-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import { reposWithoutCiAutoDeploy, githubRepoFromUrl } from "./deploy-policy.js";
@@ -970,6 +970,12 @@ export async function reloadWorkflowDefs(): Promise<
     for (const s of def.states ?? []) {
       const role = s.owner_role;
       if (!role || s.kind === "terminal") continue;
+
+      // INF-996: a bound role (owner_binding: 'bound') is seated from the ticket's
+      // per-ticket binding at runtime (captured at intake), NOT from a static
+      // capability-policy pool. It legitimately has no static candidate set, so the
+      // load-time reachability/selection checks below do not apply — exempt it.
+      if (s.owner_binding === "bound") continue;
 
       let bodies: string[];
       try {
@@ -6831,6 +6837,11 @@ export async function applyStateTransition(
   if (intent === "escape" || toStateName === "__ad_hoc__") {
     removeArtifact(issueId);
     await removeAcRecord(issueId);
+    // INF-996: escape re-enters at intake and demote leaves the workflow — either way
+    // the ticket's bound seats are no longer authoritative. Clear ALL role bindings so
+    // a re-intake re-binds fresh (this is the deregistered-/down-owner recovery: escape
+    // is the sanctioned way to re-open a stuck bound seat).
+    await clearTicketBindings(issueId);
   }
   // Clean up implementer record on terminal states
   if (isTerminal) {
