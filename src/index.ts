@@ -79,6 +79,7 @@ import { classifyCrossCheckIssue, type CrossCheckIssue } from "./first-action-cr
 import { StallReasonCode, type StallReason, type WakeFailureDiagnostic } from "./wake-observability/index.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
 import { getCapabilityPolicy, resolveBodiesForRole, roleResolutionScopeForOwnerRole } from "./escalation-gate.js";
+import { boundSeatFor } from "./implementer-store.js";
 import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
 import { onAlert as onConfigHealthAlert } from "./config-health.js";
 import { getRegistryPolicyStatus, startRegistryPolicyCheck } from "./registry-policy.js";
@@ -1585,7 +1586,11 @@ export function createApp(options?: CreateAppOptions) {
         return;
       }
 
-      const bodies = await resolveBodiesForRole(stateDef.owner_role, roleResolutionScopeForOwnerRole(stateDef.owner_role, def));
+      // INF-996 freeze: if the state pins its owner_role (owner_binding: 'bound'),
+      // a steward reseat must restore the PINNED body (the ticket's named owner),
+      // NOT a pool pick — otherwise the admin reseat itself re-pools a bound chore.
+      const boundBody = await boundSeatFor(stateDef, issue.id);
+      const bodies = boundBody ? [boundBody] : await resolveBodiesForRole(stateDef.owner_role, roleResolutionScopeForOwnerRole(stateDef.owner_role, def));
       const bodyId = bodies[0];
       const delegateLinearUserId = bodyId ? getLinearUserIdForAgent(bodyId) : undefined;
       if (!bodyId || !delegateLinearUserId) {

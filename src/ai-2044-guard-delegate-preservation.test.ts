@@ -22,6 +22,9 @@
  */
 
 import { jest, describe, it, expect, beforeEach, afterEach } from "@jest/globals";
+import os from "node:os";
+import path from "node:path";
+import { recordBinding, clearImplementerStore } from "./implementer-store.js";
 
 // ── ESM-compatible mocks (must be declared before dynamic imports) ─────────
 
@@ -251,5 +254,68 @@ describe("AI-2044: role-guard never evicts a legal in-flight delegate", () => {
     for (const call of fetchCalls) {
       expect(call.authorization).toBe("Bearer service-token");
     }
+  });
+});
+
+// ── INF-996 PR-C addendum: routing-guard corrects a bound seat TOWARD the pin ──
+// This is the LIVE-CULPRIT path (the Felix→Grover revert happened here). Proves the
+// freeze corrects a bound chore to its named owner even when the current delegate is
+// a "legal" static-pool body — never re-pooling.
+describe("INF-996: routing-guard corrects a bound seat toward the pin, never re-pools", () => {
+  const BOUND_DEF = {
+    id: "chore",
+    states: [
+      {
+        id: "implementation",
+        owner_role: "dev",
+        owner_binding: "bound",
+        transitions: [{ command: "submit", to: "review" }],
+      },
+    ],
+  };
+  const BOUND_LABELS = ["wf:chore", "state:implementation"];
+
+  beforeEach(() => {
+    fetchCalls.length = 0;
+    installFetchMock();
+    mockLoadWorkflowDefById.mockResolvedValue(BOUND_DEF as never);
+    // The `dev` pool is MULTI-body — the exact INF-943 shape: a bound body need not
+    // be the "first" pool filler, and other pool bodies look "legal" to the static guard.
+    mockResolveBodiesForRole.mockResolvedValue(["felix", "noah", "sage", "igor"] as never);
+    process.env.LINEAR_OAUTH_TOKEN = "service-token";
+    process.env.IMPLEMENTER_STORE_PATH = path.join(os.tmpdir(), `inf996-guard-${Date.now()}-${Math.floor(process.hrtime()[1])}.json`);
+    clearImplementerStore();
+  });
+  afterEach(() => {
+    clearImplementerStore();
+    delete process.env.IMPLEMENTER_STORE_PATH;
+    delete process.env.LINEAR_OAUTH_TOKEN;
+  });
+
+  it("WITH a pin: a blocked dispatch corrects to the PINNED body (sage), not the pool", async () => {
+    await recordBinding("internal-uuid-2040", "dev", "sage", "chore"); // sage is the named owner
+    // Current delegate is felix — a LEGAL dev-pool body, but NOT the pin. Without the
+    // freeze the guard would call felix legal and leave it (the INF-943 mis-seat). The
+    // freeze makes sage the sole legal seat → felix is corrected to sage.
+    currentDelegateResponse = { ok: true, delegateId: LINEAR_IDS.felix };
+
+    const result = await checkRoleGuardAndBlock("tdd", "CHO-1", BOUND_LABELS, resolver);
+
+    expect(result.blocked).toBe(true);
+    expect(result.legalBodies).toEqual(["sage"]);       // pool collapsed to the pin
+    expect(result.correctedTo).toBe("sage");            // corrected TOWARD the pin
+    // and the delegate write carried sage's linear id (not felix, not a pool pick)
+    expect(delegateWrites().some((c) => JSON.stringify(c).includes(LINEAR_IDS.sage))).toBe(true);
+  });
+
+  it("WITHOUT a pin: the same state keeps the full multi-body pool and leaves felix (control)", async () => {
+    // No binding → not frozen. felix is a legal dev body → preserved (no single correction).
+    currentDelegateResponse = { ok: true, delegateId: LINEAR_IDS.felix };
+
+    const result = await checkRoleGuardAndBlock("tdd", "CHO-1", BOUND_LABELS, resolver);
+
+    expect(result.legalBodies).toEqual(["felix", "noah", "sage", "igor"]);
+    expect(result.correctedTo).not.toBe("sage");
+    expect(result.delegatePreserved).toBe(true);        // felix left untouched — the pre-freeze behavior
   });
 });
