@@ -455,6 +455,19 @@ async function maybeDemoteCrossFunctionalRequest(
     : (issueId ? (issueCtx = await fetchIssueContext(issueId, authToken))?.teamId ?? null : null);
   if (!teamId) return null;
 
+  // INF-996 / INF-925-class hardening (Astrid directive, 2026-07-28): a ticket
+  // already ENROLLED in a concrete workflow — carrying any `wf:*` label — is NOT an
+  // un-triaged cross-functional request. It has a real workflow home with its own
+  // intake/park/demote verbs, so the xfn auto-demote must never strip its `wf:*`
+  // label and re-park it in Backlog. This is the loop that swallowed wf:chore at
+  // intake (live 2026-07-28) — defeating cache-flush / begin-work / assign / chained
+  // re-labeling — and it double-duties as the fix for the whole INF-910/888/916/925
+  // demote-clobber class. Skip demote for any ticket carrying a concrete workflow
+  // label. (Steward enrollment writes are already exempt above via `human:escalate`.)
+  if (issueCtx?.labelNames?.some((n) => /^wf:/i.test(n))) {
+    return null;
+  }
+
   // INF-930 AC4: idempotent intake. If this ticket is already a demoted
   // cross-functional request that a steward has since promoted out of Backlog,
   // a replayed active-state write must not re-demote it and undo the promotion.
