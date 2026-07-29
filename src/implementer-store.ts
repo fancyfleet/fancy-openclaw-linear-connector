@@ -198,6 +198,24 @@ export async function removeImplementer(issueId: string): Promise<void> {
   await clearTicketBindings(issueId);
 }
 
+/**
+ * INF-996 freeze helper. If a ticket's current state pins its owner_role
+ * (`owner_binding: 'bound'`) AND a body is bound for that role, return the bound
+ * body id — its seat is authoritative and must NOT be re-derived from the role
+ * pool. Returns null for static roles, roles with no owner_role, or unbound
+ * tickets (i.e. "not frozen — proceed with normal resolution").
+ *
+ * Used by the reconciliation sweeps and the routing-guard so a bound chore seat
+ * survives a reconciliation/routing pass unchanged (the anti-INF-943 property).
+ */
+export async function boundSeatFor(
+  state: { owner_role?: string; owner_binding?: string } | undefined,
+  issueId: string,
+): Promise<string | null> {
+  if (!state || state.owner_binding !== "bound" || !state.owner_role) return null;
+  return getBinding(issueId, state.owner_role);
+}
+
 /** Clear all records (for testing). */
 export function clearImplementerStore(): void {
   _store.clear();

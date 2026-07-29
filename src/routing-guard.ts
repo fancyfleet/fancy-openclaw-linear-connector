@@ -31,6 +31,7 @@ import {
   type WorkflowInstanceContext,
 } from "./workflow-gate.js";
 import { resolveBodiesForRole, resolveBodiesWithCapability, roleResolutionScopeForOwnerRole } from "./escalation-gate.js";
+import { getBinding } from "./implementer-store.js";
 import { notify } from "./alerts/alert-bus.js";
 
 const log = componentLogger(createLogger(), "routing-guard");
@@ -46,6 +47,11 @@ export interface RoleGuardResult {
   correctedTo?: string;
   /** All legal body IDs for the state's owner_role when blocked. */
   legalBodies?: string[];
+  /** INF-996: the blocked state's owner_role and its binding mode, surfaced so the
+   *  mutation wrapper (checkRoleGuardAndBlock) can apply the bound-seat freeze —
+   *  a bound role's only legal body is the pinned one, never a pool pick. */
+  ownerRole?: string;
+  ownerBinding?: string;
   /**
    * AI-2044: true when the dispatch was blocked but the ticket's current
    * delegate fills the owner_role (or could not be verified), so the guard
@@ -257,6 +263,8 @@ export async function checkRoleGuardEnforced(
     blocked: true,
     reason,
     legalBodies,
+    ownerRole,
+    ownerBinding: stateNode.owner_binding,
   };
 
   // Surface the correction target so the caller can update the delegate.
@@ -328,6 +336,24 @@ export async function checkRoleGuardAndBlock(
   if (!internalId) {
     log.warn(`routing-guard: could not resolve issue id for ${issueIdentifier} — skipping comment/correction`);
     return result;
+  }
+
+  // INF-996 freeze: if the blocked state pins its owner_role (owner_binding:
+  // 'bound') and a body is bound for this ticket, that pinned body is the SOLE
+  // legal seat. Override the pool-derived legal set so the guard corrects toward
+  // the pin (or, when the delegate already IS the pin, leaves it untouched) —
+  // it must NEVER re-pool a bound chore off its named owner. This is the exact
+  // re-derivation Astrid called out at the correction site.
+  if (result.ownerBinding === "bound" && result.ownerRole) {
+    const boundBody = await getBinding(internalId, result.ownerRole);
+    if (boundBody) {
+      result.legalBodies = [boundBody];
+      result.correctedTo = boundBody;
+      log.info(
+        `routing-guard: ${issueIdentifier} owner_role '${result.ownerRole}' is bound → pinned body '${boundBody}' ` +
+          `is the sole legal seat (freeze; not re-pooled)`,
+      );
+    }
   }
 
   // AI-2044: the enforcement check answers "is the dispatch TARGET legal for

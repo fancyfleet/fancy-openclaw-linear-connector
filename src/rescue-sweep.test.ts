@@ -37,6 +37,7 @@ import {
   type RescueSweepResult,
   type RescueSweepOptions,
 } from "./rescue-sweep.js";
+import { recordBinding, clearImplementerStore } from "./implementer-store.js";
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -1196,5 +1197,75 @@ describe("regression guard — rescue-sweep module shape", () => {
     expect(result).toHaveProperty("errors");
     expect(Array.isArray(result.rescues)).toBe(true);
     expect(Array.isArray(result.errors)).toBe(true);
+  });
+});
+
+// ── INF-996 PR-C: the freeze — a bound seat survives the real sweep unchanged ──
+describe("INF-996 — bound-role seat survives a full rescue sweep unchanged (anti-INF-943)", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    process.env.IMPLEMENTER_STORE_PATH = path.join(tmpDir, `bind-${Date.now()}-${Math.floor(process.hrtime()[1])}.json`);
+    clearImplementerStore();
+  });
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    clearImplementerStore();
+    delete process.env.IMPLEMENTER_STORE_PATH;
+  });
+
+  // chore-shaped def: `implementation` pins its owner_role (owner_binding: bound).
+  // owner_role is `dev` (a real capability-policy role) so the classifier has a
+  // non-empty pool to (wrongly) prefer — the exact INF-943 shape.
+  const choreDef = {
+    id: "chore",
+    entry_state: "intake",
+    states: [
+      { id: "intake", owner_role: "steward" },
+      { id: "implementation", owner_role: "dev", owner_binding: "bound" },
+      { id: "done" },
+    ],
+  } as unknown as typeof TEST_WORKFLOW_DEF;
+
+  // The ticket's delegate is `astrid` — NOT in the `dev` pool [felix,noah,sage,igor].
+  const boundTicket = {
+    id: "uuid-bound",
+    identifier: "CHO-1",
+    labels: ["wf:chore", "state:implementation"],
+    delegateId: "astrid",
+    delegateName: "astrid",
+  };
+
+  it("WITH the pin recorded: the bound seat is healthy and is NEVER re-seated (freeze holds)", async () => {
+    await recordBinding("uuid-bound", "dev", "astrid", "chore"); // astrid is the pinned owner
+    const { fetch: mock, delegateUpdateCalls } = makeLinearMock({ issues: [boundTicket] });
+    globalThis.fetch = mock;
+
+    const result = await runRescueSweep({
+      authToken: "Bearer test-token",
+      capabilityPolicyPath: writeCapabilityPolicy(),
+      workflowRegistry: new Map([["chore", choreDef]]),
+    });
+
+    expect(result.rescued).toBe(0);
+    expect(delegateUpdateCalls).toHaveLength(0); // the pinned seat was NOT re-written
+    expect(result.byClassification.drifted ?? 0).toBe(0); // reclassified healthy by the freeze
+    expect(result.byClassification.healthy ?? 0).toBeGreaterThanOrEqual(1);
+  });
+
+  it("WITHOUT the pin: the same ticket IS classified drifted (proves the freeze is what protects it)", async () => {
+    // No recordBinding → no pin → the bound state has nothing to freeze on → the
+    // classifier compares astrid against the dev pool → drifted (the pre-freeze,
+    // INF-943 mis-classification that would re-pool the seat).
+    const { fetch: mock } = makeLinearMock({ issues: [boundTicket] });
+    globalThis.fetch = mock;
+
+    const result = await runRescueSweep({
+      authToken: "Bearer test-token",
+      capabilityPolicyPath: writeCapabilityPolicy(),
+      workflowRegistry: new Map([["chore", choreDef]]),
+    });
+
+    expect(result.byClassification.drifted ?? 0).toBeGreaterThanOrEqual(1);
   });
 });
