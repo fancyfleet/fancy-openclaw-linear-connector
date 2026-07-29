@@ -22,7 +22,7 @@ export interface OpsActionsProps {
 
 type GovernedTier = "T0" | "T1" | "T2";
 type GovernedAction = "delegate-set" | "force-redispatch" | "promote" | "park" | "probe";
-type DialogKind = GovernedAction | "set-state" | "recapture-ac" | null;
+type DialogKind = GovernedAction | "set-state" | "recapture-ac" | "redispatch" | null;
 
 const GOVERNED_ACTIONS: Record<GovernedAction, { label: string; tier: GovernedTier; capability: `governed-console:${GovernedAction}` }> = {
   "delegate-set": { label: "Delegate Set", tier: "T1", capability: "governed-console:delegate-set" },
