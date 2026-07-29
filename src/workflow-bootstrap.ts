@@ -76,24 +76,43 @@ export function parseWorkflowRequestMarker(description: string | undefined | nul
 const TASK_WORKFLOW_ID = "task";
 
 /**
- * INF-594: signals that a ticket's text describes a code change — a GitHub PR
- * URL, a "PR #123" mention, an inline "pull request" phrase, or a conventional
- * git branch name. Any one of these entering the `task` workflow is the
- * fingerprint of a fix that should have been routed through `dev-impl`.
+ * INF-1023: the code workflow. `wf:task` is Design-scoped and has no code-review
+ * gate; when the intake guardrail (below) detects code signals on a `wf:task`
+ * request, it redirects the ticket here — the track with code-review → merge →
+ * deploy built in — rather than admitting a code fix to a Design-only track.
+ */
+const DEV_IMPL_WORKFLOW_ID = "dev-impl";
+
+/**
+ * INF-594 / INF-1023: signals that a ticket's text describes a code change. The
+ * original INF-594 set — a GitHub PR URL, a "PR #123" mention, an inline "pull
+ * request" phrase, or a conventional git branch name — is extended by INF-1023
+ * with three more fingerprints called out in the AC of record: a unified diff
+ * header, a source-file path, and an explicit `engineering-domain:` marker. Any
+ * one of these on a `wf:task` intake is the fingerprint of a request that must
+ * run through `dev-impl`, not the Design track.
  *
- * Deliberately advisory-grade, not exhaustive: false negatives cost nothing
- * (the ticket routes as authored), and the guard that consumes this only posts
- * a suggestion — never a block — so a rare false positive is a harmless nudge.
+ * The extension list is deliberately conservative about extensions (backend/code
+ * source suffixes only — no css/html/scss/png/jpg/svg) so ordinary design/media
+ * asks referencing an asset file never trip the guardrail (INF-1023 AC3).
  */
 const PR_URL_RE = /https?:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/i;
 const PR_HASH_RE = /\bPR\s*#?\d+\b/i;
 const PULL_REQUEST_RE = /\bpull request\b/i;
+// INF-1023: a unified-diff header ("diff --git a/… b/…").
+const DIFF_RE = /(?:^|\n)\s*diff --git\s+/;
+// INF-1023: a source-file path ("src/workflow-bootstrap.ts", "a/src/foo.py").
+const SOURCE_PATH_RE =
+  /\b[\w.-]+\/[\w./-]*\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|rb|php|c|cc|cpp|h|hpp|cs|sh|sql|ya?ml|json|toml)\b/i;
+// INF-1023: an explicit engineering-domain marker ("engineering-domain: backend").
+const ENG_DOMAIN_MARKER_RE = /\bengineering-domain\s*:/i;
 const BRANCH_NAME_RE = /\b(?:feature|fix|bugfix|hotfix|chore|refactor)\/[A-Za-z0-9._-]+/;
 
 /**
- * INF-594: true when the ticket's title/description references a PR or branch —
- * the fingerprint of a code change. Used to catch code fixes mis-routed into
- * the `task` workflow (INF-585 dead-end class).
+ * INF-594 / INF-1023: true when the ticket's title/description references a code
+ * change — a PR, branch, unified diff, source path, or engineering-domain marker.
+ * Used to catch code fixes mis-routed into the `task` workflow (INF-585 dead-end
+ * class) and, per INF-1023, to redirect them off the Design track at intake.
  */
 export function referencesCodeChange(title?: string | null, description?: string | null): boolean {
   const text = `${title ?? ""}\n${description ?? ""}`;
@@ -101,25 +120,12 @@ export function referencesCodeChange(title?: string | null, description?: string
     PR_URL_RE.test(text) ||
     PR_HASH_RE.test(text) ||
     PULL_REQUEST_RE.test(text) ||
+    DIFF_RE.test(text) ||
+    SOURCE_PATH_RE.test(text) ||
+    ENG_DOMAIN_MARKER_RE.test(text) ||
     BRANCH_NAME_RE.test(text)
   );
 }
-
-/**
- * INF-594: advisory posted when a PR/branch-bearing ticket enters `task`. It
- * names the dead-end concretely (INF-585) and the fix (re-route to dev-impl),
- * and — because the guard is intentionally advisory — tells a genuine non-code
- * task ticket that merely cites a PR that it can ignore the note.
- */
-const TASK_CODE_FIX_ADVISORY =
-  "⚠️ **Routing lint (INF-594):** this ticket entered the `task` workflow, but its text " +
-  "references a PR/branch — usually the fingerprint of a code change. `task` has no " +
-  "merge-gate or deploy stage, so a code fix dead-ends at review-approved with no verb to " +
-  "engage merge (Hanzo) or deploy (the [INF-585](https://linear.app/fancymatt/issue/INF-585) " +
-  "class). Route connector/code changes through **`dev-impl`** instead — it has " +
-  "code-review → merge-gate → deploy built in: demote out of `task` and re-file under " +
-  "`dev-impl`. If this is genuinely a non-code deliverable that merely cites a PR for " +
-  "context, ignore this note.";
 
 // ── Public result type ────────────────────────────────────────────────────────
 
@@ -451,6 +457,27 @@ export async function applyBootstrapToIssue(
     workflowId = wfLabelNode.name.slice("wf:".length);
   }
 
+  // INF-1023: wf:task intake guardrail (parent decision INF-1022, fix #2a).
+  // `wf:task` is Design-scoped — its routing/review states resolve only to the
+  // Design head, so a code/PR-bearing request mis-filed onto it can never reach a
+  // code reviewer and deadlocks (repro: INF-995). Detect code signals at intake
+  // and redirect the ticket to `dev-impl` (code-review → merge → deploy built in)
+  // instead of admitting it to the Design track. This is the loud, non-dropping
+  // redirect: the ticket lands on `dev-impl` at its entry state with wf:task
+  // swapped for wf:dev-impl below — it never enters `routing` on `wf:task`, and
+  // no Eng-head route is added inside `task` (AC5; fix #2b rejected in INF-1022).
+  // Supersedes the INF-594 advisory nudge, which only suggested dev-impl while
+  // still letting the code fix into `task`.
+  let redirectedFromLabelId: string | undefined;
+  if (workflowId === TASK_WORKFLOW_ID && referencesCodeChange(issue.title, issue.description)) {
+    log.info(
+      `workflow-bootstrap: INF-1023 guardrail — ${issue.identifier ?? issue.id} carries code signals on ` +
+        `wf:task; redirecting to dev-impl (the Design track has no code-review gate)`,
+    );
+    redirectedFromLabelId = wfLabelNode.id;
+    workflowId = DEV_IMPL_WORKFLOW_ID;
+  }
+
   let registry: Map<string, WorkflowDef>;
   if (workflowRegistryOverride) {
     registry = workflowRegistryOverride;
@@ -528,20 +555,26 @@ export async function applyBootstrapToIssue(
     return null;
   }
 
-  // INF-552: for the `wf:pending` sentinel authoring path, swap the sentinel for
-  // the concrete `wf:<id>` label. The engine CAN create labels (unlike the CLI's
-  // agent OAuth token), so this is where the real `wf:<id>` first materializes —
-  // find-or-create so a registered workflow enrolls even on a team that has
-  // never used it. Drop the sentinel's id so the ticket is left cleanly managed.
+  // Swap the source wf:* label for the concrete target `wf:<id>` label when the
+  // workflow id changed after label resolution. Two paths reach here:
+  //   - INF-552 `wf:pending` sentinel authoring: the sentinel is replaced by the
+  //     resolved `wf:<id>`.
+  //   - INF-1023 task→dev-impl redirect: the `wf:task` label is replaced by
+  //     `wf:dev-impl` so the ticket no longer carries the Design track.
+  // The engine CAN create labels (unlike the CLI's agent OAuth token), so this is
+  // where the real `wf:<id>` first materializes — find-or-create so a registered
+  // workflow enrolls even on a team that has never used it. Drop the old label id
+  // so the ticket is left cleanly managed under the single correct workflow.
   const currentLabelIds = issue.labels.map((l) => l.id);
   let baseLabelIds = currentLabelIds;
-  if (pendingSentinelLabelId) {
+  const labelToSwapOutId = pendingSentinelLabelId ?? redirectedFromLabelId;
+  if (labelToSwapOutId) {
     const wfLabelId = await findOrCreateLabel(issue.teamId, `wf:${workflowId}`, authToken);
     if (!wfLabelId) {
       log.warn(`workflow-bootstrap: could not resolve label 'wf:${workflowId}' — aborting bootstrap`);
       return null;
     }
-    baseLabelIds = currentLabelIds.filter((id) => id !== pendingSentinelLabelId).concat(wfLabelId);
+    baseLabelIds = currentLabelIds.filter((id) => id !== labelToSwapOutId).concat(wfLabelId);
   }
   const newLabelIds = Array.from(new Set([...baseLabelIds, stateLabelId]));
   const success = await issueUpdateAtomic(issue.id, newLabelIds, authToken, delegateLinearUserId);
@@ -567,23 +600,10 @@ export async function applyBootstrapToIssue(
       entryStateLabel: workflowId === 'sprint-spawner' ? 'state:todo' : undefined,
     });
 
-    // INF-594: routing lint for the INF-585 dead-end class. A code fix routed
-    // into `task` reaches review-approved and then has no verb to merge or
-    // deploy — sign-off (Done ≠ merged ≠ deployed) can never be satisfied from
-    // inside `task`, so it ping-pongs until a steward breaks glass. When a
-    // ticket enters `task` carrying a PR/branch reference — the fingerprint of
-    // a code change — post a single advisory suggesting `dev-impl` (which has
-    // code-review → merge-gate → deploy built in). Advisory, not blocking: a
-    // legitimate non-code deliverable may cite a PR for context, so we nudge
-    // rather than bounce (candidate fix 1, per Astrid's INF-594 triage). Fires
-    // once — bootstrap is idempotent (returns early once state:* is present).
-    if (workflowId === TASK_WORKFLOW_ID && referencesCodeChange(issue.title, issue.description)) {
-      await postComment(issue.id, TASK_CODE_FIX_ADVISORY, authToken);
-      log.info(
-        `workflow-bootstrap: INF-594 routing lint fired on ${issue.identifier ?? issue.id} — ` +
-          `task ticket references a PR/branch; suggested dev-impl`,
-      );
-    }
+    // INF-594's advisory routing lint (a nudge posted while still admitting the
+    // code fix to `task`) is superseded by the INF-1023 intake guardrail above,
+    // which redirects code-signaled `wf:task` requests to `dev-impl` before they
+    // ever bootstrap into the Design track. There is nothing left to nudge here.
   }
 
   return {
