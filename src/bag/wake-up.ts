@@ -19,7 +19,7 @@ import { loadUniversalCanon, formatCanonBlock, getActiveCanonVersion, type Canon
 import { normalizeSessionKey } from "../session-key.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { randomUUID } from "node:crypto";
-import type { SessionSpawnIdempotencyStore, SessionSpawnRuntime } from "../store/session-spawn-idempotency-store.js";
+import { terminalRotationReason, type SessionSpawnIdempotencyStore, type SessionSpawnRuntime } from "../store/session-spawn-idempotency-store.js";
 
 const log = componentLogger(createLogger(), "wakeup");
 
@@ -212,12 +212,26 @@ export async function sendWakeUpSignal(
     agentId,
     sessionKey,
   });
+  // INF-1003: terminal-session rotation guard on the pending-bag re-dispatch
+  // path. Mirrors deliverToAgent — a terminal bound session (e.g. `stopReason:
+  // stop`) is not replayed (that is the LIF-338 C3 loop); we fall through to
+  // mint a fresh session and record the old→new rotation on the binding below.
+  let rotation: { fromSessionId: string | null; reason: string } | undefined;
   if (idempotency?.action === "return-existing") {
+    const reason = terminalRotationReason(idempotency.record.state);
+    if (!reason) {
+      log.info(
+        `sessions_spawn idempotent replay: wake ${sessionKey}/${taskKey} already has ` +
+        `state=${idempotency.record.state} run=${idempotency.record.run_id ?? "pending"}`,
+      );
+      return { runId: idempotency.record.run_id ?? undefined, canonVersion: canonVersion ?? undefined };
+    }
+    rotation = { fromSessionId: idempotency.record.session_id, reason };
     log.info(
-      `sessions_spawn idempotent replay: wake ${sessionKey}/${taskKey} already has ` +
-      `state=${idempotency.record.state} run=${idempotency.record.run_id ?? "pending"}`,
+      `INF-1003 terminal-session rotation: wake ${sessionKey}/${taskKey} bound session ` +
+      `${idempotency.record.session_id ?? "?"} is terminal (state=${idempotency.record.state}) — ` +
+      `minting a fresh session instead of replaying the dead transcript`,
     );
-    return { runId: idempotency.record.run_id ?? undefined, canonVersion: canonVersion ?? undefined };
   }
 
   log.info(`Sending wake-up signal to ${agentId}: ${ticketIds.length} ticket(s) [${ticketIds.join(", ")}]`);
@@ -252,6 +266,8 @@ export async function sendWakeUpSignal(
           sessionId: sessionKey,
           state: "live",
           runtimeStatePath: defaultRuntimeStatePath(config),
+          rotationFromSessionId: rotation?.fromSessionId,
+          rotationReason: rotation?.reason,
         });
       }
       return { canonVersion: canonVersion ?? undefined };
@@ -267,6 +283,8 @@ export async function sendWakeUpSignal(
         sessionId: sessionKey,
         state: "live",
         runtimeStatePath: defaultRuntimeStatePath(config),
+        rotationFromSessionId: rotation?.fromSessionId,
+        rotationReason: rotation?.reason,
       });
     }
     return { runId: result.runId, canonVersion: canonVersion ?? undefined };

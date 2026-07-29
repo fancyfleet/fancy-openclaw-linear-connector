@@ -9,10 +9,11 @@ import { resolveCanonicalIdentifierFromEvent } from "../canonical-identifier.js"
 import { normalizeSessionKey } from "../session-key.js";
 import type { DispatchLeaseStore } from "../store/dispatch-lease-store.js";
 import type { DispatchInFlightStore } from "../store/dispatch-inflight-store.js";
-import type {
-  SessionSpawnIdempotencyStore,
-  SessionSpawnRunRecord,
-  SessionSpawnRuntime,
+import {
+  terminalRotationReason,
+  type SessionSpawnIdempotencyStore,
+  type SessionSpawnRunRecord,
+  type SessionSpawnRuntime,
 } from "../store/session-spawn-idempotency-store.js";
 
 const log = componentLogger(createLogger(), "delivery");
@@ -197,18 +198,34 @@ export async function deliverToAgent(
     agentId: route.agentId,
     sessionKey: route.sessionKey,
   });
+  // INF-1003: terminal-session rotation guard. A bound session that reached a
+  // terminal state (e.g. codex-mirrored `stopReason: stop`) will produce no new
+  // turns, so replaying it resumes a dead transcript — the LIF-338 C3
+  // silent-completion loop. When the existing binding is terminal we DO NOT
+  // return the idempotent replay; we fall through to mint a fresh session and
+  // record the old→new rotation on the (reused) binding record below.
+  let rotation: { fromSessionId: string | null; reason: string } | undefined;
   if (idempotency?.action === "return-existing") {
+    const reason = terminalRotationReason(idempotency.record.state);
+    if (!reason) {
+      log.info(
+        `sessions_spawn idempotent replay: ${route.sessionKey}/${taskKey} already has ` +
+        `state=${idempotency.record.state} run=${idempotency.record.run_id ?? "pending"}`,
+      );
+      return {
+        dispatched: true,
+        runId: idempotency.record.run_id ?? undefined,
+        pendingAck: idempotency.record.state === "pending",
+        idempotentReplay: true,
+        sessionSpawnRecord: idempotency.record,
+      };
+    }
+    rotation = { fromSessionId: idempotency.record.session_id, reason };
     log.info(
-      `sessions_spawn idempotent replay: ${route.sessionKey}/${taskKey} already has ` +
-      `state=${idempotency.record.state} run=${idempotency.record.run_id ?? "pending"}`,
+      `INF-1003 terminal-session rotation: ${route.sessionKey}/${taskKey} bound session ` +
+      `${idempotency.record.session_id ?? "?"} is terminal (state=${idempotency.record.state}) — ` +
+      `minting a fresh session instead of replaying the dead transcript`,
     );
-    return {
-      dispatched: true,
-      runId: idempotency.record.run_id ?? undefined,
-      pendingAck: idempotency.record.state === "pending",
-      idempotentReplay: true,
-      sessionSpawnRecord: idempotency.record,
-    };
   }
 
   // INF-413: Ticket-level in-flight guard, checked BEFORE the agent-scoped
@@ -268,6 +285,8 @@ export async function deliverToAgent(
       sessionId: route.sessionKey,
       state: "live",
       runtimeStatePath: defaultRuntimeStatePath(config),
+      rotationFromSessionId: rotation?.fromSessionId,
+      rotationReason: rotation?.reason,
     });
     return { ...result, canonVersion, sessionSpawnRecord: marked };
   }
