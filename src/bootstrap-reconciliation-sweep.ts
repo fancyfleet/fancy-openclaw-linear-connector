@@ -78,7 +78,7 @@ export interface ReconciliationSweepOptions {
   /** Alert bus for heal/failure notifications. */
   alertBus?: AlertBus;
   /** Called to wake the first-owner delegate after a successful heal. */
-  wakeFn?: (agentName: string, ticketIdentifier: string) => Promise<void>;
+  wakeFn?: (agentName: string, ticketIdentifier: string) => Promise<{ dispatched: boolean; suppressed?: boolean; reason?: string } | void>;
   /** Dispatch ack tracker used by the watchdog/reconciliation backstop. */
   dispatchAckTracker?: DispatchAckTracker;
   /** Injectable fetch (tests). Defaults to global fetch. */
@@ -1124,7 +1124,7 @@ export function registerBootstrapReconciliationCron(
     /** Delivers a wake to the first-owner delegate after a successful heal.
      *  Required for AC1 in the prod path — index.ts wires this to the same
      *  delivery mechanism the webhook bootstrap path uses. */
-    wakeFn?: (agentName: string, ticketIdentifier: string) => Promise<void>;
+    wakeFn?: (agentName: string, ticketIdentifier: string) => Promise<{ dispatched: boolean; suppressed?: boolean; reason?: string } | void>;
     /** Dispatch ack tracker used by the watchdog/reconciliation backstop. */
     dispatchAckTracker?: DispatchAckTracker;
   },

@@ -2141,12 +2141,19 @@ if (isEntryPoint) {
   // and every build-message title/label fetch, blinding fleet-wide reconciliation.
   const resolveReconciliationAuthToken = () =>
     getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
-  const reconciliationWakeFn = async (agentName: string, ticketIdentifier: string) => {
+  const reconciliationWakeFn = async (
+    agentName: string,
+    ticketIdentifier: string,
+  ): Promise<{ dispatched: boolean; suppressed: boolean; reason?: string }> => {
     const sessionKey = normalizeSessionKey(ticketIdentifier);
     // AI-2313: guard against re-dispatch when a session is already live for this (agent, ticket).
     if (sessionTracker.isActiveForTicket(agentName, sessionKey)) {
       log.info(`AI-2313 re-dispatch skipped for ${agentName} [${sessionKey}]: session already active (reconciliationWakeFn)`);
-      return;
+      // INF-1026: report the suppression honestly. Previously returned void and the
+      // reconciliation sweep stamped `dispatch-accepted` regardless — a false success
+      // that masked a wake that never fired, so the watchdog never re-drove the dead
+      // session (dev-fleet-dark self-DoS).
+      return { dispatched: false, suppressed: true, reason: "session already active (AI-2313)" };
     }
     const agentCfg = getAgent(agentName);
     const deliveryConfig: DeliveryConfig = {
@@ -2167,7 +2174,7 @@ if (isEntryPoint) {
     // INF-282: Wire DispatchLeaseStore check into reconciliation wake path.
     // Call the module version which checks hasActiveLease and acquires a lease
     // before delivering, preventing duplicate wakes on connector restart.
-    await reconciliationWakeWithLeaseCheck({
+    const wake = await reconciliationWakeWithLeaseCheck({
       agentId: agentName,
       ticketId: ticketIdentifier,
       leaseStore: dispatchLeaseStore,
@@ -2177,6 +2184,14 @@ if (isEntryPoint) {
         return await deliverMessageToAgent(agId, sessionKey, msg, cfg);
       },
     });
+    // INF-1026: propagate the real disposition so the reconciliation sweep only
+    // records `dispatch-accepted` when a session actually fired (dispatched), and
+    // records `delivery-failed` when the wake was lease-suppressed or not delivered.
+    return {
+      dispatched: wake.dispatched,
+      suppressed: wake.suppressed ?? false,
+      reason: wake.reason,
+    };
   };
 
   // QUIESCE (Matt/Astrid directive 2026-07-28, INF-925 self-DoS): env-gated muzzle for

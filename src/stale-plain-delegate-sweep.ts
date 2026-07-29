@@ -50,7 +50,7 @@ export interface StalePlainDelegateOptions {
   operationalEventStore: OperationalEventStore;
   alertBus: AlertBus;
   ackTracker?: DispatchAckTracker;
-  wakeFn: (agentName: string, ticketIdentifier: string) => Promise<void>;
+  wakeFn: (agentName: string, ticketIdentifier: string) => Promise<{ dispatched: boolean; suppressed?: boolean; reason?: string } | void>;
   fetchFn?: typeof fetch;
   postLinearComment?: (agentName: string, ticketId: string, body: string) => Promise<boolean>;
   staleTimeoutMs?: number;
@@ -412,7 +412,7 @@ export function registerStalePlainDelegateCron(opts: {
   operationalEventStore?: OperationalEventStore;
   alertBus?: AlertBus;
   ackTracker?: DispatchAckTracker;
-  wakeFn?: (agentName: string, ticketIdentifier: string) => Promise<void>;
+  wakeFn?: (agentName: string, ticketIdentifier: string) => Promise<{ dispatched: boolean; suppressed?: boolean; reason?: string } | void>;
   fetchFn?: typeof fetch;
   postLinearComment?: (agentName: string, ticketId: string, body: string) => Promise<boolean>;
 }): NodeJS.Timeout {

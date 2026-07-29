@@ -57,7 +57,13 @@ export interface DelegationReconciliationOptions {
   authToken: string | (() => string);
   operationalEventStore: OperationalEventStoreType;
   alertBus: AlertBus;
-  wakeFn: (agentName: string, ticketIdentifier: string) => Promise<void>;
+  // INF-1026: the wake fn reports its real delivery disposition so the sweep only
+  // records `dispatch-accepted` when a session actually fired. A `void` return is
+  // tolerated for legacy/mocked callers (treated as dispatched).
+  wakeFn: (
+    agentName: string,
+    ticketIdentifier: string,
+  ) => Promise<{ dispatched: boolean; suppressed?: boolean; reason?: string } | void>;
   sessionTracker?: SessionTracker;
   fetchFn?: typeof fetch;
   /** AC5: single-ticket mode — reconcile only these identifiers. */
@@ -911,48 +917,74 @@ export async function runDelegationReconciliationSweep(
 
       // Heal: re-dispatch the delegation wake through the normal delivery path
       try {
-        await wakeFn(delegateAgentName, ticket.identifier);
+        // INF-1026: gate the success signal on the REAL delivery disposition.
+        // Previously this stamped `dispatch-accepted` unconditionally even when the
+        // wake was suppressed (active-session guard / held lease) and no POST fired —
+        // a false success that told the watchdog the dead session was handled, so it
+        // was never re-driven (the dev-fleet-dark self-DoS). A `void` return (legacy
+        // / mocked wakeFn) is treated as dispatched to preserve prior behavior.
+        const wake = await wakeFn(delegateAgentName, ticket.identifier);
+        const dispatched = wake ? wake.dispatched : true;
 
-        result.healed++;
-        log.info(
-          `delegation-reconciliation: healed ${ticket.identifier} → wake dispatched to ${delegateAgentName}`,
-        );
+        if (!dispatched) {
+          result.skippedIdempotent++;
+          log.warn(
+            `delegation-reconciliation: wake NOT dispatched for ${ticket.identifier} → ${delegateAgentName} ` +
+              `(${wake?.reason ?? "suppressed"}); recording delivery-failed instead of dispatch-accepted`,
+          );
+          operationalEventStore.append({
+            outcome: "delivery-failed",
+            agent: delegateAgentName,
+            key: `linear-${ticket.identifier}`,
+            errorSummary: wake?.reason ?? "reconciliation wake suppressed — no session dispatched",
+            detail: {
+              mode: "delegation-reconciliation",
+              ticket: ticket.identifier,
+              suppressed: wake?.suppressed ?? false,
+            },
+          });
+        } else {
+          result.healed++;
+          log.info(
+            `delegation-reconciliation: healed ${ticket.identifier} → wake dispatched to ${delegateAgentName}`,
+          );
 
-        // Emit operational event
-        operationalEventStore.append({
-          outcome: "dispatch-accepted",
-          agent: delegateAgentName,
-          key: `linear-${ticket.identifier}`,
-          detail: {
-            mode: "delegation-reconciliation",
+          // Emit operational event
+          operationalEventStore.append({
+            outcome: "dispatch-accepted",
+            agent: delegateAgentName,
+            key: `linear-${ticket.identifier}`,
+            detail: {
+              mode: "delegation-reconciliation",
+              ticket: ticket.identifier,
+            },
+          });
+
+          // Also emit a delegation-reconciled event for AC3 observability
+          operationalEventStore.append({
+            outcome: "delegation-reconciled",
+            agent: delegateAgentName,
+            key: `linear-${ticket.identifier}`,
+            detail: {
+              mode: "delegation-wake",
+              ticket: ticket.identifier,
+              delegate: delegateAgentName,
+            },
+          });
+
+          // Alert (AC3)
+          alertBus.notify({
+            severity: "warning",
+            source: "delegation-reconciled",
+            title: `Delegation reconciliation healed ${ticket.identifier}`,
+            detail: {
+              ticket: ticket.identifier,
+              delegate: ticket.delegateName,
+              mode: "stranded-delegation-wake",
+            },
             ticket: ticket.identifier,
-          },
-        });
-
-        // Also emit a delegation-reconciled event for AC3 observability
-        operationalEventStore.append({
-          outcome: "delegation-reconciled",
-          agent: delegateAgentName,
-          key: `linear-${ticket.identifier}`,
-          detail: {
-            mode: "delegation-wake",
-            ticket: ticket.identifier,
-            delegate: delegateAgentName,
-          },
-        });
-
-        // Alert (AC3)
-        alertBus.notify({
-          severity: "warning",
-          source: "delegation-reconciled",
-          title: `Delegation reconciliation healed ${ticket.identifier}`,
-          detail: {
-            ticket: ticket.identifier,
-            delegate: ticket.delegateName,
-            mode: "stranded-delegation-wake",
-          },
-          ticket: ticket.identifier,
-        });
+          });
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         result.errors.push(
@@ -1010,7 +1042,10 @@ export function registerDelegationReconciliationCron(opts: {
   intervalMs?: number;
   operationalEventStore?: OperationalEventStoreType;
   alertBus?: AlertBus;
-  wakeFn?: (agentName: string, ticketIdentifier: string) => Promise<void>;
+  wakeFn?: (
+    agentName: string,
+    ticketIdentifier: string,
+  ) => Promise<{ dispatched: boolean; suppressed?: boolean; reason?: string } | void>;
   sessionTracker?: SessionTracker;
   fetchFn?: typeof fetch;
   dispatchLeaseStore?: DispatchLeaseStore;
