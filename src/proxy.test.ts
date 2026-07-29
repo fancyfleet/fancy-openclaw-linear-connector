@@ -2033,7 +2033,9 @@ describe("proxy — Phase 6.5 fail-closed (AI-1476)", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.errors).toBeDefined();
-    expect(res.body.errors[0].message).toContain("could not be loaded");
+    expect(res.body.errors[0].message).toContain("[Proxy]");
+    expect(res.body.errors[0].message).toMatch(/could not be loaded|config artifacts are degraded/);
+    expect(res.body.errors[0].message).toContain("break-glass");
   });
 
   // AC2 (G-13a / AI-1551): steward can break-glass to move a wedged ticket.
