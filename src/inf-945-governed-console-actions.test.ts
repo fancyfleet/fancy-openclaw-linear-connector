@@ -71,7 +71,7 @@ describe("INF-945 scoped admin API routes", () => {
   let wakeCalls: Array<{ agentId: string; ticketIds: string[] }>;
 
   function json(data: unknown) {
-    return { json: async () => data } as Response;
+    return { ok: true, status: 200, json: async () => data } as Response;
   }
 
   function installLinearMock() {
@@ -144,6 +144,27 @@ describe("INF-945 scoped admin API routes", () => {
               labels: { nodes: [{ name: expectedState }] },
               delegate: expectedDelegate,
               state: { id: lastIssueUpdate?.stateId ?? TODO_STATE_ID },
+            },
+          },
+        });
+      }
+      if (query.includes("TargetedRedispatchIssue")) {
+        // INF-945: force-redispatch routes through the targeted single-issue
+        // sweep path (queryTargetedTickets → TargetedRedispatchIssue), not the
+        // issues-list DelegationReconciliation query. Return the same governed
+        // ticket in the single-issue shape the targeted query selects.
+        return json({
+          data: {
+            issue: {
+              id: INTERNAL_ID,
+              identifier: TICKET,
+              updatedAt: "2026-07-28T09:00:00.000Z",
+              title: "INF-945 governed console control plane",
+              labels: { nodes: [{ id: "label-wf-dev-impl", name: "wf:dev-impl" }, { id: "label-state-implementation", name: "state:implementation" }] },
+              delegate: { id: IGOR_LINEAR_ID, name: "igor" },
+              team: { id: TEAM_ID },
+              state: { name: "In Progress", type: "started" },
+              relations: { nodes: [] },
             },
           },
         });
