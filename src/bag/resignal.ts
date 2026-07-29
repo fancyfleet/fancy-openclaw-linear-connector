@@ -141,8 +141,24 @@ export async function resignalPendingTickets(
       bag.recordSignal();
 
       const wakeResult = await sendWakeUp(agentId, [ticketId], ticketWakeConfig);
+      const wakeRunId = (wakeResult as { runId?: string; canonVersion?: string } | void | undefined)?.runId;
+
+      // INF-1026: the active-session slot was claimed optimistically BEFORE delivery
+      // (AI-2091 §7, to close the double-dispatch race). If delivery produced no real
+      // gateway session (no runId), release the claim now — otherwise a PHANTOM
+      // active-session lingers: `isActiveForTicket` reports the agent as "working" and
+      // the active-session guard suppresses every future re-drive, so the agent goes
+      // dark forever (confirmed live by Grover: igor stuck on linear-INF-995 with no
+      // backing session). Only a confirmed runId keeps the claim.
+      if (claimedSession && !wakeRunId) {
+        sessionTracker.endSession(agentId, ticketId);
+        log.warn(
+          `No session runId from wake for ${agentId} [${ticketId}] — releasing optimistic active-session claim (phantom-active guard, INF-1026)`,
+        );
+      }
+
       options.onDispatched?.(agentId, ticketId);
-      results.push({ ticketId, dispatched: true, runId: (wakeResult as { runId?: string; canonVersion?: string } | void | undefined)?.runId, canonVersion: (wakeResult as { runId?: string; canonVersion?: string } | void | undefined)?.canonVersion ?? null });
+      results.push({ ticketId, dispatched: true, runId: wakeRunId, canonVersion: (wakeResult as { runId?: string; canonVersion?: string } | void | undefined)?.canonVersion ?? null });
     } catch (err) {
       log.error(
         `Re-signal failed for ${agentId} [${ticketId}]: ${err instanceof Error ? err.message : String(err)}`,
