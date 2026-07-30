@@ -143,7 +143,7 @@ function makeFetch(currentLabelNames: () => string[]): typeof globalThis.fetch {
           issue: {
             id: ISSUE_UUID,
             identifier: TICKET_IDENTIFIER,
-            team: { id: TEAM_ID },
+            team: { id: TEAM_ID, key: "GEN", name: "General" },
             labels: { nodes: currentLabelNames().map((name) => ({ id: `${name}-id`, name })) },
             delegate: null,
           },

@@ -186,7 +186,13 @@ describe("INF-848 AC1/AC2: wf:task department-head paths survive DSN-scoped Lare
     const intake = def!.states.find((s) => s.id === "intake");
     const request = intake!.transitions?.find((t) => t.command === "request");
 
-    await expect(resolveTransitionTargets(request!, def!)).resolves.toEqual({
+    // INF-942: scope is resolved from instance context, not def-level department_scope.
+    await expect(resolveTransitionTargets(request!, def!, {
+      issueIdentifier: "INF-848",
+      teamKey: "DSN",
+      teamName: "Design",
+      workflowEnrollment: { department: "DSN", team: "Design" },
+    })).resolves.toEqual({
       bodies: ["laren"],
       mode: "auto",
     });
@@ -196,7 +202,13 @@ describe("INF-848 AC1/AC2: wf:task department-head paths survive DSN-scoped Lare
     globalThis.fetch = makeLabelFetch(["wf:task", "state:intake"]);
     const { buildDeliveryMessage } = await import("./delivery/build-message.js");
 
-    const message = await buildDeliveryMessage(makeRoute("INF-848", "Unscoped wf:task review/routing"), TOK);
+    // INF-942: provide enrollment metadata so the department-head scope resolves correctly.
+    const message = await buildDeliveryMessage(makeRoute("INF-848", "Unscoped wf:task review/routing", {
+      teamKey: "DSN",
+      teamName: "Design",
+      department: "DSN",
+      team: "Design",
+    }), TOK);
 
     expect(message).toContain("This is a [task] managed workflow ticket");
     expect(message).toContain("linear continue-workflow INF-848");
