@@ -21,6 +21,7 @@ import type { FanoutConfig, WorkflowDef, WorkflowState, WorkflowTransition } fro
 
 const REGISTERED_DEFS_DIR = path.resolve(process.cwd(), "src/registered-defs");
 const DEV_SPRINT_PATH = path.join(REGISTERED_DEFS_DIR, "dev-sprint.yaml");
+const INTEGRATION_VERIFY_PATH = path.join(REGISTERED_DEFS_DIR, "integration-verify.yaml");
 
 type V8Transition = WorkflowTransition & {
   requires_capability_statement?: boolean;
@@ -41,6 +42,10 @@ type V8FanoutConfig = FanoutConfig & {
 
 function loadDevSprint(): WorkflowDef {
   return yamlLoad(fs.readFileSync(DEV_SPRINT_PATH, "utf8")) as WorkflowDef;
+}
+
+function loadIntegrationVerify(): WorkflowDef {
+  return yamlLoad(fs.readFileSync(INTEGRATION_VERIFY_PATH, "utf8")) as WorkflowDef;
 }
 
 function state(def: WorkflowDef, id: string): WorkflowState {
@@ -118,14 +123,22 @@ describe("INF-359 AC3: integration-verify children for capabilities", () => {
   });
 
   it("integration-verify routes the execution step to an explicit dev verifier", () => {
-    const raw = fs.readFileSync(path.join(REGISTERED_DEFS_DIR, "integration-verify.yaml"), "utf8");
-    const def = yamlLoad(raw) as WorkflowDef;
+    const def = loadIntegrationVerify();
     const intakeAccept = transition(def, "intake", "accept");
     const verificationRevision = transition(def, "verification", "request-changes");
 
     expect(state(def, "verification").owner_role).toBe("dev");
     expect(intakeAccept.assign).toEqual({ mode: "required" });
     expect(verificationRevision.assign).toEqual({ mode: "required" });
+  });
+
+  it("INF-902: integration-verify provisions the explicit verification workflow state", () => {
+    const def = loadIntegrationVerify();
+
+    expect(def.entry_state).toBe("intake");
+    expect(transition(def, "intake", "accept").to).toBe("verification");
+    expect(state(def, "verification").native_state).toBe("doing");
+    expect(state(def, "verification").owner_role).toBe("dev");
   });
 
   it("spawn-impl declares one integration-verify child per capability blocked by component tickets", () => {
