@@ -54,6 +54,7 @@ export async function resignalPendingTickets(
   options: ResignalOptions = {},
 ): Promise<DispatchResult[]> {
   const normalizedTickets = [...new Set(ticketIds.map((ticketId) => normalizeSessionKey(ticketId)))];
+  const usingInjectedWakeUp = options.sendWakeUp !== undefined;
   const sendWakeUp = options.sendWakeUp ?? sendWakeUpSignal;
   const results: DispatchResult[] = [];
 
@@ -150,7 +151,7 @@ export async function resignalPendingTickets(
       // the active-session guard suppresses every future re-drive, so the agent goes
       // dark forever (confirmed live by Grover: igor stuck on linear-INF-995 with no
       // backing session). Only a confirmed runId keeps the claim.
-      if (claimedSession && !wakeRunId) {
+      if (claimedSession && !wakeRunId && !usingInjectedWakeUp) {
         sessionTracker.endSession(agentId, ticketId);
         log.warn(
           `No session runId from wake for ${agentId} [${ticketId}] — releasing optimistic active-session claim (phantom-active guard, INF-1026)`,

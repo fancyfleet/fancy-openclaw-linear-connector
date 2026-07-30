@@ -222,8 +222,18 @@ export async function sendWakeUpSignal(
   // `stop`), so the guard fires on the real signal here.
   let rotation: { fromSessionId: string | null; reason: string } | undefined;
   if (idempotency?.action === "return-existing") {
+    const hasConcreteLiveBinding = idempotency.record.state === "live" && !!idempotency.record.session_id;
+    if (!hasConcreteLiveBinding) {
+      log.info(
+        `sessions_spawn idempotent replay: wake ${sessionKey}/${taskKey} already has ` +
+        `state=${idempotency.record.state} run=${idempotency.record.run_id ?? "pending"}`,
+      );
+      return { runId: idempotency.record.run_id ?? undefined, canonVersion: canonVersion ?? undefined };
+    }
     const probe = probeBoundSessionTerminal(agentId, sessionKey, config.openclawHome);
-    if (!probe.terminal) {
+    const boundSessionMatches =
+      !idempotency.record.session_id || !probe.sessionId || probe.sessionId === idempotency.record.session_id;
+    if (!probe.terminal || !boundSessionMatches) {
       log.info(
         `sessions_spawn idempotent replay: wake ${sessionKey}/${taskKey} already has ` +
         `state=${idempotency.record.state} run=${idempotency.record.run_id ?? "pending"}`,
