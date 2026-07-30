@@ -2286,6 +2286,7 @@ if (isEntryPoint) {
       wakeFn: reconciliationWakeFn,
       dispatchLeaseStore,
       enrolledTicketsStore,
+      dispatchIdempotencyStore: idempotencyStore,
     });
   } else {
     log.warn("[quiesce] reconciliation sweeps NOT registered (QUIESCE_RECONCILIATION_SWEEPS=1)");

@@ -35,6 +35,7 @@ import { OperationalEventStore, type OperationalEventStore as OperationalEventSt
 import type { SessionTracker } from "./bag/session-tracker.js";
 import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
+import { type DispatchIdempotencyStore } from "./store/dispatch-idempotency-store.js";
 
 const log = componentLogger(
   createLogger(process.env.LOG_LEVEL ?? "info"),
@@ -77,6 +78,14 @@ export interface DelegationReconciliationOptions {
   dispatchLeaseStore?: DispatchLeaseStore;
   /** INF-334: mirror enrollment for plain delegated tickets promoted to wf:task. */
   enrolledTicketsStore?: EnrolledTicketsStore;
+  /**
+   * INF-943: optional dispatch idempotency store. When provided, stale
+   * dispatch-idempotency rows for (ticket, agent) are cleared before the
+   * reconciliation wake is dispatched — mirroring redispatchViaWatchdog
+   * (first-action-watchdog.ts:312). Prevents a never-started C4 husk from
+   * stranding the ticket permanently by blocking re-dispatch.
+   */
+  dispatchIdempotencyStore?: DispatchIdempotencyStore;
 }
 
 export interface DelegationReconciliationResult {
@@ -915,6 +924,25 @@ export async function runDelegationReconciliationSweep(
         }
       }
 
+      // INF-943: clear stale dispatch-idempotency rows for (ticket, agent) before
+      // re-dispatching. Mirrors redispatchViaWatchdog (first-action-watchdog.ts:312)
+      // which clears idempotency rows so a fresh wake is admitted rather than
+      // suppressed as a duplicate — prevents a never-started C4 husk from stranding
+      // the ticket permanently.
+      if (opts.dispatchIdempotencyStore) {
+        const ticketKey = `linear-${ticket.identifier}`;
+        const cleared = opts.dispatchIdempotencyStore.clearAgentRows(
+          ticketKey,
+          delegateAgentName,
+        );
+        if (cleared > 0) {
+          log.info(
+            `INF-943: cleared ${cleared} stale dispatch-idempotency row(s) ` +
+            `for ${ticketKey} / ${delegateAgentName} before reconciliation wake`,
+          );
+        }
+      }
+
       // Heal: re-dispatch the delegation wake through the normal delivery path
       try {
         // INF-1026: gate the success signal on the REAL delivery disposition.
@@ -1050,6 +1078,7 @@ export function registerDelegationReconciliationCron(opts: {
   fetchFn?: typeof fetch;
   dispatchLeaseStore?: DispatchLeaseStore;
   enrolledTicketsStore?: EnrolledTicketsStore;
+  dispatchIdempotencyStore?: DispatchIdempotencyStore;
 }): NodeJS.Timeout {
   const intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
   registerCron(
@@ -1072,6 +1101,7 @@ export function registerDelegationReconciliationCron(opts: {
       fetchFn: opts.fetchFn,
       dispatchLeaseStore: opts.dispatchLeaseStore,
       enrolledTicketsStore: opts.enrolledTicketsStore,
+      dispatchIdempotencyStore: opts.dispatchIdempotencyStore,
     }).catch((err) => {
       log.error(
         `delegation-reconciliation: unexpected sweep failure: ${err instanceof Error ? err.message : String(err)}`,

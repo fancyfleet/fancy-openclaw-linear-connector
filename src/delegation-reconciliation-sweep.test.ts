@@ -2737,3 +2737,90 @@ describe("INF-589: governed heal wakes by resolved OpenClaw id, not Linear displ
     eventStore.close();
   });
 });
+
+// ══════════════════════════════════════════════════════════════════════════
+// INF-943: Reconciliation sweep clears stale dispatch-idempotency rows
+//           before re-dispatching, so the DispatchIdempotencyStore doesn't
+//           suppress the wake as a duplicate.
+// ══════════════════════════════════════════════════════════════════════════
+
+describe("INF-943: idempotency-clear on reconciliation redispatch", () => {
+  it("clears stale dispatch-idempotency rows before re-dispatching a stranded ticket", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: Array<{ agentName: string; ticketIdentifier: string }> = [];
+    const { bus } = makeTestAlertBus();
+    const clearedTicketKeys: string[] = [];
+    const clearedAgents: string[] = [];
+
+    globalThis.fetch = makeReconciliationFetch({
+      governedTickets: [
+        {
+          id: "issue-943-stranded",
+          identifier: "INF-943-TEST",
+          updatedAt: OLD_TIMESTAMP,
+          labels: [WF_LABEL, STATE_IMPLEMENTATION_LABEL],
+          delegateId: DELEGATE_LINEAR_ID,
+          delegateName: DELEGATE_AGENT_NAME,
+          teamId: TEAM_ID,
+        },
+      ],
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (agentName, ticketIdentifier) => {
+        wakeDispatches.push({ agentName, ticketIdentifier });
+      },
+      dispatchIdempotencyStore: {
+        clearAgentRows(ticketKey: string, agent: string): number {
+          clearedTicketKeys.push(ticketKey);
+          clearedAgents.push(agent);
+          return 0;
+        },
+      },
+    });
+
+    expect(result.healed).toBe(1);
+    expect(wakeDispatches).toHaveLength(1);
+    expect(clearedTicketKeys).toContain("linear-INF-943-TEST");
+    expect(clearedAgents).toContain(DELEGATE_AGENT_NAME);
+
+    eventStore.close();
+  });
+
+  it("does not call clearAgentRows when no dispatchIdempotencyStore is provided (backward compat)", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: Array<{ agentName: string; ticketIdentifier: string }> = [];
+    const { bus } = makeTestAlertBus();
+
+    globalThis.fetch = makeReconciliationFetch({
+      governedTickets: [
+        {
+          id: "issue-943-no-store",
+          identifier: "INF-943-LEGACY",
+          updatedAt: OLD_TIMESTAMP,
+          labels: [WF_LABEL, STATE_IMPLEMENTATION_LABEL],
+          delegateId: DELEGATE_LINEAR_ID,
+          delegateName: DELEGATE_AGENT_NAME,
+          teamId: TEAM_ID,
+        },
+      ],
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (agentName, ticketIdentifier) => {
+        wakeDispatches.push({ agentName, ticketIdentifier });
+      },
+      // No dispatchIdempotencyStore — should work as before
+    });
+
+    expect(result.healed).toBe(1);
+    expect(wakeDispatches).toHaveLength(1);
+    eventStore.close();
+  });
+});
