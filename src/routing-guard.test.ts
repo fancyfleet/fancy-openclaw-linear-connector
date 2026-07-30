@@ -79,6 +79,27 @@ const DEV_IMPL_DEF = {
   ],
 };
 
+const INTEGRATION_VERIFY_DEF = {
+  id: "integration-verify",
+  states: [
+    {
+      id: "intake",
+      owner_role: "steward",
+      transitions: [{ command: "accept", to: "verification" }],
+    },
+    {
+      id: "verification",
+      owner_role: "dev",
+      transitions: [{ command: "complete", to: "done" }],
+    },
+    {
+      id: "done",
+      kind: "terminal",
+      transitions: [],
+    },
+  ],
+};
+
 // Hard-coded copy of the review-only set for test verification.
 // Must be kept in sync with routing-guard.ts REVIEW_ONLY_AGENTS.
 const REVIEW_ONLY_FOR_TEST = [
@@ -228,6 +249,44 @@ describe("checkRoleGuardEnforced (Phase 2 enforcement)", () => {
     const result = await checkRoleGuardEnforced("igor", ["wf:dev-impl", "state:implementation"]);
     expect(result.blocked).toBe(false);
     expect(result.reason).toBeUndefined();
+  });
+
+  it("allows explicit transition target that fills a non-terminal destination owner role", async () => {
+    mockLoadWorkflowDefById.mockImplementation(async (workflowId: string) => {
+      if (workflowId === "integration-verify") return INTEGRATION_VERIFY_DEF;
+      return null;
+    });
+    mockResolveBodiesForRole.mockImplementation(async (role: string) => {
+      if (role === "steward") return ["astrid"];
+      if (role === "dev") return ["igor"];
+      return [];
+    });
+
+    const result = await checkRoleGuardEnforced("igor", ["wf:integration-verify", "state:intake"]);
+
+    expect(result.blocked).toBe(false);
+    expect(mockResolveBodiesForRole).toHaveBeenCalledWith("steward", undefined);
+    expect(mockResolveBodiesForRole).toHaveBeenCalledWith("dev", undefined);
+  });
+
+  it("blocks unrelated targets that fill neither current nor destination owner role", async () => {
+    mockLoadWorkflowDefById.mockImplementation(async (workflowId: string) => {
+      if (workflowId === "integration-verify") return INTEGRATION_VERIFY_DEF;
+      return null;
+    });
+    mockResolveBodiesForRole.mockImplementation(async (role: string) => {
+      if (role === "steward") return ["astrid"];
+      if (role === "dev") return ["igor"];
+      return [];
+    });
+
+    const result = await checkRoleGuardEnforced("charles", ["wf:integration-verify", "state:intake"]);
+
+    expect(result.blocked).toBe(true);
+    expect(result.reason).toContain("charles");
+    expect(result.reason).toContain("steward");
+    expect(result.reason).toContain("astrid");
+    expect(result.correctedTo).toBe("astrid");
   });
 
   it("threads workflow department scope when enforcing a department-head-owned state", async () => {
