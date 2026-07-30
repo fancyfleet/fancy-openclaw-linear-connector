@@ -330,6 +330,46 @@ function applyDevSprintArmInference(finding: Finding): Finding {
   return finding;
 }
 
+const ENGINEERING_SOLICIT_RECIPIENTS = new Set(["felix", "noah", "sage", "igor", "tdd"]);
+const ENGINEERING_SOLICIT_ROLES = new Set([
+  "backend",
+  "dev",
+  "frontend",
+  "mobile",
+  "owned-resource",
+  "react-native",
+  "test-author",
+  "web",
+]);
+
+function metadataToken(material: string, field: string): string | undefined {
+  return extractMetadataValue(material, field)
+    ?.trim()
+    .toLowerCase()
+    .replace(/^@/, "");
+}
+
+function isEngineeringSolicitFinding(finding: Finding): boolean {
+  const material = `${finding.title}\n${finding.description ?? ""}`;
+  const recipient = metadataToken(material, "recipient");
+  const role = metadataToken(material, "role");
+  return (
+    (recipient !== undefined && ENGINEERING_SOLICIT_RECIPIENTS.has(recipient)) ||
+    (role !== undefined && ENGINEERING_SOLICIT_ROLES.has(role)) ||
+    /\bengineering\s+solicitation\b/i.test(material)
+  );
+}
+
+function engineeringSolicitRecoveryMessage(findings: Finding[]): string {
+  const titles = findings.map((f) => `"${f.title}"`).join(", ");
+  return (
+    `Refusing fan-out: department-engine Engineering solicitations cannot mint Design-scoped wf:task children. ` +
+    `Matched ${findings.length} Engineering solicitation entr${findings.length === 1 ? "y" : "ies"}: ${titles}. ` +
+    `Recovery for already-minted ENG-18..22: recreate or reroute each child through the dev-impl/Engineering entry path ` +
+    `with the intended delegate (Noah, Sage, Igor, tdd, Igor) and remove the Backlog/null-delegate wf:task xfn stubs.`
+  );
+}
+
 function cleanSpawnChildDescription(description: string | null | undefined, parentIssueId?: string): string | undefined {
   let clean = description ?? "";
   clean = clean.replace(SPEC_ENTRY_MARKER_RE, "");
@@ -1598,6 +1638,19 @@ export async function executeFanout(
       message: `No '${config.spec_source}' entries found — fan-out requires at least one parseable spec entry`,
     });
     return result;
+  }
+  if (config.spec_source.toLowerCase() === "solicitations" && childWorkflowLabel === "wf:task") {
+    const engineeringSolicitations = findings.filter(isEngineeringSolicitFinding);
+    if (engineeringSolicitations.length > 0) {
+      const message = engineeringSolicitRecoveryMessage(engineeringSolicitations);
+      result.refused = true;
+      result.errors.push({
+        findingIndex: findings.findIndex((finding) => engineeringSolicitations.includes(finding)),
+        message,
+      });
+      log.warn(`fanout: ${message}`);
+      return result;
+    }
   }
   const unsupportedArm = findings.find((f) => f.unsupportedArmType);
   if (unsupportedArm) {
