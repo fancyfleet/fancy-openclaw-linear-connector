@@ -18,6 +18,7 @@ import os from "node:os";
 import { createLogger, componentLogger } from "../logger.js";
 import { getAccessToken, getAgent, getLinearUserIdForAgent, getOpenclawAgentName } from "../agents.js";
 import { tryNormalizeSessionKey } from "../session-key.js";
+import { GlobalRedispatchBudget } from "./global-redispatch-budget.js";
 import { StaleRedispatchCounter } from "./stale-redispatch-counter.js";
 
 const log = componentLogger(createLogger(), "stale-forensics");
@@ -133,6 +134,21 @@ export interface ForensicsConfig {
   redispatchDbPath?: string;
   /** Max C2/C4 re-dispatch attempts before escalating to human. Default: 3 (STALE_REDISPATCH_MAX_ATTEMPTS env) */
   maxRedispatchAttempts?: number;
+  /**
+   * INF-982: shared global redispatch budget across all detectors (stale-session,
+   * no-activity-detector, dispatch-watchdog). When provided, replaces the per-detector
+   * StaleRedispatchCounter with a unified global budget so a ticket can't loop through
+   * each detector's independent cap (3+3+3=9 attempts before human escalation).
+   */
+  globalRedispatchBudget?: GlobalRedispatchBudget;
+  /**
+   * Callback invoked when this recovery wants to mark a fresh re-dispatch key.
+   * The caller receives (agentId, ticketId, recoveryAttemptNumber) and should
+   * return a versioned session key string, or null if no fresh key is needed.
+   * Used by the stale-session processStaleSession caller to produce
+   * `linear-INF-982:r2`-style keys.
+   */
+  onFreshKeyNeeded?: (agentId: string, ticketId: string, attemptNumber: number) => string | null;
   /**
    * Deterministic replay fixture for same-key recovery guards. When a zero-output
    * C4 husk is only a lifecycle claim collision and another same-key session is
@@ -1049,11 +1065,25 @@ export async function recoverTicket(
   let isRedispatchCapped = false;
 
   if (snapshot.classification === "C2" || snapshot.classification === "C4") {
-    redispatchMax = config.maxRedispatchAttempts ?? parseEnvInt("STALE_REDISPATCH_MAX_ATTEMPTS", 3);
-    const counter = new StaleRedispatchCounter(config.redispatchDbPath);
-    redispatchAttempt = counter.incrementAndGet(snapshot.metadata.ticketId);
-    counter.close();
+    // INF-982: prefer the shared global redispatch budget when available.
+    // Falls back to the per-detector StaleRedispatchCounter for backward compat
+    // while the fleet rolls out the unified budget.
+    if (config.globalRedispatchBudget) {
+      redispatchMax = config.globalRedispatchBudget.maxAttempts;
+      redispatchAttempt = config.globalRedispatchBudget.consume(snapshot.metadata.ticketId);
+    } else {
+      redispatchMax = config.maxRedispatchAttempts ?? parseEnvInt("STALE_REDISPATCH_MAX_ATTEMPTS", 3);
+      const counter = new StaleRedispatchCounter(config.redispatchDbPath);
+      redispatchAttempt = counter.incrementAndGet(snapshot.metadata.ticketId);
+      counter.close();
+    }
     isRedispatchCapped = redispatchAttempt >= redispatchMax;
+
+    // INF-982: signal the caller that a fresh session key is needed for re-dispatch.
+    // This avoids the next stale-session recovery reading the old session's data.
+    if (isRedispatchCapped && config.onFreshKeyNeeded && snapshot.metadata.agentId) {
+      config.onFreshKeyNeeded(snapshot.metadata.agentId, snapshot.metadata.ticketId, redispatchAttempt);
+    }
   }
 
   const isInfraCapacityEscalation =
