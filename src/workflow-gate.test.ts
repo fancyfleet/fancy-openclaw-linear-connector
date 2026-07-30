@@ -976,7 +976,7 @@ type FetchCall = {
 
 /** Build a fetch mock that handles the three B2 API calls and records all calls. */
 function makeTransitionFetch(opts: {
-  issueLabels: Array<{ id: string; name: string }>;
+  issueLabels: Array<{ id: string; name: string; team?: { id: string } | null }>;
   teamId?: string;
   teamLabels?: Array<{ id: string; name: string }>;
   issueUpdateSuccess?: boolean;
@@ -1016,6 +1016,20 @@ function makeTransitionFetch(opts: {
           data: {
             issue: {
               id: "internal-uuid",
+              team: { id: teamId },
+              labels: { nodes: opts.issueLabels },
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    if (query.includes("IssueLabelOwnershipForAtomicWrite")) {
+      return new Response(
+        JSON.stringify({
+          data: {
+            issue: {
               team: { id: teamId },
               labels: { nodes: opts.issueLabels },
             },
@@ -1255,6 +1269,32 @@ describe("applyStateTransition — normal state advance", () => {
     expect(vars.labelIds).toContain("other-lbl");
     expect(vars.labelIds).toContain("existing-cr-lbl");
     expect(vars.labelIds).not.toContain("state-lbl");
+  });
+
+  it("INF-1045 drops inherited cross-team current labels before full labelIds replacement", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      teamId: "lif-team",
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl", team: null },
+        { id: "state-lbl", name: "state:implementation", team: null },
+        { id: "inherited-xfn-lbl", name: "xfn:workflow", team: { id: "parent-team" } },
+        { id: "local-priority-lbl", name: "priority:high", team: { id: "lif-team" } },
+      ],
+      teamLabels: [
+        { id: "existing-cr-lbl", name: "state:code-review" },
+      ],
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("submit", "issue-uuid", "Bearer tok");
+
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+    const vars = updateCall!.body.variables as { labelIds: string[] };
+    expect(vars.labelIds).toContain("wf-lbl");
+    expect(vars.labelIds).toContain("local-priority-lbl");
+    expect(vars.labelIds).toContain("existing-cr-lbl");
+    expect(vars.labelIds).not.toContain("state-lbl");
+    expect(vars.labelIds).not.toContain("inherited-xfn-lbl");
   });
 
   it("INF-522: 'force-deploy' advances state:merge → state:deploy (B2 alias mirrors B1)", async () => {

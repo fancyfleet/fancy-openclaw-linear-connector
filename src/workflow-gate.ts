@@ -1468,7 +1468,7 @@ interface LabelNode {
   parent?: { id: string; name: string } | null;
   /** AI-2557: the team that owns this label. Undefined when the query doesn't select it.
    *  Used to reject inherited parent-team label IDs that Linear rejects on atomic write. */
-  team?: { id: string };
+  team?: { id: string } | null;
 }
 
 interface TicketContext {
@@ -7146,6 +7146,60 @@ async function postFanoutSummaryComment(
  */
 export const _issueUpdateAtomicForTests = issueUpdateAtomic;
 
+async function sanitizeAtomicLabelIdsForIssueTeam(
+  internalId: string,
+  labelIds: string[],
+  authToken: string,
+): Promise<string[]> {
+  const query = `
+    query IssueLabelOwnershipForAtomicWrite($id: String!) {
+      issue(id: $id) {
+        team { id }
+        labels { nodes { id name team { id } } }
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: internalId } }),
+    });
+    type Resp = {
+      data?: {
+        issue?: {
+          team?: { id: string } | null;
+          labels?: { nodes?: LabelNode[] | null } | null;
+        } | null;
+      };
+    };
+    const data = (await res.json()) as Resp;
+    const issue = data.data?.issue;
+    const issueTeamId = issue?.team?.id;
+    if (!issueTeamId) return labelIds;
+
+    const currentLabelsById = new Map((issue.labels?.nodes ?? []).map((label) => [label.id, label]));
+    const sanitized = labelIds.filter((id) => {
+      const label = currentLabelsById.get(id);
+      if (!label) return true;
+      const labelTeamId = label.team?.id ?? null;
+      return labelTeamId === null || labelTeamId === issueTeamId;
+    });
+    if (sanitized.length !== labelIds.length) {
+      const dropped = labelIds
+        .filter((id) => !sanitized.includes(id))
+        .map((id) => currentLabelsById.get(id)?.name ?? id)
+        .join(", ");
+      log.warn(`workflow-gate: atomic issueUpdate dropped inherited cross-team label IDs for ${internalId}: ${dropped}`);
+    }
+    return sanitized;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: atomic label ownership fetch failed for ${internalId}: ${msg} — preserving requested labels`);
+    return labelIds;
+  }
+}
+
 async function issueUpdateAtomic(
   internalId: string,
   labelIds: string[],
@@ -7154,6 +7208,8 @@ async function issueUpdateAtomic(
   nativeStateId?: string | null,
   assigneeId?: string | null,
 ): Promise<boolean> {
+  const sanitizedLabelIds = await sanitizeAtomicLabelIdsForIssueTeam(internalId, labelIds, authToken);
+
   // Build the mutation input: include delegateId when explicitly set (string or null to clear).
   // undefined means "don't touch delegate". null means "clear delegate".
   // AI-1498: include nativeStateId when explicitly set — the proxy writes ALL three facets
@@ -7183,7 +7239,7 @@ async function issueUpdateAtomic(
       }
     }
   `;
-  const variables: Record<string, unknown> = { issueId: internalId, labelIds };
+  const variables: Record<string, unknown> = { issueId: internalId, labelIds: sanitizedLabelIds };
   if (hasDelegate) {
     variables.delegateId = delegateId;
     variables.assigneeId = assigneeId ?? null;
