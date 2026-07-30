@@ -202,7 +202,7 @@ export async function checkRoleGuardEnforced(
     const scope = ownerRole === "department-head"
       ? deriveWorkflowInstanceScope(def, context)
       : roleResolutionScopeForOwnerRole(ownerRole, def);
-    scopeApplied = ownerRole === "department-head" && def.id === "dept-engine" && Boolean(scope);
+    scopeApplied = ownerRole === "department-head" && (def.id === "dept-engine" || def.id === "task") && Boolean(scope);
     const missingScopeReason = describeMissingInstanceScope(def, context);
     if (missingScopeReason && ownerRole === "department-head" && !scope) {
       return {
@@ -217,8 +217,9 @@ export async function checkRoleGuardEnforced(
       const issue = context?.issueIdentifier ? ` for ${context.issueIdentifier}` : "";
       const department = context?.workflowEnrollment?.department ?? context?.teamKey ?? "unknown";
       const team = context?.workflowEnrollment?.team ?? context?.teamName ?? "unknown";
+      const wfTag = def.id === "task" ? "wf:task" : "wf:dept-engine";
       unresolvedScopeReason =
-        `wf:dept-engine${issue} has unresolved or ambiguous department/team instance scope ` +
+        `${wfTag}${issue} has unresolved or ambiguous department/team instance scope ` +
         `(department=${department}, team=${team}); no department-head body matches. ` +
         `Repair workflow enrollment department/team metadata or the Linear team key/name before routing.`;
     }
@@ -248,6 +249,37 @@ export async function checkRoleGuardEnforced(
   if (legalBodies.map((b) => b.toLowerCase()).includes(normalizedAgent)) {
     // Legal dispatch — pass-through.
     return { blocked: false };
+  }
+
+  // INF-1041: workflow commands with an explicit target can temporarily seat
+  // the destination state's owner before the state label swap is visible to the
+  // webhook router. Allow targets that fill any non-terminal outgoing
+  // transition destination role from the current state.
+  for (const transition of stateNode.transitions ?? []) {
+    const destinationStateId = transition.to;
+    if (!destinationStateId) continue;
+    const destinationState = def.states.find((s) => s.id === destinationStateId);
+    if (!destinationState || destinationState.kind === "terminal" || !destinationState.owner_role) continue;
+
+    try {
+      const destinationScope = destinationState.owner_role === "department-head"
+        ? deriveWorkflowInstanceScope(def, context)
+        : roleResolutionScopeForOwnerRole(destinationState.owner_role, def);
+      const destinationBodies = await resolveBodiesForRole(destinationState.owner_role, destinationScope);
+      if (destinationBodies.map((b) => b.toLowerCase()).includes(normalizedAgent)) {
+        log.info(
+          `routing-guard: '${targetAgentId}' fills destination role '${destinationState.owner_role}' ` +
+            `for ${currentState} → ${destinationStateId} (wf:${workflowId}) — legal explicit transition target`,
+        );
+        return { blocked: false };
+      }
+    } catch (err) {
+      log.warn(
+        `routing-guard: failed to resolve destination role '${destinationState.owner_role}' ` +
+          `for ${currentState} → ${destinationStateId} (wf:${workflowId}) — skipping explicit-target allowance: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   // 7. Violation — build the blocking result.

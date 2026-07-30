@@ -3,13 +3,19 @@
 # The canonical fixture is a mirror of the registered-def (INF-723 single-source rule).
 
 id: task
-version: 3                      # INF-804: approved PR tasks route through merge gate before sign-off
+version: 4                      # INF-942: department scope is instance-resolved from enrollment context
+                              #   (no hardcoded DSN/Design default)
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
 
-department_scope:
-  department: DSN
-  team: Design
+# department_scope is resolved from ticket enrollment context at runtime
+# (see deriveWorkflowInstanceScope in workflow-gate.ts). The static default
+# is intentionally absent — each enrollment provides its own department scope
+# via WorkflowInstanceContext.workflowEnrollment.
+#
+# This replaced the previously hardcoded {department: DSN, team: Design} default
+# (INF-942) which misrouted every wf:task ticket to the Design head regardless
+# of its actual department.
 
 break_glass:
   command: escape

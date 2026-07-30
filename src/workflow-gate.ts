@@ -362,21 +362,30 @@ export function deriveWorkflowInstanceScope(
   def: WorkflowDef,
   context?: WorkflowInstanceContext,
 ): RoleResolutionScope | undefined {
-  if (def.id !== "dept-engine") {
-    return roleResolutionScopeForOwnerRole("department-head", def);
+  if (def.id === "dept-engine" || def.id === "task") {
+    // For dept-engine and task: derive department/team scope from the
+    // instance context (workflow enrollment or Linear team metadata).
+    // No static/def-level fallback — tickets without scope metadata
+    // must fail closed (see describeMissingInstanceScope).
+    const department = context?.workflowEnrollment?.department ?? context?.teamKey;
+    const team = context?.workflowEnrollment?.team ?? context?.teamName;
+    return department || team ? { department, team } : undefined;
   }
 
-  const department = context?.workflowEnrollment?.department ?? context?.teamKey;
-  const team = context?.workflowEnrollment?.team ?? context?.teamName;
-  return department || team ? { department, team } : undefined;
+  // All other workflows: use def-level department_scope / instantiation.
+  return roleResolutionScopeForOwnerRole("department-head", def);
 }
 
 export function describeMissingInstanceScope(def: WorkflowDef, context?: WorkflowInstanceContext): string | undefined {
-  if (def.id !== "dept-engine") return undefined;
+  if (def.id !== "dept-engine" && def.id !== "task") return undefined;
   const issue = context?.issueIdentifier ? ` for ${context.issueIdentifier}` : "";
+  const wfLabel = def.id === "dept-engine" ? "wf:dept-engine" : "wf:task";
+  const staticNote = def.id === "task"
+    ? "; the def-level department_scope was removed (no static fallback)"
+    : "; refusing to fall back to static ENG defaults";
   return (
-    `wf:dept-engine${issue} is missing department/team instance scope metadata from workflow enrollment ` +
-    `or Linear team context; refusing to fall back to static ENG defaults.`
+    `${wfLabel}${issue} is missing department/team instance scope metadata from workflow enrollment ` +
+    `or Linear team context${staticNote}.`
   );
 }
 
