@@ -590,13 +590,18 @@ describe("recoverTicket — C2/C4 redispatch cap", () => {
     expect(recoverBody.variables.input.delegateId).toBeNull();
   });
 
-  test("C4 at cap: escalates to human", async () => {
+  test("INF-1037: C4 at cap moves to a non-dispatchable needs-human state with evidence", async () => {
     const setupCounter = new StaleRedispatchCounter(dbPath);
     setupCounter.incrementAndGet("linear-AI-1044");
     setupCounter.incrementAndGet("linear-AI-1044");
     setupCounter.close();
 
-    global.fetch = makeFetchMock() as unknown as typeof fetch;
+    global.fetch = makeFetchMockWithState({
+      teamStates: [
+        { id: "state-todo", name: "Todo", type: "unstarted" },
+        { id: "state-needs-human", name: "Needs Human", type: "triage" },
+      ],
+    }) as unknown as typeof fetch;
 
     const snapshot = makeSnapshot("C4");
     const result = await recoverTicket(snapshot, "igor", {
@@ -614,6 +619,18 @@ describe("recoverTicket — C2/C4 redispatch cap", () => {
     });
     const commentBody = JSON.parse((commentCall![1].body ?? "{}") as string);
     expect(commentBody.variables.body).toContain("Max re-dispatch attempts reached (**3/3**). Escalating to human review.");
+    expect(commentBody.variables.body).toMatch(/needs-human/i);
+
+    const recoverCall = (fetchMock.mock.calls as Array<[string, RequestInit]>).find(([, opts]) => {
+      const b = JSON.parse((opts?.body ?? "{}") as string);
+      return b.query?.includes("RecoverIssue");
+    });
+    expect(recoverCall).toBeDefined();
+    const recoverBody = JSON.parse((recoverCall![1].body ?? "{}") as string);
+    expect(recoverBody.variables.input.stateId).toBe("state-needs-human");
+    expect(recoverBody.variables.input.delegateId).toBeNull();
+    expect(recoverBody.variables.input.assigneeId).toBe("human-linear-id");
+    expect(JSON.stringify(recoverBody.variables.input)).toMatch(/needs-human/i);
   });
 
   test("AI-1306: recoverTicket issues a single atomic mutation (state + ownership, no separate OwnershipUpdate call)", async () => {

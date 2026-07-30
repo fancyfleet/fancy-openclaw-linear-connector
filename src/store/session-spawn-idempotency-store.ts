@@ -157,6 +157,7 @@ export class SessionSpawnIdempotencyStore {
 
   private isStaleInFlight(r: SessionSpawnRunRecord): boolean {
     if (r.state !== "live" && r.state !== "pending") return false;
+    if (r.state === "live" && (r.run_id || r.session_id)) return false;
     const lastIso = r.updated_at || r.spawned_at || r.requested_at;
     const last = lastIso ? Date.parse(lastIso) : NaN;
     if (Number.isNaN(last)) return false;

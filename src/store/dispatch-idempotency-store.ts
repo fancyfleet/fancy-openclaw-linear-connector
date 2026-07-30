@@ -50,6 +50,10 @@ export interface IdempotencyCheckResult {
   ttlExpired?: boolean;
   /** Number of prior rows cleared for (ticket, agent) due to delegate change. */
   clearedRows?: number;
+  /** True when a duplicate row was reclaimed because its owner is proven dead. */
+  reclaimedDeadOwner?: boolean;
+  /** True when the incoming dispatch should spawn or re-spawn a session. */
+  respawned?: boolean;
 }
 
 export interface IdempotencyCounters {
@@ -68,6 +72,19 @@ export interface IdempotencyOptions {
    *  all prior idempotency rows for (ticket, agent) are cleared before
    *  admitting the new dispatch. */
   delegateChanged?: boolean;
+  /**
+   * Evidence about the owner that originally satisfied this idempotency row.
+   * A positively ended zero-call session is not a live owner; it is a dead
+   * claim stub and must be reclaimed so dispatch can respawn work.
+   */
+  existingOwnerEvidence?: {
+    sessionId?: string | null;
+    status?: string | null;
+    toolCallCount?: number | null;
+    lastObservedAt?: string | null;
+  };
+  /** Diagnostic reason for admitting despite an existing idempotency row. */
+  recoveryReason?: string;
 }
 
 export class DispatchIdempotencyStore {
@@ -121,6 +138,14 @@ export class DispatchIdempotencyStore {
    */
   private now(options?: IdempotencyOptions): Date {
     return new Date(options?.nowMs ?? Date.now());
+  }
+
+  private hasDeadZeroCallOwner(options?: IdempotencyOptions): boolean {
+    const evidence = options?.existingOwnerEvidence;
+    if (!evidence) return false;
+    const status = (evidence.status ?? "").toLowerCase();
+    const toolCallCount = evidence.toolCallCount ?? null;
+    return toolCallCount === 0 && ["ended", "dead", "failed", "closed", "terminal"].includes(status);
   }
 
   /**
@@ -233,6 +258,21 @@ export class DispatchIdempotencyStore {
             return { suppressed: false, stale: true };
           }
           if (incomingUpdatedAt === existingUpdatedAt) {
+            if (this.hasDeadZeroCallOwner(options)) {
+              this.db
+                .prepare(
+                  `INSERT OR REPLACE INTO dispatch_idempotency
+                   (ticket_key, workflow_state, agent, updated_at, created_at)
+                   VALUES (?, ?, ?, ?, ?)`,
+                )
+                .run(ticketKey, workflowState, agent, updatedAt, now.toISOString());
+              return {
+                suppressed: false,
+                stale: false,
+                reclaimedDeadOwner: true,
+                respawned: true,
+              };
+            }
             this._suppressedDuplicates++;
             return { suppressed: true, stale: false };
           }

@@ -215,8 +215,24 @@ export async function deliverToAgent(
   // through to mint a fresh session and record the old→new rotation below.
   let rotation: { fromSessionId: string | null; reason: string } | undefined;
   if (idempotency?.action === "return-existing") {
+    const hasConcreteLiveBinding = idempotency.record.state === "live" && !!idempotency.record.session_id;
+    if (!hasConcreteLiveBinding) {
+      log.info(
+        `sessions_spawn idempotent replay: ${route.sessionKey}/${taskKey} already has ` +
+        `state=${idempotency.record.state} run=${idempotency.record.run_id ?? "pending"}`,
+      );
+      return {
+        dispatched: true,
+        runId: idempotency.record.run_id ?? undefined,
+        pendingAck: idempotency.record.state === "pending",
+        idempotentReplay: true,
+        sessionSpawnRecord: idempotency.record,
+      };
+    }
     const probe = probeBoundSessionTerminal(route.agentId, route.sessionKey, config.openclawHome);
-    if (!probe.terminal) {
+    const boundSessionMatches =
+      !idempotency.record.session_id || !probe.sessionId || probe.sessionId === idempotency.record.session_id;
+    if (!probe.terminal || !boundSessionMatches) {
       log.info(
         `sessions_spawn idempotent replay: ${route.sessionKey}/${taskKey} already has ` +
         `state=${idempotency.record.state} run=${idempotency.record.run_id ?? "pending"}`,

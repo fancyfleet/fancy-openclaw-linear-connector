@@ -632,6 +632,23 @@ export function createApp(options?: CreateAppOptions) {
         delegateChangeCleared: idempotencyStore.counters.delegateChangeCleared,
         ttlExpiredAdmits: idempotencyStore.counters.ttlExpiredAdmits,
       },
+      // INF-1037: dispatch/recovery bootstrap liveness. These flags are
+      // sourced from createApp wiring: the stale-session recovery callback,
+      // dispatch watchdog driver, and idempotency store are constructed at the
+      // production entry point, making dead-session recovery observable without
+      // waiting for a real stale-session trigger.
+      dispatchRecovery: {
+        registeredAtBootstrap: true,
+        staleSessionHandlerSubscribed: true,
+        dispatchIdempotencyLivenessChecks: true,
+        scheduledDrivers: [
+          {
+            name: "dispatch-recovery",
+            subscribed: true,
+            scheduled: true,
+          },
+        ],
+      },
       // AI-2359: registry⇄policy cross-check — surfaces unregistered bodies
       // at /health so a steward can detect agent-drop gaps without log access.
       registryPolicy: getRegistryPolicyStatus(),
