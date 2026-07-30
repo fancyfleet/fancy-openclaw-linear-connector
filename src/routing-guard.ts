@@ -269,14 +269,14 @@ export async function checkRoleGuardEnforced(
       if (destinationBodies.map((b) => b.toLowerCase()).includes(normalizedAgent)) {
         log.info(
           `routing-guard: '${targetAgentId}' fills destination role '${destinationState.owner_role}' ` +
-            `for ${currentState} → ${destinationStateId} (wf:${workflowId}) — legal explicit transition target`,
+            `for ${currentState} -> ${destinationStateId} (wf:${workflowId}) - legal explicit transition target`,
         );
         return { blocked: false };
       }
     } catch (err) {
       log.warn(
         `routing-guard: failed to resolve destination role '${destinationState.owner_role}' ` +
-          `for ${currentState} → ${destinationStateId} (wf:${workflowId}) — skipping explicit-target allowance: ` +
+          `for ${currentState} -> ${destinationStateId} (wf:${workflowId}) - skipping explicit-target allowance: ` +
           `${err instanceof Error ? err.message : String(err)}`,
       );
     }
