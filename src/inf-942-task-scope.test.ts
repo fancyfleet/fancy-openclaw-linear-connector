@@ -7,6 +7,7 @@ import { resolveBodiesForRole, resetPolicyCache } from "./escalation-gate.js";
 import {
   deriveWorkflowInstanceScope,
   describeMissingInstanceScope,
+  resetWorkflowCache,
   type WorkflowDef,
   type WorkflowInstanceContext,
 } from "./workflow-gate.js";
@@ -310,16 +311,30 @@ describe("INF-942 AC4: dept-engine scope resolution is NOT regressed", () => {
 });
 
 describe("INF-942 AC5: registered def fixture parity", () => {
+  const oldWorkflowDefsDir = process.env.WORKFLOW_DEFS_DIR;
+
+  beforeEach(() => {
+    process.env.WORKFLOW_DEFS_DIR = REGISTERED_DEFS_DIR;
+    resetWorkflowCache();
+  });
+
+  afterEach(() => {
+    if (oldWorkflowDefsDir === undefined) delete process.env.WORKFLOW_DEFS_DIR;
+    else process.env.WORKFLOW_DEFS_DIR = oldWorkflowDefsDir;
+    resetWorkflowCache();
+  });
+
   it("keeps canonical-task.yaml in sync with task.yaml (no department_scope)", async () => {
     // This is the INF-784 fixture-canary pattern: the canonical fixture must
     // match the registered def so check-workflow-def-sync passes at startup.
-    const { loadWorkflowDef } = await import("./workflow-gate.js");
-    const registered = await loadWorkflowDef("task", REGISTERED_DEFS_DIR);
+    const { loadWorkflowDefById } = await import("./workflow-gate.js");
+    const registered = await loadWorkflowDefById("task");
+    expect(registered).not.toBeNull();
     const fixture = fs.readFileSync(CANONICAL_FIXTURE_PATH, "utf8");
 
     // The fixture is generated from the registered def, so they should match
     // structurally. For the department_scope check, verify absent in both.
-    expect(registered.department_scope).toBeUndefined();
+    expect(registered!.department_scope).toBeUndefined();
     const fixtureLines = fixture.split("\n");
     const hasDeptScopeKey = fixtureLines.some(l => l.trimStart().startsWith("department_scope:"));
     expect(hasDeptScopeKey).toBe(false);
