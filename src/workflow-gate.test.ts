@@ -976,9 +976,9 @@ type FetchCall = {
 
 /** Build a fetch mock that handles the three B2 API calls and records all calls. */
 function makeTransitionFetch(opts: {
-  issueLabels: Array<{ id: string; name: string }>;
+  issueLabels: Array<{ id: string; name: string; team?: { id: string } }>;
   teamId?: string;
-  teamLabels?: Array<{ id: string; name: string }>;
+  teamLabels?: Array<{ id: string; name: string; team?: { id: string } }>;
   issueUpdateSuccess?: boolean;
   /** Override to simulate a fetch error for the issue fetch. */
   issueError?: boolean;
@@ -1255,6 +1255,32 @@ describe("applyStateTransition — normal state advance", () => {
     expect(vars.labelIds).toContain("other-lbl");
     expect(vars.labelIds).toContain("existing-cr-lbl");
     expect(vars.labelIds).not.toContain("state-lbl");
+  });
+
+  it("INF-1045: drops inherited xfn label IDs from governed transition writes", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      teamId: "lif-team",
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl", team: { id: "lif-team" } },
+        { id: "state-lbl", name: "state:implementation", team: { id: "lif-team" } },
+        { id: "xfn-parent-lbl", name: "xfn:workflow", team: { id: "parent-team" } },
+        { id: "cross-functional-lbl", name: "cross-functional-request", team: { id: "lif-team" } },
+      ],
+      teamLabels: [
+        { id: "existing-cr-lbl", name: "state:code-review", team: { id: "lif-team" } },
+      ],
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("submit", "issue-uuid", "Bearer tok");
+
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+    const vars = updateCall!.body.variables as { labelIds: string[] };
+    expect(vars.labelIds).toContain("wf-lbl");
+    expect(vars.labelIds).toContain("cross-functional-lbl");
+    expect(vars.labelIds).toContain("existing-cr-lbl");
+    expect(vars.labelIds).not.toContain("state-lbl");
+    expect(vars.labelIds).not.toContain("xfn-parent-lbl");
   });
 
   it("INF-522: 'force-deploy' advances state:merge → state:deploy (B2 alias mirrors B1)", async () => {
