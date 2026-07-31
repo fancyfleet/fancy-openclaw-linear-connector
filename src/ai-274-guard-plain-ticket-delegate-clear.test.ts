@@ -57,6 +57,9 @@ jest.unstable_mockModule("./transition-audit.js", () => ({
   buildTransitionAuditRecord: jest.fn(),
   emitTransitionAuditRecord: jest.fn(),
   verifyPostTransition: jest.fn(),
+  // INF-771: proxy.ts now imports healPostTransitionDesync for post-transition
+  // self-heal; the ESM mock must provide it or proxy.js fails to link.
+  healPostTransitionDesync: jest.fn(async () => ({ verified: false, matched: false, healed: false, detail: "mocked" })),
 }));
 
 jest.unstable_mockModule("./agents.js", () => ({

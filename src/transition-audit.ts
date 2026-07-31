@@ -132,30 +132,123 @@ export async function verifyPostTransition(
   authToken: string,
 ): Promise<PostTransitionVerification | null> {
   try {
-    const actualState = await fetchStateLabel(issueId, authToken);
-    if (actualState === null) {
+    const rawLabel = await fetchStateLabel(issueId, authToken);
+    if (rawLabel === null) {
       log.warn(
         `[transition-audit] post-transition verify: could not read state label for ${issueId}`,
       );
       return null;
     }
-    const match = actualState === expectedState;
+    // INF-771: `fetchStateLabel` returns the full label name (`state:<id>`) while
+    // callers pass the BARE target state (`transitionResult.to`, e.g. `spawn-arms`).
+    // The old raw `===` therefore reported a mismatch on EVERY transition — the
+    // detector was structurally always-false (and any self-heal built on it would
+    // fire on every correctly-applied transition). Canonicalize both sides to the
+    // bare state id before comparing, and report the bare actual state.
+    const stripState = (s: string): string => (s.startsWith("state:") ? s.slice("state:".length) : s);
+    const actualState = stripState(rawLabel);
+    const expectedBare = stripState(expectedState);
+    const match = actualState === expectedBare;
     if (!match) {
       log.warn(
         `[transition-audit] post-transition LABEL MISMATCH for ${issueId}: ` +
-        `expected 'state:${expectedState}', got '${actualState}'`,
+        `expected 'state:${expectedBare}', got 'state:${actualState}'`,
       );
     } else {
       log.info(
-        `[transition-audit] post-transition verify: ${issueId} → confirmed state:${expectedState}`,
+        `[transition-audit] post-transition verify: ${issueId} → confirmed state:${expectedBare}`,
       );
     }
-    return { match, expectedState, actualState };
+    return { match, expectedState: expectedBare, actualState };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log.warn(`[transition-audit] post-transition verify failed for ${issueId}: ${msg}`);
     return null;
   }
+}
+
+/**
+ * Outcome of a post-transition desync heal attempt.
+ */
+export interface PostTransitionHealResult {
+  /** True if the read-back resolved a state:* label to compare against. */
+  verified: boolean;
+  /** True if the live label already matched the expected target (no heal needed). */
+  matched: boolean;
+  /** True if a desync was detected AND the reconcile applied successfully. */
+  healed: boolean;
+  /** Human-readable detail for logs/audit. */
+  detail: string;
+}
+
+/**
+ * INF-771: detect and self-heal a post-transition label desync.
+ *
+ * The live incident (INF-768, dev-sprint continue-workflow): the CLI's forwarded
+ * mutation advanced the NATIVE Linear state while the proxy's B2 `state:*` label
+ * swap did not land, leaving the ticket at a stale `state:*` label. Detection
+ * alone (a WARN) let the desync persist; the ticket's Expected behavior is that a
+ * transition "atomically advances the label OR fails without partial state".
+ *
+ * This helper re-reads the live label via `verifyPostTransition`; if it is stale,
+ * it invokes `reconcile` (in production: a label-only `setStateAtomic` to the
+ * expected state, which strips the old `state:*`, adds the target, and is
+ * verified read-after-write by AI-1762 — with no fanout/comment side effects).
+ * A reconcile that cannot apply is reported loudly (`healed: false`) rather than
+ * swallowed, so a stuck desync surfaces instead of masquerading as success.
+ *
+ * `reconcile` is injected so the seam is unit-testable without the full proxy
+ * write path.
+ */
+export async function healPostTransitionDesync(
+  issueId: string,
+  expectedState: string,
+  authToken: string,
+  reconcile: (
+    issueId: string,
+    expectedState: string,
+    authToken: string,
+  ) => Promise<{ ok: boolean; error?: string }>,
+): Promise<PostTransitionHealResult> {
+  const verification = await verifyPostTransition(issueId, expectedState, authToken);
+  if (!verification) {
+    return {
+      verified: false,
+      matched: false,
+      healed: false,
+      detail: `post-transition read-back could not resolve a state:* label for ${issueId}`,
+    };
+  }
+  if (verification.match) {
+    return { verified: true, matched: true, healed: false, detail: `label already at state:${expectedState}` };
+  }
+
+  // Desync detected — reconcile the stale state:* label to the applied target.
+  log.warn(
+    `[transition-audit] post-transition DESYNC for ${issueId}: label '${verification.actualState ?? "(null)"}' ` +
+      `!= expected 'state:${expectedState}' — attempting self-heal`,
+  );
+  let outcome: { ok: boolean; error?: string };
+  try {
+    outcome = await reconcile(issueId, expectedState, authToken);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.error(`[transition-audit] post-transition self-heal threw for ${issueId} → state:${expectedState}: ${msg}`);
+    return { verified: true, matched: false, healed: false, detail: `self-heal threw: ${msg}` };
+  }
+  if (outcome.ok) {
+    log.info(`[transition-audit] post-transition self-heal reconciled ${issueId} → state:${expectedState}`);
+    return { verified: true, matched: false, healed: true, detail: `reconciled to state:${expectedState}` };
+  }
+  log.error(
+    `[transition-audit] post-transition self-heal FAILED for ${issueId} → state:${expectedState}: ${outcome.error ?? "unknown"}`,
+  );
+  return {
+    verified: true,
+    matched: false,
+    healed: false,
+    detail: `self-heal failed: ${outcome.error ?? "unknown"}`,
+  };
 }
 
 // ── Label-sync audit ───────────────────────────────────────────────────────
