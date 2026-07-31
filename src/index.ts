@@ -1593,6 +1593,7 @@ export function createApp(options?: CreateAppOptions) {
     enrolledTicketsStore,
     forensicsDiagnosticsDir: options?.forensicsDiagnosticsDir,
     mutationAuditStore,
+    dispatchIdempotencyStore: idempotencyStore,
     wakeConfigForAgent,
     reconciliationWakeFn: options?.sendWakeUp
       ? async (agentId: string, ticketId: string) => options.sendWakeUp!(agentId, [ticketId])
@@ -2286,6 +2287,7 @@ if (isEntryPoint) {
       wakeFn: reconciliationWakeFn,
       dispatchLeaseStore,
       enrolledTicketsStore,
+      dispatchIdempotencyStore: idempotencyStore,
     });
   } else {
     log.warn("[quiesce] reconciliation sweeps NOT registered (QUIESCE_RECONCILIATION_SWEEPS=1)");
@@ -2512,6 +2514,7 @@ if (isEntryPoint) {
         until: body?.until,
         dispatchLeaseStore,
         enrolledTicketsStore,
+        dispatchIdempotencyStore: idempotencyStore,
       });
       res.json({ success: true, ...result });
     } catch (err) {

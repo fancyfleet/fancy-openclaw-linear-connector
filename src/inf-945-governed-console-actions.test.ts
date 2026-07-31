@@ -358,6 +358,8 @@ describe("INF-945 scoped admin API routes", () => {
   });
 
   test("C2 force-redispatch: /admin/api/redispatch is governed in-process and writes one audit row", async () => {
+    const clearIdempotencyRows = jest.spyOn(appState.idempotencyStore, "clearAgentRows");
+
     const res = await authedPost("/admin/api/redispatch", {
       ticketId: TICKET,
       invoker: "astrid",
@@ -367,6 +369,7 @@ describe("INF-945 scoped admin API routes", () => {
     });
 
     expect(res.status).toBe(200);
+    expect(clearIdempotencyRows).toHaveBeenCalledWith(`linear-${TICKET}`, "igor");
     expect(res.body).toMatchObject({
       success: true,
       action: "force-redispatch",
