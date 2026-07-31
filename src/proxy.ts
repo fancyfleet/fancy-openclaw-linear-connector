@@ -307,6 +307,7 @@ type XfnDemotionNotification = {
 };
 
 type TeamState = { id: string; name: string; type: string };
+type TeamLabel = { id: string; name: string };
 
 type IssueContext = {
   teamId: string | null;
@@ -370,6 +371,35 @@ async function fetchTeamStates(teamId: string, authToken: string): Promise<TeamS
   if (!res.ok) return [];
   const data = (await res.json()) as { data?: { team?: { states?: { nodes?: TeamState[] } } } };
   return data.data?.team?.states?.nodes ?? [];
+}
+
+async function fetchTeamLabels(teamId: string, authToken: string): Promise<TeamLabel[]> {
+  const res = await fetch(LINEAR_API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: authToken },
+    body: JSON.stringify({
+      query: `query($teamId: String!) {
+        team(id: $teamId) {
+          labels { nodes { id name } }
+        }
+      }`,
+      variables: { teamId },
+    }),
+  });
+  if (!res.ok) return [];
+  const data = (await res.json()) as { data?: { team?: { labels?: { nodes?: TeamLabel[] } } } };
+  return data.data?.team?.labels?.nodes ?? [];
+}
+
+async function inputAddsWorkflowLabel(input: Record<string, unknown>, teamId: string, authToken: string): Promise<boolean> {
+  const inputLabelIds = Array.isArray(input.labelIds)
+    ? input.labelIds.filter((id): id is string => typeof id === "string")
+    : [];
+  if (inputLabelIds.length === 0) return false;
+
+  const wanted = new Set(inputLabelIds);
+  const labels = await fetchTeamLabels(teamId, authToken);
+  return labels.some((label) => wanted.has(label.id) && /^wf:/i.test(label.name));
 }
 
 async function requesterDimension(agentId: string): Promise<string> {
@@ -457,14 +487,10 @@ async function maybeDemoteCrossFunctionalRequest(
 
   // INF-996 / INF-925-class hardening (Astrid directive, 2026-07-28): a ticket
   // already ENROLLED in a concrete workflow — carrying any `wf:*` label — is NOT an
-  // un-triaged cross-functional request. It has a real workflow home with its own
-  // intake/park/demote verbs, so the xfn auto-demote must never strip its `wf:*`
-  // label and re-park it in Backlog. This is the loop that swallowed wf:chore at
-  // intake (live 2026-07-28) — defeating cache-flush / begin-work / assign / chained
-  // re-labeling — and it double-duties as the fix for the whole INF-910/888/916/925
-  // demote-clobber class. Skip demote for any ticket carrying a concrete workflow
-  // label. (Steward enrollment writes are already exempt above via `human:escalate`.)
-  if (issueCtx?.labelNames?.some((n) => /^wf:/i.test(n))) {
+  // un-triaged cross-functional request. INF-1065 extends that to enrollment/resume
+  // writes that add the `wf:*` label in the same mutation; otherwise the demoter can
+  // park a paused sprint-spawner resume before the workflow labels persist.
+  if (issueCtx?.labelNames?.some((n) => /^wf:/i.test(n)) || await inputAddsWorkflowLabel(input, teamId, authToken)) {
     return null;
   }
 
