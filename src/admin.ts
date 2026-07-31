@@ -13,6 +13,7 @@ import type { RouteResult } from "./types.js";
 import type { LinearEvent } from "./webhook/schema.js";
 import type { OperationalEventStore, OperationalEventOutcome } from "./store/operational-event-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
+import type { DispatchIdempotencyStore } from "./store/dispatch-idempotency-store.js";
 import type { ObservationStore, ReasonCode, MetricSummary } from "./store/observation-store.js";
 import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forensics.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
@@ -55,6 +56,8 @@ interface AdminDeps {
   deploymentName: string;
   /** AI-1799: enrolled-tickets mirror for the /api/board endpoint. */
   enrolledTicketsStore?: EnrolledTicketsStore;
+  /** INF-943: clear stale wake-idempotency rows before targeted redispatch. */
+  dispatchIdempotencyStore?: DispatchIdempotencyStore;
   /** If provided, set-state will re-dispatch to the new state's owner role (AI-1607). */
   wakeConfigForAgent?: (agentId: string) => WakeUpConfig;
   /** Override the SPA asset directory (tests). */
@@ -1536,6 +1539,7 @@ export function createAdminRouter(deps: AdminDeps): Router {
         wakeFn,
         ticketIdentifiers: [ticketId],
         enrolledTicketsStore: deps.enrolledTicketsStore,
+        dispatchIdempotencyStore: deps.dispatchIdempotencyStore,
       });
       if (result.errors.length > 0) {
         res.status(500).json({ success: false, action: "force-redispatch", ticketId, shellPath: false, ...result });
@@ -1596,6 +1600,7 @@ export function createAdminRouter(deps: AdminDeps): Router {
         wakeFn,
         ticketIdentifiers: [ticketId],
         enrolledTicketsStore: deps.enrolledTicketsStore,
+        dispatchIdempotencyStore: deps.dispatchIdempotencyStore,
       });
       res.status(200).json({ success: true, ...result });
     } catch (err) {

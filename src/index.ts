@@ -1593,6 +1593,7 @@ export function createApp(options?: CreateAppOptions) {
     enrolledTicketsStore,
     forensicsDiagnosticsDir: options?.forensicsDiagnosticsDir,
     mutationAuditStore,
+    dispatchIdempotencyStore: idempotencyStore,
     wakeConfigForAgent,
     reconciliationWakeFn: options?.sendWakeUp
       ? async (agentId: string, ticketId: string) => options.sendWakeUp!(agentId, [ticketId])
@@ -2513,6 +2514,7 @@ if (isEntryPoint) {
         until: body?.until,
         dispatchLeaseStore,
         enrolledTicketsStore,
+        dispatchIdempotencyStore: idempotencyStore,
       });
       res.json({ success: true, ...result });
     } catch (err) {
