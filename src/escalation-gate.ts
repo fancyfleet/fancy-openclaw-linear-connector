@@ -320,10 +320,22 @@ export async function resolveBodiesForRole(roleId: string, scope?: RoleResolutio
     if (!scope?.department && !scope?.team) {
       throw new Error("department-head resolution requires a department or team scope");
     }
-    return candidates
+    const scopedMatches = candidates
       .filter(bodyHasDepartmentScope)
       .filter((b) => bodyMatchesRoleScope(b, scope ?? {}))
       .map((b) => b.id);
+    if (scopedMatches.length > 0) {
+      return scopedMatches;
+    }
+    // INF-1054: the ticket's department has no scoped head (unfilled or a
+    // department/team mismatch). Fall back to the UNSCOPED catch-all head(s) —
+    // task.yaml is explicit that "Astrid is the catch-all head/reviewer when no
+    // department matches." Without this, `wf:task submit` (doing→review,
+    // `assign: { mode: auto }`) resolves to nobody and fail-closes with
+    // delegate-unresolved, wedging the ticket in a stale-session recovery loop.
+    // When no catch-all head exists either, this stays [] (INF-784's OPS case),
+    // so the fail-closed contract is preserved for policies with no catch-all.
+    return candidates.filter((b) => !bodyHasDepartmentScope(b)).map((b) => b.id);
   }
 
   if (scope?.department || scope?.team) {
