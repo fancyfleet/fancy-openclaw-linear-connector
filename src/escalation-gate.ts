@@ -45,6 +45,14 @@ export interface PolicyBody {
    */
   openclaw_container?: string;
   fills_roles: string[];
+  /**
+   * INF-924: departments this body belongs to (e.g. ["ENG"]). Used to team-scope
+   * domain-routed role resolution (e.g. `department-head`) so a cross-team ticket
+   * enrolled in another department's archetype never mis-routes to the wrong head.
+   */
+  departments?: string[];
+  /** INF-924: teams this body belongs to (e.g. ["Engineering"]). See `departments`. */
+  teams?: string[];
 }
 
 interface PolicyContainer {
@@ -262,6 +270,82 @@ export async function resolveBodiesForRole(roleId: string): Promise<string[]> {
   return policy.bodies
     .filter((b) => b.fills_roles.includes(roleId))
     .map((b) => b.id);
+}
+
+/**
+ * INF-924: the team/department context of the ticket whose role is being resolved.
+ * Passed by the outbound delivery path, the transition-target resolver, and the
+ * routing guard so a domain-routed role (e.g. `department-head`) narrows to the
+ * head that owns the *ticket's* team — never the head of the archetype's home
+ * department via a blind prefix/default fallback.
+ */
+export interface TicketScope {
+  issueIdentifier?: string;
+  teamKey?: string;
+  teamName?: string;
+  workflowEnrollment?: {
+    department?: string;
+    team?: string;
+  };
+}
+
+/**
+ * INF-924 — team-scoped variant of {@link resolveBodiesForRole}.
+ *
+ * Root cause: a `wf:task` ticket is a Design-scoped archetype (`task.yaml`
+ * department_scope: DSN/Design). Its `department-head` role is domain-routed,
+ * but the resolution was team-blind — an ENG-team ticket running under the
+ * Design-scoped def resolved the head via the department-prefix fallback to the
+ * Design head (Laren) instead of the correct Engineering head (Charles). This
+ * narrows the role's bodies to those matching the ticket's team/department.
+ *
+ * Conservative / fail-open by construction:
+ *   - No scope, or a scope with no team/department signal → unchanged (all bodies).
+ *   - None of the role's bodies carry team/department metadata → unchanged
+ *     (policies predating INF-924 have no `teams`/`departments`).
+ *   - A team/department signal that matches ≥1 body → the matching subset.
+ *   - A signal that matches no body → the full set (never silently drop work;
+ *     a no-legal-head ticket surfaces via the caller's existing empty/multi paths
+ *     rather than mis-routing to an unrelated head).
+ */
+export async function resolveBodiesForRoleScoped(
+  roleId: string,
+  scope?: TicketScope,
+): Promise<string[]> {
+  const bodies = await resolveBodiesForRole(roleId);
+  if (!scope || bodies.length <= 1) return bodies;
+
+  const wantTeam = (scope.workflowEnrollment?.team ?? scope.teamName)?.trim().toLowerCase();
+  const wantDept = (scope.workflowEnrollment?.department ?? scope.teamKey)?.trim().toLowerCase();
+  if (!wantTeam && !wantDept) return bodies;
+
+  const policy = await loadPolicy();
+  const byId = new Map(policy.bodies.map((b) => [b.id, b]));
+
+  const carriesScopeMeta = bodies.some((id) => {
+    const b = byId.get(id);
+    return (b?.teams?.length ?? 0) > 0 || (b?.departments?.length ?? 0) > 0;
+  });
+  if (!carriesScopeMeta) return bodies;
+
+  const matched = bodies.filter((id) => {
+    const b = byId.get(id);
+    const teams = (b?.teams ?? []).map((t) => t.toLowerCase());
+    const depts = (b?.departments ?? []).map((d) => d.toLowerCase());
+    return (
+      (wantTeam !== undefined && teams.includes(wantTeam)) ||
+      (wantDept !== undefined && depts.includes(wantDept))
+    );
+  });
+
+  if (matched.length === 0) {
+    log.warn(
+      `escalation-gate: role '${roleId}' has no body scoped to team='${wantTeam ?? "?"}' ` +
+        `department='${wantDept ?? "?"}' — returning unscoped set [${bodies.join(", ")}] (no mis-route)`,
+    );
+    return bodies;
+  }
+  return matched;
 }
 
 // ── Workflow ticket detection ──────────────────────────────────────────────

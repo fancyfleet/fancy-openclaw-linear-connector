@@ -39,6 +39,10 @@ jest.unstable_mockModule("./workflow-gate.js", () => ({
 
 jest.unstable_mockModule("./escalation-gate.js", () => ({
   resolveBodiesForRole: mockResolveBodiesForRole,
+  // INF-924: routing-guard now resolves via the team-scoped variant. These
+  // tests pass no scope, so scoped resolution delegates to the same mock and
+  // preserves the prior (unscoped) legal-body expectations.
+  resolveBodiesForRoleScoped: (role: string, _scope?: unknown) => mockResolveBodiesForRole(role),
 }));
 
 // Dynamic import after mocks are registered.

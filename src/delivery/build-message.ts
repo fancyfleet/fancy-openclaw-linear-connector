@@ -26,6 +26,7 @@ import {
   type WorkflowDef,
   type StakesLevel,
 } from "../workflow-gate.js";
+import type { TicketScope } from "../escalation-gate.js";
 import { getAcRecord } from "../ac-record-store.js";
 import { getAppliedState } from "../store/applied-state-store.js";
 import { componentLogger, createLogger } from "../logger.js";
@@ -41,6 +42,31 @@ const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "buil
  */
 function guidanceDir(): string {
   return process.env.WORKFLOW_GUIDANCE_DIR ?? defaultGuidanceDir();
+}
+
+/**
+ * INF-924: derive the ticket's team/department scope from the routed event so
+ * the per-step instruction block renders a domain-routed head (e.g.
+ * `department-head`) scoped to the ticket's own team — a cross-team ENG ticket
+ * running under the Design-scoped `wf:task` archetype must show Charles as the
+ * singleton head, never `<charles|laren>`. Returns undefined when the event
+ * carries no team/enrollment signal (fail-open → unscoped, prior behavior).
+ */
+function scopeFromRoute(route: RouteResult): TicketScope | undefined {
+  const data = (route.event?.data ?? {}) as Record<string, unknown>;
+  const sessionData = data.agentSession as Record<string, unknown> | undefined;
+  const issue = (data.issue ?? sessionData?.issue ?? data) as Record<string, unknown>;
+  const team = (issue.team ?? data.team) as { key?: string; name?: string } | undefined;
+  const workflowEnrollment = (issue.workflowEnrollment ?? data.workflowEnrollment) as
+    | { department?: string; team?: string }
+    | undefined;
+  if (!team && !workflowEnrollment) return undefined;
+  return {
+    issueIdentifier: route.sessionKey.replace("linear-", ""),
+    teamKey: team?.key,
+    teamName: team?.name,
+    workflowEnrollment,
+  };
 }
 
 /**
@@ -147,7 +173,7 @@ export async function buildDeliveryMessage(route: RouteResult, authToken?: strin
   if (reason === "mention" || reason === "body-mention") {
     message = buildMentionMessage(actorName, identifier, title);
   } else {
-    message = await buildDelegationMessage(reason, identifier, title, authToken);
+    message = await buildDelegationMessage(reason, identifier, title, authToken, scopeFromRoute(route));
   }
 
   // Inject the canon block after the hook line (before per-step guidance).
@@ -212,6 +238,7 @@ async function buildDelegationMessage(
   identifier: string,
   title: string,
   authToken: string | undefined,
+  scope?: TicketScope,
 ): Promise<string> {
   const actionText =
     reason === "delegate"
@@ -225,6 +252,7 @@ async function buildDelegationMessage(
       identifier,
       title,
       authToken,
+      scope,
     );
     if (workflowMessage !== null) return workflowMessage;
   }
@@ -276,6 +304,7 @@ export async function tryBuildWorkflowMessage(
   identifier: string,
   title: string,
   authToken: string,
+  scope?: TicketScope,
 ): Promise<string | null> {
   let labels: string[];
   try {
@@ -331,7 +360,7 @@ export async function tryBuildWorkflowMessage(
 
   const [stepLines, guidance, lastComment] = await Promise.all([
     Promise.all(transitions.map(async (t) => {
-      const { bodies, mode } = await resolveTransitionTargets(t, def);
+      const { bodies, mode } = await resolveTransitionTargets(t, def, scope);
 
       // Use the generic command name when available (Matt's directive: guidance always
       // uses generic transitions so agents don't need workflow-specific command names).

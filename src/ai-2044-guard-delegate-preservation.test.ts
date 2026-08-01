@@ -53,6 +53,9 @@ jest.unstable_mockModule("./workflow-gate.js", () => ({
 
 jest.unstable_mockModule("./escalation-gate.js", () => ({
   resolveBodiesForRole: mockResolveBodiesForRole,
+  // INF-924: routing-guard resolves via the team-scoped variant; unscoped
+  // callers here delegate to the same mock.
+  resolveBodiesForRoleScoped: (role: string, _scope?: unknown) => mockResolveBodiesForRole(role),
 }));
 
 jest.unstable_mockModule("./alerts/alert-bus.js", () => ({

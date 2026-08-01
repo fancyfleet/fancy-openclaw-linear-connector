@@ -39,7 +39,7 @@ import path from "node:path";
 import yaml from "js-yaml";
 import { componentLogger, createLogger, type Logger } from "./logger.js";
 import { defaultWorkflowDefPath } from "./instance-config.js";
-import { bodyHasCapability, resolveBodiesForRole } from "./escalation-gate.js";
+import { bodyHasCapability, resolveBodiesForRole, resolveBodiesForRoleScoped, type TicketScope } from "./escalation-gate.js";
 import type { ObservationStore } from "./store/observation-store.js";
 import { recordObservation } from "./store/observation-write-path.js";
 import { isBodyKnown } from "./escalation-gate.js";
@@ -1430,13 +1430,17 @@ async function findOrCreateLabel(
 export async function resolveTransitionTargets(
   transition: WorkflowTransition,
   def: WorkflowDef,
+  scope?: TicketScope,
 ): Promise<{ bodies: string[]; mode: 'auto' | 'required' | 'none' }> {
   const destState = def.states.find((s) => s.id === transition.to);
   const ownerRole = destState?.owner_role;
   if (!ownerRole || destState?.kind === 'terminal') {
     return { bodies: [], mode: 'none' };
   }
-  const bodies = await resolveBodiesForRole(ownerRole);
+  // INF-924: team-scope the role so a domain-routed head (e.g. department-head)
+  // for a cross-team ticket resolves to the ticket's team head, not the
+  // archetype's home-department head via a blind fallback.
+  const bodies = await resolveBodiesForRoleScoped(ownerRole, scope);
   if (bodies.length === 0) return { bodies: [], mode: 'none' };
   if (bodies.length === 1) return { bodies, mode: 'auto' };
   return { bodies, mode: 'required' };

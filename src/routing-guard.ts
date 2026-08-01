@@ -22,7 +22,7 @@
 import { createLogger, componentLogger } from "./logger.js";
 import { getAccessToken } from "./agents.js";
 import { loadWorkflowDefById, getWorkflowId, getCurrentState } from "./workflow-gate.js";
-import { resolveBodiesForRole } from "./escalation-gate.js";
+import { resolveBodiesForRoleScoped, type TicketScope } from "./escalation-gate.js";
 import { notify } from "./alerts/alert-bus.js";
 
 const log = componentLogger(createLogger(), "routing-guard");
@@ -111,6 +111,7 @@ export function checkRoleGuard(
 export async function checkRoleGuardEnforced(
   targetAgentId: string,
   ticketLabels: string[],
+  scope?: TicketScope,
 ): Promise<RoleGuardResult> {
   // 1. No workflow label → pass-through.
   const workflowId = getWorkflowId(ticketLabels);
@@ -153,9 +154,11 @@ export async function checkRoleGuardEnforced(
   }
 
   // 5. Resolve legal bodies for this role.
+  //    INF-924: team-scope the role so a Design head holding an ENG wf:task
+  //    routing state is correctly blocked and corrected to the ENG head.
   let legalBodies: string[];
   try {
-    legalBodies = await resolveBodiesForRole(ownerRole);
+    legalBodies = await resolveBodiesForRoleScoped(ownerRole, scope);
   } catch (err) {
     log.warn(`routing-guard: failed to resolve bodies for role '${ownerRole}' — failing open: ${err instanceof Error ? err.message : String(err)}`);
     return { blocked: false };
@@ -235,8 +238,9 @@ export async function checkRoleGuardAndBlock(
   issueIdentifier: string,
   ticketLabels: string[],
   delegateLinearUserIdResolver?: LinearUserIdResolver,
+  scope?: TicketScope,
 ): Promise<RoleGuardResult> {
-  const result = await checkRoleGuardEnforced(targetAgentId, ticketLabels);
+  const result = await checkRoleGuardEnforced(targetAgentId, ticketLabels, scope);
 
   if (!result.blocked || !result.reason) {
     return result;
@@ -358,8 +362,9 @@ export async function checkRoleGuardAndWarn(
   issueIdentifier: string,
   ticketLabels: string[],
   delegateLinearUserIdResolver?: LinearUserIdResolver,
+  scope?: TicketScope,
 ): Promise<RoleGuardResult> {
-  return checkRoleGuardAndBlock(targetAgentId, issueIdentifier, ticketLabels, delegateLinearUserIdResolver);
+  return checkRoleGuardAndBlock(targetAgentId, issueIdentifier, ticketLabels, delegateLinearUserIdResolver, scope);
 }
 
 // ── Internal helpers ────────────────────────────────────────────────────────
