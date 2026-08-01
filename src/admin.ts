@@ -988,11 +988,14 @@ export function createAdminRouter(deps: AdminDeps): Router {
       wake_cycles: wakeCycles,
     }];
 
-    // AI-2008 AC4: per-ticket dispatch timeline. Project delivery-lifecycle
-    // events into normalized statuses (delivered / failed / retrying /
-    // undeliverable) so the console shows how each dispatch actually landed —
-    // not just raw event summaries.
+    // AI-2008 AC4 + INF-1077: per-ticket dispatch timeline. Project delivery
+    // lifecycle and accepted-dispatch rows into normalized statuses, then mark
+    // the one matching the mirror's current delegate/state as authoritative.
     const DISPATCH_STATUS: Record<string, string> = {
+      routed: "routed",
+      "dispatch-accepted": "accepted",
+      dispatched: "dispatched",
+      "delivery-pending-ack": "pending-ack",
       delivered: "delivered",
       "delivery-failed": "failed",
       "delivery-unconfirmed": "retrying",
@@ -1006,16 +1009,36 @@ export function createAdminRouter(deps: AdminDeps): Router {
         attempt: e.attemptCount ?? null,
         dispatch_id: e.wakeId ?? null,
         delegate: e.agent ?? null,
+        workflow_state: e.workflowState ?? null,
+        authoritative: e.agent === row.delegate && e.workflowState === row.state,
+        stale_reason: e.agent === row.delegate && e.workflowState === row.state
+          ? null
+          : "superseded-by-current-ticket-state",
         timestamp: e.occurredAt,
       }))
       // Oldest-first so the timeline reads in dispatch order.
       .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+    const authoritativeDispatch = [...dispatchTimeline]
+      .reverse()
+      .find((entry) => entry.authoritative) ?? null;
+    const supersededDispatchIds = dispatchTimeline
+      .filter((entry) => !entry.authoritative && entry.dispatch_id)
+      .map((entry) => entry.dispatch_id as string);
+    const currentDispatchAuthority = authoritativeDispatch
+      ? {
+          delegate: row.delegate,
+          workflow_state: row.state,
+          dispatch_id: authoritativeDispatch.dispatch_id,
+          supersedes: supersededDispatchIds,
+        }
+      : null;
 
     res.json({
       ticket_id: row.ticket_id,
       workflow: row.workflow,
       state: row.state,
       delegate: row.delegate,
+      current_dispatch_authority: currentDispatchAuthority,
       state_transitions: stateTransitions,
       dispatch_timeline: dispatchTimeline,
     });
