@@ -1586,7 +1586,7 @@ async function fetchIssueWithLabels(
         id
         identifier
         team { id key name }
-        labels { nodes { id name } }
+        labels { nodes { id name team { id } } }
         delegate { id }
         assignee { id }
         state { id }
@@ -1677,6 +1677,30 @@ export async function fetchTeamStateLabelIds(
     log.warn(`workflow-gate: team state-label fetch failed for ${issueId}: ${msg} — failing open`);
     return new Set();
   }
+}
+
+function labelBelongsToIssueTeam(label: LabelNode, teamId: string): boolean {
+  return label.team == null || label.team.id === teamId;
+}
+
+function retainedLabelIdsForIssue(
+  labels: LabelNode[],
+  teamId: string,
+  options: { stripWorkflowLabels?: boolean } = {},
+): string[] {
+  return labels
+    .filter((label) => !label.name.startsWith("state:"))
+    .filter((label) => !options.stripWorkflowLabels || !label.name.startsWith("wf:"))
+    .filter((label) => {
+      const keep = labelBelongsToIssueTeam(label, teamId);
+      if (!keep) {
+        log.warn(
+          `workflow-gate: dropping inherited cross-team label '${label.name}' (${label.id}) from governed labelIds write for team ${teamId}`,
+        );
+      }
+      return keep;
+    })
+    .map((label) => label.id);
 }
 
 /**
@@ -5636,9 +5660,7 @@ export async function applyStateTransition(
   // ── Special target: __ad_hoc__ ─────────────────────────────────────────
   // Ticket is demoted out of the workflow — remove state:* and wf:* labels.
   if (toStateName === "__ad_hoc__") {
-    const keepIds = issue.labels
-      .filter((l) => !l.name.startsWith("state:") && !l.name.startsWith("wf:"))
-      .map((l) => l.id);
+    const keepIds = retainedLabelIdsForIssue(issue.labels, issue.teamId, { stripWorkflowLabels: true });
     const labelsApplied = await issueUpdateLabels(issue.internalId, keepIds, authToken);
     if (!labelsApplied) {
       log.error(
@@ -5706,9 +5728,7 @@ export async function applyStateTransition(
     }
 
     // Strip all wf:* and state:* labels
-    const keepIds = issue.labels
-      .filter((l) => !l.name.startsWith("state:") && !l.name.startsWith("wf:"))
-      .map((l) => l.id);
+    const keepIds = retainedLabelIdsForIssue(issue.labels, issue.teamId, { stripWorkflowLabels: true });
     const labelsApplied = await issueUpdateLabels(issue.internalId, keepIds, authToken);
     if (!labelsApplied) {
       log.error(`workflow-gate: B2 apply: FAILED — ${issueId} retired but label mutation returned false`);
@@ -6001,9 +6021,7 @@ export async function applyStateTransition(
         (l) => l.name.startsWith("state:") && l.name !== targetLabelName,
       );
       if (staleStateLabels.length > 0) {
-        const cleanedLabelIds = issue.labels
-          .filter((l) => !l.name.startsWith("state:"))
-          .map((l) => l.id);
+        const cleanedLabelIds = retainedLabelIdsForIssue(issue.labels, issue.teamId);
         const targetLabelId = issue.labels.find((l) => l.name === targetLabelName)?.id;
         if (targetLabelId) cleanedLabelIds.push(targetLabelId);
         const purged = await issueUpdateLabels(issue.internalId, cleanedLabelIds, authToken);
@@ -6048,9 +6066,7 @@ export async function applyStateTransition(
       return { status: "failed", code: "label-resolve-failed", detail: `could not resolve label '${targetLabelName}' for re-stamp`, from: currentStateName, to: toStateName };
     }
     // Remove any stale state:* labels and add the correct one.
-    const cleanedLabelIds = issue.labels
-      .filter((l) => !l.name.startsWith("state:"))
-      .map((l) => l.id);
+    const cleanedLabelIds = retainedLabelIdsForIssue(issue.labels, issue.teamId);
     cleanedLabelIds.push(newLabelId);
     const applied = await issueUpdateLabels(issue.internalId, cleanedLabelIds, authToken);
     if (applied) {
@@ -6288,7 +6304,7 @@ export async function applyStateTransition(
   // on the source label still being present. This guarantees the ticket ends with a
   // single state:* label matching the destination, regardless of the CLI's pre-write.
   const newLabelIds = [
-    ...issue.labels.filter((l) => !l.name.startsWith("state:")).map((l) => l.id),
+    ...retainedLabelIdsForIssue(issue.labels, issue.teamId),
     newLabelId,
   ];
 
@@ -8054,9 +8070,7 @@ export async function parkIssueToBacklog(
   if (!backlogStateId) {
     return { ok: false, ticketId: ticketIdentifier, from: snapshot.currentState, to: "Backlog", error: "could not resolve native Backlog state" };
   }
-  const keepLabelIds = snapshot.labels
-    .filter((l) => !l.name.startsWith("state:") && !l.name.startsWith("wf:"))
-    .map((l) => l.id);
+  const keepLabelIds = retainedLabelIdsForIssue(snapshot.labels, snapshot.teamId, { stripWorkflowLabels: true });
   const applied = await issueUpdateAtomic(snapshot.internalId, keepLabelIds, authToken, null, backlogStateId);
   if (!applied) {
     return { ok: false, ticketId: ticketIdentifier, from: snapshot.currentState, to: "Backlog", error: "Backlog issueUpdate mutation failed" };
@@ -8136,7 +8150,7 @@ export async function setStateAtomic(
   if (!newTargetLabelId) return fail(`could not resolve label '${targetLabelName}'`, fromState);
 
   const newLabelIds = [
-    ...issue.labels.filter((l) => !l.name.startsWith("state:")).map((l) => l.id),
+    ...retainedLabelIdsForIssue(issue.labels, issue.teamId),
     newTargetLabelId,
   ];
 
