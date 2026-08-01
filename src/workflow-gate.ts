@@ -340,6 +340,23 @@ export interface WorkflowDef {
    * a hard validation failure (no silent misspellings). The skip is per-def,
    * not per-state. */
   invariant_skip?: string[];
+  /**
+   * INF-862: declares the release contract for a workflow whose deliverable is
+   * non-code (a `wf:task` action, decision, or document). Such a ticket has no
+   * branch or pull request by design and must never be routed onto the dev-impl
+   * merge/deploy spine, whose release gate (§5.6) requires branch/PR evidence —
+   * that is exactly what stranded INF-850. When present with
+   * `requires_github_pr_evidence: false`, the sanctioned release is the
+   * requester approval gate (`approved_state`) advancing to the terminal
+   * (`terminal_state`) via `linear continue-workflow`, with no GitHub PR asked
+   * for. See config-templates/workflows/task/release.md.
+   */
+  release?: {
+    kind: string;
+    approved_state?: string;
+    terminal_state?: string;
+    requires_github_pr_evidence?: boolean;
+  };
   states: WorkflowState[];
 }
 
@@ -4349,7 +4366,19 @@ export async function checkWorkflowRules(
           ticket: issueId,
           dedupKey: "done-gate|no-evidence",
         });
-        return `[Proxy] '${intent}' blocked: cannot release — no branch/PR evidence found.`;
+        // INF-862: this is the exact path that stranded INF-850 — a non-code
+        // deliverable routed onto the dev-impl spine hits the merge branch/PR
+        // evidence gate and cannot release, because no branch or PR exists by
+        // design. Name the path (wf:<id>/state:<state>) and point at the sanctioned
+        // non-code release route so operators fix the routing rather than reaching
+        // for force-deploy/escape.
+        return (
+          `[Proxy] '${intent}' blocked: cannot release — no branch/PR evidence found. ` +
+          `This is the wf:${workflowId} merge path (state:${currentState}) enforcing branch/PR evidence for code deliverables. ` +
+          `If this ticket's deliverable is non-code (a wf:task workflow action, not a code change), it does not belong on the ` +
+          `dev-impl spine: route it through the wf:task release path instead (sign-off → continue-workflow → done, no GitHub ` +
+          `PR required). See config-templates/workflows/task/release.md.`
+        );
       } else if (branchStatus.hasPR && !branchStatus.hasMergedPR && !branchStatus.prMetadataAvailable) {
         // Has PR evidence but metadata does not show merged status.
         // This happens when Hanzo creates branches externally — Linear's GitHub

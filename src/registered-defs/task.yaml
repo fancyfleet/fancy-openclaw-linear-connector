@@ -82,6 +82,23 @@ break_glass:
 migrations:
   escape: intake
 
+# INF-862: explicit non-code release contract. A `task` deliverable is a
+#   department doing something (a governed Linear workflow action, a decision,
+#   a doc) — NOT a code change. It therefore has no branch or pull request, and
+#   must never be routed onto the dev-impl merge/deploy spine, whose release gate
+#   requires branch/PR evidence (§5.6). INF-850 was a wf:task deliverable that
+#   reached the dev-impl `merge` state and stranded because no PR exists by
+#   design; Hanzo could not complete, needs-human, or force-deploy cleanly.
+#   This block declares the sanctioned release path for approved non-code tasks:
+#   the requester's `sign-off` state is the approval gate, `accept` carries the
+#   ticket to the `done` terminal via `linear continue-workflow`, and NO GitHub
+#   PR evidence is required. See config-templates/workflows/task/release.md.
+release:
+  kind: non-code-task
+  approved_state: sign-off      # requester approval gate (owner_role: requester)
+  terminal_state: done          # reached via `accept` (generic: continue)
+  requires_github_pr_evidence: false
+
 states:
 
   - id: intake
