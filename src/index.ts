@@ -78,6 +78,8 @@ import { registerFirstActionWatchdogCron } from "./first-action-watchdog.js";
 import { getFirstActionWatchdogState } from "./first-action-watchdog-state.js";
 import { classifyCrossCheckIssue, type CrossCheckIssue } from "./first-action-crosscheck.js";
 import { StallReasonCode, type StallReason, type WakeFailureDiagnostic } from "./wake-observability/index.js";
+import { registerNativeStateReconcilerCron } from "./native-state-reconciler.js";
+import { getNativeStateReconcilerLiveness, createLinearReconcilerDataPlane } from "./native-state-reconciler.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
 import { getCapabilityPolicy, resolveBodiesForRole, roleResolutionScopeForOwnerRole } from "./escalation-gate.js";
 import { boundSeatFor } from "./implementer-store.js";
@@ -595,6 +597,10 @@ export function createApp(options?: CreateAppOptions) {
       // AI-2468 AC2: done-ticket detector liveness — scheduled + last-run
       // visibility, observable at ac-validate without waiting for a cron tick.
       doneTicketDetector: getDetectorState(),
+      // INF-993 AC5: native-state reconciler liveness — scheduled + lastRunAt,
+      // proving the write-back branch is armed at bootstrap and observable at
+      // ac-validate without waiting for a confirmed-dead trigger.
+      nativeStateReconciler: getNativeStateReconcilerLiveness(),
       // AI-1848 (Pillar 2 D1): universal policy canon liveness — confirms
       // the canon file loaded and its version, observable at ac-validate
       // without waiting for a dispatch trigger.
@@ -2078,6 +2084,22 @@ export function createApp(options?: CreateAppOptions) {
   // entries to prevent stale resolution and memory accumulation of unread keys.
   registerTtlInvalidationCron(ttlCache, 60_000);
   log.info("INF-193: TTL cache invalidation cron registered (every 60s)");
+
+  // INF-993: native-state reconciler — project the connector's source-of-truth
+  // (workflow-state + session liveness) back onto the visible native Linear
+  // state. On a confirmed-dead session the native state keeps lying (e.g. stays
+  // "Thinking") while the first-action watchdog drives redispatch/escalate; this
+  // reverts native → To Do (retaining the delegate for re-dispatch). Registered
+  // here at bootstrap so it is reachable from the production entry point
+  // (AI-1810 registry ⇒ /health.crons, AI-1808 ⇒ /health.nativeStateReconciler)
+  // and armed by createApp() alone. The confirmed-dead signal is the
+  // first-action watchdog's terminal `unreachable` ladder — the frozen contract
+  // fires the corrective write on confirmed-dead ONLY, never live-but-slow.
+  const reconcilerAuthToken =
+    getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  registerNativeStateReconcilerCron(
+    createLinearReconcilerDataPlane({ authToken: reconcilerAuthToken }),
+  );
 
   return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore, livenessDispatchStore, linearRateLimitClient, globalRedispatchBudget, transcriptRedactionHealth: getTranscriptRedactionHealth() });
 }
