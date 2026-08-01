@@ -21,6 +21,8 @@
  *   delegate untouched.
  * - CONTROL (INF-880 regression guard): a plain (no `wf:*`) active-state injection by
  *   the same non-steward agent IS still demoted to Backlog with the xfn labels.
+ * - INF-1065: a workflow enrollment/resume write that adds `wf:*` in the same
+ *   mutation is NOT demoted before the workflow labels can persist.
  */
 
 import fs from "node:fs";
@@ -179,6 +181,8 @@ function makeLinearFetch(opts: { enrolled?: boolean } = {}): { fetch: typeof glo
                 { id: "lbl-xfn-design", name: "xfn:design" },
                 { id: "lbl-xfn-dev", name: "xfn:dev" },
                 { id: "lbl-wf-chore", name: "wf:chore" },
+                { id: "lbl-wf-task", name: "wf:task" },
+                { id: "lbl-state-doing", name: "state:doing" },
               ],
             },
           },
@@ -273,6 +277,37 @@ describe("INF-996 — xfn-demote skips tickets already enrolled in a workflow", 
       expect.arrayContaining(["lbl-cross-functional"]),
     );
     // No steward-triage demotion comment.
+    expect(mock.calls.some((c) => c.query.includes("commentCreate"))).toBe(false);
+  });
+
+  it("INF-1065: an active-state issueUpdate adding wf:* labelIds in the same mutation is NOT demoted", async () => {
+    const mock = makeLinearFetch({ enrolled: false });
+    boot(mock.fetch);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer tok-igor")
+      .set("X-Openclaw-Agent", "igor")
+      .set("Content-Type", "application/json")
+      .send({
+        query: `mutation ResumeTask($id: String!, $input: IssueUpdateInput!) {
+          issueUpdate(id: $id, input: $input) { success issue { id identifier } }
+        }`,
+        variables: {
+          id: "issue-uuid",
+          input: { stateId: "s-doing", labelIds: ["lbl-wf-task", "lbl-state-doing"], delegateId: "u-igor" },
+        },
+        operationName: "ResumeTask",
+      });
+
+    expect(res.body.errors).toBeUndefined();
+
+    const update = mock.calls.find((c) => c.query.includes("issueUpdate"));
+    expect(update).toBeDefined();
+    const updateInput = inputOf(update!);
+    expect(updateInput.stateId).toBe("s-doing");
+    expect(updateInput.delegateId).toBe("u-igor");
+    expect(updateInput.labelIds as string[]).toEqual(["lbl-wf-task", "lbl-state-doing"]);
     expect(mock.calls.some((c) => c.query.includes("commentCreate"))).toBe(false);
   });
 
