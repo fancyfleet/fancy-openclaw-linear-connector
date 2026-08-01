@@ -270,6 +270,68 @@ export async function findUnblockWakeRoutesForTerminalIssue(event: LinearEvent):
   return routes;
 }
 
+function labelNamesFromUnknown(value: unknown): string[] {
+  if (!value) return [];
+  if (Array.isArray(value)) {
+    return value
+      .map((label) => {
+        if (typeof label === "string") return label;
+        if (label && typeof label === "object") {
+          const name = (label as { name?: unknown }).name;
+          return typeof name === "string" ? name : null;
+        }
+        return null;
+      })
+      .filter((name): name is string => Boolean(name));
+  }
+  if (typeof value === "object") {
+    const nodes = (value as { nodes?: unknown }).nodes;
+    return labelNamesFromUnknown(nodes);
+  }
+  return [];
+}
+
+function resolveWorkflowStateFromEvent(event: LinearEvent): {
+  workflowState: string | null;
+  source: "state-label" | "native-state" | null;
+  nativeState: string | null;
+  staleNativeState: string | null;
+} {
+  const data = (event.data ?? {}) as Record<string, unknown>;
+  const rawData = ((event.raw as { data?: unknown } | undefined)?.data ?? {}) as Record<string, unknown>;
+  const labelNames = [
+    ...labelNamesFromUnknown(data.labels),
+    ...labelNamesFromUnknown(rawData.labels),
+  ];
+  const stateLabel = labelNames
+    .find((label) => /^state:/i.test(label))
+    ?.slice("state:".length)
+    .toLowerCase() ?? null;
+  const nativeName = (() => {
+    const state = data.state as { name?: unknown } | undefined;
+    return typeof state?.name === "string" && state.name.trim() ? state.name : null;
+  })();
+  const nativeSlug = nativeName?.trim().toLowerCase().replace(/\s+/g, "-") ?? null;
+
+  if (stateLabel) {
+    return {
+      workflowState: stateLabel,
+      source: "state-label",
+      nativeState: nativeName,
+      staleNativeState: nativeSlug && nativeSlug !== stateLabel ? nativeName : null,
+    };
+  }
+  if (nativeSlug) {
+    return {
+      workflowState: nativeSlug,
+      source: "native-state",
+      nativeState: nativeName,
+      staleNativeState: null,
+    };
+  }
+  return { workflowState: null, source: null, nativeState: null, staleNativeState: null };
+}
+
 async function checkDelegatePingPong(
   event: LinearEvent,
   detector: DelegatePingPongDetector,
@@ -1060,12 +1122,11 @@ export function createWebhookRouter(
       // Check (ticket, workflowState, agent) against the persistent idempotency
       // store BEFORE emitting the routed event. A suppressed duplicate or
       // dropped stale dispatch must never reach the routed/bag/wake path.
+      const workflowStateResolution = resolveWorkflowStateFromEvent(event);
       if (idempotencyStore) {
         const ticketId = route.sessionKey;
         const data = event.data as Record<string, unknown> | null;
-        const stateName = (data?.state as Record<string, unknown> | undefined)?.name as string
-          ?? route.routingReason
-          ?? "unknown";
+        const stateName = workflowStateResolution.workflowState ?? route.routingReason ?? "unknown";
         const updatedAt = (data?.updatedAt as string) ?? new Date().toISOString();
         const idempotencyResult = idempotencyStore.checkAndRecord(
           ticketId, stateName, route.agentId, updatedAt,
@@ -1354,7 +1415,22 @@ export function createWebhookRouter(
 
       const agentName = route.agentId;
       log.info(`Routed event to ${agentName} [${route.sessionKey}]`);
-      appendOperationalEvent(operationalEventStore, { outcome: "routed", type: event.type, agent: agentName, key: route.sessionKey, sessionKey: route.sessionKey, deliveryMode: bag && sessionTracker ? "pending-bag" : agentQueue ? "agent-queue" : "direct", wakeId, plane: "connector" });
+      appendOperationalEvent(operationalEventStore, {
+        outcome: "routed",
+        type: event.type,
+        agent: agentName,
+        key: route.sessionKey,
+        sessionKey: route.sessionKey,
+        deliveryMode: bag && sessionTracker ? "pending-bag" : agentQueue ? "agent-queue" : "direct",
+        wakeId,
+        workflowState: workflowStateResolution.workflowState,
+        plane: "connector",
+        detail: {
+          authoritativeWorkflowStateSource: workflowStateResolution.source,
+          nativeState: workflowStateResolution.nativeState,
+          staleNativeState: workflowStateResolution.staleNativeState,
+        },
+      });
 
       // ── 9c. AI-1428: Pre-flight liveness check + role-guard ────────────
       // Before dispatching to an agent, verify it's reachable. If not,

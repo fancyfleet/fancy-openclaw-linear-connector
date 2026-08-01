@@ -37,6 +37,7 @@ import { markDispatchIntegrityGateActive, getDispatchIntegrityState } from "./di
 import { getCircuitBreakerHealth } from "./dispatch-circuit-breaker.js";
 import { getRemediationHealth } from "./remediation/remediation-state.js";
 import { getCommentStats, getTransitionCommentLogicHealth } from "./transition-comment-logic.js";
+import { getStewardStateRedispatchLiveness, registerStewardStateRedispatch } from "./steward-state-redispatch.js";
 import { getPreFlightLiveness, registerSpawnerPreflight } from "./spawner-preflight.js";
 import { checkFanoutOutcomeStoreLiveness, getFanoutOutcomeStoreLiveness } from "./fanout-outcome-store.js";
 import { registerDistillationCron, createProdGenerationContext } from "./cron/p4-metrics-distillation.js";
@@ -360,6 +361,7 @@ export function createApp(options?: CreateAppOptions) {
   // AI-2568: enable native_state-aware engagement overlay so "doing" semantics
   // respect the workflow state's native_state declaration on delegate assignment.
   registerEngagementNativeStateOverlay();
+  registerStewardStateRedispatch();
 
   // Raw body capture for webhook signature validation.
   app.use(
@@ -749,6 +751,10 @@ export function createApp(options?: CreateAppOptions) {
       // agent comments, so mandatory transition metadata never feeds a
       // rate-limit/dedup counter.
       commentStats: getCommentStats(),
+      // INF-1077: steward-state redispatch liveness. Registered from createApp()
+      // so production bootstrap exposes whether the stale steward-state guard is
+      // armed without waiting for a delegate/state-change trigger.
+      stewardStateRedispatch: getStewardStateRedispatchLiveness(),
     });
   });
 
