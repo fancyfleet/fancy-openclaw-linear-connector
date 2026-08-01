@@ -123,10 +123,19 @@ export async function writeDelegate(
     const data = (await res.json()) as QResp;
     if (data.errors?.length) {
       lastReadErr = data.errors.map((e) => e.message).join("; ");
-    } else if (data.data && data.data.issue) {
-      // A real issue object came back — this read is authoritative.
+    } else if (data.data && data.data.issue && data.data.issue.delegate !== undefined) {
+      // A real issue object came back WITH the `delegate` field present (either
+      // an id object or an explicit null) — this read is authoritative.
+      //
+      // INF-1005: a *partial* issue object that OMITS `delegate` entirely (e.g.
+      // `{ issue: {} }` from a truncated/degraded read under load) is NOT a
+      // confirmed "no delegate" — treating absent-field as `delegate: null`
+      // would false-fail a successful write as a mismatch, the exact conflation
+      // INF-984 hardened against. Fall through to UNVERIFIED instead.
       persisted = data.data.issue.delegate?.id ?? null;
       readConfirmed = true;
+    } else if (data.data && data.data.issue) {
+      lastReadErr = "read-back omitted the delegate field (partial response)";
     } else {
       lastReadErr = "read-back returned no issue";
     }

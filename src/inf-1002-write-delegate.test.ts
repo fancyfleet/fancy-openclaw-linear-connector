@@ -11,6 +11,7 @@ function mockFetch(opts: {
   readBackDelegateId?: string | null;
   readBackThrows?: boolean;
   readBackErrors?: string[];
+  readBackOmitsDelegate?: boolean;
   capture?: Array<{ query: string; variables: Record<string, unknown> }>;
 }): typeof fetch {
   return (async (_url: unknown, init: { body: string }) => {
@@ -23,6 +24,7 @@ function mockFetch(opts: {
     // read-back query
     if (opts.readBackThrows) throw new Error("read-back network error (INF-984)");
     if (opts.readBackErrors) return jsonResponse({ errors: opts.readBackErrors.map((message) => ({ message })) });
+    if (opts.readBackOmitsDelegate) return jsonResponse({ data: { issue: {} } });
     const id = opts.readBackDelegateId;
     return jsonResponse({ data: { issue: { delegate: id == null ? null : { id } } } });
   }) as unknown as typeof fetch;
@@ -61,6 +63,15 @@ describe("INF-1002: writeDelegate chokepoint (INF-973/AI-1395 root-cause close)"
     const r = await writeDelegate("issue-1", "user-1", "Bearer x", mockFetch({ writeSuccess: true, readBackErrors: ["Rate limit exceeded"] }));
     expect(r.ok).toBe(true);
     expect(r.verified).toBe(false);
+  });
+
+  it("INF-1005: a partial verify-read that omits delegate is unverified, not a delegate mismatch", async () => {
+    const r = await writeDelegate("issue-1", "user-1", "Bearer x", mockFetch({ writeSuccess: true, readBackOmitsDelegate: true }));
+    expect(r.ok).toBe(true);
+    expect(r.verified).toBe(false);
+    expect(r.persistedDelegateId).toBeNull();
+    expect(r.error).toMatch(/unverified|read-back/i);
+    expect(r.error).not.toMatch(/did not persist/i);
   });
 
   it("clears the delegate WITHOUT touching assigneeId (preserves a human assignee)", async () => {
