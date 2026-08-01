@@ -40,6 +40,7 @@ const EXPECTED_CRONS = [
   "label-sync-audit", // AI-2554: periodic proxy-store vs Linear label divergence check
   "matrix-approval-gate", // INF-192: Matrix approval gate bootstrap registrar
   "merged-evidence-reconciler",
+  "native-state-reconciler", // INF-993: native-state reconciler write-back cron
   "oob-reconcile-sweep",
   "p4-metrics-distillation",
   "registry-integrity-check", // AI-2359: periodic registry⇄policy integrity check (registered in createApp)
