@@ -17,7 +17,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, jest } from "@jest/globals";
-import { findOrCreateLabel } from "./linear-helpers.js";
+import { findOrCreateLabel, issueUpdateLabels } from "./linear-helpers.js";
 
 interface LabelFixture {
   id: string;
@@ -180,6 +180,99 @@ describe("findOrCreateLabel — group-aware resolution (AI-2176)", () => {
     const logged = errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
     expect(logged).toContain("A label with this name already exists.");
     expect(logged).toContain("state:product-definition");
+  });
+
+  it("INF-1068: semantic handoff/ad-hoc label update skips inherited xfn labels after duplicate fallback", async () => {
+    const updateLabelIds: string[][] = [];
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      const bodyText = typeof init?.body === "string" ? init.body : "";
+      const parsed = bodyText ? JSON.parse(bodyText) as { variables?: Record<string, unknown> } : {};
+
+      if (bodyText.includes("TeamLabels")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              team: {
+                labels: {
+                  nodes: [
+                    {
+                      id: "lbl-ai-xfn-workflow",
+                      name: "xfn:workflow",
+                      team: { id: "team-ai" },
+                    },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (bodyText.includes("mutation CreateLabel")) {
+        return new Response(
+          JSON.stringify({
+            data: { issueLabelCreate: { success: false, issueLabel: null } },
+            errors: [{ message: "conflicting inherited label" }],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (bodyText.includes("mutation WsLabelCreate")) {
+        return new Response(
+          JSON.stringify({
+            data: { issueLabelCreate: { success: false, issueLabel: null } },
+            errors: [{ message: "duplicate label name" }],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (bodyText.includes("OrgTeams")) {
+        return new Response(
+          JSON.stringify({ data: { teams: { nodes: [{ id: "team-lif" }, { id: "team-ai" }] } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (bodyText.includes("OtherTeamLabels")) {
+        const tid = parsed.variables?.tid;
+        const nodes = tid === "team-ai"
+          ? [{ id: "lbl-ai-xfn-workflow", name: "xfn:workflow", team: { id: "team-ai" } }]
+          : [];
+        return new Response(
+          JSON.stringify({ data: { team: { labels: { nodes } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (bodyText.includes("UpdateLabels")) {
+        const labelIds = (parsed.variables?.labelIds ?? []) as string[];
+        updateLabelIds.push(labelIds);
+        return new Response(
+          JSON.stringify({
+            data: {
+              issueUpdate: {
+                success: !labelIds.includes("lbl-ai-xfn-workflow"),
+                issue: { id: parsed.variables?.issueId ?? "lif-344-uuid" },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      return new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } });
+    }) as unknown as typeof globalThis.fetch;
+
+    const xfnId = await findOrCreateLabel("team-lif", "xfn:workflow", "Bearer t");
+    const labelIds = ["lbl-lif-existing", xfnId].filter((id): id is string => typeof id === "string");
+    const ok = await issueUpdateLabels("lif-344-uuid", labelIds, "Bearer t");
+
+    expect(xfnId).toBeNull();
+    expect(ok).toBe(true);
+    expect(updateLabelIds).toEqual([["lbl-lif-existing"]]);
   });
 });
 

@@ -1835,9 +1835,8 @@ async function findOrCreateLabel(
     // Tier 2: Existing-label search.
     //   When workspace-level create fails with "duplicate label name" (name already
     //   exists as a team-level label on GEN/BBS/etc.), search all org teams for
-    //   the existing label and return its ID as best-effort. Logs a warning that
-    //   issueUpdate may reject it ("labelIds for incorrect team") — the caller
-    //   should be prepared for this.
+    //   the existing label for diagnostics only. Never return that ID: Linear
+    //   rejects cross-team label IDs in issueUpdate(labelIds:).
     //
     // Tier 3: Manual migration warning.
     //   If nothing can be found, logs a clear error directing to manual migration
@@ -1914,16 +1913,16 @@ async function findOrCreateLabel(
             // Match logic: flat name match or group-child match
             const flatMatch = otherNodes.find((n) => n.name === labelName && !n.isGroup && (n.team == null || n.team.id === tid));
             if (flatMatch) {
-              log.warn(`workflow-gate: found existing label '${labelName}' in team ${tid} as id=${flatMatch.id} — this is a best-effort fallback; issueUpdate may reject inherited label IDs`);
-              return flatMatch.id;
+              log.warn(`workflow-gate: found existing cross-team label '${labelName}' in team ${tid} as id=${flatMatch.id}; returning null so callers do not write a foreign label ID`);
+              return null;
             }
             if (groupName) {
               const childMatch = otherNodes.find(
                 (n) => !n.isGroup && n.parent?.name === groupName && n.name === childName && (n.team == null || n.team.id === tid),
               );
               if (childMatch) {
-                log.warn(`workflow-gate: found existing label '${labelName}' in team ${tid} as id=${childMatch.id} (group-child) — this is a best-effort fallback; issueUpdate may reject inherited label IDs`);
-                return childMatch.id;
+                log.warn(`workflow-gate: found existing cross-team label '${labelName}' in team ${tid} as id=${childMatch.id} (group-child); returning null so callers do not write a foreign label ID`);
+                return null;
               }
             }
           }

@@ -209,9 +209,8 @@ export async function findOrCreateLabel(
     // Tier 2: Existing-label search.
     //   When workspace-level create fails with "duplicate label name" (name already
     //   exists as a team-level label on GEN/BBS/etc.), search all org teams for
-    //   the existing label and return its ID as best-effort. Logs a warning that
-    //   issueUpdate may reject it ("labelIds for incorrect team") — the caller
-    //   should be prepared for this.
+    //   the existing label for diagnostics only. Never return that ID: Linear
+    //   rejects cross-team label IDs in issueUpdate(labelIds:).
     //
     // Tier 3: Manual migration warning.
     //   If nothing can be found, logs a clear error directing to manual migration
@@ -285,8 +284,8 @@ export async function findOrCreateLabel(
             const otherNodes = otherData.data?.team?.labels?.nodes ?? [];
             const found = findLabelInNodes(otherNodes, labelName, tid);
             if (found) {
-              log.warn(`findOrCreateLabel: found existing label '${labelName}' in team ${tid} as id=${found} — this is a best-effort fallback; issueUpdate may reject inherited label IDs`);
-              return found;
+              log.warn(`findOrCreateLabel: found existing cross-team label '${labelName}' in team ${tid} as id=${found}; returning null so callers do not write a foreign label ID`);
+              return null;
             }
           }
 
