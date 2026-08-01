@@ -112,6 +112,27 @@ describe("AI-2420 per-agent gateway-API delivery", () => {
     expect(headers["x-openclaw-session-key"]).toBe(SESSION); // unchanged, not agent:igor:agent:igor:...
   });
 
+  it("INF-1029: force-fresh delivery emits reset signal without changing the stable per-ticket session key", async () => {
+    const { calls } = installFetchMock();
+    const config = {
+      ...BASE,
+      nodeBin: "node",
+      gatewayUrl: "http://10.10.0.105:18820/v1/chat/completions",
+      gatewayToken: "igor-operator-token",
+      forceFreshSession: true,
+    } satisfies DeliveryConfig & { forceFreshSession: true };
+
+    const result = await deliverMessageToAgent(AGENT, "linear-INF-1029", "wake up", config);
+
+    expect(result.dispatched).toBe(true);
+    const headers = calls[0].init.headers as Record<string, string>;
+    // INF-1029: the reset/force-fresh signal is additive. The stable
+    // linear-<id> key still routes the delivery, but the gateway must not treat
+    // the redispatch as a continuation of the timed-out C4 husk.
+    expect(headers["x-openclaw-session-key"]).toBe("agent:igor:linear-INF-1029");
+    expect(headers["x-openclaw-force-fresh"]).toBe("true");
+  });
+
   it("falls back to the per-agent hooks payload path when no gateway fields are set", async () => {
     const { calls } = installFetchMock(200, { ok: true, runId: "hook-run" });
     const config: DeliveryConfig = {
