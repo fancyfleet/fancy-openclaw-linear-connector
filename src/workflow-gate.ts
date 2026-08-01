@@ -1580,6 +1580,9 @@ async function fetchIssueWithLabels(
   assigneeId: string | null;
   nativeStateId: string | null;
 } | null> {
+  // INF-979 (AC2): also read the live delegate so setStateAtomic can detect a
+  // null-delegate husk and bootstrap-seat the workflow role owner instead of
+  // re-writing null on a governed redispatch.
   const query = `
     query IssueWithLabels($id: String!) {
       issue(id: $id) {
@@ -8178,6 +8181,44 @@ export async function setStateAtomic(
       return fail(`delegate agent '${delegate}' not found or has no linearUserId`, fromState);
     }
     resolvedDelegateId = agent.linearUserId;
+  } else {
+    // INF-979 (AC2): an omitted delegate arg normally means "leave delegate as-is",
+    // but a governed redispatch onto a state whose live Linear delegate is null is
+    // the NULL-DELEGATE husk (DSN-15/INF-961) — it draws no dispatch and stalls.
+    // Bootstrap-seat the singleton owner_role body from the workflow spec so the
+    // redispatch re-establishes ownership instead of re-writing null. Only fires
+    // when there is a hole to fill (live delegate null), the destination is a
+    // governed non-terminal state, and its role resolves to exactly one body.
+    if (issue.delegateId == null && def) {
+      const destNode = def.states.find((s) => s.id === targetState);
+      const ownerRole = destNode?.owner_role;
+      const isTerminal = destNode?.kind === "terminal" || !ownerRole;
+      if (!isTerminal && ownerRole) {
+        try {
+          const roleBodies = await resolveBodiesForRole(ownerRole);
+          if (roleBodies.length === 1) {
+            const seat = getAgent(roleBodies[0]);
+            if (seat?.linearUserId) {
+              resolvedDelegateId = seat.linearUserId;
+              log.info(
+                `workflow-gate: set-state: INF-979 bootstrap-seating null delegate on governed state '${targetState}' → '${roleBodies[0]}' (singleton role '${ownerRole}')`,
+              );
+            } else {
+              log.warn(
+                `workflow-gate: set-state: INF-979 bootstrap-seat skipped for ${ticketIdentifier} — role '${ownerRole}' body '${roleBodies[0]}' has no linearUserId`,
+              );
+            }
+          } else {
+            log.info(
+              `workflow-gate: set-state: INF-979 bootstrap-seat skipped for ${ticketIdentifier} — role '${ownerRole}' resolves to ${roleBodies.length} bodies (not a singleton); delegate untouched`,
+            );
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.warn(`workflow-gate: set-state: INF-979 bootstrap-seat resolution failed for ${ticketIdentifier}: ${msg} — leaving delegate untouched`);
+        }
+      }
+    }
   }
 
   // Step 7+8: Atomic write (AC4 — single mutation), verified read-after-write with

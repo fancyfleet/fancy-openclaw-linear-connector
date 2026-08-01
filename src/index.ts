@@ -31,6 +31,12 @@ import { makeFreshSessionKey, normalizeSessionKey } from "./session-key.js";
 import { applyEngagementStatus, registerEngagementNativeStateOverlay } from "./engagement-status.js";
 import { createAdminRouter } from "./admin.js";
 import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, collectSameKeySessionReplay, STALE_CLASS_NAMES, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
+import {
+  getStaleSessionRecoveryLiveness,
+  markStaleSessionRecoveryDriverRegistered,
+  markStaleSessionHandlerSubscribed,
+  markGovernedRedispatchReseatActive,
+} from "./stale-session-recovery-liveness.js";
 import { checkLinearIssueRouting } from "./linear-actionable.js";
 import { assertDispatchTargetFetchable } from "./delivery/index.js";
 import { markDispatchIntegrityGateActive, getDispatchIntegrityState } from "./dispatch-integrity-state.js";
@@ -589,6 +595,14 @@ export function createApp(options?: CreateAppOptions) {
       // INF-314 AC9: stall detection liveness — active state + thresholds
       // observable at /health without waiting for a stall to occur.
       stallDetection: getStallDetectionState(),
+      // INF-979 AC4 (AI-1808 guard): stale-session recovery + governed re-seat
+      // liveness. driverRegistered/staleSessionHandlerSubscribed prove the recovery
+      // driver (SessionTracker) and its delegate-preserving handler are wired at
+      // bootstrap; governedRedispatchReseatActive proves the setStateAtomic
+      // bootstrap-seat guard is live. Marked at their wiring points in createApp,
+      // never a detached literal, so ac-validate confirms the wiring without
+      // waiting for a stale session.
+      staleSessionRecovery: getStaleSessionRecoveryLiveness(),
       // AI-2009 AC7: first-action watchdog liveness — scheduled + armedCount,
       // observable at ac-validate without waiting for a deadline breach.
       firstActionWatchdog: getFirstActionWatchdogState(),
@@ -1074,6 +1088,15 @@ export function createApp(options?: CreateAppOptions) {
       }
     }
   });
+  // INF-979 (AC4 / AI-1808): mark the stale-session recovery liveness at the real
+  // wiring point. The recovery driver (SessionTracker) is now constructed and its
+  // stale-session handler (processStaleSession — which preserves owned delegates
+  // per AC1) is subscribed. The governed-redispatch re-seat guard (setStateAtomic
+  // bootstrap-seat, AC2) is part of this build's transition path. Set here, inside
+  // createApp, precisely because bootstrap installed these — never a detached literal.
+  markStaleSessionRecoveryDriverRegistered();
+  markStaleSessionHandlerSubscribed();
+  markGovernedRedispatchReseatActive();
   const livenessEndpoint = new LivenessChannelEndpoint({
     dispatchRecordStore: livenessDispatchStore,
     sessionHealthProbe: new SessionHealthProbe({ sessionTracker }),

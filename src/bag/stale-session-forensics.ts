@@ -1197,10 +1197,29 @@ export async function recoverTicket(
       }),
     });
 
+    // INF-979 (AC1): a still-owned, non-terminal governed ticket must NOT have its
+    // delegate nulled by silent-completion healing — clearing it is exactly what
+    // regenerates the NULL-DELEGATE husk (DSN-15/INF-961): a null-delegate governed
+    // ticket gets no dispatch and stalls silently. The delegate is cleared only on a
+    // genuine terminal transition (guarded above) or a genuine human-blocker escalation.
+    // For C3/C4 silent-completion healing where the ticket is still owned (a live
+    // delegate remains — the terminal and wrong-delegate guards above have already
+    // ruled out completed work and a foreign owner), preserve the delegate and let the
+    // ticket re-dispatch to its existing owner instead of orphaning it.
+    const stillOwned = liveDelegateLinearId != null;
+    const preserveDelegate =
+      stillOwned &&
+      !isRedispatchCapped &&
+      (snapshot.classification === "C3" || snapshot.classification === "C4");
+
     // Apply needs-human semantics: set assignee + clear delegate.
     // C1/C3/C5/C6/C-UNK → assign to human owner and clear delegate (human must review).
     // C2/C4 → clear both (connector will re-dispatch normally), unless cap is breached.
-    const needsHuman = NEEDS_HUMAN_CLASSES.has(snapshot.classification) || isRedispatchCapped;
+    // preserveDelegate (INF-979) overrides both: a live owner is never escalated to a
+    // human nor cleared while still mid-workflow.
+    const needsHuman =
+      !preserveDelegate &&
+      (NEEDS_HUMAN_CLASSES.has(snapshot.classification) || isRedispatchCapped);
     const sprintStewardLinearId =
       config.sprintStewardLinearId ??
       process.env.STALE_SPRINT_STEWARD_LINEAR_ID ??
@@ -1225,15 +1244,20 @@ export async function recoverTicket(
       ? (process.env.STALE_RECOVERY_NEEDS_HUMAN_STATE ?? "Needs Human")
       : targetStateName;
 
-    // Build combined update input: ownership (always) + optional state transition.
+    // Build combined update input: ownership + optional state transition.
     // Using a single issueUpdate mutation instead of two sequential calls avoids the
     // race where the state-change webhook arrives at the connector before the delegate-clear
     // has propagated, causing the stale-route guard to see the old delegate and re-wake
     // the same agent that just timed out.
-    const updateInput: Record<string, string | null> = {
-      delegateId: null,
-      assigneeId: needsHuman ? (humanId ?? null) : null,
-    };
+    // INF-979 (AC1): when preserving a live owner, omit delegateId entirely — leaving
+    // the field out of the mutation keeps the current delegate intact — and clear only
+    // any stray human assignee so the ticket stays agent-owned and re-dispatchable.
+    const updateInput: Record<string, string | null> = preserveDelegate
+      ? { assigneeId: null }
+      : {
+          delegateId: null,
+          assigneeId: needsHuman ? (humanId ?? null) : null,
+        };
 
     let stateTransitioned = false;
     if (effectiveTargetStateName && teamId) {
@@ -1275,9 +1299,13 @@ export async function recoverTicket(
     stateTransitioned = updateBody.data?.issueUpdate?.success ?? false;
 
     const className = STALE_CLASS_NAMES[snapshot.classification];
-    const ownershipTag = isInfraCapacityEscalation
-      ? (humanId ? "+infra-escalation(assignee+delegate-cleared)" : "+infra-escalation(delegate-cleared)")
-      : needsHuman ? (humanId ? "+needs-human(assignee+delegate-cleared)" : "+delegate-cleared") : "+delegate-cleared";
+    const ownershipTag = preserveDelegate
+      ? "+delegate-preserved"
+      : isInfraCapacityEscalation
+        ? (humanId ? "+infra-escalation(assignee+delegate-cleared)" : "+infra-escalation(delegate-cleared)")
+        : needsHuman
+          ? (humanId ? "+needs-human(assignee+delegate-cleared)" : "+delegate-cleared")
+          : "+delegate-cleared";
     log.info(
       `Recovery for ${identifier}: class=${snapshot.classification} (${className}), ` +
       `comment posted, state ${stateTransitioned ? "transitioned to " + effectiveTargetStateName : "unchanged"}, ${ownershipTag}`,
