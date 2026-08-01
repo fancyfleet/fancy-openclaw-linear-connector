@@ -6668,12 +6668,13 @@ export async function applyStateTransition(
         // it to the team's actual Linear state UUID (same resolver the governed
         // B2 transition path uses). Returns undefined on any miss so the mint
         // fails open to the team default rather than aborting.
-        lookupEntryStateId: async (wfLabel: string, teamId: string) => {
+        lookupEntryStateId: async (wfLabel: string, teamId: string, stateLabelName?: string) => {
           const defId = wfLabel.startsWith("wf:") ? wfLabel.slice(3) : wfLabel;
           const def = await loadWorkflowDefById(defId);
           if (def) fanoutWorkflowRegistry.set(defId, def);
-          if (!def?.entry_state) return undefined;
-          const entryStateNode = def.states.find((s) => s.id === def.entry_state);
+          const targetStateId = stateLabelName?.replace(/^state:/, "") ?? def?.entry_state;
+          if (!def || !targetStateId) return undefined;
+          const entryStateNode = def.states.find((s) => s.id === targetStateId);
           if (!entryStateNode?.native_state) return undefined;
           return await resolveNativeStateId(teamId, entryStateNode.native_state, authToken);
         },

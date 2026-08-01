@@ -149,6 +149,36 @@ states:
     native_state: invalid
 `;
 
+const DEV_IMPL_YAML = `
+id: dev-impl
+version: 1
+entry_state: intake
+break_glass: { command: escape, to: escape, owner_role: steward }
+states:
+  - id: intake
+    owner_role: steward
+    native_state: todo
+    transitions:
+      - { command: accept, to: write-tests }
+  - id: write-tests
+    owner_role: test-author
+    native_state: todo
+    transitions:
+      - { command: tests-ready, to: implementation }
+  - id: implementation
+    owner_role: dev
+    native_state: doing
+    transitions:
+      - { command: submit, to: done }
+  - id: done
+    kind: terminal
+    native_state: done
+    satisfies_parent_barrier: true
+  - id: escape
+    kind: terminal
+    native_state: invalid
+`;
+
 const SPRINT_ARM_UX_YAML = `
 id: sprint-arm-ux
 version: 1
@@ -287,6 +317,16 @@ const PER_ENTRY_SPEC_NO_DELEGATE = [
   "- **[wf:sprint-arm-ux] UX shaping**: Design UX",
 ].join("\n");
 
+const ENG_TESTING_SOLICITATION_SPEC = [
+  "## Structured",
+  "- **[wf:dev-impl#write-tests -> tdd] ENG-style testing/validation solicitation**: Add the department-engine regression coverage.",
+].join("\n");
+
+const INVALID_STATE_SOLICITATION_SPEC = [
+  "## Structured",
+  "- **[wf:dev-impl#not-a-state -> tdd] Bad testing solicitation**: This must refuse before mint.",
+].join("\n");
+
 const UNREGISTERED_SPEC = [
   "## Structured",
   "- **[wf:sprint-arm-scope → igor] Scope**: Define scope",
@@ -374,6 +414,15 @@ describe("AC1: extractSpecFindings per-entry workflow markers", () => {
     expect(findings[1].title).toBe("UX shaping");
     expect(findings[1].child_workflow).toBe("wf:sprint-arm-ux");
     expect(findings[1].delegate).toBeUndefined();
+  });
+
+  it("parses [wf:dev-impl#write-tests -> tdd] markers with initial state and delegate", () => {
+    const findings = extractSpecFindings(ENG_TESTING_SOLICITATION_SPEC, "Structured");
+    expect(findings).toHaveLength(1);
+    expect(findings[0].title).toBe("ENG-style testing/validation solicitation");
+    expect(findings[0].child_workflow).toBe("wf:dev-impl");
+    expect(findings[0].target_state).toBe("write-tests");
+    expect(findings[0].delegate).toBe("tdd");
   });
 
   it("entries without markers produce Findings with child_workflow undefined", () => {
@@ -674,6 +723,75 @@ describe("AC1: executeFanout per-entry child_workflow", () => {
     // because we have 3 different delegate body ids: igor, signe, laren.
     // The agent registry in this env may not resolve them all, but the engine
     // MUST attempt to resolve per-entry delegates.
+  });
+
+  it("mints an ENG-style testing solicitation as dev-impl/write-tests delegated to tdd", async () => {
+    const origAgentsFile = process.env.AGENTS_FILE;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "inf877-tdd-"));
+    fs.writeFileSync(path.join(dir, "agents.json"), JSON.stringify({
+      agents: [
+        { name: "tdd", linearUserId: "tdd-linear-uuid", clientId: "t-c", clientSecret: "t-s", accessToken: "t-t", refreshToken: "t-r" },
+      ],
+    }), "utf8");
+
+    try {
+      process.env.AGENTS_FILE = path.join(dir, "agents.json");
+      reloadAgents();
+
+      globalThis.fetch = makeFetch(ENG_TESTING_SOLICITATION_SPEC, [
+        { id: "wf-dev-impl", name: "wf:dev-impl" },
+        { id: "state-write-tests", name: "state:write-tests" },
+      ]);
+      const config = {
+        spec_source: "Structured",
+        child_workflow: "wf:task",
+      } as FanoutConfig;
+      const devImplDef = parseDef(DEV_IMPL_YAML);
+      const result = await executeFanout("ENG-5", "Bearer tok", config, {
+        skipPreview: true,
+        findingsOverride: extractSpecFindings(ENG_TESTING_SOLICITATION_SPEC, "Structured"),
+        workflowRegistry: new Map([["dev-impl", devImplDef]]),
+        lookupEntryStateId: async (_wfLabel, _teamId, stateLabelName) =>
+          stateLabelName === "state:write-tests" ? "state-id-write-tests" : null,
+      });
+
+      expect(result.created).toBe(1);
+      expect(result.refused).toBe(false);
+      expect(result.createdChildDelegates).toEqual([
+        { identifier: "AI-6001", delegateAgentId: "tdd" },
+      ]);
+      const childCreates = fetchCalls.filter((c) => c.query.includes("issueCreate"));
+      expect(childCreates).toHaveLength(1);
+      const input = childCreates[0].variables.input as Record<string, unknown>;
+      expect(input.delegateId).toBe("tdd-linear-uuid");
+      expect(input.stateId).toBe("state-id-write-tests");
+      expect(input.labelIds).toEqual(["wf-dev-impl", "state-write-tests"]);
+    } finally {
+      if (origAgentsFile !== undefined) process.env.AGENTS_FILE = origAgentsFile;
+      else delete process.env.AGENTS_FILE;
+      reloadAgents();
+    }
+  });
+
+  it("refuses an invalid per-entry initial state before creating any child", async () => {
+    globalThis.fetch = makeFetch(INVALID_STATE_SOLICITATION_SPEC, [
+      { id: "wf-dev-impl", name: "wf:dev-impl" },
+      { id: "state-write-tests", name: "state:write-tests" },
+    ]);
+    const config = {
+      spec_source: "Structured",
+      child_workflow: "wf:task",
+    } as FanoutConfig;
+    const result = await executeFanout("ENG-5", "Bearer tok", config, {
+      skipPreview: true,
+      findingsOverride: extractSpecFindings(INVALID_STATE_SOLICITATION_SPEC, "Structured"),
+      workflowRegistry: new Map([["dev-impl", parseDef(DEV_IMPL_YAML)]]),
+    });
+
+    expect(result.refused).toBe(true);
+    expect(result.created).toBe(0);
+    expect(result.errors[0]?.message).toMatch(/not-a-state/);
+    expect(fetchCalls.some((c) => c.query.includes("issueCreate"))).toBe(false);
   });
 
   it("falls back to config.child_workflow when finding has no child_workflow", async () => {

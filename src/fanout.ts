@@ -138,6 +138,13 @@ export interface Finding {
    */
   child_workflow?: string;
   /**
+   * INF-877: optional per-entry initial workflow state override. Parsed from
+   * markers like `[wf:dev-impl#write-tests -> tdd]`; validated against the
+   * child workflow before mint so testing solicitations can seat TDD directly
+   * in dev-impl/write-tests instead of routing through wf:task review.
+   */
+  target_state?: string;
+  /**
    * AI-2199: per-entry delegate override. When set, this finding's child is
    * delegated to this body id instead of the fanout config's `initial_delegate`.
    * Parsed from the `[wf:sprint-arm-ux → signe]` marker (the part after →).
@@ -587,8 +594,13 @@ export function extractSpecFindings(
   const sectionMatch = sectionRegex.exec(description);
   /**
    * AI-2199: regex for per-entry child workflow marker in spec bullet titles.
-   * Matches: [wf:sprint-arm-ux → signe] or [wf:sprint-arm-ux]
-   * The arrow separates workflow id from optional delegate.
+   * Matches: [wf:sprint-arm-ux → signe], [wf:sprint-arm-ux], or
+   * [wf:dev-impl#write-tests -> tdd].
+   * Groups: (1) workflow id, (2) optional #state suffix, (3) optional delegate.
+   * The arrow separates workflow id from optional delegate; the optional #suffix
+   * (INF-877) selects an initial child workflow state so testing/validation
+   * solicitations can seat directly at write-tests -> tdd instead of falling
+   * through wf:task role routing to the department head.
    *
    * INF-890: the arrow may be a unicode arrow (→), an ASCII arrow (->), a bare
    * angle (>), or a smart dash (— / –). The pre-INF-890 pattern modeled the
@@ -605,14 +617,16 @@ export function extractSpecFindings(
    * The unicode arrow → happened to work (single distinct char), which is why
    * the AI-2199 suite — authored entirely with → — stayed green over the bug.
    *
-   * Fix: the workflow-id group excludes the separator characters (> → — –) and
-   * is non-greedy, and the separator is an explicit alternation that matches the
-   * two-char "->" before any single char. The ASCII hyphen stays legal INSIDE
-   * an id (sprint-arm-ux) because a lone '-' is no longer a separator — only
-   * "->" / "→" / ">" / "—" / "–" are.
+   * Fix: the workflow-id group excludes the separator characters (> → — –) AND
+   * '#' (the state-suffix delimiter) and is non-greedy, and the separator is an
+   * explicit alternation that matches the two-char "->" before any single char.
+   * The ASCII hyphen stays legal INSIDE an id (sprint-arm-ux) because a lone '-'
+   * is not a separator — only "->" / "→" / ">" / "—" / "–" are. Keeping the id
+   * non-greedy is what preserves the INF-890 unspaced-`->` fix under the added
+   * '#' suffix group.
    */
   const PER_ENTRY_MARKER_RE =
-    /^\\?\[\s*wf:\s*([^\s\\\]>→—–]+?)(?:\s*(?:->|→|—|–|>)\s*([^\s\\\]]+))?\s*\\?\]\s*/;
+    /^\\?\[\s*wf:\s*([^\s\\\]>→—–#]+?)(?:#([^\s\\\]]+))?(?:\s*(?:->|→|—|–|>)\s*([^\s\\\]]+))?\s*\\?\]\s*/;
 
   if (sectionMatch) {
     // INF-730: one entry per TOP-LEVEL bullet — a multi-paragraph structured
@@ -630,7 +644,10 @@ export function extractSpecFindings(
       if (markerMatch) {
         finding.child_workflow = `wf:${markerMatch[1]}`;
         if (markerMatch[2]) {
-          finding.delegate = markerMatch[2];
+          finding.target_state = markerMatch[2];
+        }
+        if (markerMatch[3]) {
+          finding.delegate = markerMatch[3];
         }
       }
       findings.push(finding);
@@ -1577,6 +1594,7 @@ export async function executeFanout(
     lookupEntryStateId?: (
       workflowLabel: string,
       teamId: string,
+      stateLabelName?: string,
     ) => Promise<string | null | undefined>;
     /**
      * INF-570: workflow registry and dispatch seams used to route children born
@@ -1740,6 +1758,32 @@ export async function executeFanout(
       `(${findings.length} spec entr${findings.length === 1 ? "y" : "ies"}, all already spawned)`,
     );
     return result;
+  }
+
+  for (const finding of toSpawn) {
+    if (!finding.target_state) continue;
+    const findingWorkflow = finding.child_workflow ?? childWorkflowLabel;
+    if (!workflowDefForLabel(options?.workflowRegistry, findingWorkflow) && options?.lookupEntryState) {
+      await options.lookupEntryState(findingWorkflow);
+    }
+    const def = workflowDefForLabel(options?.workflowRegistry, findingWorkflow);
+    if (!def) {
+      result.refused = true;
+      result.errors.push({
+        findingIndex: toSpawn.indexOf(finding),
+        message: `Refusing fan-out: "${finding.title}" declares initial state '${finding.target_state}' for '${findingWorkflow}', but the workflow definition is unavailable for validation`,
+      });
+      return result;
+    }
+    const state = def.states.find((s) => s.id === finding.target_state);
+    if (!state) {
+      result.refused = true;
+      result.errors.push({
+        findingIndex: toSpawn.indexOf(finding),
+        message: `Refusing fan-out: "${finding.title}" declares initial state '${finding.target_state}' that does not exist in '${findingWorkflow}'`,
+      });
+      return result;
+    }
   }
 
   // INF-453: Guard against zero arms/spec in dev-sprint.
@@ -2005,9 +2049,11 @@ export async function executeFanout(
     // If the caller provided lookupEntryState, use it to get the correct
     // state label from the workflow definition. Otherwise fall back to
     // "state:intake" (legacy default). Cache by state name for efficiency.
-    const entryStateLabel = options?.lookupEntryState
-      ? await options.lookupEntryState(findingWorkflow)
-      : undefined;
+    const entryStateLabel = finding.target_state
+      ? `state:${finding.target_state}`
+      : options?.lookupEntryState
+        ? await options.lookupEntryState(findingWorkflow)
+        : undefined;
     // INF-441: default to 'state:todo' (To Do) instead of 'state:intake' (Backlog)
     // for all spawned children to ensure they are dispatched and not silently inert.
     const stateLabelName = entryStateLabel ?? "state:todo";
@@ -2033,11 +2079,12 @@ export async function executeFanout(
     // Fail-open: a null result mints the child at the team default, as before.
     let entryStateId: string | null | undefined;
     if (options?.lookupEntryStateId) {
-      if (stateIdCache.has(findingWorkflow)) {
-        entryStateId = stateIdCache.get(findingWorkflow);
+      const stateIdCacheKey = `${findingWorkflow}|${stateLabelName}`;
+      if (stateIdCache.has(stateIdCacheKey)) {
+        entryStateId = stateIdCache.get(stateIdCacheKey);
       } else {
-        entryStateId = await options.lookupEntryStateId(findingWorkflow, parentCtx.teamId);
-        stateIdCache.set(findingWorkflow, entryStateId ?? null);
+        entryStateId = await options.lookupEntryStateId(findingWorkflow, parentCtx.teamId, stateLabelName);
+        stateIdCache.set(stateIdCacheKey, entryStateId ?? null);
         if (!entryStateId) {
           log.warn(
             `fanout: could not resolve native stateId for '${findingWorkflow}' (${stateLabelName}) ` +
