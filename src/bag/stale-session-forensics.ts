@@ -1302,6 +1302,65 @@ export async function recoverTicket(
 }
 
 /**
+ * Assess whether a stale session's claimed implementation may be trapped as an
+ * unpushed/uncommitted artifact inside the worker's container worktree.
+ *
+ * This is the INF-1061 detection for the INF-1045 failure mode: a C3
+ * ("Silent completion") husk whose last message *claims* code work
+ * ("Implemented …", "383 passed", "npm run build passed") but where the session
+ * timed out before `git commit`/`git push` ever ran. Because each container's
+ * `./workspace` is a separate host directory and the only artifact-publication
+ * path is a push to origin, that work is invisible to the reviewer and every
+ * stale replay re-announces a non-reviewable claim (INF-1045 looped 8×).
+ *
+ * The signal is derived purely from the forensic snapshot we already collect:
+ *   - `claimedImplementation` — the last assistant message asserts code work.
+ *   - `pushObserved` — a `git commit`/`git push`/`oc-commit` call appears among
+ *     the visible tool calls and did not error. Conservative by design: absence
+ *     of a push in the observed window is treated as "not published".
+ *
+ * `atRisk` is only raised for C3 — the class that claims completion without
+ * transitioning. Research/analysis C3s that make no implementation claim are
+ * not flagged.
+ */
+export interface UnpushedArtifactRisk {
+  atRisk: boolean;
+  claimedImplementation: boolean;
+  pushObserved: boolean;
+}
+
+const IMPLEMENTATION_CLAIM_PATTERNS: RegExp[] = [
+  /\b(implemented|committed|pushed|refactored|patched|wrote the (?:fix|patch|code))\b/i,
+  /\bnpm run build\b/i,
+  /\bbuild (?:passed|succeeded|clean|is clean)\b/i,
+  /\b\d+\s+(?:tests?\s+)?pass(?:ed|ing)\b/i, // e.g. "383 passed"
+  /\bchanged\s+`?src\//i,
+  /\b(?:added|modified|updated)\b[^.\n]*\.(?:ts|tsx|js|mjs|py|go|rs|java)\b/i,
+];
+
+// A shell/exec tool argument blob that shows the work was actually published.
+const PUSH_EVIDENCE_PATTERN = /git\s+push\b|oc-commit(?:\.sh)?\b|git-commit\b/i;
+// A bare commit (no push) is weaker evidence, but still shows the agent reached
+// the publication step rather than dying mid-implementation.
+const COMMIT_EVIDENCE_PATTERN = /git\s+commit\b/i;
+
+export function assessUnpushedArtifactRisk(snapshot: StaleSnapshot): UnpushedArtifactRisk {
+  const text = snapshot.lastAssistantMessage?.fullText ?? "";
+  const claimedImplementation = IMPLEMENTATION_CLAIM_PATTERNS.some((re) => re.test(text));
+
+  const pushObserved = snapshot.toolCallSummary.last10.some((call) => {
+    if (call.result === "error") return false;
+    const blob = `${call.name} ${JSON.stringify(call.arguments ?? {})}`;
+    return PUSH_EVIDENCE_PATTERN.test(blob) || COMMIT_EVIDENCE_PATTERN.test(blob);
+  });
+
+  const atRisk =
+    snapshot.classification === "C3" && claimedImplementation && !pushObserved;
+
+  return { atRisk, claimedImplementation, pushObserved };
+}
+
+/**
  * Build a human-readable recovery comment for the Linear ticket based on classification.
  * For C2/C4, pass attempt (1-based current count) and maxAttempts to include retry info.
  */
@@ -1339,11 +1398,24 @@ export function buildRecoveryComment(snapshot: StaleSnapshot, attempt?: number, 
         attemptSuffix;
     }
 
-    case "C3":
+    case "C3": {
+      const risk = assessUnpushedArtifactRisk(snapshot);
+      const warning = risk.atRisk
+        ? `⚠️ **Unpushed-artifact risk (INF-1061).** The agent claimed implementation ` +
+          `but no \`git commit\`/\`git push\` was observed in this session. The work may ` +
+          `exist only as **uncommitted changes inside the worker's container worktree** ` +
+          `and will **not be reviewable** until it is pushed to origin — this is the ` +
+          `INF-1045 failure mode, where a non-reviewable claim was replayed 8×.\n\n` +
+          `**Do not confirm completion on this comment.** Verify a pushed branch/commit ` +
+          `actually exists first; if it does not, re-route to the worker to commit and ` +
+          `push before review.\n\n`
+        : "";
       return `🔴 **Stale session recovered** — class **${cls}** (${className})\n\n` +
+        warning +
         `Session timed out after ${duration} minutes. The agent appears to have completed work but did not transition the ticket state.\n\n` +
         `Last assistant message:\n> ${(snapshot.lastAssistantMessage?.fullText ?? "").slice(0, 500)}\n\n` +
         `Please review and confirm completion or re-route.${diagPath ? `\n\n📝 Diagnostics: \`${diagPath}\`` : ""}`;
+    }
 
     case "C4": {
       const isCapped = attempt !== undefined && maxAttempts !== undefined && attempt >= maxAttempts;

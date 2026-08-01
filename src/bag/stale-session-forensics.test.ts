@@ -1,5 +1,5 @@
 import { jest } from "@jest/globals";
-import { classify, buildRecoveryComment, type ToolCallSummary, type LastAssistantMessage, type StaleSnapshot, STALE_CLASS_NAMES, buildSnapshot, writeSnapshot, aggregateDigest, formatDigestSummary, recoverTicket, collectSameKeySessionReplay } from "./stale-session-forensics.js";
+import { classify, buildRecoveryComment, assessUnpushedArtifactRisk, type ToolCallSummary, type LastAssistantMessage, type StaleSnapshot, STALE_CLASS_NAMES, buildSnapshot, writeSnapshot, aggregateDigest, formatDigestSummary, recoverTicket, collectSameKeySessionReplay } from "./stale-session-forensics.js";
 import { StaleRedispatchCounter } from "./stale-redispatch-counter.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -410,6 +410,92 @@ describe("buildRecoveryComment — C4 attempt tracking", () => {
     const comment = buildRecoveryComment(makeSnapshot("C4"), 3, 3);
     expect(comment).toContain("Max re-dispatch attempts reached (**3/3**). Escalating to human review.");
     expect(comment).not.toContain("Ticket returned to Todo for re-dispatch.");
+  });
+});
+
+// ── INF-1061: unpushed-artifact detection on C3 completion claims ───────────
+
+describe("assessUnpushedArtifactRisk", () => {
+  const claimText =
+    "Implemented INF-1045 in src/workflow-gate.ts. Verification: 383 passed; npm run build passed.";
+
+  test("C3 + implementation claim + no push observed → atRisk", () => {
+    const snap = makeSnapshotWith("C3", {
+      lastAssistantMessage: makeAssistant({ fullText: claimText }),
+      toolCallSummary: { byName: { exec: 3 }, totalCalls: 3, last10: [
+        { name: "exec", arguments: { command: "npx jest --runInBand" }, result: "success", timestamp: "t" },
+      ] },
+    });
+    const risk = assessUnpushedArtifactRisk(snap);
+    expect(risk.claimedImplementation).toBe(true);
+    expect(risk.pushObserved).toBe(false);
+    expect(risk.atRisk).toBe(true);
+  });
+
+  test("C3 + implementation claim + push observed → not atRisk", () => {
+    const snap = makeSnapshotWith("C3", {
+      lastAssistantMessage: makeAssistant({ fullText: claimText }),
+      toolCallSummary: { byName: { exec: 2 }, totalCalls: 2, last10: [
+        { name: "exec", arguments: { command: "git push origin fix/INF-1045" }, result: "success", timestamp: "t" },
+      ] },
+    });
+    const risk = assessUnpushedArtifactRisk(snap);
+    expect(risk.pushObserved).toBe(true);
+    expect(risk.atRisk).toBe(false);
+  });
+
+  test("push that errored does not count as observed", () => {
+    const snap = makeSnapshotWith("C3", {
+      lastAssistantMessage: makeAssistant({ fullText: claimText }),
+      toolCallSummary: { byName: { exec: 1 }, totalCalls: 1, last10: [
+        { name: "exec", arguments: { command: "git push origin fix/INF-1045" }, result: "error", timestamp: "t" },
+      ] },
+    });
+    expect(assessUnpushedArtifactRisk(snap).atRisk).toBe(true);
+  });
+
+  test("C3 research/analysis (no implementation claim) → not atRisk", () => {
+    const snap = makeSnapshotWith("C3", {
+      lastAssistantMessage: makeAssistant({ fullText: "That confirms it — no branch or commit exists on any visible remote. The root cause is the container workspace topology." }),
+    });
+    const risk = assessUnpushedArtifactRisk(snap);
+    expect(risk.claimedImplementation).toBe(false);
+    expect(risk.atRisk).toBe(false);
+  });
+
+  test("non-C3 class is never flagged even with a claim", () => {
+    const snap = makeSnapshotWith("C1", {
+      lastAssistantMessage: makeAssistant({ fullText: claimText }),
+    });
+    expect(assessUnpushedArtifactRisk(snap).atRisk).toBe(false);
+  });
+});
+
+describe("buildRecoveryComment — C3 unpushed-artifact warning", () => {
+  const claimText = "Implemented the fix; 383 passed; npm run build passed.";
+
+  test("at-risk C3 prepends the INF-1061 warning and blocks confirmation", () => {
+    const comment = buildRecoveryComment(makeSnapshotWith("C3", {
+      lastAssistantMessage: makeAssistant({ fullText: claimText }),
+      toolCallSummary: { byName: { exec: 1 }, totalCalls: 1, last10: [
+        { name: "exec", arguments: { command: "npx jest" }, result: "success", timestamp: "t" },
+      ] },
+    }));
+    expect(comment).toContain("Unpushed-artifact risk (INF-1061)");
+    expect(comment).toContain("Do not confirm completion");
+    // Still carries the normal C3 body.
+    expect(comment).toContain("did not transition the ticket state");
+  });
+
+  test("non-at-risk C3 (push observed) omits the warning", () => {
+    const comment = buildRecoveryComment(makeSnapshotWith("C3", {
+      lastAssistantMessage: makeAssistant({ fullText: claimText }),
+      toolCallSummary: { byName: { exec: 1 }, totalCalls: 1, last10: [
+        { name: "exec", arguments: { command: "git push origin HEAD" }, result: "success", timestamp: "t" },
+      ] },
+    }));
+    expect(comment).not.toContain("Unpushed-artifact risk");
+    expect(comment).toContain("Please review and confirm completion or re-route.");
   });
 });
 
