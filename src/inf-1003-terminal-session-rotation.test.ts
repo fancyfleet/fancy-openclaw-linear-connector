@@ -158,13 +158,18 @@ describe("INF-1003 terminal-session rotation on re-dispatch", () => {
       runtime: "openclaw-acp",
       agentId: "igor",
       sessionKey: "agent:igor:linear-INF-1003",
-      requestedAt: "2026-07-28T23:00:00.000Z",
+      // INF-1088: anchor the bound claim to "now". These tests decide terminal-ness
+      // from the transcript (via probeBoundSessionTerminal), not the claim clock, and
+      // assert the still-working case is NOT over-rotated. Under the INF-1088 live-claim
+      // TTL a days-old `updated_at` would read as an expired corpse and re-spawn before
+      // the probe runs, so the "in-flight bound session" fixture must be stamped recently.
+      requestedAt: new Date(Date.now() - 60_000).toISOString(),
     });
     store.markSpawned(bound.record.id, {
       runId: "prior-live-run",
       sessionId: TERMINAL_SESSION_ID,
       state: "live",
-      observedAt: "2026-07-28T23:01:00.000Z",
+      observedAt: new Date(Date.now() - 30_000).toISOString(),
       runtimeStatePath: "/tmp/openclaw/sessions.json",
     });
   }
