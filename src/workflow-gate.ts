@@ -2241,6 +2241,12 @@ export async function fetchWorkflowLabels(issueId: string, authToken: string): P
  */
 export const SIGNOFF_WAKE_DISPATCHED_PHRASE = "A signoff wake has been dispatched";
 
+// INF-792: stable marker in the Rule 6b unmerged-close rejection message. The
+// proxy matches this phrase to escalate the decline to a hard 403 (a policy
+// refusal), distinct from the soft 200-with-errors of the ordinary workflow
+// blocks — the same exported-phrase idiom as SIGNOFF_WAKE_DISPATCHED_PHRASE.
+export const UNMERGED_CLOSE_BLOCK_PHRASE = "cannot close unmerged work";
+
 /**
  * INF-629: For a non-holder's attempted designated-approver gated transition,
  * resolve the approver body/bodies to wake and the ticket's canonical
@@ -4261,6 +4267,53 @@ export async function checkWorkflowRules(
 
   // Resolve destination state for subsequent gates.
   const destStateNode = def.states.find((s) => s.id === match.to);
+
+  // ── INF-792: Rule 6b — refuse a wf:task terminal close carrying unmerged work ──
+  // A `wf:task` ticket must not be closed To Do → Done while it carries an open,
+  // unmerged PR reference. This is the INF-781 false-Done: a NULL-DELEGATE
+  // stall-sweep re-seat landed the ticket in Done one second after the re-seat
+  // comment, while its approved fix (PR #563, head not an ancestor of
+  // `origin/main`) was never merged — the approved fix was stranded, and the
+  // false-Done deleted the very alarm that should have caught it. Break-glass
+  // (`escape`/`reopen`, AC #3) remains the intentional override, and is exempt
+  // here as it is in the dev-impl release gate.
+  //
+  // Scoped to `wf:task` deliberately: this is the workflow whose terminal close
+  // ships a code PR that must be merged (AC #4). The dev-impl release path has
+  // its own §5.6 merged-PR gate below, and the sprint/ux-audit/design/chore
+  // workflows converge to done on non-code semantics (a sprint's terminal is
+  // not a PR) — subjecting them to a PR-merge gate would refuse legitimate
+  // closes. A steward wanting Rule 6b on another workflow is a separate, tested
+  // extension of this list.
+  //
+  // Blocks ONLY on affirmative evidence of an unmerged PR: an attached PR whose
+  // status metadata is present and shows no merged PR. Absent PR evidence (no PR
+  // referenced) and a merged PR both permit the close — AC #4's two-sided
+  // contract. A null status (transient API failure) or the INF-112 metadata-gap
+  // (PR URLs without synced status) fail open, so a legitimately-merged ticket
+  // is never stranded (INF-695 lineage).
+  const closesToDone =
+    workflowId === "task" && destStateNode?.kind === "terminal" && destStateNode?.native_state === "done";
+  if (closesToDone && !breakGlassOverride) {
+    const branchStatus = await fetchBranchAndPRStatus(issueId, authToken, fetchedIdentifier);
+    if (branchStatus && branchStatus.hasPR && !branchStatus.hasMergedPR && branchStatus.prMetadataAvailable) {
+      log.warn(
+        `workflow-gate: INF-792 Rule 6b: ${issueId} blocked '${intent}' — terminal close with open/unmerged PR (${branchStatus.prUrls.join(", ")})`,
+      );
+      notify({
+        severity: "warning",
+        source: "done-gate",
+        title: "wf:task terminal close blocked — unmerged PR (INF-792 Rule 6b)",
+        detail: `Ticket ${issueId}: '${intent}' would close to Done while an attached pull request is open/unmerged (${branchStatus.prUrls.join(", ")}). This is the INF-781 false-Done pattern — an approved-but-unmerged fix would be stranded and invisible to every sweep. Merge the PR before closing, or use break-glass (escape/reopen) to override.`,
+        ticket: issueId,
+        dedupKey: `done-gate|inf-792-unmerged|${issueId}`,
+      });
+      return (
+        `[Proxy] '${intent}' blocked: ${UNMERGED_CLOSE_BLOCK_PHRASE}. The attached pull request is not yet merged ` +
+        `(its head is not an ancestor of origin/main). Merge the PR before closing to Done, or use break-glass to override.`
+      );
+    }
+  }
 
   // ── AI-2476: Merged-PR release gate re-armed (§5.6) ──────────────────
   // A wf:dev-impl ticket must not leave merge or deploy states forward without

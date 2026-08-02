@@ -33,7 +33,7 @@ import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules, bodyHasCapability, getCapabilityPolicy } from "./escalation-gate.js";
 import { checkLeakedCredentialGate } from "./leaked-credential-gate.js";
 import { checkStaleSnapshotForTerminal } from "./proxy-cas-check.js";
-import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, setStateAtomic, verifyCommentSatisfiedBy, fetchTicketVerification, resolveSignoffWakeTargets, SIGNOFF_WAKE_DISPATCHED_PHRASE, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
+import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, setStateAtomic, verifyCommentSatisfiedBy, fetchTicketVerification, resolveSignoffWakeTargets, SIGNOFF_WAKE_DISPATCHED_PHRASE, UNMERGED_CLOSE_BLOCK_PHRASE, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
 import { buildTransitionAuditRecord, emitTransitionAuditRecord, verifyPostTransition, type GateResult, type TransitionAuditRecord } from "./transition-audit.js";
 import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import type { ObservationStore } from "./store/observation-store.js";
@@ -1324,7 +1324,14 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             // fail-open: don't suppress the rejection if verification fetch fails
           }
         }
-        res.status(200).json(gateDeclineResponse);
+        // INF-792 AC5: the Rule 6b unmerged-work close guard is a hard policy
+        // refusal, escalated to 403 (distinct from the soft 200-with-errors of
+        // ordinary workflow blocks) so a client cannot mistake a strand-a-prod-fix
+        // close for an ordinary advisory decline. Wired here at the live
+        // /proxy/graphql transition path — the guard fires inside checkWorkflowRules
+        // (above) and its rejection is surfaced with the 403 status.
+        const declineStatus = p3rejection.includes(UNMERGED_CLOSE_BLOCK_PHRASE) ? 403 : 200;
+        res.status(declineStatus).json(gateDeclineResponse);
         return;
       }
 
