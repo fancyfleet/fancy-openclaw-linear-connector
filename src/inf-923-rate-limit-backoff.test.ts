@@ -29,6 +29,7 @@ import { AlertStore } from "./alerts/alert-store.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
 import { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
 import { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
+import { LinearRateLimitClient, RateLimitBreakerOpenError } from "./linear-rate-limit-client.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DIST_ENTRY = path.resolve(__dirname, "../dist/index.js");
@@ -283,6 +284,41 @@ describe("INF-923 AC2: 429 breaker suppresses reconciliation query storms", () =
     expect(breakerAlerts).toHaveLength(1);
     expect(breakerAlerts[0].count).toBe(1);
   });
+
+  it("INF-981: a headerless 429 still marks budget depleted and trips the breaker", async () => {
+    const client = new LinearRateLimitClient({
+      alertBus,
+      budgetTotal: 10_000,
+      floor: 500,
+    });
+    const fetchFn = jest.fn<typeof fetch>(async () =>
+      makeLinearResponse({ errors: [{ message: "rate limit exceeded" }] }, { status: 429 }),
+    );
+
+    await expect(client.wrap(fetchFn)("https://api.linear.app/graphql", { method: "POST" }))
+      .rejects.toBeInstanceOf(RateLimitBreakerOpenError);
+
+    expect(client.liveness()).toEqual(expect.objectContaining({
+      remaining: 0,
+      source: "live",
+      breaker: expect.objectContaining({ state: "open", tripped: true }),
+    }));
+    expect(client.redispatchBudget()).toBe(0);
+  });
+
+  it("INF-981: source unknown is unsafe and grants no redispatch budget", () => {
+    const client = new LinearRateLimitClient({
+      alertBus,
+      budgetTotal: 10_000,
+      floor: 500,
+    });
+
+    expect(client.liveness()).toEqual(expect.objectContaining({
+      remaining: 10_000,
+      source: "unknown",
+    }));
+    expect(client.redispatchBudget()).toBe(0);
+  });
 });
 
 describe("INF-923 AC4/AC6: admin and health rate-limit liveness surfaces", () => {
@@ -334,6 +370,8 @@ describe("INF-923 AC4/AC6: admin and health rate-limit liveness surfaces", () =>
         tripped: expect.any(Boolean),
       }),
       gatedConsumers: expect.arrayContaining([
+        "proxy-graphql-passthrough",
+        "webhook-linear-enrichment",
         "stale-c4-repoke",
         "delegation-reconciliation-sweep",
         "bootstrap-reconciliation-sweep",
@@ -419,6 +457,8 @@ describe("INF-923 AC5/AC6: production entrypoint wiring", () => {
         state: expect.stringMatching(/closed|open|half-open/i),
       }),
       gatedConsumers: expect.arrayContaining([
+        "proxy-graphql-passthrough",
+        "webhook-linear-enrichment",
         "delegation-reconciliation-sweep",
         "bootstrap-reconciliation-sweep",
         "stale-plain-delegate-sweep",

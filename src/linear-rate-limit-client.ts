@@ -40,6 +40,8 @@ const log = componentLogger(
  * ac-validate without waiting for a real 429 (AC5/AC6).
  */
 export const RATE_LIMIT_GATED_CONSUMERS = [
+  "proxy-graphql-passthrough",
+  "webhook-linear-enrichment",
   "stale-c4-repoke",
   "delegation-reconciliation-sweep",
   "bootstrap-reconciliation-sweep",
@@ -151,6 +153,7 @@ export class LinearRateLimitClient {
    */
   redispatchBudget(): number {
     if (this.isBreakerOpen()) return 0;
+    if (this.source === "unknown") return 0;
     return this.remaining > this.floorValue ? this.remaining - this.floorValue : 0;
   }
 
@@ -174,36 +177,46 @@ export class LinearRateLimitClient {
       const res = await fetchFn(input, init);
       self.observeResponse(res);
       if (res.status === 429) {
-        self.record429();
         throw new RateLimitBreakerOpenError(
           `Linear API 429 — request budget exhausted (remaining=${self.remaining})`,
         );
       }
-      self.onSuccessfulResponse();
       return res;
     };
     return wrapped as typeof fetch;
   }
 
-  private observeResponse(res: Response): void {
+  observeResponse(res: Response): void {
     const headers = res.headers;
-    if (!headers || typeof headers.get !== "function") return;
-    const remainingHeader =
-      headers.get("ratelimit-remaining") ?? headers.get("x-ratelimit-remaining");
-    if (remainingHeader !== null && remainingHeader !== undefined && remainingHeader !== "") {
-      const parsed = Number(remainingHeader);
-      if (Number.isFinite(parsed)) {
-        this.remaining = parsed;
-        this.source = "header";
+    if (headers && typeof headers.get === "function") {
+      const remainingHeader =
+        headers.get("ratelimit-remaining") ?? headers.get("x-ratelimit-remaining");
+      if (remainingHeader !== null && remainingHeader !== undefined && remainingHeader !== "") {
+        const parsed = Number(remainingHeader);
+        if (Number.isFinite(parsed)) {
+          this.remaining = parsed;
+          this.source = "header";
+        }
+      }
+      const resetHeader = headers.get("ratelimit-reset") ?? headers.get("x-ratelimit-reset");
+      if (resetHeader) {
+        const secs = Number(resetHeader);
+        if (Number.isFinite(secs) && secs > 0) {
+          this.resetAtMs = this.now() + secs * 1000;
+        }
       }
     }
-    const resetHeader = headers.get("ratelimit-reset") ?? headers.get("x-ratelimit-reset");
-    if (resetHeader) {
-      const secs = Number(resetHeader);
-      if (Number.isFinite(secs) && secs > 0) {
-        this.resetAtMs = this.now() + secs * 1000;
+
+    if (res.status === 429) {
+      if (this.source === "unknown") {
+        this.remaining = 0;
+        this.source = "live";
       }
+      this.record429();
+      return;
     }
+
+    this.onSuccessfulResponse();
   }
 
   private onSuccessfulResponse(): void {

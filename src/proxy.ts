@@ -30,6 +30,7 @@
 
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
+import { getAlertBus } from "./alerts/alert-bus.js";
 import { checkEnforcementRules, bodyHasCapability, getCapabilityPolicy } from "./escalation-gate.js";
 import { checkLeakedCredentialGate } from "./leaked-credential-gate.js";
 import { checkStaleSnapshotForTerminal } from "./proxy-cas-check.js";
@@ -51,9 +52,25 @@ import { checkArtifactDisclosure } from "./artifact-disclosure.js";
 import { recordTransitionCarriedComment } from "./transition-comment-logic.js";
 import { LINEAR_PROXY_PROTOCOL_VERSION, minWorkflowCliVersion } from "./proxy-compatibility.js";
 import { findOrCreateLabel } from "./linear-helpers.js";
+import { getRateLimitClient, RateLimitBreakerOpenError } from "./linear-rate-limit-client.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
+
+async function linearApiFetch(
+  input: Parameters<typeof globalThis.fetch>[0],
+  init?: Parameters<typeof globalThis.fetch>[1],
+): Promise<globalThis.Response> {
+  const client = getRateLimitClient(getAlertBus());
+  if (client.isBreakerOpen()) {
+    throw new RateLimitBreakerOpenError(
+      "Linear API rate-limit breaker is open — proxy request suppressed until budget recovers",
+    );
+  }
+  const res = await globalThis.fetch(input, init);
+  client.observeResponse(res);
+  return res;
+}
 
 /**
  * AGI-3: process-local dedup window for agent-driven `issueCreate`.
@@ -316,7 +333,7 @@ type IssueContext = {
 };
 
 async function fetchIssueContext(issueId: string, authToken: string): Promise<IssueContext | null> {
-  const res = await fetch(LINEAR_API_URL, {
+  const res = await linearApiFetch(LINEAR_API_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: authToken },
     body: JSON.stringify({
@@ -356,7 +373,7 @@ async function fetchIssueContext(issueId: string, authToken: string): Promise<Is
 }
 
 async function fetchTeamStates(teamId: string, authToken: string): Promise<TeamState[]> {
-  const res = await fetch(LINEAR_API_URL, {
+  const res = await linearApiFetch(LINEAR_API_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: authToken },
     body: JSON.stringify({
@@ -374,7 +391,7 @@ async function fetchTeamStates(teamId: string, authToken: string): Promise<TeamS
 }
 
 async function fetchTeamLabels(teamId: string, authToken: string): Promise<TeamLabel[]> {
-  const res = await fetch(LINEAR_API_URL, {
+  const res = await linearApiFetch(LINEAR_API_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: authToken },
     body: JSON.stringify({
@@ -551,7 +568,7 @@ async function emitXfnDemotionNotification(
   if (!issueId) return;
   const body =
     `[Cross-functional request demoted] requester=${notification.requester}; source=${notification.dimension}; routed to Backlog for ${notification.steward} steward triage.`;
-  await fetch(LINEAR_API_URL, {
+  await linearApiFetch(LINEAR_API_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: authToken },
     body: JSON.stringify({
@@ -754,7 +771,7 @@ async function resolveMutationIssueIds(
     if (typeof value !== "string" || !isHumanReadableIdentifier(value)) continue;
 
     try {
-      const res = await fetch(LINEAR_API_URL, {
+      const res = await linearApiFetch(LINEAR_API_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: authToken },
         body: JSON.stringify({
@@ -1091,7 +1108,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
 
         let migrateRes: globalThis.Response;
         try {
-          migrateRes = await fetch(LINEAR_API_URL, {
+          migrateRes = await linearApiFetch(LINEAR_API_URL, {
             method: "POST",
             headers: { "Content-Type": "application/json", Authorization: authorization },
             body: JSON.stringify(body),
@@ -1177,7 +1194,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         if (commentIssueId) {
           const commentBody =
             `[Steward rewind by ${agentId}] state:${rewindResult.from ?? "?"} -> state:${rewindTarget} - break-glass rewind (INF-27 AC3). This is a rewind, not an escape: the ticket remains live in its workflow.`;
-          await fetch(LINEAR_API_URL, {
+          await linearApiFetch(LINEAR_API_URL, {
             method: "POST",
             headers: { "Content-Type": "application/json", Authorization: authorization },
             body: JSON.stringify({
@@ -1628,7 +1645,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
 
       let upstreamRes: globalThis.Response;
       try {
-        upstreamRes = await fetch(LINEAR_API_URL, {
+        upstreamRes = await linearApiFetch(LINEAR_API_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: authorization },
           body: JSON.stringify(body),
@@ -1955,7 +1972,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
   // Non-intent forward path (reads and raw non-workflow mutations).
   let upstreamRes: globalThis.Response;
   try {
-    upstreamRes = await fetch(LINEAR_API_URL, {
+    upstreamRes = await linearApiFetch(LINEAR_API_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

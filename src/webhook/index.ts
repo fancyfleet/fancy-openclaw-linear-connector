@@ -38,7 +38,8 @@ import { createLogger, componentLogger } from "../logger.js";
 import { checkLinearIssueRouting, isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
 import { onChildTerminal } from "../barrier.js";
 import { maybeBootstrapWorkflow } from "../workflow-bootstrap.js";
-import { notify } from "../alerts/alert-bus.js";
+import { getAlertBus, notify } from "../alerts/alert-bus.js";
+import { getRateLimitClient, RateLimitBreakerOpenError } from "../linear-rate-limit-client.js";
 import { loadKnownHumans } from "../known-humans.js";
 import { emitStreamTopic } from "../admin-stream.js";
 import { DelegatePingPongDetector, shouldCheckDelegatePingPong } from "../delegate-ping-pong-detector.js";
@@ -47,6 +48,22 @@ import type { GatewayDispatchAck } from "../liveness-channel/gateway-ack-types.j
 import { extractRejectedWebhookDiagnostic, WebhookSecretDriftTracker } from "./drift.js";
 
 const log = componentLogger(createLogger(), "webhook");
+const LINEAR_API_URL = "https://api.linear.app/graphql";
+
+async function linearApiFetch(
+  input: Parameters<typeof globalThis.fetch>[0],
+  init?: Parameters<typeof globalThis.fetch>[1],
+): Promise<globalThis.Response> {
+  const client = getRateLimitClient(getAlertBus());
+  if (client.isBreakerOpen()) {
+    throw new RateLimitBreakerOpenError(
+      "Linear API rate-limit breaker is open — webhook enrichment suppressed until budget recovers",
+    );
+  }
+  const res = await globalThis.fetch(input, init);
+  client.observeResponse(res);
+  return res;
+}
 
 export type { LinearEvent } from "./schema.js";
 export { verifyLinearSignature } from "./signature.js";
@@ -196,7 +213,7 @@ export async function findUnblockWakeRoutesForTerminalIssue(event: LinearEvent):
   const token = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
   if (!token) return [];
 
-  const response = await fetch("https://api.linear.app/graphql", {
+  const response = await linearApiFetch(LINEAR_API_URL, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -400,7 +417,7 @@ export async function enrichCommentEventForRouting(event: LinearEvent): Promise<
     return undefined;
   })();
   try {
-    const res = await fetch("https://api.linear.app/graphql", {
+    const res = await linearApiFetch(LINEAR_API_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

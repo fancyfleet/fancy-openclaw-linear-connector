@@ -34,6 +34,7 @@ import { getRegistryPolicyStatus } from "./registry-policy.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 import { runDelegationReconciliationSweep } from "./delegation-reconciliation-sweep.js";
 import { getAlertBus } from "./alerts/alert-bus.js";
+import { getRateLimitClient, RateLimitBreakerOpenError } from "./linear-rate-limit-client.js";
 import type { AlertSeverity } from "./alerts/alert-store.js";
 import {
   mintSessionToken,
@@ -93,6 +94,21 @@ const GOVERNED_CONSOLE_POLICIES: Record<GovernedConsoleAction, GovernedConsolePo
   park: { tier: "T2", capability: "governed-console:park" },
   probe: { tier: "T0", capability: "governed-console:probe" },
 };
+
+async function linearApiFetch(
+  input: Parameters<typeof globalThis.fetch>[0],
+  init?: Parameters<typeof globalThis.fetch>[1],
+): Promise<globalThis.Response> {
+  const client = getRateLimitClient(getAlertBus());
+  if (client.isBreakerOpen()) {
+    throw new RateLimitBreakerOpenError(
+      "Linear API rate-limit breaker is open — admin Linear write suppressed until budget recovers",
+    );
+  }
+  const res = await globalThis.fetch(input, init);
+  client.observeResponse(res);
+  return res;
+}
 
 /** AI-2037: the three stores the triage endpoint can cluster over. */
 const TRIAGE_CLUSTER_KINDS = ["observations", "operational-events", "alerts"] as const;
@@ -1411,7 +1427,7 @@ export function createAdminRouter(deps: AdminDeps): Router {
     const auditCommentBody =
       `[Admin set-state by ${invoker}] ${result.from ?? "?"} → ${targetState} — ${reason}`;
     const auditIssueId = result.internalId ?? ticketId;
-    await fetch("https://api.linear.app/graphql", {
+    await linearApiFetch("https://api.linear.app/graphql", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({
@@ -1480,7 +1496,7 @@ export function createAdminRouter(deps: AdminDeps): Router {
 
       // AI-1954 AC2: post audit comment naming the true invoker.
       const auditCommentBody = `[Admin recapture-ac by ${invoker}] ${reason}`;
-      await fetch("https://api.linear.app/graphql", {
+      await linearApiFetch("https://api.linear.app/graphql", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: authToken },
         body: JSON.stringify({
