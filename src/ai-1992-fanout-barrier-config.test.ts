@@ -63,6 +63,7 @@ import {
   type FanoutConfig,
 } from "./workflow-gate.js";
 import { shouldTriggerFanout, executeFanout, type Finding } from "./fanout.js";
+import { clearFanoutOutcomeStore } from "./fanout-outcome-store.js";
 import { attemptBarrierTransition } from "./barrier.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { reloadAgents } from "./agents.js";
@@ -820,6 +821,8 @@ describe("AI-1992 two-phase synthetic def — end to end", () => {
   let policyFile: string;
   let origDefsDir: string | undefined;
   let origPolicy: string | undefined;
+  let origFanoutOutcomePath: string | undefined;
+  let fanoutOutcomeDir: string | undefined;
   let originalFetch: typeof globalThis.fetch;
   const FINDINGS = "## Findings\n- **A**: alpha\n- **B**: beta\n";
 
@@ -850,6 +853,7 @@ states:
   beforeAll(() => {
     origDefsDir = process.env.WORKFLOW_DEFS_DIR;
     origPolicy = process.env.CAPABILITY_POLICY_PATH;
+    origFanoutOutcomePath = process.env.FANOUT_OUTCOME_PATH;
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1992-2phase-"));
     fs.writeFileSync(path.join(dir, "synthetic-two-phase.yaml"), SYNTHETIC_TWO_PHASE_YAML, "utf8");
     // Register child workflow defs so INF-41 registry validation doesn't reject
@@ -878,17 +882,29 @@ states:
     else delete process.env.WORKFLOW_DEFS_DIR;
     if (origPolicy !== undefined) process.env.CAPABILITY_POLICY_PATH = origPolicy;
     else delete process.env.CAPABILITY_POLICY_PATH;
+    if (origFanoutOutcomePath !== undefined) process.env.FANOUT_OUTCOME_PATH = origFanoutOutcomePath;
+    else delete process.env.FANOUT_OUTCOME_PATH;
     resetWorkflowCache();
     resetPolicyCache();
   });
 
   beforeEach(() => {
+    fanoutOutcomeDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1992-2phase-outcomes-"));
+    process.env.FANOUT_OUTCOME_PATH = path.join(fanoutOutcomeDir, "fanout-outcomes.json");
+    clearFanoutOutcomeStore();
     resetWorkflowCache();
     resetPolicyCache();
     originalFetch = globalThis.fetch;
   });
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    clearFanoutOutcomeStore();
+    if (fanoutOutcomeDir !== undefined) {
+      fs.rmSync(fanoutOutcomeDir, { recursive: true, force: true });
+      fanoutOutcomeDir = undefined;
+    }
+    if (origFanoutOutcomePath !== undefined) process.env.FANOUT_OUTCOME_PATH = origFanoutOutcomePath;
+    else delete process.env.FANOUT_OUTCOME_PATH;
   });
 
   it("AC4: the def has two distinct fanout states and two barrier states", async () => {
