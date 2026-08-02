@@ -18,8 +18,10 @@ import {
   resolveTransitionDelegate,
   loadWorkflowDefById,
   resetWorkflowCache,
+  _setTransitionWritePolicyForTests,
 } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
+import { _resetAppliedStateStore } from "./store/applied-state-store.js";
 
 const CANONICAL_TASK_FIXTURE = path.resolve(process.cwd(), "src/__fixtures__/canonical-task.yaml");
 
@@ -94,6 +96,7 @@ interface FetchCall {
 function makeTransitionFetch(opts: {
   issueLabels: Array<{ id: string; name: string }>;
   teamLabels: Array<{ id: string; name: string }>;
+  verifyIssue?: { labels: string[]; stateId: string | null; delegateId?: string | null; assigneeId?: string | null } | "throw";
 }): { fetch: typeof globalThis.fetch; calls: FetchCall[] } {
   const calls: FetchCall[] = [];
   const mock = (async (_url: string, init?: RequestInit) => {
@@ -139,8 +142,32 @@ function makeTransitionFetch(opts: {
     if (query.includes("ApplyAtomicTransition")) {
       return jsonResponse({ data: { issueUpdate: { success: true } } });
     }
+    if (query.includes("VerifyTransitionWrite")) {
+      if (opts.verifyIssue === "throw") {
+        throw new Error("verification read failed");
+      }
+      const verifyIssue = opts.verifyIssue ?? {
+        labels: ["wf:task", "state:done", "priority:high"],
+        stateId: "state-done-uuid",
+        delegateId: null,
+        assigneeId: null,
+      };
+      return jsonResponse({
+        data: {
+          issue: {
+            labels: { nodes: verifyIssue.labels.map((name) => ({ name })) },
+            delegate: verifyIssue.delegateId === undefined ? null : verifyIssue.delegateId === null ? null : { id: verifyIssue.delegateId },
+            assignee: verifyIssue.assigneeId === undefined ? null : verifyIssue.assigneeId === null ? null : { id: verifyIssue.assigneeId },
+            state: verifyIssue.stateId === null ? null : { id: verifyIssue.stateId },
+          },
+        },
+      });
+    }
     if (query.includes("UpdateDelegate")) {
       return jsonResponse({ data: { issueUpdate: { success: true } } });
+    }
+    if (query.includes("ChildParent")) {
+      return jsonResponse({ data: { issue: { parent: null } } });
     }
     throw new Error(`unexpected Linear query: ${query.slice(0, 80)}`);
   }) as unknown as typeof globalThis.fetch;
@@ -176,11 +203,14 @@ describe("AI-2197 — wf:task sign-off→done edge (silent decline fix)", () => 
   beforeEach(() => {
     resetWorkflowCache();
     resetPolicyCache();
+    _resetAppliedStateStore();
     originalFetch = globalThis.fetch;
   });
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    _setTransitionWritePolicyForTests();
+    _resetAppliedStateStore();
   });
 
   // AC1: continue-workflow from sign-off resolves to 'accept'
@@ -246,6 +276,68 @@ describe("AI-2197 — wf:task sign-off→done edge (silent decline fix)", () => 
     expect(stateLabels).toEqual(["done-lbl"]);
     // sign-off label removed
     expect(labelIds).not.toContain("signoff-lbl");
+  });
+
+  it("INF-724 AC1: sign-off→done reports failure when the readable writeback is still label-less To Do", async () => {
+    _setTransitionWritePolicyForTests({ maxAttempts: 1, retryDelayMs: 0 });
+    const { fetch: mock } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:task" },
+        { id: "signoff-lbl", name: "state:sign-off" },
+      ],
+      teamLabels: [
+        { id: "done-lbl", name: "state:done" },
+      ],
+      verifyIssue: {
+        labels: ["wf:task"],
+        stateId: "state-todo-uuid",
+        delegateId: null,
+        assigneeId: null,
+      },
+    });
+    globalThis.fetch = mock;
+
+    const result = await applyStateTransition("accept", ISSUE, TOK, {
+      sourceStateOverride: "sign-off",
+      delegateOverride: null,
+    });
+
+    expect(result).toMatchObject({
+      status: "failed",
+      code: "transition-write-unverified",
+      from: "sign-off",
+      to: "done",
+    });
+    expect(result.detail).toMatch(/state-label expected 'state:done'/);
+    expect(result.detail).toMatch(/native-state expected 'state-done-uuid' got 'state-todo-uuid'/);
+  });
+
+  it("INF-724 AC2: sign-off→done does not declare terminal success when native Done cannot be verified", async () => {
+    _setTransitionWritePolicyForTests({ maxAttempts: 1, retryDelayMs: 0 });
+    const { fetch: mock } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:task" },
+        { id: "signoff-lbl", name: "state:sign-off" },
+      ],
+      teamLabels: [
+        { id: "done-lbl", name: "state:done" },
+      ],
+      verifyIssue: "throw",
+    });
+    globalThis.fetch = mock;
+
+    const result = await applyStateTransition("accept", ISSUE, TOK, {
+      sourceStateOverride: "sign-off",
+      delegateOverride: null,
+    });
+
+    expect(result).toMatchObject({
+      status: "failed",
+      code: "transition-write-unverified",
+      from: "sign-off",
+      to: "done",
+    });
+    expect(result.detail).toMatch(/native Done could not be verified/i);
   });
 
   // AC4: buildStateTransitionReminder returns null for terminal state (done has no transitions)
