@@ -201,14 +201,24 @@ export function registerOobReconcileCron(
 
   registerCron("oob-reconcile-sweep", formatIntervalMs(interval));
 
-  setInterval(() => {
+  const runSweep = (): void => {
     reconcileOobMutations(store, { operationalEventStore }).catch((err) => {
       const msg = err instanceof Error ? err.message : String(err);
       log.error(`reconcile sweep failed: ${msg}`);
     }).finally(() => {
       markCronRun("oob-reconcile-sweep");
     });
-  }, interval);
+  };
 
-  log.info(`oob-reconcile sweep registered: ${formatIntervalMs(interval)}`);
+  // INF-1081: fire a first run shortly after startup (unref'd) so the sweep
+  // executes on every boot instead of waiting a full interval. With a 24h
+  // interval and sub-daily connector restarts, a plain setInterval timer never
+  // reached its first tick — the sweep never ran and /health went critical.
+  const firstRunTimer = setTimeout(runSweep, 0);
+  firstRunTimer.unref();
+
+  const timer = setInterval(runSweep, interval);
+  timer.unref();
+
+  log.info(`oob-reconcile sweep registered: ${formatIntervalMs(interval)} — first run queued immediately`);
 }

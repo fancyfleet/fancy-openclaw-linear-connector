@@ -3,7 +3,11 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { MutationAuditStore, type MutationAuditInput } from "./store/mutation-audit-store.js";
-import { reconcileOobMutations } from "./oob-reconcile-sweep.js";
+import { reconcileOobMutations, registerOobReconcileCron } from "./oob-reconcile-sweep.js";
+import {
+  getRegisteredCrons,
+  resetCronRegistryForTest,
+} from "./cron/registry.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 
 function tempDb(): string {
@@ -320,5 +324,45 @@ describe("reconcileOobMutations", () => {
 
     expect(opStore._events.length).toBeGreaterThanOrEqual(1);
     expect(String(opStore._events[0].errorSummary)).toContain("Out-of-band");
+  });
+});
+
+describe("registerOobReconcileCron startup kick (INF-1081)", () => {
+  let store: MutationAuditStore;
+  let dbPath: string;
+
+  beforeEach(() => {
+    resetCronRegistryForTest();
+    dbPath = tempDb();
+    store = new MutationAuditStore(dbPath);
+  });
+
+  afterEach(() => {
+    resetCronRegistryForTest();
+    store.close();
+    fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+  });
+
+  // Regression: with a 24h interval and sub-daily restarts, a plain setInterval
+  // never reached its first tick, so the sweep never ran and lastRunAt stayed
+  // null → /health critical. The startup kick must run once on registration,
+  // independent of the interval.
+  test("fires a first run shortly after registration without waiting the interval", async () => {
+    const opStore = fakeOpStore();
+    // Huge interval so the recurring setInterval cannot fire during the test —
+    // only the startup kick can mark a run.
+    registerOobReconcileCron(store, opStore, 24 * 60 * 60 * 1000);
+
+    // Before the kick fires, the cron is armed but has never run.
+    const armed = getRegisteredCrons().find((c) => c.name === "oob-reconcile-sweep");
+    expect(armed).toBeDefined();
+    expect(armed!.lastRunAt).toBeNull();
+
+    // Let the setTimeout(0) startup kick fire and its async reconcile settle.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const ran = getRegisteredCrons().find((c) => c.name === "oob-reconcile-sweep");
+    expect(ran!.lastRunAt).not.toBeNull();
+    expect(Number.isNaN(Date.parse(ran!.lastRunAt as string))).toBe(false);
   });
 });
