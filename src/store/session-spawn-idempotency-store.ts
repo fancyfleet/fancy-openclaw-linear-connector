@@ -22,6 +22,19 @@ export type SessionSpawnRunState = "pending" | "live" | "completed" | "failed" |
  */
 export const TERMINAL_STOP_ROTATION_REASON = "terminal-stop";
 
+/**
+ * INF-1074: canonical `rotation_reason` recorded when the re-dispatch guard
+ * rotates away from a bound session the OpenClaw session index marks
+ * `status: "completed"`. This is the lifecycle signal the INF-1003 terminal-tail
+ * guard did not consult: a session can be marked completed while its transcript
+ * tail is a `tool_use`, an empty/frozen tail, or absent — none of which normalize
+ * to `end_turn` — so `probeBoundSessionTerminal().terminal` stays false and the
+ * old guard replayed the dead completed transcript (the ENG-5 zero-output C3
+ * husk). Rotating on `status: "completed"` closes that gap. Read from the index
+ * `status` column via `probeBoundSessionTerminal().statusCompleted`.
+ */
+export const COMPLETED_STATUS_ROTATION_REASON = "completed-status";
+
 export interface SessionSpawnBeginInput {
   ticketId: string;
   taskKey: string;

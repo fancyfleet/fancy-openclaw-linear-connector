@@ -331,6 +331,14 @@ export interface BoundSessionTerminalProbe {
   sessionId: string | null;
   /** Normalized stop reason of the last assistant turn (null when none observed). */
   stopReason: LastAssistantMessage["stopReason"] | null;
+  /**
+   * INF-1074: true when the OpenClaw session index marks this bound session
+   * `status: "completed"`. This lifecycle signal is independent of the
+   * transcript tail — a completed session may have a `tool_use`, empty, or
+   * absent tail that never normalizes to `end_turn`, so `terminal` can be false
+   * while `statusCompleted` is true. The re-dispatch guard rotates on either.
+   */
+  statusCompleted: boolean;
 }
 
 /**
@@ -355,10 +363,18 @@ export function probeBoundSessionTerminal(
   openclawHome: string = defaultOpenclawHome(),
 ): BoundSessionTerminalProbe {
   const entry = findSessionFile(agentId, sessionKey, openclawHome);
-  if (!entry) return { terminal: false, sessionId: null, stopReason: null };
+  if (!entry) return { terminal: false, sessionId: null, stopReason: null, statusCompleted: false };
+
+  // INF-1074: the OpenClaw session index `status` column is the lifecycle
+  // signal the INF-1003 terminal-tail probe never read. `status: "completed"`
+  // means the session finished its work — regardless of whether its transcript
+  // tail is a frozen `end_turn`, a `tool_use`, or absent — so replaying it
+  // resumes a dead conversation (the ENG-5 zero-output C3 husk). Surface it so
+  // the re-dispatch guard can rotate on it.
+  const statusCompleted = entry.status === "completed";
 
   const last = extractLastAssistantMessage(readSessionJsonl(entry.sessionFile));
-  if (!last) return { terminal: false, sessionId: entry.sessionId, stopReason: null };
+  if (!last) return { terminal: false, sessionId: entry.sessionId, stopReason: null, statusCompleted };
 
   // `stop`/`end_turn` normalize to "end_turn" — a cleanly-ended turn with no
   // pending tool call, i.e. the frozen tail that produces nothing on re-wake.
@@ -368,6 +384,7 @@ export function probeBoundSessionTerminal(
     terminal: last.stopReason === "end_turn",
     sessionId: entry.sessionId,
     stopReason: last.stopReason,
+    statusCompleted,
   };
 }
 

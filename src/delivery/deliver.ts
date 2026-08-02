@@ -10,6 +10,7 @@ import { normalizeSessionKey } from "../session-key.js";
 import type { DispatchLeaseStore } from "../store/dispatch-lease-store.js";
 import type { DispatchInFlightStore } from "../store/dispatch-inflight-store.js";
 import {
+  COMPLETED_STATUS_ROTATION_REASON,
   TERMINAL_STOP_ROTATION_REASON,
   type SessionSpawnIdempotencyStore,
   type SessionSpawnRunRecord,
@@ -205,14 +206,25 @@ export async function deliverToAgent(
     agentId: route.agentId,
     sessionKey: route.sessionKey,
   });
-  // INF-1003: terminal-session rotation guard. A bound session whose last turn
-  // ended with `stopReason: stop` (the codex-mirror-frozen tail) produces no new
-  // turn on wake, so replaying it resumes a dead transcript — the LIF-338 C3
-  // silent-completion loop. Terminal-ness is read from the live transcript (not
-  // the dispatch-lifecycle `state` column, which never carries `stop`) so the
-  // guard fires on the real signal at this production entry point. When the
-  // bound session is terminal we DO NOT return the idempotent replay; we fall
-  // through to mint a fresh session and record the old→new rotation below.
+  // INF-1003 / INF-1074: re-dispatch rotation guard. A bound session that will
+  // produce no new turn on wake must NOT be replayed — doing so resumes a dead
+  // transcript (the LIF-338 / ENG-5 C3 silent-completion loop). Two independent
+  // signals mean "dead", read at this production entry point:
+  //
+  //   • INF-1003 terminal tail — the last assistant turn normalized to
+  //     `stopReason: end_turn` (the codex-mirror-frozen tail). Read from the live
+  //     transcript, not the dispatch-lifecycle `state` column which never carries
+  //     `stop`.
+  //   • INF-1074 completed status — the OpenClaw session index marks the bound
+  //     session `status: "completed"`, regardless of its transcript tail. A
+  //     completed session with a `tool_use`/empty/absent tail is NOT terminal by
+  //     the INF-1003 signal, so the old guard replayed the silent completed husk
+  //     (zero-output C3 replay). The lifecycle signal closes that half-covered gap.
+  //
+  // On either signal we DO NOT return the idempotent replay; we fall through to
+  // mint a fresh session and record the old→new rotation below. In-flight bindings
+  // (`tool_use`/no-assistant tail and NOT status:completed) hit neither signal and
+  // still replay idempotently (AC3).
   let rotation: { fromSessionId: string | null; reason: string } | undefined;
   if (idempotency?.action === "return-existing") {
     const hasConcreteLiveBinding = idempotency.record.state === "live" && !!idempotency.record.session_id;
@@ -232,7 +244,12 @@ export async function deliverToAgent(
     const probe = probeBoundSessionTerminal(route.agentId, route.sessionKey, config.openclawHome);
     const boundSessionMatches =
       !idempotency.record.session_id || !probe.sessionId || probe.sessionId === idempotency.record.session_id;
-    if (!probe.terminal || !boundSessionMatches) {
+    // INF-1074: the completed-status lifecycle signal takes precedence over the
+    // INF-1003 tail signal when both fire — it is the stronger "this session is
+    // done" statement, and AC1 requires it to rotate "regardless of the tail's
+    // stopReason".
+    const shouldRotate = boundSessionMatches && (probe.statusCompleted || probe.terminal);
+    if (!shouldRotate) {
       log.info(
         `sessions_spawn idempotent replay: ${route.sessionKey}/${taskKey} already has ` +
         `state=${idempotency.record.state} run=${idempotency.record.run_id ?? "pending"}`,
@@ -245,14 +262,19 @@ export async function deliverToAgent(
         sessionSpawnRecord: idempotency.record,
       };
     }
+    const reason = probe.statusCompleted
+      ? COMPLETED_STATUS_ROTATION_REASON
+      : TERMINAL_STOP_ROTATION_REASON;
     rotation = {
       fromSessionId: probe.sessionId ?? idempotency.record.session_id,
-      reason: TERMINAL_STOP_ROTATION_REASON,
+      reason,
     };
     log.info(
-      `INF-1003 terminal-session rotation: ${route.sessionKey}/${taskKey} bound session ` +
-      `${probe.sessionId ?? idempotency.record.session_id ?? "?"} is terminal ` +
-      `(stopReason=${probe.stopReason}) — minting a fresh session instead of replaying the dead transcript`,
+      `${probe.statusCompleted ? "INF-1074 completed-status" : "INF-1003 terminal-session"} rotation: ` +
+      `${route.sessionKey}/${taskKey} bound session ` +
+      `${probe.sessionId ?? idempotency.record.session_id ?? "?"} is dead ` +
+      `(status=${probe.statusCompleted ? "completed" : "n/a"}, stopReason=${probe.stopReason}) — ` +
+      `minting a fresh session instead of replaying the dead transcript`,
     );
   }
 
