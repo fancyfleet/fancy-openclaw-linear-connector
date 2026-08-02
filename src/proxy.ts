@@ -1738,6 +1738,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             cliTarget: target ?? undefined,
             enrolledTicketsStore: deps?.enrolledTicketsStore,
             operationalEventStore: deps?.operationalEventStore,
+            codeArtifact: codeArtifactHeader,
             delegateOverride,
             fanoutWakeFn: deps?.fanoutWakeFn,
             getDispatchAckTracker: deps?.getDispatchAckTracker,

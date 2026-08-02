@@ -53,6 +53,7 @@ import { onChildTerminal, onManagingEntry, isTerminalState, evaluateBarrier, get
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
 import { fetchLastCommentByUser } from "./linear-helpers.js";
 import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store.js";
+import { parseCodeArtifact } from "./artifact.js";
 import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./config-health.js";
 import { captureAc, extractAcFromDescription, removeAcRecord } from "./ac-record-store.js";
 import { validateDefStateRemovals } from "./def-state-migration.js";
@@ -2903,6 +2904,65 @@ async function verifyPrMergeStateViaGitHub(prUrls: string[]): Promise<{ merged: 
 }
 
 /**
+ * INF-1060: verify that a commit SHA is reachable on a branch on `origin`.
+ *
+ * The push-before-claim gate needs to know the difference between "the agent
+ * pushed the branch" and "the work exists only as uncommitted working-tree
+ * changes inside the dev container" — the exact gap that let INF-1051/INF-1045
+ * replay an unreviewable claim 8 times in 3.5h. Origin is the only publication
+ * boundary the review container can see, so origin is what we check.
+ *
+ * Uses the GitHub compare API: `GET /repos/{owner}/{repo}/compare/{branch}...{sha}`.
+ * A commit that is an ancestor of (or identical to) the branch tip returns a
+ * compare `status` of `behind`/`identical` — i.e. the commit is published on
+ * that branch. `ahead`/`diverged`, or a 404 for a missing commit or branch,
+ * means the supplied SHA is NOT on the named origin branch.
+ *
+ * The branch name is placed in the path UN-encoded: GitHub's compare endpoint
+ * takes ref names literally (branch names contain `/`), and encoding the slash
+ * would name a different, non-existent ref.
+ *
+ * Returns:
+ *   { reachable: true,  verified: true  } — commit confirmed on the origin branch
+ *   { reachable: false, verified: true  } — authoritatively NOT on origin (unpushed)
+ *   { reachable: false, verified: false } — GitHub could not be reached to confirm/deny
+ */
+async function verifyCommitReachableOnOrigin(
+  repo: string,
+  branch: string,
+  sha: string,
+): Promise<{ reachable: boolean; verified: boolean }> {
+  const slug = repo.includes("/") ? repo : `fancyfleet/${repo}`;
+  const [owner, name] = slug.split("/");
+  if (!owner || !name) return { reachable: false, verified: false };
+  const url = `${GITHUB_API_BASE}/repos/${owner}/${name}/compare/${branch}...${sha}`;
+  try {
+    const headers: Record<string, string> = {
+      Accept: "application/vnd.github.v3+json",
+      "User-Agent": "fancy-openclaw-linear-connector",
+    };
+    if (GITHUB_TOKEN) headers.Authorization = `Bearer ${GITHUB_TOKEN}`;
+    const res = await fetch(url, { headers });
+    if (!res.ok) {
+      // 404 = branch or commit not found on origin → authoritatively unreachable.
+      // Any other non-2xx (403 private-repo access, 5xx, rate-limit) is an
+      // infra-uncertainty answer, not a "definitely not on origin" answer.
+      if (res.status === 404) return { reachable: false, verified: true };
+      return { reachable: false, verified: false };
+    }
+    const data = (await res.json()) as { status?: string; reachable?: unknown };
+    const reachable =
+      data.reachable === true || data.status === "identical" || data.status === "behind";
+    return { reachable, verified: true };
+  } catch (err) {
+    log.warn(
+      `workflow-gate: INF-1060: origin reachability check threw for ${slug} ${branch}@${sha}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return { reachable: false, verified: false };
+  }
+}
+
+/**
  * Extract owner, repo, and PR number from a GitHub PR URL.
  * Example: https://github.com/fancymatt/fancy-openclaw-linear-connector/pull/307
  * Returns null if the URL doesn't match the expected pattern.
@@ -5282,6 +5342,21 @@ export interface ApplyStateTransitionOptions {
   }) => void | Promise<void>;
   /** INF-695: marks an activity-observer accept so /health can expose liveness. */
   commitmentAutoAccept?: boolean;
+  /**
+   * INF-1060: published-artifact evidence for the dev-impl implementation submit
+   * claim, in the CLI's `X-Openclaw-Code-Artifact` shape (`<branch>@<sha>`). The
+   * push-before-claim gate on `implementation`/`doing` → `code-review` requires
+   * this: a submit that lacks it (uncommitted/unpushed working-tree work) is
+   * refused before the state advances, so a stale-recovered session replaying an
+   * evidence-less claim can never advance the ticket (INF-1051/INF-1045 loop).
+   */
+  codeArtifact?: string | null;
+  /**
+   * INF-1060: optional `owner/repo` slug whose `origin` must contain the supplied
+   * commit. When omitted, the gate resolves repo context from the ticket's
+   * `repo:*` labels / GitHub attachments before validating the artifact.
+   */
+  originRepository?: string | null;
 }
 
 function deriveFanoutBarrierOutcome(result: FanoutResult): {
@@ -6302,6 +6377,87 @@ export async function applyStateTransition(
       if (missing.length === 0) missing.push('pull request not yet merged');
       log.warn(`workflow-gate: B2 apply: done gate blocked for ${issueId} — ${missing.join('; ')}`);
       return { status: "blocked", code: "release-gate", detail: missing.join('; '), from: currentStateName, to: toStateName };
+    }
+  }
+
+  // ── INF-1060: Push-before-claim evidence gate (implementation → code-review) ──
+  // The dev-impl `submit` claim advances a ticket out of an active implementation
+  // state (`implementation`/`doing`, owner_role dev) toward `code-review`. The
+  // review container can only see what has been pushed to origin — an
+  // implementation that lives as uncommitted working-tree changes inside the dev
+  // container is not reviewable. Without a gate, a stale-recovered session replays
+  // an evidence-less claim indefinitely (INF-1051/INF-1045: 8 C3 timeouts in
+  // ~3.5h before the branch was manually pushed). Require published-artifact
+  // evidence — a branch + commit SHA reachable on origin — before the state
+  // advances. Same class as the merge/deploy release gate above, one phase earlier.
+  //
+  const sourceStateNode = currentStateName
+    ? def.states.find((s) => s.id === currentStateName)
+    : undefined;
+  const isImplementationSubmitClaim =
+    intent === "submit" &&
+    matchedTransition?.to === "code-review" &&
+    matchedTransition?.generic === "continue" &&
+    sourceStateNode?.owner_role === "dev";
+  if (isImplementationSubmitClaim) {
+    const rawArtifact = options?.codeArtifact ?? null;
+    const artifact = rawArtifact ? parseCodeArtifact(rawArtifact) : null;
+    if (!artifact) {
+      // AC1 + AC4: no (or malformed) evidence → refuse before any write, naming
+      // push-before-claim so the agent pushes rather than retrying blindly.
+      const detail = rawArtifact
+        ? `push-before-claim: the supplied code artifact '${rawArtifact}' is not a valid '<branch>@<sha>'. ` +
+          `Push your branch to origin and re-run the submit supplying the branch name and the commit SHA.`
+        : `push-before-claim: this implementation submit supplied no published artifact. ` +
+          `Push your branch to origin, then re-run the submit naming the branch and the commit SHA ` +
+          `(the reviewer reviews the pushed commit, not your working tree).`;
+      log.warn(
+        `workflow-gate: INF-1060: push-before-claim gate REFUSED ${issueId} (${currentStateName} → ${toStateName}): no valid branch+commit evidence`,
+      );
+      return { status: "blocked", code: "push-before-claim", detail, from: currentStateName, to: toStateName };
+    }
+
+    const originRepository = options?.originRepository ?? (await resolveTicketRepoRefs(labelNames, issueId, authToken))[0] ?? null;
+    if (!originRepository) {
+      const detail =
+        `push-before-claim: cannot validate ${artifact.branch}@${artifact.sha} because this ticket has no origin repository context. ` +
+        `Add a repo:* label or GitHub attachment, then re-run the submit with the pushed branch and commit SHA.`;
+      log.warn(
+        `workflow-gate: INF-1060: push-before-claim gate REFUSED ${issueId} (${currentStateName} → ${toStateName}): no origin repository context`,
+      );
+      return { status: "blocked", code: "push-before-claim", detail, from: currentStateName, to: toStateName };
+    }
+
+    // AC2 + AC4 / AC5: evidence supplied — validate the commit is on origin.
+    const { reachable, verified } = await verifyCommitReachableOnOrigin(
+      originRepository,
+      artifact.branch,
+      artifact.sha,
+    );
+    if (!reachable && verified) {
+      const detail =
+        `push-before-claim: commit ${artifact.sha} is not reachable on branch ${artifact.branch} on origin ` +
+        `(the work is unpushed or uncommitted). Push the branch to origin, then re-run the submit with the pushed commit SHA.`;
+      log.warn(
+        `workflow-gate: INF-1060: push-before-claim gate REFUSED ${issueId} (${currentStateName} → ${toStateName}): ` +
+          `${artifact.branch}@${artifact.sha} not reachable on origin ${originRepository}`,
+      );
+      return { status: "blocked", code: "push-before-claim", detail, from: currentStateName, to: toStateName };
+    }
+    if (!reachable && !verified) {
+      // Infra uncertainty (no token / private-repo access / GitHub unreachable):
+      // fail open loudly rather than strand a legitimately-pushed submit, mirroring
+      // the merge/deploy release gate's INF-714 posture. The evidence-presence half
+      // (AC1) already blocked the true replay case (no artifact at all).
+      log.warn(
+        `workflow-gate: INF-1060: push-before-claim origin check UNVERIFIABLE for ${issueId} ` +
+          `(${artifact.branch}@${artifact.sha} on origin ${originRepository}) — GitHub could not confirm/deny; failing open`,
+      );
+    } else {
+      log.info(
+        `workflow-gate: INF-1060: push-before-claim gate PASSED ${issueId} (${currentStateName} → ${toStateName}): ` +
+          `${artifact.branch}@${artifact.sha} reachable on origin ${originRepository}`,
+      );
     }
   }
 
