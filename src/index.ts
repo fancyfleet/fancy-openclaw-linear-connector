@@ -1764,8 +1764,13 @@ export function createApp(options?: CreateAppOptions) {
       flipEngagementStatus(agentId, ticketId, "thinking");
     },
     (agentId, ticketId) => {
-      const acknowledged = ackTracker.acknowledge(agentId, ticketId);
-      if (acknowledged > 0) {
+      // INF-989: a delegate comment is authored activity but not a workflow
+      // transition. If the watchdog has already poked this dispatch, treat the
+      // comment as ack-without-transition and keep surveillance open instead of
+      // acknowledging (the single-shot stale-session bug from INF-958). Only a
+      // genuine acknowledgment (fresh, never-poked dispatch) clears warnings.
+      const disposition = ackTracker.noteAuthoredActivity(agentId, ticketId);
+      if (disposition === "acknowledged") {
         noActivityDetector.clearWarned(agentId, ticketId);
       }
       // AI-1533: mark transition seen so session-end won't hold-retry this ticket.
