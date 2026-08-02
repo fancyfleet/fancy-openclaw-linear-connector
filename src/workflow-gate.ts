@@ -6785,6 +6785,16 @@ export async function applyStateTransition(
           nativeStateId: issue.nativeStateId,
         }
       : undefined,
+    isTerminal && workflowId === "task"
+      ? {
+          requireReadableVerification: true,
+          allowStateLabelLagFallback: false,
+          unreadableVerificationDetail:
+            destNativeState === "done"
+              ? "native Done could not be verified"
+              : `native terminal state '${destNativeState ?? toStateName}' could not be verified`,
+        }
+      : undefined,
   );
   const applied = writeOutcome.ok;
 
@@ -7368,6 +7378,12 @@ interface VerifiedWriteOutcome {
   unverified: boolean;
 }
 
+interface VerifiedWriteOptions {
+  requireReadableVerification?: boolean;
+  allowStateLabelLagFallback?: boolean;
+  unreadableVerificationDetail?: string;
+}
+
 /**
  * AI-1762: issueUpdateAtomic wrapped in read-after-write verification and a
  * bounded internal retry. Each attempt re-issues the FULL bundled mutation
@@ -7394,8 +7410,10 @@ async function issueUpdateAtomicVerified(
     assigneeId: string | null;
     nativeStateId: string | null;
   },
+  options?: VerifiedWriteOptions,
 ): Promise<VerifiedWriteOutcome> {
   const { maxAttempts, retryDelayMs } = transitionWritePolicy;
+  const allowStateLabelLagFallback = options?.allowStateLabelLagFallback ?? true;
   let failureKind: "mutation" | "verification" = "mutation";
   let divergent: string[] = [];
 
@@ -7430,6 +7448,15 @@ async function issueUpdateAtomicVerified(
       authToken,
     );
     if (verification === null) {
+      if (options?.requireReadableVerification) {
+        failureKind = "verification";
+        divergent = [options.unreadableVerificationDetail ?? "transition write could not be verified"];
+        log.warn(
+          `workflow-gate: AI-1762: write for ${internalId} reported success but could not be read back — ` +
+          `${divergent[0]}${attempt < maxAttempts ? " — retrying" : ""}`,
+        );
+        continue;
+      }
       log.warn(`workflow-gate: AI-1762: write for ${internalId} reported success but could not be read back — accepting unverified (attempt ${attempt})`);
       return { ok: true, attempts: attempt, failureKind: "none", divergent: [], unverified: true };
     }
@@ -7453,6 +7480,7 @@ async function issueUpdateAtomicVerified(
   // bug class) still fails loudly; that risk is unrelated to label read lag.
   if (
     failureKind === "verification" &&
+    allowStateLabelLagFallback &&
     divergent.length > 0 &&
     divergent.every((d) => d.startsWith("state-label"))
   ) {
