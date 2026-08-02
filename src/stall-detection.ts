@@ -44,6 +44,17 @@ export interface LivenessRecord {
   state: string;
   /** Whether the ticket has already been redispatched once after a prior stall. */
   redispatched: boolean;
+  /**
+   * INF-979 (AC3): connector-engagement owner (agent name) if engagement still
+   * holds one, even when the Linear delegate reads null. A null Linear delegate
+   * while engagement names a live owner is a desync, not an orphan — the ticket
+   * must not be classified as ownerless.
+   */
+  engagementOwner?: string | null;
+  /** INF-979 (AC3): semantic of the engagement owner's current session. */
+  engagementSemantic?: "thinking" | "doing";
+  /** INF-979 (AC3): epoch ms when the engagement ownership was last observed. */
+  engagementObservedAt?: number;
 }
 
 export interface StallClassifierConfig {
@@ -97,7 +108,16 @@ export function classifyStall(
   }
 
   // 2. Null delegate in a working state — orphaned ticket, immediate stall.
-  if (record.delegate === null) {
+  //    INF-979 (AC3): reconcile the engagement/Linear-delegate desync first. A null
+  //    Linear delegate is NOT ownerless when connector engagement still names an
+  //    active owner (thinking/doing). Treating it as orphaned falsely flags a live
+  //    owner and drives the husk churn (DSN-15). When engagement holds an active
+  //    owner, skip the null-delegate stall and fall through to the normal ack/progress
+  //    liveness checks, which still catch a genuinely silent owner.
+  const engagementHoldsActiveOwner =
+    !!record.engagementOwner &&
+    (record.engagementSemantic === "thinking" || record.engagementSemantic === "doing");
+  if (record.delegate === null && !engagementHoldsActiveOwner) {
     return {
       stalled: true,
       reason: "null-delegate",

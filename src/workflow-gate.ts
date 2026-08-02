@@ -1580,6 +1580,9 @@ async function fetchIssueWithLabels(
   assigneeId: string | null;
   nativeStateId: string | null;
 } | null> {
+  // INF-979 (AC2): also read the live delegate so setStateAtomic can detect a
+  // null-delegate husk and bootstrap-seat the workflow role owner instead of
+  // re-writing null on a governed redispatch.
   const query = `
     query IssueWithLabels($id: String!) {
       issue(id: $id) {
@@ -8212,6 +8215,57 @@ export async function setStateAtomic(
       return fail(`delegate agent '${delegate}' not found or has no linearUserId`, fromState);
     }
     resolvedDelegateId = agent.linearUserId;
+  } else {
+    // INF-979 (AC2): an omitted delegate arg normally means "leave delegate as-is".
+    // The one exception is a governed *redispatch that re-seats in place*
+    // (fromState === targetState) whose live Linear delegate is null — that is the
+    // NULL-DELEGATE husk (DSN-15/INF-961): it draws no dispatch and stalls. Only then
+    // do we bootstrap-seat the singleton owner_role body from the workflow spec so the
+    // redispatch re-establishes ownership instead of re-writing null.
+    //
+    // The fromState === targetState guard is the positive husk indicator (INF-979
+    // review): it separates a re-seat-in-place from a genuine state transition. Without
+    // it the block also fired on transitions that merely omit the delegate and carry a
+    // null live delegate — the escape→implementation re-open and migrate-state→ac-validate
+    // paths — seating a delegate there and regressing them. A redispatch does not change
+    // state; a re-open / migrate-state does.
+    //
+    // Fires only when there is a hole to fill (live delegate null), the move is a
+    // same-state redispatch, the destination is a governed non-terminal state, and its
+    // role resolves to exactly one body.
+    if (issue.delegateId == null && def && fromState != null && fromState === targetState) {
+      const destNode = def.states.find((s) => s.id === targetState);
+      const ownerRole = destNode?.owner_role;
+      const isTerminal = destNode?.kind === "terminal" || !ownerRole;
+      if (!isTerminal && ownerRole) {
+        try {
+          // Scoped resolver against the already-loaded def — never a disk registry
+          // load, so a role-resolution failure is caught below and leaves the delegate
+          // untouched rather than propagating out and flipping result.ok (fail-open).
+          const roleBodies = await resolveBodiesForOwnerRole(ownerRole, def);
+          if (roleBodies.length === 1) {
+            const seat = getAgent(roleBodies[0]);
+            if (seat?.linearUserId) {
+              resolvedDelegateId = seat.linearUserId;
+              log.info(
+                `workflow-gate: set-state: INF-979 bootstrap-seating null delegate on governed state '${targetState}' → '${roleBodies[0]}' (singleton role '${ownerRole}')`,
+              );
+            } else {
+              log.warn(
+                `workflow-gate: set-state: INF-979 bootstrap-seat skipped for ${ticketIdentifier} — role '${ownerRole}' body '${roleBodies[0]}' has no linearUserId`,
+              );
+            }
+          } else {
+            log.info(
+              `workflow-gate: set-state: INF-979 bootstrap-seat skipped for ${ticketIdentifier} — role '${ownerRole}' resolves to ${roleBodies.length} bodies (not a singleton); delegate untouched`,
+            );
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.warn(`workflow-gate: set-state: INF-979 bootstrap-seat resolution failed for ${ticketIdentifier}: ${msg} — leaving delegate untouched`);
+        }
+      }
+    }
   }
 
   // Step 7+8: Atomic write (AC4 — single mutation), verified read-after-write with
