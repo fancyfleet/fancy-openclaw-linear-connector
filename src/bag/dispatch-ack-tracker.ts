@@ -169,6 +169,59 @@ export class DispatchAckTracker {
   }
 
   /**
+   * INF-989: record delegate-authored activity (a comment) that is NOT a
+   * workflow transition, and decide whether it counts as recovery.
+   *
+   * The stale-session watchdog was single-shot: it poked a stalled dispatch
+   * once, and then *any* delegate comment acknowledged the entry and ended
+   * surveillance. An agent that posts a status ("still working on it") and then
+   * goes idle again fell off the watchdog entirely (the INF-958 stall: ack at
+   * 12:40Z, no follow-up for 5+ hours). A comment is a liveness signal but not
+   * a state transition, so for a dispatch the watchdog has already poked it must
+   * be treated as "acknowledged but not transitioned" — surveillance stays open
+   * and the next cadence re-pokes (or escalates) if still no transition.
+   *
+   * Disposition by current ack_status:
+   *   - pending      → acknowledge. Happy path: the agent picked the work up and
+   *                    commented before the watchdog ever poked it. This is the
+   *                    legitimate Doing-flip signal (AI-1564) and is preserved.
+   *   - unconfirmed  → keep under surveillance ("surveilled"). The watchdog has
+   *                    poked at least once, so this comment is an
+   *                    ack-without-transition. Refresh last_signal_at so the
+   *                    delegate gets a fresh cadence window from THIS ack before
+   *                    the next re-poke, but do NOT clear the flag and do NOT
+   *                    reset attempt_count — so continued ack-without-transition
+   *                    still escalates once the re-signal cap is exhausted.
+   *   - other/absent → no-op ("none").
+   *
+   * Returns the disposition so the caller only runs acknowledge-side effects
+   * (e.g. clearing no-activity warnings) on genuine recovery.
+   */
+  noteAuthoredActivity(agentId: string, ticketId: string): "acknowledged" | "surveilled" | "none" {
+    const normalizedId = normalizeSessionKey(ticketId);
+    const row = this.db
+      .prepare(`SELECT ack_status FROM dispatch_acks WHERE agent_id = ? AND ticket_id = ?`)
+      .get(agentId, normalizedId) as { ack_status: string } | undefined;
+    if (!row) return "none";
+    if (row.ack_status === "unconfirmed") {
+      this.db
+        .prepare(
+          `UPDATE dispatch_acks SET last_signal_at = datetime('now')
+           WHERE agent_id = ? AND ticket_id = ?`,
+        )
+        .run(agentId, normalizedId);
+      log.info(
+        `Authored activity noted (ack-without-transition, surveillance kept): ${agentId} [${normalizedId}]`,
+      );
+      return "surveilled";
+    }
+    if (row.ack_status === "pending") {
+      return this.acknowledge(agentId, ticketId) > 0 ? "acknowledged" : "none";
+    }
+    return "none";
+  }
+
+  /**
    * Return dispatches that are still pending/unconfirmed and whose last_signal_at
    * is older than timeoutMs milliseconds. The watchdog calls this each cycle.
    *
