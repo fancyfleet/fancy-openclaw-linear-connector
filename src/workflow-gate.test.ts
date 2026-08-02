@@ -1001,7 +1001,10 @@ function makeTransitionFetch(opts: {
 
   const mockFetch: typeof globalThis.fetch = async (url, init) => {
     if (typeof url !== "string" || !url.includes("api.linear.app")) {
-      throw new Error("unexpected fetch call");
+      return new Response(JSON.stringify({ status: "behind" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
     }
     const bodyText = typeof init?.body === "string" ? init.body : "{}";
     const parsed = JSON.parse(bodyText) as { query?: string; variables?: Record<string, unknown> };
@@ -1138,7 +1141,10 @@ describe("applyStateTransition — no-ops (fail-open / mode switch)", () => {
       issueLabels: [{ id: "lbl-1", name: "bug" }],
     });
     globalThis.fetch = mock;
-    await applyStateTransition("submit", "issue-uuid", "Bearer tok");
+    await applyStateTransition("submit", "issue-uuid", "Bearer tok", {
+      codeArtifact: "feature/test@0123456789abcdef0123456789abcdef01234567",
+      originRepository: "fancyfleet/fancy-openclaw-linear-connector",
+    });
     // Only the IssueWithLabels fetch should fire; no issueUpdate.
     expect(calls.some((c) => (c.body.query ?? "").includes("IssueWithLabels"))).toBe(true);
     expect(calls.some((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"))).toBe(false);
@@ -1167,7 +1173,10 @@ describe("applyStateTransition — no-ops (fail-open / mode switch)", () => {
     // 'submit' transitions implementation → code-review, but ticket is already code-review.
     // The transition lookup finds 'submit' only in implementation, not code-review.
     // So this logs a warn (no transition for submit in code-review) and returns.
-    await applyStateTransition("submit", "issue-uuid", "Bearer tok");
+    await applyStateTransition("submit", "issue-uuid", "Bearer tok", {
+      codeArtifact: "feature/test@0123456789abcdef0123456789abcdef01234567",
+      originRepository: "fancyfleet/fancy-openclaw-linear-connector",
+    });
     expect(calls.some((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"))).toBe(false);
   });
 
@@ -2678,7 +2687,10 @@ describe("applyStateTransition — AI-2476: merged-PR release gate defense-in-de
       branchStatus: { hasBranch: false, hasPR: false },
     });
     globalThis.fetch = mock;
-    await applyStateTransition("submit", "issue-uuid", "Bearer tok");
+    await applyStateTransition("submit", "issue-uuid", "Bearer tok", {
+      codeArtifact: "feature/test@0123456789abcdef0123456789abcdef01234567",
+      originRepository: "fancyfleet/fancy-openclaw-linear-connector",
+    });
     const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
   });
@@ -4046,7 +4058,10 @@ bodies:
 
     return async (url, init) => {
       if (typeof url !== "string" || !url.includes("api.linear.app")) {
-        throw new Error("unexpected fetch call");
+        return new Response(JSON.stringify({ status: "behind" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
       }
       const bodyText = typeof init?.body === "string" ? init.body : "{}";
       const parsed = JSON.parse(bodyText) as { query?: string; variables?: Record<string, unknown> };
@@ -4246,7 +4261,10 @@ bodies:
     });
 
     // submit from implementation → code-review (not terminal)
-    await applyStateTransition("submit", "AI-2001", "Bearer tok");
+    await applyStateTransition("submit", "AI-2001", "Bearer tok", {
+      codeArtifact: "feature/test@0123456789abcdef0123456789abcdef01234567",
+      originRepository: "fancyfleet/fancy-openclaw-linear-connector",
+    });
 
     process.env.WORKFLOW_DEF_PATH = CANONICAL_UX_AUDIT_FIXTURE;
 
@@ -6954,7 +6972,13 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
   } {
     const mutations: Array<{ query: string; variables: Record<string, unknown> }> = [];
 
-    const fetch: typeof globalThis.fetch = async (_url, init) => {
+    const fetch: typeof globalThis.fetch = async (url, init) => {
+      if (typeof url === "string" && !url.includes("api.linear.app")) {
+        return new Response(JSON.stringify({ status: "behind" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
       const bodyText = typeof init?.body === "string" ? init.body : "{}";
       const parsed = JSON.parse(bodyText) as { query?: string; variables?: Record<string, unknown> };
       const q = parsed.query ?? "";
@@ -7077,6 +7101,12 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
 
       await applyStateTransition(intent, "AI-CONF", "Bearer tok", {
         bodyId: "charles",
+        ...(intent === "submit"
+          ? {
+              codeArtifact: "feature/test@0123456789abcdef0123456789abcdef01234567",
+              originRepository: "fancyfleet/fancy-openclaw-linear-connector",
+            }
+          : {}),
       });
 
       // Find the ApplyAtomicTransition mutation
@@ -7211,7 +7241,11 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     const { fetch, mutations } = makeConformanceFetch(["wf:dev-impl", "state:implementation"]);
     globalThis.fetch = fetch;
 
-    await applyStateTransition("submit", "AI-CONF-ONE", "Bearer tok", { bodyId: "charles" });
+    await applyStateTransition("submit", "AI-CONF-ONE", "Bearer tok", {
+      bodyId: "charles",
+      codeArtifact: "feature/test@0123456789abcdef0123456789abcdef01234567",
+      originRepository: "fancyfleet/fancy-openclaw-linear-connector",
+    });
 
     // Count ApplyAtomicTransition mutations — must be exactly 1
     const atomicMutations = mutations.filter((m) => m.query.includes("ApplyAtomicTransition"));

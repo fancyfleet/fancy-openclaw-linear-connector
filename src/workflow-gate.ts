@@ -5256,13 +5256,9 @@ export interface ApplyStateTransitionOptions {
    */
   codeArtifact?: string | null;
   /**
-   * INF-1060: `owner/repo` slug whose `origin` must contain the supplied commit.
-   * The gate validates the artifact's SHA is reachable on the named branch on
-   * this origin. Presence of this field is also the gate's ACTIVATION signal:
-   * when omitted the push-before-claim gate is dormant (enforcement is
-   * meaningless without an origin to check), which keeps non-participating
-   * callers and the not-yet-wired submit path unaffected until the coordinated
-   * CLI + proxy rollout supplies it.
+   * INF-1060: optional `owner/repo` slug whose `origin` must contain the supplied
+   * commit. When omitted, the gate resolves repo context from the ticket's
+   * `repo:*` labels / GitHub attachments before validating the artifact.
    */
   originRepository?: string | null;
 }
@@ -6286,75 +6282,73 @@ export async function applyStateTransition(
   // evidence — a branch + commit SHA reachable on origin — before the state
   // advances. Same class as the merge/deploy release gate above, one phase earlier.
   //
-  // ACTIVATION: the gate enforces only when the caller supplies an
-  // `originRepository` to validate the artifact against. That is the deliberate
-  // opt-in signal — enforcement is meaningless without an origin to check, and
-  // keying on it keeps the gate DORMANT for callers that don't participate. This
-  // is load-bearing for a safe rollout: the CLI does not yet attach a code
-  // artifact to `submit`/`continue-workflow` (only `handoff-work` carries
-  // `--code-artifact` today), and the proxy does not yet thread it. Firing
-  // unconditionally would refuse EVERY live dev-impl submit the moment the
-  // connector deploys, ahead of the CLI. The full activation is a coordinated
-  // follow-up: CLI attaches `--code-artifact` to submit, proxy threads the
-  // header + resolves the ticket's origin repo, then this gate goes live.
-  const originRepository = options?.originRepository ?? null;
-  if (originRepository) {
-    const sourceStateNode = currentStateName
-      ? def.states.find((s) => s.id === currentStateName)
-      : undefined;
-    const isImplementationSubmitClaim =
-      intent === "submit" &&
-      matchedTransition?.to === "code-review" &&
-      matchedTransition?.generic === "continue" &&
-      sourceStateNode?.owner_role === "dev";
-    if (isImplementationSubmitClaim) {
-      const rawArtifact = options?.codeArtifact ?? null;
-      const artifact = rawArtifact ? parseCodeArtifact(rawArtifact) : null;
-      if (!artifact) {
-        // AC1 + AC4: no (or malformed) evidence → refuse before any write, naming
-        // push-before-claim so the agent pushes rather than retrying blindly.
-        const detail = rawArtifact
-          ? `push-before-claim: the supplied code artifact '${rawArtifact}' is not a valid '<branch>@<sha>'. ` +
-            `Push your branch to origin and re-run the submit supplying the branch name and the commit SHA.`
-          : `push-before-claim: this implementation submit supplied no published artifact. ` +
-            `Push your branch to origin, then re-run the submit naming the branch and the commit SHA ` +
-            `(the reviewer reviews the pushed commit, not your working tree).`;
-        log.warn(
-          `workflow-gate: INF-1060: push-before-claim gate REFUSED ${issueId} (${currentStateName} → ${toStateName}): no valid branch+commit evidence`,
-        );
-        return { status: "blocked", code: "push-before-claim", detail, from: currentStateName, to: toStateName };
-      }
-      // AC2 + AC4 / AC5: evidence supplied — validate the commit is on origin.
-      const { reachable, verified } = await verifyCommitReachableOnOrigin(
-        originRepository,
-        artifact.branch,
-        artifact.sha,
+  const sourceStateNode = currentStateName
+    ? def.states.find((s) => s.id === currentStateName)
+    : undefined;
+  const isImplementationSubmitClaim =
+    intent === "submit" &&
+    matchedTransition?.to === "code-review" &&
+    matchedTransition?.generic === "continue" &&
+    sourceStateNode?.owner_role === "dev";
+  if (isImplementationSubmitClaim) {
+    const rawArtifact = options?.codeArtifact ?? null;
+    const artifact = rawArtifact ? parseCodeArtifact(rawArtifact) : null;
+    if (!artifact) {
+      // AC1 + AC4: no (or malformed) evidence → refuse before any write, naming
+      // push-before-claim so the agent pushes rather than retrying blindly.
+      const detail = rawArtifact
+        ? `push-before-claim: the supplied code artifact '${rawArtifact}' is not a valid '<branch>@<sha>'. ` +
+          `Push your branch to origin and re-run the submit supplying the branch name and the commit SHA.`
+        : `push-before-claim: this implementation submit supplied no published artifact. ` +
+          `Push your branch to origin, then re-run the submit naming the branch and the commit SHA ` +
+          `(the reviewer reviews the pushed commit, not your working tree).`;
+      log.warn(
+        `workflow-gate: INF-1060: push-before-claim gate REFUSED ${issueId} (${currentStateName} → ${toStateName}): no valid branch+commit evidence`,
       );
-      if (!reachable && verified) {
-        const detail =
-          `push-before-claim: commit ${artifact.sha} is not reachable on branch ${artifact.branch} on origin ` +
-          `(the work is unpushed or uncommitted). Push the branch to origin, then re-run the submit with the pushed commit SHA.`;
-        log.warn(
-          `workflow-gate: INF-1060: push-before-claim gate REFUSED ${issueId} (${currentStateName} → ${toStateName}): ` +
-            `${artifact.branch}@${artifact.sha} not reachable on origin ${originRepository}`,
-        );
-        return { status: "blocked", code: "push-before-claim", detail, from: currentStateName, to: toStateName };
-      }
-      if (!reachable && !verified) {
-        // Infra uncertainty (no token / private-repo access / GitHub unreachable):
-        // fail open loudly rather than strand a legitimately-pushed submit, mirroring
-        // the merge/deploy release gate's INF-714 posture. The evidence-presence half
-        // (AC1) already blocked the true replay case (no artifact at all).
-        log.warn(
-          `workflow-gate: INF-1060: push-before-claim origin check UNVERIFIABLE for ${issueId} ` +
-            `(${artifact.branch}@${artifact.sha} on origin ${originRepository}) — GitHub could not confirm/deny; failing open`,
-        );
-      } else {
-        log.info(
-          `workflow-gate: INF-1060: push-before-claim gate PASSED ${issueId} (${currentStateName} → ${toStateName}): ` +
-            `${artifact.branch}@${artifact.sha} reachable on origin ${originRepository}`,
-        );
-      }
+      return { status: "blocked", code: "push-before-claim", detail, from: currentStateName, to: toStateName };
+    }
+
+    const originRepository = options?.originRepository ?? (await resolveTicketRepoRefs(labelNames, issueId, authToken))[0] ?? null;
+    if (!originRepository) {
+      const detail =
+        `push-before-claim: cannot validate ${artifact.branch}@${artifact.sha} because this ticket has no origin repository context. ` +
+        `Add a repo:* label or GitHub attachment, then re-run the submit with the pushed branch and commit SHA.`;
+      log.warn(
+        `workflow-gate: INF-1060: push-before-claim gate REFUSED ${issueId} (${currentStateName} → ${toStateName}): no origin repository context`,
+      );
+      return { status: "blocked", code: "push-before-claim", detail, from: currentStateName, to: toStateName };
+    }
+
+    // AC2 + AC4 / AC5: evidence supplied — validate the commit is on origin.
+    const { reachable, verified } = await verifyCommitReachableOnOrigin(
+      originRepository,
+      artifact.branch,
+      artifact.sha,
+    );
+    if (!reachable && verified) {
+      const detail =
+        `push-before-claim: commit ${artifact.sha} is not reachable on branch ${artifact.branch} on origin ` +
+        `(the work is unpushed or uncommitted). Push the branch to origin, then re-run the submit with the pushed commit SHA.`;
+      log.warn(
+        `workflow-gate: INF-1060: push-before-claim gate REFUSED ${issueId} (${currentStateName} → ${toStateName}): ` +
+          `${artifact.branch}@${artifact.sha} not reachable on origin ${originRepository}`,
+      );
+      return { status: "blocked", code: "push-before-claim", detail, from: currentStateName, to: toStateName };
+    }
+    if (!reachable && !verified) {
+      // Infra uncertainty (no token / private-repo access / GitHub unreachable):
+      // fail open loudly rather than strand a legitimately-pushed submit, mirroring
+      // the merge/deploy release gate's INF-714 posture. The evidence-presence half
+      // (AC1) already blocked the true replay case (no artifact at all).
+      log.warn(
+        `workflow-gate: INF-1060: push-before-claim origin check UNVERIFIABLE for ${issueId} ` +
+          `(${artifact.branch}@${artifact.sha} on origin ${originRepository}) — GitHub could not confirm/deny; failing open`,
+      );
+    } else {
+      log.info(
+        `workflow-gate: INF-1060: push-before-claim gate PASSED ${issueId} (${currentStateName} → ${toStateName}): ` +
+          `${artifact.branch}@${artifact.sha} reachable on origin ${originRepository}`,
+      );
     }
   }
 

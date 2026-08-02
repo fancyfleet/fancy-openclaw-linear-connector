@@ -300,7 +300,10 @@ describe("executeFanout — mocked Linear API", () => {
 
     return async (url, init) => {
       if (typeof url !== "string" || !url.includes("api.linear.app")) {
-        throw new Error("unexpected fetch call");
+        return new Response(JSON.stringify({ status: "behind" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
       }
       const bodyText = typeof init?.body === "string" ? init.body : "{}";
       const parsed = JSON.parse(bodyText) as { query?: string; variables?: Record<string, unknown> };
@@ -1139,7 +1142,10 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
       ],
     });
 
-    await applyStateTransition("submit", "AI-1439", "Bearer tok");
+    await applyStateTransition("submit", "AI-1439", "Bearer tok", {
+      codeArtifact: "feature/test@0123456789abcdef0123456789abcdef01234567",
+      originRepository: "fancyfleet/fancy-openclaw-linear-connector",
+    });
 
     // Restore ux-audit workflow def
     process.env.WORKFLOW_DEF_PATH = CANONICAL_UX_AUDIT_FIXTURE;

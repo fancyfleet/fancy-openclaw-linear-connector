@@ -10,11 +10,15 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import express from "express";
+import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it } from "@jest/globals";
 
 import { reloadAgents } from "./agents.js";
 import { resetConfigHealth } from "./config-health.js";
+import { handleProxyRequest } from "./proxy.js";
 import { resetPolicyCache } from "./escalation-gate.js";
+import { clearAppliedState } from "./store/applied-state-store.js";
 import {
   _setTransitionWritePolicyForTests,
   applyStateTransition,
@@ -31,6 +35,7 @@ const VALID_BRANCH = "feature/INF-1060-push-before-claim-evidence";
 const VALID_SHA = "0123456789abcdef0123456789abcdef01234567";
 const MISSING_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const AUTH = "Bearer tok-igor";
+const ORIGIN_REPO = "fancyfleet/fancy-openclaw-linear-connector";
 
 const POLICY_YAML = `
 capabilities:
@@ -165,11 +170,31 @@ function makeFetch(reachableShas = new Set<string>()) {
               nodes: [
                 { id: "label-wf-dev-impl", name: "wf:dev-impl", team: { id: TEAM_ID } },
                 { id: "label-state-implementation", name: "state:implementation", team: { id: TEAM_ID } },
+                { id: "label-repo-connector", name: "repo:fancy-openclaw-linear-connector", team: { id: TEAM_ID } },
               ],
             },
             delegate: { id: IGOR_LINEAR_ID },
             assignee: null,
             state: { id: "state-todo" },
+          },
+        },
+      });
+    }
+
+    if (query.includes("IssueContext")) {
+      return jsonResponse({
+        data: {
+          issue: {
+            identifier: ISSUE_IDENTIFIER,
+            labels: {
+              nodes: [
+                { name: "wf:dev-impl" },
+                { name: "state:implementation" },
+                { name: "repo:fancy-openclaw-linear-connector" },
+              ],
+            },
+            delegate: { id: IGOR_LINEAR_ID },
+            state: { type: "started", name: "Doing" },
           },
         },
       });
@@ -204,6 +229,10 @@ function makeFetch(reachableShas = new Set<string>()) {
           },
         },
       });
+    }
+
+    if (query.includes("IssueRepoAttachments")) {
+      return jsonResponse({ data: { issue: { attachments: { nodes: [] } } } });
     }
 
     if (query.includes("ApplyAtomicTransition")) {
@@ -245,9 +274,59 @@ function submitOptions(overrides: Partial<CodeArtifactOptions> = {}): CodeArtifa
     bodyId: "igor",
     cliTarget: "charles",
     sourceStateOverride: "implementation",
-    originRepository: "fancyfleet/fancy-openclaw-linear-connector",
+    originRepository: ORIGIN_REPO,
     ...overrides,
   };
+}
+
+function createProxyApp(): express.Application {
+  const app = express();
+  app.use(
+    express.raw({ type: "application/json", limit: "1mb" }),
+    (req: express.Request, _res: express.Response, next: express.NextFunction) => {
+      if (Buffer.isBuffer(req.body)) {
+        try {
+          req.body = JSON.parse(req.body.toString("utf8"));
+        } catch {
+          // Leave malformed JSON to the proxy parser.
+        }
+      }
+      next();
+    },
+  );
+  app.post("/proxy/graphql", async (req, res) => {
+    await handleProxyRequest(req, res);
+  });
+  return app;
+}
+
+function submitMutationBody(): Record<string, unknown> {
+  return {
+    operationName: "SubmitImplementationClaim",
+    query: `
+      mutation SubmitImplementationClaim($id: String!, $input: IssueUpdateInput!) {
+        issueUpdate(id: $id, input: $input) { success }
+      }
+    `,
+    variables: {
+      id: ISSUE_UUID,
+      input: { description: "Implementation claim" },
+    },
+  };
+}
+
+function postSubmit(app: express.Application, codeArtifact?: string) {
+  let req = request(app)
+    .post("/proxy/graphql")
+    .set("Content-Type", "application/json")
+    .set("Authorization", AUTH)
+    .set("X-Openclaw-Agent", "igor")
+    .set("X-Openclaw-Linear-Intent", "submit")
+    .set("X-Openclaw-Linear-Target", "charles")
+    .set("X-Openclaw-Linear-Cli-Version", "999.0.0")
+    .send(JSON.stringify(submitMutationBody()));
+  if (codeArtifact) req = req.set("X-Openclaw-Code-Artifact", codeArtifact);
+  return req;
 }
 
 describe("INF-1060 push-before-claim evidence gate", () => {
@@ -291,6 +370,7 @@ describe("INF-1060 push-before-claim evidence gate", () => {
     resetPolicyCache();
     resetWorkflowCache();
     resetConfigHealth();
+    clearAppliedState(ISSUE_IDENTIFIER);
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -369,5 +449,41 @@ describe("INF-1060 push-before-claim evidence gate", () => {
       delegateId: CHARLES_LINEAR_ID,
       labelIds: expect.arrayContaining(["label-wf-dev-impl", "label-state-code-review"]),
     });
+  });
+
+  it("proxy path: live submit without artifact is refused before the atomic state transition write", async () => {
+    const transport = makeFetch();
+    globalThis.fetch = transport.fetch;
+    const app = createProxyApp();
+
+    const res = await postSubmit(app);
+
+    expect(res.status).toBe(200);
+    expect(res.body._workflowTransition).toMatchObject({
+      status: "blocked",
+      code: "push-before-claim",
+      from: "implementation",
+      to: "code-review",
+    });
+    expect(res.body._workflowTransition.detail).toMatch(/push-before-claim/i);
+    expect(res.body._workflowTransition.detail).toMatch(/push/i);
+    expect(transport.transitionWrites()).toHaveLength(0);
+  });
+
+  it("proxy path: live submit with a reachable artifact advances through the normal code-review path", async () => {
+    const transport = makeFetch(new Set([VALID_SHA]));
+    globalThis.fetch = transport.fetch;
+    const app = createProxyApp();
+
+    const res = await postSubmit(app, `${VALID_BRANCH}@${VALID_SHA}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body._workflowTransition).toMatchObject({
+      status: "applied",
+      from: "implementation",
+      to: "code-review",
+    });
+    expect(transport.originChecks).toHaveLength(1);
+    expect(transport.transitionWrites()).toHaveLength(1);
   });
 });
