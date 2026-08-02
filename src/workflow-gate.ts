@@ -1704,6 +1704,37 @@ function retainedLabelIdsForIssue(
 }
 
 /**
+ * INF-1085: drop inherited cross-team label IDs from an EXISTING label set that
+ * is about to be carried forward into a governed `issueUpdate(labelIds:)` write,
+ * WITHOUT touching state or wf label retention.
+ *
+ * INF-1045 (`retainedLabelIdsForIssue`) fixed the transition/demote/park/setState
+ * write sites, which fully replace the label set and therefore strip state labels
+ * (and optionally wf labels). The enrollment/heal sites are different: they ADD the
+ * wf and state labels to whatever the ticket already carries, so they must preserve
+ * existing state and wf labels — but they were still building `labelIds` from the
+ * raw `issue.labels` set, so an
+ * inherited parent-team label (e.g. `xfn:workflow` on a demoted LIF ticket) survived
+ * into the write and Linear rejected the whole atomic labelIds mutation. That is the
+ * exact "INF-1045 fix does not hold" regression: the sanitizer never reached these
+ * three enrollment paths. This helper applies only the cross-team filter (with the
+ * same warn-level auditability) so enrollment keeps its label semantics intact.
+ */
+function issueTeamLabelIds(labels: LabelNode[], teamId: string): string[] {
+  return labels
+    .filter((label) => {
+      const keep = labelBelongsToIssueTeam(label, teamId);
+      if (!keep) {
+        log.warn(
+          `workflow-gate: dropping inherited cross-team label '${label.name}' (${label.id}) from governed enrollment labelIds write for team ${teamId}`,
+        );
+      }
+      return keep;
+    })
+    .map((label) => label.id);
+}
+
+/**
  * Find an existing label by name in the team, or create it if absent.
  * Returns the label ID, or null if both lookup and creation fail.
  */
@@ -7625,7 +7656,8 @@ export async function enrollIfMissing(
     return { enrolled: false };
   }
 
-  const existingIds = issue.labels.map((l) => l.id);
+  // INF-1085: sanitize inherited cross-team labels before the governed write.
+  const existingIds = issueTeamLabelIds(issue.labels, issue.teamId);
   const newLabelIds = [...existingIds, entryLabelId];
   const success = await issueUpdateLabels(issue.internalId, newLabelIds, authToken);
   if (!success) {
@@ -7811,8 +7843,9 @@ export async function autoEnrollByTeam(
     return { enrolled: false };
   }
 
-  // Add both labels alongside existing ones
-  const existingIds = issue.labels.map((l) => l.id);
+  // Add both labels alongside existing ones.
+  // INF-1085: sanitize inherited cross-team labels before the governed write.
+  const existingIds = issueTeamLabelIds(issue.labels, issue.teamId);
   const newLabelIds = [...new Set([...existingIds, wfLabelId, stateLabelId])];
 
   const success = await issueUpdateLabels(issue.internalId, newLabelIds, authToken);
@@ -7921,7 +7954,8 @@ export async function autoEnrollPlainDelegation(
     return { enrolled: false };
   }
 
-  const existingIds = issue.labels.map((l) => l.id);
+  // INF-1085: sanitize inherited cross-team labels before the governed write.
+  const existingIds = issueTeamLabelIds(issue.labels, issue.teamId);
   const newLabelIds = [...new Set([...existingIds, wfLabelId, stateLabelId])];
   const success = await issueUpdateLabels(issue.internalId, newLabelIds, authToken);
   if (!success) {
