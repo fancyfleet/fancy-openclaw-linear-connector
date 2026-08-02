@@ -1,33 +1,29 @@
 /**
- * DoneTicketDetector — failing tests for all 11 acceptance criteria.
+ * DoneTicketDetector — tests for the live-signal deploy verdict (INF-1099).
  *
- * Must be RED before the implementation lands.
+ * The detector's "is this shipped?" verdict is now derived from LIVE signals —
+ * the running commit read from `/health` and a code-level `git grep` of the
+ * fix's hallmark symbol — never from the ticket identifier/title/`Done` label.
  *
- * AC1 — Done ticket sweep: script queries Done tickets from last N days (N=14 start)
- * AC2 — Code presence check: matches ticket ID (AI-XXXX) in git log origin/main --oneline
- * AC3 — Flagging: no match within M hours → apply needs-merge-verify label + note comment
- * AC4 — Skip labeled: skips tickets already bearing needs-merge-verify label
- * AC5 — Skip unbranched: skips tickets with no branch in the repo
- * AC6 — Re-land creation: creates new re-land ticket for missing fixes; does NOT reopen original
- * AC7 — No ancestry matching: only ticket-ID string match in squash-merge commit message
- * AC8 — Advisory only: never block a transition or fail closed; all errors log and continue
- * AC9 — One comment per ticket: at most one note comment per flagged ticket
- * AC10 — Bootstrap registration: registered in host's periodic task scheduler alongside
- *        linear-connector-watchdog.py
- * AC11 — Liveness observability: on startup, logs a confirmation that it is configured
- *        and scheduled; verifiable without waiting for a full trigger cycle
+ * Retained ACs (from AI-2576): sweep, skip-labeled, skip-unbranched, re-land,
+ * advisory-only, one-comment-per-ticket, liveness, lifecycle.
+ * Superseded: ticket-ID string match in git log (AC2/AC7) → live deploy verdict.
  */
 
 import { describe, it, expect, beforeEach, afterEach, jest } from "@jest/globals";
 import {
   DoneTicketDetector,
   type DoneTicketDetectorConfig,
-  type DoneTicketCycleResult,
   type LinearIssue,
   type LinearApi,
-  type GitApi,
   type LinearCreateIssueInput,
 } from "./done-ticket-detector.js";
+import {
+  makeDeployVerdictApi,
+  type DeployVerdictApi,
+  type DeployVerdict,
+  type CodePresence,
+} from "./deploy-verdict.js";
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -38,37 +34,78 @@ const DEFAULT_CONFIG: DoneTicketDetectorConfig = {
   repoPath: "/tmp/test-repo",
 };
 
-/** Create a minimal Linear issue fixture. */
+/** Create a minimal Linear issue fixture (with a hallmark label by default). */
 function makeIssue(overrides: Partial<LinearIssue> & { identifier: string }): LinearIssue {
   return {
     id: `linear-${overrides.identifier.toLowerCase()}`,
     createdAt: new Date().toISOString(),
-    labels: [],
+    labels: ["hallmark:someExportedSymbol"],
     hasBranch: true,
     doneAt: new Date().toISOString(),
     ...overrides,
   };
 }
 
+/** Verdict fixtures. */
+function deployedVerdict(): DeployVerdict {
+  return {
+    status: "deployed",
+    deployed: true,
+    stall: false,
+    hallmarkSymbol: "someExportedSymbol",
+    runningCommit: "abc1234",
+    presentOnMain: true,
+    presentInDeployed: true,
+    evidence: "Hallmark `someExportedSymbol` is present in the live deployed artifact at commit `abc1234`.",
+  };
+}
+
+function stallVerdict(): DeployVerdict {
+  return {
+    status: "stale-not-deployed",
+    deployed: false,
+    stall: true,
+    hallmarkSymbol: "someExportedSymbol",
+    runningCommit: "abc1234",
+    presentOnMain: true,
+    presentInDeployed: false,
+    evidence:
+      "/health reports running commit `abc1234`; hallmark `someExportedSymbol` is ABSENT from that deployed artifact (present on `origin/main`). Done ≠ deployed — the running service does not contain this fix.",
+  };
+}
+
+function unverifiableVerdict(): DeployVerdict {
+  return {
+    status: "unverifiable",
+    deployed: false,
+    stall: false,
+    hallmarkSymbol: null,
+    runningCommit: null,
+    presentOnMain: null,
+    presentInDeployed: null,
+    evidence: "No `hallmark:<symbol>` label — not flagged from ticket text (AC4).",
+  };
+}
+
 /** Create a mock LinearApi with spies. */
 function makeMockLinearApi(overrides?: Partial<LinearApi>): jest.Mocked<LinearApi> {
   return {
-    fetchDoneTickets: jest.fn().mockResolvedValue([]),
-    applyLabel: jest.fn().mockResolvedValue(true),
-    postComment: jest.fn().mockResolvedValue(true),
-    createIssue: jest.fn().mockResolvedValue({ id: "new-issue-id", identifier: "AI-9999" }),
-    hasExistingComment: jest.fn().mockResolvedValue(false),
+    fetchDoneTickets: jest.fn<LinearApi["fetchDoneTickets"]>().mockResolvedValue([]),
+    applyLabel: jest.fn<LinearApi["applyLabel"]>().mockResolvedValue(true),
+    postComment: jest.fn<LinearApi["postComment"]>().mockResolvedValue(true),
+    createIssue: jest
+      .fn<LinearApi["createIssue"]>()
+      .mockResolvedValue({ id: "new-issue-id", identifier: "AI-9999" }),
+    hasExistingComment: jest.fn<LinearApi["hasExistingComment"]>().mockResolvedValue(false),
     ...overrides,
   } as jest.Mocked<LinearApi>;
 }
 
-/** Create a mock GitApi with spies. */
-function makeMockGitApi(overrides?: Partial<GitApi>): jest.Mocked<GitApi> {
+/** Create a mock DeployVerdictApi (defaults to an all-clear "deployed" verdict). */
+function makeMockDeployApi(verdict: DeployVerdict = deployedVerdict()): jest.Mocked<DeployVerdictApi> {
   return {
-    ticketIdInMainLog: jest.fn().mockResolvedValue(true),
-    hasBranchForTicket: jest.fn().mockResolvedValue(true),
-    ...overrides,
-  } as jest.Mocked<GitApi>;
+    verify: jest.fn<DeployVerdictApi["verify"]>().mockResolvedValue(verdict),
+  } as jest.Mocked<DeployVerdictApi>;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -76,13 +113,13 @@ function makeMockGitApi(overrides?: Partial<GitApi>): jest.Mocked<GitApi> {
 describe("DoneTicketDetector", () => {
   let detector: DoneTicketDetector;
   let mockLinear: jest.Mocked<LinearApi>;
-  let mockGit: jest.Mocked<GitApi>;
+  let mockDeploy: jest.Mocked<DeployVerdictApi>;
   let config: DoneTicketDetectorConfig;
 
   beforeEach(() => {
     config = { ...DEFAULT_CONFIG };
     mockLinear = makeMockLinearApi();
-    mockGit = makeMockGitApi();
+    mockDeploy = makeMockDeployApi();
   });
 
   afterEach(() => {
@@ -97,9 +134,8 @@ describe("DoneTicketDetector", () => {
         makeIssue({ identifier: "AI-1000" }),
         makeIssue({ identifier: "AI-1001" }),
       ]);
-      mockGit.ticketIdInMainLog.mockResolvedValue(true); // both are on main
 
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
       const result = await detector.runCycle();
 
       expect(mockLinear.fetchDoneTickets).toHaveBeenCalledWith(14); // N=14 start
@@ -109,7 +145,7 @@ describe("DoneTicketDetector", () => {
     it("returns scanned=0 when no Done tickets exist", async () => {
       mockLinear.fetchDoneTickets.mockResolvedValueOnce([]);
 
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
       const result = await detector.runCycle();
 
       expect(result.scanned).toBe(0);
@@ -117,75 +153,97 @@ describe("DoneTicketDetector", () => {
     });
   });
 
-  // ── AC2: Code presence check ──────────────────────────────────────────────
+  // ── Live deploy verdict (supersedes AC2/AC7 ticket-ID string match) ────────
 
-  describe("AC2 — Code presence check", () => {
-    it("checks git log origin/main --oneline for the ticket ID", async () => {
+  describe("Live deploy verdict — code + /health, not ticket text", () => {
+    it("does NOT flag when the fix is confirmed live in the deployed artifact", async () => {
       const ticket = makeIssue({ identifier: "AI-2576" });
       mockLinear.fetchDoneTickets.mockResolvedValueOnce([ticket]);
-      mockGit.ticketIdInMainLog.mockResolvedValue(true); // found on main
+      mockDeploy = makeMockDeployApi(deployedVerdict());
 
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
       const result = await detector.runCycle();
 
-      expect(mockGit.ticketIdInMainLog).toHaveBeenCalledWith(
-        "AI-2576",
-        expect.any(Date),
-      );
-      expect(result.flagged).toBe(0); // found → no flag
+      expect(mockDeploy.verify).toHaveBeenCalledWith({
+        identifier: "AI-2576",
+        labels: ticket.labels,
+      });
+      expect(result.flagged).toBe(0);
     });
 
-    it("flags tickets whose ID is absent from main log", async () => {
+    it("flags tickets whose fix is absent from the deployed artifact (STALL)", async () => {
       const ticket = makeIssue({ identifier: "AI-2576" });
       mockLinear.fetchDoneTickets.mockResolvedValueOnce([ticket]);
-      mockGit.ticketIdInMainLog.mockResolvedValue(false); // NOT found on main
+      mockDeploy = makeMockDeployApi(stallVerdict());
 
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
       const result = await detector.runCycle();
 
-      expect(mockGit.ticketIdInMainLog).toHaveBeenCalledWith("AI-2576", expect.any(Date));
+      expect(mockDeploy.verify).toHaveBeenCalledWith({
+        identifier: "AI-2576",
+        labels: ticket.labels,
+      });
       expect(result.flagged).toBe(1);
+    });
+
+    it("does NOT flag from ticket text when there is no live signal (unverifiable)", async () => {
+      // AC4: a ticket with no hallmark label cannot be verified from live
+      // signals — it must be skipped, never flagged from its Done label/title.
+      const ticket = makeIssue({ identifier: "AI-2600", labels: [] });
+      mockLinear.fetchDoneTickets.mockResolvedValueOnce([ticket]);
+      mockDeploy = makeMockDeployApi(unverifiableVerdict());
+
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
+      const result = await detector.runCycle();
+
+      expect(result.flagged).toBe(0);
+      expect(result.skippedUnverifiable).toBe(1);
+      expect(mockLinear.applyLabel).not.toHaveBeenCalled();
+      expect(mockLinear.postComment).not.toHaveBeenCalled();
     });
   });
 
-  // ── AC3: Flagging ─────────────────────────────────────────────────────────
+  // ── AC3: Flagging with label + comment quoting live evidence ──────────────
 
-  describe("AC3 — Flagging with label + comment", () => {
-    it("applies needs-merge-verify label when ticket is absent from main", async () => {
+  describe("AC3 — Flagging with label + evidence-quoting comment", () => {
+    it("applies needs-merge-verify label on a STALL verdict", async () => {
       const ticket = makeIssue({ identifier: "AI-2000" });
       mockLinear.fetchDoneTickets.mockResolvedValueOnce([ticket]);
-      mockGit.ticketIdInMainLog.mockResolvedValue(false);
+      mockDeploy = makeMockDeployApi(stallVerdict());
 
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
       await detector.runCycle();
 
       expect(mockLinear.applyLabel).toHaveBeenCalledWith(ticket.id, "needs-merge-verify");
     });
 
-    it("posts a note comment explaining the flag", async () => {
-      const ticket = makeIssue({ identifier: "AI-2000", doneAt: "2026-07-17T12:00:00Z" });
+    it("posts a comment quoting the live evidence, not the ticket title", async () => {
+      const ticket = makeIssue({
+        identifier: "AI-2000",
+        title: "Some human-written ticket title",
+        doneAt: "2026-07-17T12:00:00Z",
+      } as Partial<LinearIssue> & { identifier: string; title: string });
       mockLinear.fetchDoneTickets.mockResolvedValueOnce([ticket]);
-      mockGit.ticketIdInMainLog.mockResolvedValue(false);
+      mockDeploy = makeMockDeployApi(stallVerdict());
 
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
       await detector.runCycle();
 
-      expect(mockLinear.postComment).toHaveBeenCalledWith(
-        ticket.id,
-        expect.stringContaining("AI-2000"),
-      );
       const actualBody = mockLinear.postComment.mock.calls[0][1];
-      expect(actualBody).toContain("Done but not on main");
-      expect(actualBody).toContain("origin/main");
       expect(actualBody).toContain("AI-2000");
+      // Quotes the live evidence (running commit + hallmark), AC3.
+      expect(actualBody).toContain("abc1234");
+      expect(actualBody).toContain("someExportedSymbol");
+      // Never quotes the ticket title as ground truth (AC4).
+      expect(actualBody).not.toContain("Some human-written ticket title");
     });
 
     it("includes the Done timestamp in the flagging comment", async () => {
       const ticket = makeIssue({ identifier: "AI-2000", doneAt: "2026-07-17T14:30:00Z" });
       mockLinear.fetchDoneTickets.mockResolvedValueOnce([ticket]);
-      mockGit.ticketIdInMainLog.mockResolvedValue(false);
+      mockDeploy = makeMockDeployApi(stallVerdict());
 
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
       await detector.runCycle();
 
       const actualBody = mockLinear.postComment.mock.calls[0][1];
@@ -203,11 +261,12 @@ describe("DoneTicketDetector", () => {
       });
       mockLinear.fetchDoneTickets.mockResolvedValueOnce([ticket]);
 
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
       const result = await detector.runCycle();
 
       expect(result.skippedLabeled).toBe(1);
       expect(result.flagged).toBe(0);
+      expect(mockDeploy.verify).not.toHaveBeenCalled();
       expect(mockLinear.applyLabel).not.toHaveBeenCalled();
       expect(mockLinear.postComment).not.toHaveBeenCalled();
     });
@@ -223,12 +282,12 @@ describe("DoneTicketDetector", () => {
       });
       mockLinear.fetchDoneTickets.mockResolvedValueOnce([ticket]);
 
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
       const result = await detector.runCycle();
 
       expect(result.skippedUnbranched).toBe(1);
       expect(result.flagged).toBe(0);
-      expect(mockGit.ticketIdInMainLog).not.toHaveBeenCalled();
+      expect(mockDeploy.verify).not.toHaveBeenCalled();
       expect(mockLinear.applyLabel).not.toHaveBeenCalled();
     });
   });
@@ -239,9 +298,9 @@ describe("DoneTicketDetector", () => {
     it("creates a new re-land ticket for missing fixes", async () => {
       const ticket = makeIssue({ identifier: "AI-5000" });
       mockLinear.fetchDoneTickets.mockResolvedValueOnce([ticket]);
-      mockGit.ticketIdInMainLog.mockResolvedValue(false);
+      mockDeploy = makeMockDeployApi(stallVerdict());
 
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
       const result = await detector.runCycle();
 
       expect(mockLinear.createIssue).toHaveBeenCalledTimes(1);
@@ -258,55 +317,28 @@ describe("DoneTicketDetector", () => {
     it("does NOT reopen the original ticket", async () => {
       const ticket = makeIssue({ identifier: "AI-5000" });
       mockLinear.fetchDoneTickets.mockResolvedValueOnce([ticket]);
-      mockGit.ticketIdInMainLog.mockResolvedValue(false);
+      mockDeploy = makeMockDeployApi(stallVerdict());
 
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
       await detector.runCycle();
 
-      // The original ticket should NOT be reopened — only a new issue should be created
       const createCall = mockLinear.createIssue.mock.calls[0][0] as LinearCreateIssueInput;
       expect(createCall.title).toContain("re-land");
       expect(createCall.parentId).toBe(ticket.id); // linked as child, NOT reopened
-      // No call to an "issue update" to change the original ticket's status
       expect(mockLinear.applyLabel).toHaveBeenCalledWith(ticket.id, "needs-merge-verify");
     });
 
     it("skips re-land creation if createIssue returns null", async () => {
       const ticket = makeIssue({ identifier: "AI-5001" });
       mockLinear.fetchDoneTickets.mockResolvedValueOnce([ticket]);
-      mockGit.ticketIdInMainLog.mockResolvedValue(false);
+      mockDeploy = makeMockDeployApi(stallVerdict());
       mockLinear.createIssue.mockResolvedValueOnce(null);
 
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
       const result = await detector.runCycle();
 
       expect(result.reLandCreated).toBe(0);
-      // Should still flag the ticket even if re-land creation fails
-      expect(result.flagged).toBe(1);
-    });
-  });
-
-  // ── AC7: No ancestry matching ─────────────────────────────────────────────
-
-  describe("AC7 — No ancestry matching", () => {
-    it("only uses string match in commit message, never SHA ancestry", async () => {
-      const ticket = makeIssue({ identifier: "AI-6000" });
-      mockLinear.fetchDoneTickets.mockResolvedValueOnce([ticket]);
-
-      // The test passes when ticketIdInMainLog is called with the raw identifier string
-      // and returns false (no string match). The implementer must NOT do SHA ancestry.
-      mockGit.ticketIdInMainLog.mockImplementation(async (ticketId: string) => {
-        // This should be a simple `git log --oneline | grep ticketId` — NOT
-        // `git merge-base --is-ancestor` or any SHA chain comparison
-        return ticketId === "AI-6000" && false; // not found by string match
-      });
-
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
-      const result = await detector.runCycle();
-
-      expect(result.flagged).toBe(1);
-      // The ticketIdInMainLog call must use the verbatim identifier string
-      expect(mockGit.ticketIdInMainLog).toHaveBeenCalledWith("AI-6000", expect.any(Date));
+      expect(result.flagged).toBe(1); // still flagged even if re-land fails
     });
   });
 
@@ -318,28 +350,26 @@ describe("DoneTicketDetector", () => {
       const ticket2 = makeIssue({ identifier: "AI-7001" });
       mockLinear.fetchDoneTickets.mockResolvedValueOnce([ticket1, ticket2]);
 
-      // First ticket throws — error should be caught and logged
-      mockGit.ticketIdInMainLog
-        .mockRejectedValueOnce(new Error("Git error on AI-7000"))
-        .mockResolvedValueOnce(false); // AI-7001: not found, should be flagged
+      // First ticket's verdict throws — error should be caught and logged.
+      mockDeploy.verify
+        .mockRejectedValueOnce(new Error("Deploy verify error on AI-7000"))
+        .mockResolvedValueOnce(stallVerdict()); // AI-7001: stall → flagged
 
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
       const result = await detector.runCycle();
 
-      // AC8: Second ticket still gets processed despite first error
       expect(result.scanned).toBe(2);
       expect(result.errors).toHaveLength(1);
       expect(result.errors[0]).toContain("AI-7000");
-      expect(result.flagged).toBe(1); // AI-7001 was flagged
+      expect(result.flagged).toBe(1);
     });
 
     it("catches and logs top-level cycle errors", async () => {
       mockLinear.fetchDoneTickets.mockRejectedValueOnce(new Error("Linear API down"));
 
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
       const result = await detector.runCycle();
 
-      // AC8: Cycle error is logged, result reflects the error, does NOT throw
       expect(result.errors).toHaveLength(1);
       expect(result.errors[0]).toContain("Linear API down");
       expect(result.scanned).toBe(0);
@@ -348,8 +378,7 @@ describe("DoneTicketDetector", () => {
     it("never throws an unhandled exception from runCycle", async () => {
       mockLinear.fetchDoneTickets.mockRejectedValueOnce(new Error("Anything"));
 
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
-      // Should resolve gracefully, never reject
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
       await expect(detector.runCycle()).resolves.toBeDefined();
     });
   });
@@ -360,16 +389,14 @@ describe("DoneTicketDetector", () => {
     it("posts at most one note comment per flagged ticket across cycles", async () => {
       const ticket = makeIssue({ identifier: "AI-8000" });
       mockLinear.fetchDoneTickets.mockResolvedValue([ticket]); // always returns same ticket
-      mockGit.ticketIdInMainLog.mockResolvedValue(false); // never found
+      mockDeploy = makeMockDeployApi(stallVerdict()); // always a stall
 
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
 
-      // First cycle: should flag and comment
       const result1 = await detector.runCycle();
       expect(result1.flagged).toBe(1);
       expect(mockLinear.postComment).toHaveBeenCalledTimes(1);
 
-      // Second cycle: should NOT comment again
       const result2 = await detector.runCycle();
       expect(result2.flagged).toBe(0); // not re-flagged (already commented)
       expect(mockLinear.postComment).toHaveBeenCalledTimes(1); // still 1
@@ -380,27 +407,16 @@ describe("DoneTicketDetector", () => {
 
   describe("AC10 — Bootstrap registration in periodic scheduler", () => {
     it("start() registers a periodic timer", () => {
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
 
-      // Use a fake timer
       jest.useFakeTimers();
       detector.start();
-
-      // After starting, a timer should be registered (proven by the setInterval call)
-      // The configuration explicitly references the script path
       expect(detector).toBeDefined();
-
       jest.useRealTimers();
     });
 
-    it("is registered alongside linear-connector-watchdog.py in the scheduler config", () => {
-      // This test validates that index.ts registers the cron alongside the watchdog.
-      // The index.ts start() call for DoneTicketDetector should appear near the
-      // DispatchWatchdog.start() call, proving co-location in the scheduler.
-      //
-      // At the detector level, start() creates an unref'd setInterval just like
-      // the watchdog — proven by the timer registration test above.
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
+    it("exposes start/stop lifecycle for scheduler co-location", () => {
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
       expect(typeof detector.start).toBe("function");
       expect(typeof detector.stop).toBe("function");
     });
@@ -410,13 +426,11 @@ describe("DoneTicketDetector", () => {
 
   describe("AC11 — Liveness observability", () => {
     it("logs a startup confirmation when start() is called", () => {
-      // Spy on console.error (the logger uses console.error internally)
       const consoleSpy = jest.spyOn(console, "error").mockImplementation(() => {});
 
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
       detector.start();
 
-      // AC11: Startup log line must contain the script identity and configuration
       const logCalls = consoleSpy.mock.calls.map((c) => c.join(" "));
       const hasStartupLog = logCalls.some(
         (msg) =>
@@ -432,12 +446,12 @@ describe("DoneTicketDetector", () => {
     });
   });
 
-  // ── Integration: all ACs together ─────────────────────────────────────────
+  // ── Integration: mixed scenario ───────────────────────────────────────────
 
   describe("Integration — mixed scenario", () => {
-    it("processes a mix of found, missing, labeled, and unbranched tickets", async () => {
-      const onMain = makeIssue({ identifier: "AI-100" }); // found on main → no flag
-      const missing = makeIssue({ identifier: "AI-101" }); // not on main → flag
+    it("processes a mix of deployed, stalled, labeled, and unbranched tickets", async () => {
+      const deployed = makeIssue({ identifier: "AI-100" }); // live → no flag
+      const stalled = makeIssue({ identifier: "AI-101" }); // absent from deploy → flag
       const labeled = makeIssue({
         identifier: "AI-102",
         labels: ["needs-merge-verify"],
@@ -447,12 +461,12 @@ describe("DoneTicketDetector", () => {
         hasBranch: false,
       }); // no branch → skip
 
-      mockLinear.fetchDoneTickets.mockResolvedValueOnce([onMain, missing, labeled, noBranch]);
-      mockGit.ticketIdInMainLog.mockImplementation(async (ticketId: string) => {
-        return ticketId === "AI-100"; // only AI-100 is found on main
-      });
+      mockLinear.fetchDoneTickets.mockResolvedValueOnce([deployed, stalled, labeled, noBranch]);
+      mockDeploy.verify.mockImplementation(async ({ identifier }) =>
+        identifier === "AI-100" ? deployedVerdict() : stallVerdict(),
+      );
 
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
       const result = await detector.runCycle();
 
       expect(result.scanned).toBe(4);
@@ -465,29 +479,84 @@ describe("DoneTicketDetector", () => {
     });
   });
 
-  // ── Stop/start lifecycle ──────────────────────────────────────────────────
+  // ── INF-1099 regression: Done-but-not-deployed → STALL, end to end ────────
+
+  describe("INF-1099 regression — Done ≠ deployed via real verdict logic", () => {
+    it("a Done-labelled ticket whose fix is present on main but ABSENT from the deployed /health commit yields a STALL, not an all-clear", async () => {
+      // Real DeployVerdictApi wired to fake live signals: the hallmark is on
+      // origin/main but NOT in the deployed commit the running service reports.
+      const HALLMARK = "inf1099LiveHealthVerdict";
+      const DEPLOYED_COMMIT = "deadbee"; // an older commit missing the fix
+      const symbolPresentAt = (symbol: string, ref: string): CodePresence => {
+        if (symbol !== HALLMARK) return null;
+        if (ref === "origin/main") return true; // merged
+        if (ref === DEPLOYED_COMMIT) return false; // but not in the running artifact
+        return null;
+      };
+      const deploy = makeDeployVerdictApi({
+        symbolPresentAt,
+        fetchHealthCommit: async () => DEPLOYED_COMMIT,
+      });
+
+      const ticket = makeIssue({
+        identifier: "INF-1099",
+        labels: [`hallmark:${HALLMARK}`],
+      });
+      mockLinear.fetchDoneTickets.mockResolvedValueOnce([ticket]);
+
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy, config });
+      const result = await detector.runCycle();
+
+      expect(result.flagged).toBe(1); // STALL, NOT an all-clear
+      const body = mockLinear.postComment.mock.calls[0][1];
+      expect(body).toContain(DEPLOYED_COMMIT); // quotes the live running commit
+      expect(body).toContain(HALLMARK); // quotes the hallmark symbol
+      expect(body).toContain("Done ≠ deployed");
+    });
+
+    it("all-clear when the hallmark IS present in the deployed /health commit", async () => {
+      const HALLMARK = "inf1099LiveHealthVerdict";
+      const DEPLOYED_COMMIT = "cafef00";
+      const deploy = makeDeployVerdictApi({
+        symbolPresentAt: (symbol, ref) =>
+          symbol === HALLMARK && (ref === "origin/main" || ref === DEPLOYED_COMMIT) ? true : null,
+        fetchHealthCommit: async () => DEPLOYED_COMMIT,
+      });
+
+      const ticket = makeIssue({
+        identifier: "INF-1099b",
+        labels: [`hallmark:${HALLMARK}`],
+      });
+      mockLinear.fetchDoneTickets.mockResolvedValueOnce([ticket]);
+
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy, config });
+      const result = await detector.runCycle();
+
+      expect(result.flagged).toBe(0); // deployed → no flag
+      expect(mockLinear.postComment).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
 
   describe("Lifecycle", () => {
     it("is idempotent — calling start() twice does not double-register", () => {
       jest.useFakeTimers();
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
       detector.start();
       detector.start(); // second call should be no-op
 
-      // Only one interval should be set
       expect(jest.getTimerCount()).toBe(1);
-
       jest.useRealTimers();
     });
 
     it("stop() clears the timer", () => {
       jest.useFakeTimers();
-      detector = new DoneTicketDetector({ linear: mockLinear, git: mockGit, config });
+      detector = new DoneTicketDetector({ linear: mockLinear, deploy: mockDeploy, config });
       detector.start();
       detector.stop();
 
       expect(jest.getTimerCount()).toBe(0);
-
       jest.useRealTimers();
     });
   });
