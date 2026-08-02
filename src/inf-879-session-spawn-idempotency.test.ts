@@ -100,7 +100,11 @@ describe("INF-879 sessions_spawn task-key idempotency", () => {
       runtime: "codex",
       agentId: "tdd",
       sessionKey: "agent:tdd:linear-INF-879",
-      requestedAt: "2026-07-27T16:40:00.000Z",
+      // INF-1088: anchor the claim's timestamps to "now". This test asserts an
+      // *immediate* replay returns the still-live run; under the INF-1088 live-claim
+      // TTL a frozen (days-old) `updated_at` would correctly read as an expired
+      // corpse and re-spawn, so a live/fresh fixture must be stamped recently.
+      requestedAt: new Date(Date.now() - 2000).toISOString(),
     });
     expect(first).toMatchObject({ action: "start-new", existing: null });
 
@@ -108,7 +112,7 @@ describe("INF-879 sessions_spawn task-key idempotency", () => {
       runId: "run-native-1",
       sessionId: "session-native-1",
       state: "live" satisfies SessionSpawnRunState,
-      observedAt: "2026-07-27T16:40:01.000Z",
+      observedAt: new Date(Date.now() - 1000).toISOString(),
     });
 
     const replay = store.beginOrGetExisting({
@@ -117,7 +121,7 @@ describe("INF-879 sessions_spawn task-key idempotency", () => {
       runtime: "codex",
       agentId: "tdd",
       sessionKey: "agent:tdd:linear-INF-879",
-      requestedAt: "2026-07-27T16:40:02.000Z",
+      requestedAt: new Date().toISOString(),
     });
 
     expect(replay.action).toBe("return-existing");
