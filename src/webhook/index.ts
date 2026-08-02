@@ -56,16 +56,28 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" ? value as Record<string, unknown> : undefined;
 }
 
-function deriveWorkflowInstanceContextFromRoute(route: RouteResult, issueIdentifier: string): WorkflowInstanceContext {
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+export function deriveWorkflowInstanceContextFromRoute(route: RouteResult, issueIdentifier: string): WorkflowInstanceContext {
   const data = asRecord(route.event.data) ?? {};
   const sessionData = asRecord(data.agentSession);
   const issueData = asRecord(data.issue ?? sessionData?.issue ?? data) ?? {};
   const team = asRecord(issueData.team);
   const enrollment = asRecord(issueData.workflowEnrollment);
+  // INF-1089: normalized webhook events carry team context FLAT
+  // (`teamKey`/`teamId`, no nested `team` object; see extractIssueData in
+  // normalize.ts). Proxy-layer payloads nest it under `team`. Read the nested
+  // shape first, then fall back to the flat field, preferring whichever is
+  // populated. Empty strings (extractIssueData's absent-field sentinel) are
+  // treated as missing. Without this, teamKey/teamName came up undefined for
+  // webhook-path dispatch, so deriveWorkflowInstanceScope returned undefined
+  // for dept-engine/task and the routing-guard failed closed (INF-942).
   return {
     issueIdentifier,
-    teamKey: typeof team?.key === "string" ? team.key : undefined,
-    teamName: typeof team?.name === "string" ? team.name : undefined,
+    teamKey: nonEmptyString(team?.key) ?? nonEmptyString(issueData.teamKey),
+    teamName: nonEmptyString(team?.name) ?? nonEmptyString(issueData.teamName),
     workflowEnrollment: enrollment
       ? {
           department: typeof enrollment.department === "string" ? enrollment.department : undefined,
