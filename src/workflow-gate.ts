@@ -8182,20 +8182,33 @@ export async function setStateAtomic(
     }
     resolvedDelegateId = agent.linearUserId;
   } else {
-    // INF-979 (AC2): an omitted delegate arg normally means "leave delegate as-is",
-    // but a governed redispatch onto a state whose live Linear delegate is null is
-    // the NULL-DELEGATE husk (DSN-15/INF-961) — it draws no dispatch and stalls.
-    // Bootstrap-seat the singleton owner_role body from the workflow spec so the
-    // redispatch re-establishes ownership instead of re-writing null. Only fires
-    // when there is a hole to fill (live delegate null), the destination is a
-    // governed non-terminal state, and its role resolves to exactly one body.
-    if (issue.delegateId == null && def) {
+    // INF-979 (AC2): an omitted delegate arg normally means "leave delegate as-is".
+    // The one exception is a governed *redispatch that re-seats in place*
+    // (fromState === targetState) whose live Linear delegate is null — that is the
+    // NULL-DELEGATE husk (DSN-15/INF-961): it draws no dispatch and stalls. Only then
+    // do we bootstrap-seat the singleton owner_role body from the workflow spec so the
+    // redispatch re-establishes ownership instead of re-writing null.
+    //
+    // The fromState === targetState guard is the positive husk indicator (INF-979
+    // review): it separates a re-seat-in-place from a genuine state transition. Without
+    // it the block also fired on transitions that merely omit the delegate and carry a
+    // null live delegate — the escape→implementation re-open and migrate-state→ac-validate
+    // paths — seating a delegate there and regressing them. A redispatch does not change
+    // state; a re-open / migrate-state does.
+    //
+    // Fires only when there is a hole to fill (live delegate null), the move is a
+    // same-state redispatch, the destination is a governed non-terminal state, and its
+    // role resolves to exactly one body.
+    if (issue.delegateId == null && def && fromState != null && fromState === targetState) {
       const destNode = def.states.find((s) => s.id === targetState);
       const ownerRole = destNode?.owner_role;
       const isTerminal = destNode?.kind === "terminal" || !ownerRole;
       if (!isTerminal && ownerRole) {
         try {
-          const roleBodies = await resolveBodiesForRole(ownerRole);
+          // Scoped resolver against the already-loaded def — never a disk registry
+          // load, so a role-resolution failure is caught below and leaves the delegate
+          // untouched rather than propagating out and flipping result.ok (fail-open).
+          const roleBodies = await resolveBodiesForOwnerRole(ownerRole, def);
           if (roleBodies.length === 1) {
             const seat = getAgent(roleBodies[0]);
             if (seat?.linearUserId) {
