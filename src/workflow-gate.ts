@@ -5639,15 +5639,25 @@ export async function applyStateTransition(
     // inside the __retired__ handler below. Go straight to the retire target.
     toStateName = "__retired__";
     log.info(`workflow-gate: B2 apply: ${issueId} retiring — exiting workflow governance`);
-  } else if (intent === "handoff") {
+  } else if (intent === "handoff" || intent === "handoff-work") {
     // INF-124: handoff is a delegate-routing meta-command — self-loop, same state.
     // Skip state label swap; delegate resolution still runs below.
+    //
+    // INF-1035 (INF-905 fix #2): the CLI sends `handoff-work` as the intent for
+    // `linear handoff-work <id> <agent>`, but a workflow def declares the transition
+    // as `command: handoff` (self-loop). Without this alias, `handoff-work` fell
+    // through to normal resolution below, found no `handoff-work` command in the def,
+    // and returned `no-transition` — so no delegate write ever fired and the ticket
+    // was left ownerless (delegate nulled) and bounced. Normalize both intents onto
+    // the def's `handoff` self-loop so the delegate write persists. This also keeps
+    // an internal workflow-sourced ticket (e.g. carrying xfn:workflow) on the workflow
+    // rail instead of being treated as an ad-hoc/cross-functional request.
     if (!currentStateName) {
-      log.warn(`workflow-gate: B2 apply: handoff on ${issueId} has no state:* label — skipping`);
-      return { status: "failed", code: "no-state-label", detail: `handoff on ticket ${issueId} has no state:* label` };
+      log.warn(`workflow-gate: B2 apply: ${intent} on ${issueId} has no state:* label — skipping`);
+      return { status: "failed", code: "no-state-label", detail: `${intent} on ticket ${issueId} has no state:* label` };
     }
-    log.info(`workflow-gate: B2 apply: ${issueId} handoff self-loop at state '${currentStateName}'`);
-    matchedTransition = def.states.find((s) => s.id === currentStateName)?.transitions?.find((t) => t.command === intent);
+    log.info(`workflow-gate: B2 apply: ${issueId} ${intent} self-loop at state '${currentStateName}'`);
+    matchedTransition = def.states.find((s) => s.id === currentStateName)?.transitions?.find((t) => t.command === "handoff");
     toStateName = currentStateName;
   } else {
     // Normal transition resolution — no special handling needed.
