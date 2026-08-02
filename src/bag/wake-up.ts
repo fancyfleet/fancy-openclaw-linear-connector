@@ -19,7 +19,7 @@ import { loadUniversalCanon, formatCanonBlock, getActiveCanonVersion, type Canon
 import { normalizeSessionKey, stripRecoveryVersion } from "../session-key.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { randomUUID } from "node:crypto";
-import { TERMINAL_STOP_ROTATION_REASON, type SessionSpawnIdempotencyStore, type SessionSpawnRuntime } from "../store/session-spawn-idempotency-store.js";
+import { COMPLETED_STATUS_ROTATION_REASON, TERMINAL_STOP_ROTATION_REASON, type SessionSpawnIdempotencyStore, type SessionSpawnRuntime } from "../store/session-spawn-idempotency-store.js";
 import { probeBoundSessionTerminal } from "./stale-session-forensics.js";
 
 const log = componentLogger(createLogger(), "wakeup");
@@ -224,13 +224,13 @@ export async function sendWakeUpSignal(
     agentId,
     sessionKey: normalizedKey,
   });
-  // INF-1003: terminal-session rotation guard on the pending-bag re-dispatch
-  // path. Mirrors deliverToAgent — a bound session whose last transcript turn
-  // ended with `stopReason: stop` (codex-mirror-frozen) is not replayed (that is
-  // the LIF-338 C3 loop); we fall through to mint a fresh session and record the
-  // old→new rotation on the binding below. Terminal-ness comes from the live
-  // transcript, not the dispatch-lifecycle `state` column (which never carries
-  // `stop`), so the guard fires on the real signal here.
+  // INF-1003 / INF-1074: re-dispatch rotation guard on the pending-bag path.
+  // Mirrors deliverToAgent exactly — a bound session that produces no new turn on
+  // wake is not replayed (that is the LIF-338 / ENG-5 C3 loop); we fall through
+  // to mint a fresh session and record the old→new rotation below. Two "dead"
+  // signals fire it: the INF-1003 terminal transcript tail (`stopReason: end_turn`)
+  // and the INF-1074 lifecycle status (`status: "completed"` in the session index,
+  // regardless of tail). In-flight bindings hit neither and still replay.
   let rotation: { fromSessionId: string | null; reason: string } | undefined;
   if (idempotency?.action === "return-existing") {
     const hasConcreteLiveBinding = idempotency.record.state === "live" && !!idempotency.record.session_id;
@@ -244,21 +244,27 @@ export async function sendWakeUpSignal(
     const probe = probeBoundSessionTerminal(agentId, sessionKey, config.openclawHome);
     const boundSessionMatches =
       !idempotency.record.session_id || !probe.sessionId || probe.sessionId === idempotency.record.session_id;
-    if (!probe.terminal || !boundSessionMatches) {
+    const shouldRotate = boundSessionMatches && (probe.statusCompleted || probe.terminal);
+    if (!shouldRotate) {
       log.info(
         `sessions_spawn idempotent replay: wake ${sessionKey}/${taskKey} already has ` +
         `state=${idempotency.record.state} run=${idempotency.record.run_id ?? "pending"}`,
       );
       return { runId: idempotency.record.run_id ?? undefined, canonVersion: canonVersion ?? undefined };
     }
+    const reason = probe.statusCompleted
+      ? COMPLETED_STATUS_ROTATION_REASON
+      : TERMINAL_STOP_ROTATION_REASON;
     rotation = {
       fromSessionId: probe.sessionId ?? idempotency.record.session_id,
-      reason: TERMINAL_STOP_ROTATION_REASON,
+      reason,
     };
     log.info(
-      `INF-1003 terminal-session rotation: wake ${sessionKey}/${taskKey} bound session ` +
-      `${probe.sessionId ?? idempotency.record.session_id ?? "?"} is terminal ` +
-      `(stopReason=${probe.stopReason}) — minting a fresh session instead of replaying the dead transcript`,
+      `${probe.statusCompleted ? "INF-1074 completed-status" : "INF-1003 terminal-session"} rotation: ` +
+      `wake ${sessionKey}/${taskKey} bound session ` +
+      `${probe.sessionId ?? idempotency.record.session_id ?? "?"} is dead ` +
+      `(status=${probe.statusCompleted ? "completed" : "n/a"}, stopReason=${probe.stopReason}) — ` +
+      `minting a fresh session instead of replaying the dead transcript`,
     );
   }
 
