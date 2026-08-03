@@ -45,11 +45,23 @@ const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 export class DispatchAckTracker {
   private db: Database.Database;
   private ttlMs: number;
+  /**
+   * INF-1101: called whenever a ticket crosses the fresh-work-phase boundary —
+   * a genuine new dispatch (recordDispatch) or an explicit escalated-row re-arm
+   * (clearEscalated). Wired in index.ts to `globalRedispatchBudget.reset` so the
+   * per-ticket redispatch budget seal and the escalated ack row clear TOGETHER;
+   * clearing only one still silent-parks a legitimately re-dispatched ticket.
+   * The internal no-activity / watchdog / stale retry loops do NOT call
+   * recordDispatch (they use markResignaled + budget.consume), so a genuine loop
+   * with no real new work phase never triggers this and still seals at the cap.
+   */
+  private onFreshDispatch?: (ticketId: string) => void;
 
-  constructor(dbPath?: string, ttlMs?: number) {
+  constructor(dbPath?: string, ttlMs?: number, onFreshDispatch?: (ticketId: string) => void) {
     const resolvedPath =
       dbPath ?? path.join(process.env.DATA_DIR ?? path.join(process.cwd(), "data"), "dispatch-acks.db");
     this.ttlMs = ttlMs ?? DEFAULT_TTL_MS;
+    this.onFreshDispatch = onFreshDispatch;
     this.db = new Database(resolvedPath);
     this.db.pragma("journal_mode = WAL");
     this.migrate();
@@ -90,6 +102,14 @@ export class DispatchAckTracker {
    * If an entry already exists and is still pending/unconfirmed, updates
    * last_signal_at and increments attempt_count (idempotent re-signal tracking).
    * If it was previously acknowledged, resets to pending (re-delegation case).
+   *
+   * INF-1101: an `escalated` row is now ALSO re-armed to `pending` on a genuine
+   * new dispatch, with attempt_count and the delivery-failure streak reset to a
+   * fresh phase. Previously an escalated row survived a legitimate post-review
+   * re-dispatch untouched — invisible to the no-activity ladder (which only sees
+   * pending/unconfirmed) — so the ticket silently parked (INF-862/INF-761
+   * re-crossings). recordDispatch is the "new-dispatch identity" boundary, so it
+   * also fires onFreshDispatch to clear the sibling redispatch-budget seal.
    */
   recordDispatch(agentId: string, ticketId: string): void {
     const normalizedId = normalizeSessionKey(ticketId);
@@ -100,10 +120,15 @@ export class DispatchAckTracker {
          VALUES (?, ?, datetime('now'), datetime('now'), 'pending', 1)
          ON CONFLICT(agent_id, ticket_id) DO UPDATE SET
            last_signal_at = datetime('now'),
-           ack_status     = CASE WHEN ack_status = 'acknowledged' THEN 'pending' ELSE ack_status END,
-           attempt_count  = attempt_count + 1`,
+           dispatched_at  = CASE WHEN ack_status = 'escalated' THEN datetime('now') ELSE dispatched_at END,
+           ack_status     = CASE WHEN ack_status IN ('acknowledged', 'escalated') THEN 'pending' ELSE ack_status END,
+           attempt_count  = CASE WHEN ack_status = 'escalated' THEN 1 ELSE attempt_count + 1 END,
+           redispatch_failure_count = CASE WHEN ack_status = 'escalated' THEN 0 ELSE redispatch_failure_count END`,
       )
       .run(agentId, normalizedId);
+    // Fresh-work-phase boundary: clear the sibling redispatch-budget seal so a
+    // legitimately re-dispatched ticket gets its own budget again (INF-1101 AC1).
+    this.onFreshDispatch?.(normalizedId);
     log.info(`Dispatch recorded: ${agentId} [${normalizedId}]`);
     emitStreamTopic("fleet");
   }
@@ -423,6 +448,43 @@ export class DispatchAckTracker {
       )
       .run(agentId, normalizedId);
     log.error(`Dispatch escalated: ${agentId} [${normalizedId}] — max re-signals exceeded`);
+  }
+
+  /**
+   * INF-1101: re-arm an `escalated` dispatch row back to `pending` on a fresh
+   * work phase — the ack-tracker counterpart to `globalRedispatchBudget.reset`.
+   *
+   * A ticket that exhausted its redispatch budget pre-review is marked
+   * `escalated` (removed from the pending set so the no-activity detector stops
+   * looping). When it later re-enters a worker state via a legitimate
+   * post-review re-dispatch, the escalated row must clear or the ticket is seen
+   * as "already escalated, don't re-alert" and silently parks. Resets the phase
+   * clocks, attempt_count (fresh budget), and the delivery-failure streak, and
+   * fires onFreshDispatch so the sibling budget seal clears on the SAME
+   * boundary. Returns true iff a row was actually re-armed (was escalated).
+   *
+   * No-op for non-escalated rows, so a genuine loop that never re-enters a work
+   * phase is untouched and still seals + escalates exactly once (AC4).
+   */
+  clearEscalated(agentId: string, ticketId: string): boolean {
+    const normalizedId = normalizeSessionKey(ticketId);
+    const result = this.db
+      .prepare(
+        `UPDATE dispatch_acks
+         SET ack_status = 'pending',
+             dispatched_at = datetime('now'),
+             last_signal_at = datetime('now'),
+             attempt_count = 1,
+             redispatch_failure_count = 0
+         WHERE agent_id = ? AND ticket_id = ? AND ack_status = 'escalated'`,
+      )
+      .run(agentId, normalizedId);
+    if (result.changes > 0) {
+      this.onFreshDispatch?.(normalizedId);
+      log.info(`Escalated ack re-armed (fresh work phase): ${agentId} [${normalizedId}]`);
+      return true;
+    }
+    return false;
   }
 
   /**

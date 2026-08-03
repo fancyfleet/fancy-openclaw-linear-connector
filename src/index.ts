@@ -1132,6 +1132,12 @@ export function createApp(options?: CreateAppOptions) {
   // ── v1.2: Dispatch acknowledgment tracking + early no-activity detection ──
   const ackTracker = new DispatchAckTracker(
     options?.bagDbPath ? path.join(path.dirname(options.bagDbPath), "dispatch-acks.db") : undefined,
+    undefined,
+    // INF-1101: wire the never-called globalRedispatchBudget.reset() to the
+    // fresh-work-phase boundary. recordDispatch / clearEscalated fire this on a
+    // genuine new dispatch, clearing the per-ticket seal so a legitimate
+    // post-review re-dispatch is not silently parked at 3/3 (INF-862/INF-761).
+    (ticketId) => globalRedispatchBudget.reset(ticketId),
   );
 
   // ── AI-2008: acknowledged dispatch delivery + bounded retry + loud failure ──
