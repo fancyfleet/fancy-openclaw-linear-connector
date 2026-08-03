@@ -182,6 +182,15 @@ export class NoActivityDetector {
     const normalized = tryNormalizeSessionKey(ticketId);
     if (!normalized) return;
     this.deps.ackTracker.acknowledge(agentId, normalized);
+    // INF-1101: a proxy call is proof the agent actually started working this
+    // ticket — genuine forward progress. Re-arm the global re-dispatch budget so
+    // a LATER, independent stall gets a fresh attempt allowance instead of
+    // inheriting this ticket's lifetime-accumulated (and possibly exhausted)
+    // count. The budget is otherwise never reset (reset() existed but was never
+    // called), so once a ticket burned maxAttempts re-dispatches it escalated
+    // silently forever — even after real work resumed. reset() keys on the same
+    // normalized `linear-<TEAM>-<N>` id that consume() uses.
+    this.deps.globalRedispatchBudget?.reset(normalized);
   }
 
   private getAgentMaxConcurrentValue(agentId: string): number {

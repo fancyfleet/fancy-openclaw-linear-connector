@@ -35,6 +35,16 @@ export const TERMINAL_STOP_ROTATION_REASON = "terminal-stop";
  */
 export const COMPLETED_STATUS_ROTATION_REASON = "completed-status";
 
+/**
+ * INF-1101: canonical `rotation_reason` recorded when the re-dispatch guard
+ * rotates away from a HUSK bound session — one that produced zero assistant
+ * turns and is older than the husk age floor. This is the timed-out / C-UNK
+ * variant that has no transcript tail at all (so `terminal` is false) and never
+ * completed (so `statusCompleted` is false); the old guard replayed it forever.
+ * Read via `probeBoundSessionTerminal().husk`.
+ */
+export const HUSK_ROTATION_REASON = "husk-timeout";
+
 export interface SessionSpawnBeginInput {
   ticketId: string;
   taskKey: string;

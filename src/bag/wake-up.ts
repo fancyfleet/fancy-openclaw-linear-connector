@@ -19,7 +19,7 @@ import { loadUniversalCanon, formatCanonBlock, getActiveCanonVersion, type Canon
 import { normalizeSessionKey, stripRecoveryVersion } from "../session-key.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { randomUUID } from "node:crypto";
-import { COMPLETED_STATUS_ROTATION_REASON, TERMINAL_STOP_ROTATION_REASON, type SessionSpawnIdempotencyStore, type SessionSpawnRuntime } from "../store/session-spawn-idempotency-store.js";
+import { COMPLETED_STATUS_ROTATION_REASON, TERMINAL_STOP_ROTATION_REASON, HUSK_ROTATION_REASON, type SessionSpawnIdempotencyStore, type SessionSpawnRuntime } from "../store/session-spawn-idempotency-store.js";
 import { probeBoundSessionTerminal } from "./stale-session-forensics.js";
 
 const log = componentLogger(createLogger(), "wakeup");
@@ -244,7 +244,9 @@ export async function sendWakeUpSignal(
     const probe = probeBoundSessionTerminal(agentId, sessionKey, config.openclawHome);
     const boundSessionMatches =
       !idempotency.record.session_id || !probe.sessionId || probe.sessionId === idempotency.record.session_id;
-    const shouldRotate = boundSessionMatches && (probe.statusCompleted || probe.terminal);
+    // INF-1101: also rotate on a husk (0 assistant turns past the age floor) —
+    // the timed-out variant that fires neither statusCompleted nor terminal.
+    const shouldRotate = boundSessionMatches && (probe.statusCompleted || probe.terminal || probe.husk);
     if (!shouldRotate) {
       log.info(
         `sessions_spawn idempotent replay: wake ${sessionKey}/${taskKey} already has ` +
@@ -254,16 +256,18 @@ export async function sendWakeUpSignal(
     }
     const reason = probe.statusCompleted
       ? COMPLETED_STATUS_ROTATION_REASON
-      : TERMINAL_STOP_ROTATION_REASON;
+      : probe.terminal
+        ? TERMINAL_STOP_ROTATION_REASON
+        : HUSK_ROTATION_REASON;
     rotation = {
       fromSessionId: probe.sessionId ?? idempotency.record.session_id,
       reason,
     };
     log.info(
-      `${probe.statusCompleted ? "INF-1074 completed-status" : "INF-1003 terminal-session"} rotation: ` +
+      `${probe.statusCompleted ? "INF-1074 completed-status" : probe.terminal ? "INF-1003 terminal-session" : "INF-1101 husk-timeout"} rotation: ` +
       `wake ${sessionKey}/${taskKey} bound session ` +
       `${probe.sessionId ?? idempotency.record.session_id ?? "?"} is dead ` +
-      `(status=${probe.statusCompleted ? "completed" : "n/a"}, stopReason=${probe.stopReason}) — ` +
+      `(status=${probe.statusCompleted ? "completed" : "n/a"}, stopReason=${probe.stopReason}, husk=${probe.husk}) — ` +
       `minting a fresh session instead of replaying the dead transcript`,
     );
   }

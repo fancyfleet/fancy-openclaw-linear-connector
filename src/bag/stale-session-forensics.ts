@@ -339,7 +339,28 @@ export interface BoundSessionTerminalProbe {
    * while `statusCompleted` is true. The re-dispatch guard rotates on either.
    */
   statusCompleted: boolean;
+  /**
+   * INF-1101: true when the bound session is a HUSK — it was resolved in the
+   * live index but has produced ZERO assistant turns and is older than
+   * {@link HUSK_MIN_AGE_MS}. This is the timed-out / C-UNK variant that neither
+   * `terminal` (no `end_turn` tail — there is no tail at all) nor
+   * `statusCompleted` (it never completed) catches, so re-dispatch kept
+   * idempotently replaying the dead husk. Surfacing it lets the guard rotate.
+   * Conservative: a freshly-started 0-turn session (still spinning up) below the
+   * age threshold is NOT a husk, and an unknown start time is never a husk.
+   */
+  husk: boolean;
 }
+
+/**
+ * INF-1101: minimum age before a 0-assistant-turn bound session is treated as a
+ * husk worth rotating. Well above the seconds-to-low-minutes a healthy session
+ * takes to emit its first assistant turn (even one that immediately issues a
+ * long tool call has already produced that first turn), and below the 15-min
+ * no-activity re-dispatch window — so by the time re-dispatch consults this
+ * probe, a genuine husk is already past it while a live session never trips it.
+ */
+const HUSK_MIN_AGE_MS = 10 * 60 * 1000;
 
 /**
  * INF-1003: probe whether the per-ticket session currently bound to
@@ -363,7 +384,7 @@ export function probeBoundSessionTerminal(
   openclawHome: string = defaultOpenclawHome(),
 ): BoundSessionTerminalProbe {
   const entry = findSessionFile(agentId, sessionKey, openclawHome);
-  if (!entry) return { terminal: false, sessionId: null, stopReason: null, statusCompleted: false };
+  if (!entry) return { terminal: false, sessionId: null, stopReason: null, statusCompleted: false, husk: false };
 
   // INF-1074: the OpenClaw session index `status` column is the lifecycle
   // signal the INF-1003 terminal-tail probe never read. `status: "completed"`
@@ -373,8 +394,18 @@ export function probeBoundSessionTerminal(
   // the re-dispatch guard can rotate on it.
   const statusCompleted = entry.status === "completed";
 
-  const last = extractLastAssistantMessage(readSessionJsonl(entry.sessionFile));
-  if (!last) return { terminal: false, sessionId: entry.sessionId, stopReason: null, statusCompleted };
+  const events = readSessionJsonl(entry.sessionFile);
+
+  // INF-1101: husk = zero assistant turns AND older than the age floor. This is
+  // the timed-out variant that produced no tail at all, so neither `terminal`
+  // nor `statusCompleted` fires and re-dispatch replays it forever. Age-gated so
+  // a still-spinning-up fresh session is never rotated; unknown start = not husk.
+  const ageMs =
+    typeof entry.sessionStartedAt === "number" ? Date.now() - entry.sessionStartedAt : null;
+  const husk = countAssistantTurns(events) === 0 && ageMs !== null && ageMs > HUSK_MIN_AGE_MS;
+
+  const last = extractLastAssistantMessage(events);
+  if (!last) return { terminal: false, sessionId: entry.sessionId, stopReason: null, statusCompleted, husk };
 
   // `stop`/`end_turn` normalize to "end_turn" — a cleanly-ended turn with no
   // pending tool call, i.e. the frozen tail that produces nothing on re-wake.
@@ -385,6 +416,7 @@ export function probeBoundSessionTerminal(
     sessionId: entry.sessionId,
     stopReason: last.stopReason,
     statusCompleted,
+    husk,
   };
 }
 

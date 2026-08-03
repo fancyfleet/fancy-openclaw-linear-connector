@@ -1418,6 +1418,27 @@ export function createApp(options?: CreateAppOptions) {
   );
   noActivityDetector.start();
 
+  // ── INF-1101: session-spawn claim sweeper ────────────────────────────
+  // The idempotency store's sweepExpiredClaims()/release() existed but nothing
+  // ran them in prod, so a live claim only expired lazily on the NEXT dispatch
+  // for that (ticket, task) — and until then re-dispatch treated the seat as
+  // occupied. Run the sweep on a fixed cadence so expired live/pending claims
+  // (past LIVE_CLAIM_TTL_MS) are proactively terminalized and the seat frees on
+  // its own. unref() so it never holds the process open; try/catch so a sweep
+  // error can never crash the server loop.
+  const SESSION_SPAWN_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+  const sessionSpawnSweepTimer = setInterval(() => {
+    try {
+      const { released } = sessionSpawnStore.sweepExpiredClaims();
+      if (released > 0) {
+        log.info(`session-spawn claim sweep: terminalized ${released} expired live/pending claim(s)`);
+      }
+    } catch (err) {
+      log.warn(`session-spawn claim sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, SESSION_SPAWN_SWEEP_INTERVAL_MS);
+  sessionSpawnSweepTimer.unref();
+
   // ── Stuck-delegate detector (AI-1578 / AI-1451) ──────────────────────
   // Re-prompts delegates who posted a completion comment but never ran the
   // transition verb — the connector-native signal for "work landed but the

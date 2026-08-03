@@ -12,6 +12,7 @@ import type { DispatchInFlightStore } from "../store/dispatch-inflight-store.js"
 import {
   COMPLETED_STATUS_ROTATION_REASON,
   TERMINAL_STOP_ROTATION_REASON,
+  HUSK_ROTATION_REASON,
   type SessionSpawnIdempotencyStore,
   type SessionSpawnRunRecord,
   type SessionSpawnRuntime,
@@ -248,7 +249,11 @@ export async function deliverToAgent(
     // INF-1003 tail signal when both fire — it is the stronger "this session is
     // done" statement, and AC1 requires it to rotate "regardless of the tail's
     // stopReason".
-    const shouldRotate = boundSessionMatches && (probe.statusCompleted || probe.terminal);
+    // INF-1074: completed-status takes precedence over the INF-1003 tail signal.
+    // INF-1101: husk (0 assistant turns past the age floor) is the timed-out
+    // variant that fires neither of those, so re-dispatch replayed the dead husk
+    // forever — rotate on it too.
+    const shouldRotate = boundSessionMatches && (probe.statusCompleted || probe.terminal || probe.husk);
     if (!shouldRotate) {
       log.info(
         `sessions_spawn idempotent replay: ${route.sessionKey}/${taskKey} already has ` +
@@ -264,16 +269,18 @@ export async function deliverToAgent(
     }
     const reason = probe.statusCompleted
       ? COMPLETED_STATUS_ROTATION_REASON
-      : TERMINAL_STOP_ROTATION_REASON;
+      : probe.terminal
+        ? TERMINAL_STOP_ROTATION_REASON
+        : HUSK_ROTATION_REASON;
     rotation = {
       fromSessionId: probe.sessionId ?? idempotency.record.session_id,
       reason,
     };
     log.info(
-      `${probe.statusCompleted ? "INF-1074 completed-status" : "INF-1003 terminal-session"} rotation: ` +
+      `${probe.statusCompleted ? "INF-1074 completed-status" : probe.terminal ? "INF-1003 terminal-session" : "INF-1101 husk-timeout"} rotation: ` +
       `${route.sessionKey}/${taskKey} bound session ` +
       `${probe.sessionId ?? idempotency.record.session_id ?? "?"} is dead ` +
-      `(status=${probe.statusCompleted ? "completed" : "n/a"}, stopReason=${probe.stopReason}) — ` +
+      `(status=${probe.statusCompleted ? "completed" : "n/a"}, stopReason=${probe.stopReason}, husk=${probe.husk}) — ` +
       `minting a fresh session instead of replaying the dead transcript`,
     );
   }
