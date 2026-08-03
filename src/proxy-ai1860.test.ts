@@ -250,8 +250,28 @@ function makeMutableFetch(initial: { state: string; delegate: string | null }): 
   setWithIdsState: (state: string) => void;
 } {
   let currentContext = contextFor(initial.state, initial.delegate);
+  let currentState = initial.state;
   let withIdsState = initial.state;
   const calls: Array<{ query: string; variables: Record<string, unknown> }> = [];
+
+  // INF-1147: the atomic transition write is the sole carrier of the
+  // {delegate + state:* + native} tuple — the proxy no longer pre-writes the
+  // delegate into the forwarded mutation for generic:continue verbs. Model
+  // that faithfully: ApplyAtomicTransition persists the tuple so the following
+  // VerifyTransitionWrite read-back reflects it (previously the mock only moved
+  // via setContext, so res1's own atomic write always read the stale source
+  // state and "failed" verification — a failure the old proxy swallowed).
+  const nativeStateIdFor = (state: string): string => {
+    switch (state) {
+      case "implementation": return "s-doing";
+      case "done": return "s-done";
+      default: return "s-todo"; // intake, ac-validate
+    }
+  };
+  const labelIdToState = (labelId: string): string | undefined => {
+    const node = TEAM_LABELS.data.team.labels.nodes.find((l) => l.id === labelId);
+    return node ? node.name.replace(/^state:/, "") : undefined;
+  };
 
   const mockFetch: typeof globalThis.fetch = async (url, init) => {
     if (typeof url !== "string" || !url.includes("api.linear.app")) {
@@ -287,9 +307,21 @@ function makeMutableFetch(initial: { state: string; delegate: string | null }): 
     }
     if (q.includes("VerifyTransitionWrite")) {
       const ctx = currentContext as { data: { issue: { labels: unknown; delegate: unknown } } };
-      return json({ data: { issue: { labels: ctx.data.issue.labels, delegate: ctx.data.issue.delegate, state: { id: "s-doing" } } } });
+      return json({ data: { issue: { labels: ctx.data.issue.labels, delegate: ctx.data.issue.delegate, state: { id: nativeStateIdFor(currentState) } } } });
     }
     if (q.includes("ApplyAtomicTransition")) {
+      // Persist the written tuple so the read-after-write verification sees it.
+      const vars = (parsed.variables ?? {}) as { labelIds?: string[]; delegateId?: string | null };
+      const labelIds = Array.isArray(vars.labelIds) ? vars.labelIds : [];
+      const nextState = labelIds.map(labelIdToState).find((s): s is string => Boolean(s));
+      if (nextState) {
+        currentState = nextState;
+        withIdsState = nextState;
+      }
+      const nextDelegate = vars.delegateId === undefined
+        ? ((currentContext as { data: { issue: { delegate: { id: string } | null } } }).data.issue.delegate?.id ?? null)
+        : vars.delegateId;
+      currentContext = contextFor(currentState, nextDelegate);
       return json({ data: { issueUpdate: { success: true } } });
     }
     // Any forwarded mutation (commentCreate / issueUpdate) succeeds.
@@ -299,7 +331,7 @@ function makeMutableFetch(initial: { state: string; delegate: string | null }): 
   return {
     fetch: mockFetch,
     calls,
-    setContext: (state, delegate) => { currentContext = contextFor(state, delegate); },
+    setContext: (state, delegate) => { currentContext = contextFor(state, delegate); currentState = state; },
     setWithIdsState: (state) => { withIdsState = state; },
   };
 }

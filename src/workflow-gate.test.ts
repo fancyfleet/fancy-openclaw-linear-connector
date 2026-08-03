@@ -7042,10 +7042,13 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
         );
       }
 
-      // Issue description (for AC capture)
+      // Issue description (for AC capture). INF-1147 (T2): the accept transition
+      // gates on a capturable AC of record, so this conformance fixture — which
+      // exercises native-state writes, not AC capture — supplies a valid
+      // Acceptance Criteria section so `accept` captures and proceeds.
       if (q.includes("IssueDescription")) {
         return new Response(
-          JSON.stringify({ data: { issue: { description: "" } } }),
+          JSON.stringify({ data: { issue: { description: "## Acceptance Criteria\n\n- Conformance-walk AC of record." } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
@@ -8403,15 +8406,24 @@ describe("AI-1776: H-7 fail-visible — warning comment on null AC capture", () 
     expect(body).toMatch(/header|no.*AC|acceptance.*criteria/i);
   });
 
-  it("AC2: transition still completes (ApplyAtomicTransition fires) when AC header is absent (AI-1776)", async () => {
+  it("AC2/INF-1147 T2: transition is BLOCKED (no ApplyAtomicTransition) when AC header is absent and no prior record", async () => {
     const { fetch: mock, calls } = makeAc2Fetch({
       description: "No AC header anywhere in here.",
     });
     globalThis.fetch = mock;
 
-    await applyStateTransition("accept", "AI-1776", "Bearer tok");
+    // INF-1147 (T2) supersedes AI-1776's original "signal, not gate" stance: a
+    // missing AC of record at accept is now an explicit, repairable DECLINE — the
+    // forward transition must not advance a task into write-tests with no AC of
+    // record (the INF-1143 defect where sign-off is judged against a paraphrase).
+    // The warning comment is still posted (asserted by the two tests above); what
+    // changes is that the atomic transition write no longer fires. Repair path:
+    // the recapture verb captures the AC once an Acceptance Criteria section exists.
+    const result = await applyStateTransition("accept", "AI-1776", "Bearer tok");
 
-    expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(true);
+    expect(result.status).toBe("blocked");
+    expect(result.code).toBe("ac-of-record-missing");
+    expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(false);
   });
 
   it("AC2: posts a warning comment when description fetch fails (AI-1776)", async () => {

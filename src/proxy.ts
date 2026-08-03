@@ -1414,6 +1414,15 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // applyStateTransition call further down, which is outside that block.
       let delegateOverride: string | null | undefined;
 
+      // INF-1147: true when the matched transition is a governed dev-impl forward
+      // transition tagged `generic: continue` (i.e. `submit` / `continue-workflow`).
+      // For these, the atomic transition write in applyStateTransition is the SOLE
+      // carrier of the {delegate + state:* + native state} tuple — the forwarded
+      // placeholder mutation must NOT carry a pre-atomic delegate write, and a
+      // failed atomic write must surface as an explicit decline (no false success
+      // data payload).
+      let genericContinueForward = false;
+
       // AI-1498: snapshot the pre-forward workflow state for applyStateTransition.
       // Fail-open: on any fetch error leave it undefined and let applyStateTransition
       // fall back to the ticket's current state:* label (legacy behavior).
@@ -1584,6 +1593,14 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
                     (t) => t.command === effectiveIntent,
                   );
                   if (matchedTransition) {
+                    // INF-1147: a governed dev-impl forward transition tagged
+                    // `generic: continue` (i.e. `submit`/`continue-workflow`) is
+                    // all-or-nothing at the atomic transition write — the forwarded
+                    // placeholder mutation must NOT carry a pre-atomic delegate/state
+                    // write, and a failed atomic write must decline loudly (see the
+                    // response construction below). Flag it independently of delegate
+                    // resolution so the loud-decline covers every failure mode.
+                    genericContinueForward = matchedTransition.generic === 'continue';
                     const resolved = await resolveTransitionDelegate(
                       matchedTransition.to,
                       matchedTransition,
@@ -1593,14 +1610,35 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
                     );
                     if (resolved !== undefined) {
                       delegateOverride = resolved;
-                      // Inject into the forwarded mutation's input.
-                      const input = issueUpdateInput(body);
-                      if (input) {
-                        input.delegateId = resolved;
-                        input.assigneeId = null;
+                      if (genericContinueForward) {
+                        // The atomic transition write is the sole carrier of the
+                        // {delegate + state:* + native state} tuple. Injecting the
+                        // delegate into the forwarded placeholder mutation created a
+                        // pre-atomic delegate write that could land while the paired
+                        // state write was declined — the split-brain (delegate
+                        // advanced / state stuck) this ticket exists to kill. Keep
+                        // delegateOverride (it drives the atomic write) but do NOT
+                        // inject; defensively strip any delegate/assignee the caller's
+                        // own placeholder mutation carried so the forward can never
+                        // write half the tuple ahead of the atomic write.
+                        const input = issueUpdateInput(body);
+                        if (input && ("delegateId" in input || "assigneeId" in input)) {
+                          delete input.delegateId;
+                          delete input.assigneeId;
+                        }
                         log.info(
-                          `delegate-pre-resolve agent=${agentId} intent=${effectiveIntent}${ticketCtx}: injected delegateId=${resolved} and assigneeId:null into forwarded mutation`,
+                          `delegate-pre-resolve agent=${agentId} intent=${effectiveIntent}${ticketCtx}: resolved delegate=${resolved} for atomic transition write only — NOT injected into forward (INF-1147 generic:continue)`,
                         );
+                      } else {
+                        // Inject into the forwarded mutation's input.
+                        const input = issueUpdateInput(body);
+                        if (input) {
+                          input.delegateId = resolved;
+                          input.assigneeId = null;
+                          log.info(
+                            `delegate-pre-resolve agent=${agentId} intent=${effectiveIntent}${ticketCtx}: injected delegateId=${resolved} and assigneeId:null into forwarded mutation`,
+                          );
+                        }
                       }
                     }
                   }
@@ -1874,6 +1912,37 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           transitionResult !== null &&
           transitionResult.code !== "ad-hoc" &&
           transitionResult.code !== "no-issue-id";
+
+        // INF-1147: a FAILED governed dev-impl forward transition (generic:continue)
+        // must decline loudly. The forwarded placeholder mutation may have returned
+        // `data.issueUpdate.success: true`, but the transition tuple did NOT land —
+        // returning that success payload beside `_workflowTransition.status: "failed"`
+        // is the false-success the AC forbids. Replace the body with an explicit
+        // GraphQL error envelope (no `data`), carrying the decline reason. The
+        // atomic write is all-or-nothing, so no split-brain delegate/state was
+        // written; do NOT emit the misleading "no state was changed" phrasing.
+        if (
+          attachTransition &&
+          genericContinueForward &&
+          transitionResult &&
+          transitionResult.status === "failed"
+        ) {
+          const detail = transitionResult.detail
+            ? `: ${transitionResult.detail}`
+            : "";
+          const message =
+            `Governed transition ${transitionResult.from ?? "?"} → ${transitionResult.to ?? "?"} ` +
+            `could not be applied atomically${detail}. The delegate and state:* label were not advanced.`;
+          res
+            .status(upstreamRes.status)
+            .set("Content-Type", "application/json")
+            .send(JSON.stringify({
+              errors: [{ message, extensions: { code: transitionResult.code ?? "transition-write-failed" } }],
+              _workflowTransition: transitionResult,
+              ...(workflowReminder ? { _workflowReminder: workflowReminder } : {}),
+            }));
+          return;
+        }
 
         if (workflowReminder || attachTransition) {
           try {
