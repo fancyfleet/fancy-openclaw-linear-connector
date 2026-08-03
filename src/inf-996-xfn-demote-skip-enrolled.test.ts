@@ -23,6 +23,8 @@
  *   the same non-steward agent IS still demoted to Backlog with the xfn labels.
  * - INF-1065: a workflow enrollment/resume write that adds `wf:*` in the same
  *   mutation is NOT demoted before the workflow labels can persist.
+ * - INF-1111: a workflow-sourced `xfn:workflow` ticket that temporarily lacks
+ *   `wf:*` is NOT re-demoted back to Backlog.
  */
 
 import fs from "node:fs";
@@ -116,13 +118,14 @@ function inputOf(call: GraphQLCall): Record<string, unknown> {
 }
 
 /**
- * `enrolled` controls the IssueContext labels:
- *  - true:  the ticket carries `wf:chore` (already enrolled in a workflow)
- *  - false: a plain cross-functional injection, no `wf:*` label
+ * `enrolled` / `workflowSourced` control the IssueContext labels:
+ *  - enrolled: the ticket carries `wf:chore` (already enrolled in a workflow)
+ *  - workflowSourced: the ticket lacks `wf:*` but carries `xfn:workflow`
+ *  - neither: a plain cross-functional injection
  * The issue sits in an active state (`Doing`) in both cases — the write target is also
  * active, so the demote would fire if not exempted.
  */
-function makeLinearFetch(opts: { enrolled?: boolean } = {}): { fetch: typeof globalThis.fetch; calls: GraphQLCall[] } {
+function makeLinearFetch(opts: { enrolled?: boolean; workflowSourced?: boolean } = {}): { fetch: typeof globalThis.fetch; calls: GraphQLCall[] } {
   const calls: GraphQLCall[] = [];
 
   const fetchMock: typeof globalThis.fetch = async (url, init) => {
@@ -146,6 +149,8 @@ function makeLinearFetch(opts: { enrolled?: boolean } = {}): { fetch: typeof glo
             labels: {
               nodes: opts.enrolled
                 ? [{ id: "lbl-wf-chore", name: "wf:chore" }, { id: "lbl-state-impl", name: "state:implementation" }]
+                : opts.workflowSourced
+                  ? [{ id: "lbl-cross-functional", name: "cross-functional-request" }, { id: "lbl-xfn-workflow", name: "xfn:workflow" }]
                 : [],
             },
             delegate: { id: "u-igor", name: "Igor (dev)" },
@@ -180,6 +185,7 @@ function makeLinearFetch(opts: { enrolled?: boolean } = {}): { fetch: typeof glo
                 { id: "lbl-cross-functional", name: "cross-functional-request" },
                 { id: "lbl-xfn-design", name: "xfn:design" },
                 { id: "lbl-xfn-dev", name: "xfn:dev" },
+                { id: "lbl-xfn-workflow", name: "xfn:workflow" },
                 { id: "lbl-wf-chore", name: "wf:chore" },
                 { id: "lbl-wf-task", name: "wf:task" },
                 { id: "lbl-state-doing", name: "state:doing" },
@@ -308,6 +314,37 @@ describe("INF-996 — xfn-demote skips tickets already enrolled in a workflow", 
     expect(updateInput.stateId).toBe("s-doing");
     expect(updateInput.delegateId).toBe("u-igor");
     expect(updateInput.labelIds as string[]).toEqual(["lbl-wf-task", "lbl-state-doing"]);
+    expect(mock.calls.some((c) => c.query.includes("commentCreate"))).toBe(false);
+  });
+
+  it("INF-1111: xfn:workflow without wf:* is still workflow-sourced and is NOT re-demoted", async () => {
+    const mock = makeLinearFetch({ workflowSourced: true });
+    boot(mock.fetch);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer tok-igor")
+      .set("X-Openclaw-Agent", "igor")
+      .set("Content-Type", "application/json")
+      .send({
+        query: `mutation ManageWorkflowWake($id: String!, $input: IssueUpdateInput!) {
+          issueUpdate(id: $id, input: $input) { success issue { id identifier } }
+        }`,
+        variables: {
+          id: "issue-uuid",
+          input: { stateId: "s-doing", delegateId: "u-igor" },
+        },
+        operationName: "ManageWorkflowWake",
+      });
+
+    expect(res.body.errors).toBeUndefined();
+
+    const update = mock.calls.find((c) => c.query.includes("issueUpdate"));
+    expect(update).toBeDefined();
+    const updateInput = inputOf(update!);
+    expect(updateInput.stateId).toBe("s-doing");
+    expect(updateInput.delegateId).toBe("u-igor");
+    expect(updateInput.labelIds).toBeUndefined();
     expect(mock.calls.some((c) => c.query.includes("commentCreate"))).toBe(false);
   });
 

@@ -391,7 +391,12 @@ async function fetchTeamLabels(teamId: string, authToken: string): Promise<TeamL
   return data.data?.team?.labels?.nodes ?? [];
 }
 
-async function inputAddsWorkflowLabel(input: Record<string, unknown>, teamId: string, authToken: string): Promise<boolean> {
+async function inputAddsLabelMatching(
+  input: Record<string, unknown>,
+  teamId: string,
+  authToken: string,
+  matches: (labelName: string) => boolean,
+): Promise<boolean> {
   const inputLabelIds = Array.isArray(input.labelIds)
     ? input.labelIds.filter((id): id is string => typeof id === "string")
     : [];
@@ -399,7 +404,11 @@ async function inputAddsWorkflowLabel(input: Record<string, unknown>, teamId: st
 
   const wanted = new Set(inputLabelIds);
   const labels = await fetchTeamLabels(teamId, authToken);
-  return labels.some((label) => wanted.has(label.id) && /^wf:/i.test(label.name));
+  return labels.some((label) => wanted.has(label.id) && matches(label.name));
+}
+
+async function inputAddsWorkflowMarker(input: Record<string, unknown>, teamId: string, authToken: string): Promise<boolean> {
+  return inputAddsLabelMatching(input, teamId, authToken, (name) => /^wf:/i.test(name) || /^xfn:workflow$/i.test(name));
 }
 
 async function requesterDimension(agentId: string): Promise<string> {
@@ -490,7 +499,14 @@ async function maybeDemoteCrossFunctionalRequest(
   // un-triaged cross-functional request. INF-1065 extends that to enrollment/resume
   // writes that add the `wf:*` label in the same mutation; otherwise the demoter can
   // park a paused sprint-spawner resume before the workflow labels persist.
-  if (issueCtx?.labelNames?.some((n) => /^wf:/i.test(n)) || await inputAddsWorkflowLabel(input, teamId, authToken)) {
+  //
+  // INF-1111: `xfn:workflow` is also a workflow-origin marker. Reconciliation and
+  // escape paths can temporarily leave a workflow-sourced ticket without `wf:*`;
+  // treating that as ad-hoc re-applies the xfn labels and parks it back in Backlog.
+  if (
+    issueCtx?.labelNames?.some((n) => /^wf:/i.test(n) || /^xfn:workflow$/i.test(n)) ||
+    await inputAddsWorkflowMarker(input, teamId, authToken)
+  ) {
     return null;
   }
 
