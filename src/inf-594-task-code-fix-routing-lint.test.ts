@@ -86,6 +86,25 @@ states:
     native_state: done
 `;
 
+// INF-1164: wf:chore is the replacement track for the deprecated wf:task. A
+// non-code request that used to enroll at wf:task now redirects here.
+const CHORE_YAML = `
+id: chore
+version: 1
+entry_state: intake
+states:
+  - id: intake
+    owner_role: steward
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: continue-workflow
+        to: done
+  - id: done
+    kind: terminal
+    native_state: done
+`;
+
 const POLICY_YAML = `
 capabilities:
   - id: linear:transition
@@ -125,6 +144,7 @@ const ISSUE_INTERNAL_ID = "issue-internal-uuid-594";
 const TEAM_ID = "team-uuid-inf";
 const WF_TASK_LABEL_ID = "label-wf-task-id";
 const WF_DEV_IMPL_LABEL_ID = "label-wf-dev-impl-id";
+const WF_CHORE_LABEL_ID = "label-wf-chore-id";
 const STATE_DOING_LABEL_ID = "label-state-doing-id";
 const STATE_INTAKE_LABEL_ID = "label-state-intake-id";
 const CREATOR_USER_ID = "creator-linear-user-id";
@@ -140,6 +160,7 @@ function installFetch(opts: { mutationSuccess?: boolean } = {}): void {
     { id: STATE_INTAKE_LABEL_ID, name: "state:intake" },
     { id: WF_TASK_LABEL_ID, name: "wf:task" },
     { id: WF_DEV_IMPL_LABEL_ID, name: "wf:dev-impl" },
+    { id: WF_CHORE_LABEL_ID, name: "wf:chore" },
   ];
 
   globalThis.fetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
@@ -208,6 +229,7 @@ beforeAll(async () => {
   await fs.mkdir(defsDir);
   await fs.writeFile(path.join(defsDir, "task.yaml"), TASK_YAML);
   await fs.writeFile(path.join(defsDir, "dev-impl.yaml"), DEV_IMPL_YAML);
+  await fs.writeFile(path.join(defsDir, "chore.yaml"), CHORE_YAML);
   const policyFile = path.join(tmpDir, "policy.yaml");
   await fs.writeFile(policyFile, POLICY_YAML);
   const agentsFile = path.join(tmpDir, "agents.json");
@@ -288,8 +310,12 @@ describe("INF-594 AC1–AC3 (post-INF-1023): PR/branch-bearing `task` intake is 
 
 // ── AC4: clean `task` ticket → no redirect, no advisory ─────────────────────
 
-describe("INF-594 AC4: a non-code `task` ticket stays on `task` and is not nagged", () => {
-  it("does NOT redirect or comment when there is no code signal", async () => {
+describe("INF-594 AC4 (superseded by INF-1164): a non-code `task` ticket redirects to `chore`, not nagged", () => {
+  it("redirects to chore (no dev-impl code-signal nag) when there is no code signal", async () => {
+    // INF-594 originally left a clean non-code task ticket on `task` with no
+    // advisory. INF-1164 deprecates wf:task and redirects ALL new enrollment to
+    // wf:chore; because there is no code signal the dev-impl guardrail does not
+    // fire and there is no advisory comment — only the silent chore redirect.
     installFetch();
     const issue = makeIssue({
       workflowLabelId: WF_TASK_LABEL_ID,
@@ -301,7 +327,7 @@ describe("INF-594 AC4: a non-code `task` ticket stays on `task` and is not nagge
     const result = await applyBootstrapToIssue(issue, "test-token");
 
     expect(result?.action).toBe("bootstrapped");
-    expect(result?.workflowId).toBe("task");
+    expect(result?.workflowId).toBe("chore");
     expect(advisoryComment()).toBeUndefined();
   });
 });
