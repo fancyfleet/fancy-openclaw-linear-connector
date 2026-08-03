@@ -82,6 +82,11 @@ describe("INF-860: deployed /health required cron liveness honesty", () => {
     reloadAgents();
     resetCronRegistryForTest();
     appState = createApp({
+      // INF-1091: pin bootedAt 2h ago so these required-cron liveness
+      // assertions exercise the steady-state /health gate (a process up well
+      // past the boot-grace window), not the fresh-boot grace path. Stale
+      // required crons must still degrade health once grace has elapsed.
+      bootedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
       bagDbPath: path.join(dir, "pending-bag.db"),
       agentQueueDbPath: path.join(dir, "agent-queue.db"),
       operationalEventsDbPath: path.join(dir, "operational-events.db"),

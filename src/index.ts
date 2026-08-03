@@ -76,7 +76,7 @@ import { SessionSpawnIdempotencyStore } from "./store/session-spawn-idempotency-
 import { ProposalStore } from "./store/proposal-store.js";
 import { clearAcRecordStore } from "./ac-record-store.js";
 import { getCronStalenessMultiplierFromEnv, getRegisteredCrons, getStaleCrons } from "./cron/registry.js";
-import { evaluateCronStartupReadiness, parseCronStartupGraceMs } from "./cron/startup-readiness.js";
+import { evaluateCronStartupReadiness, isCronWithinBootGrace, parseCronStartupGraceMs } from "./cron/startup-readiness.js";
 import { buildRequiredCronHealth, getRequiredCronRetirements, isRequiredCron } from "./cron/required-crons.js";
 import { getRescueSweepState } from "./rescue-sweep-state.js";
 import { getDetectorState } from "./done-ticket-detector-state.js";
@@ -311,6 +311,13 @@ export interface CreateAppOptions {
   sendWakeUp?: (agentId: string, ticketIds: string[]) => Promise<void>;
   /** Override DeadLetterQueueStore database path (for testing). */
   deadLetterQueueDbPath?: string;
+  /**
+   * Override process boot time (for testing). Drives the /health cron
+   * boot-grace window (INF-1091): a persisted-stale cron is graced from the
+   * critical-stale 503 gate until max(intervalMs, bootGraceMs) after this
+   * instant. Defaults to now.
+   */
+  bootedAt?: Date;
 }
 
 function bindReturnedCloseMethods<T extends Record<string, unknown>>(created: T): T {
@@ -330,7 +337,7 @@ export function createApp(options?: CreateAppOptions) {
   clearAcRecordStore();
   const app = express();
   app.set("trust proxy", true);
-  const bootedAt = new Date();
+  const bootedAt = options?.bootedAt ?? new Date();
   const governedXfnReseat = {
     reseatEndpointMounted: false,
     demoteGuardActive: false,
@@ -493,14 +500,16 @@ export function createApp(options?: CreateAppOptions) {
     const activeCronsForReadiness = crons.filter((cron) => {
       return !(isRequiredCron(cron.name) && requiredCronRetirements.has(cron.name));
     });
+    const now = new Date();
+    const bootGraceMs = parseCronStartupGraceMs(process.env.CRON_STARTUP_GRACE_MS);
     const cronReadiness = evaluateCronStartupReadiness({
       crons: activeCronsForReadiness,
       bootedAt,
-      now: new Date(),
-      bootGraceMs: parseCronStartupGraceMs(process.env.CRON_STARTUP_GRACE_MS),
+      now,
+      bootGraceMs,
       log,
     });
-    const staleCrons = getStaleCrons({ stalenessMultiplier: getCronStalenessMultiplierFromEnv() });
+    const staleCrons = getStaleCrons({ now, stalenessMultiplier: getCronStalenessMultiplierFromEnv() });
     const requiredCrons = buildRequiredCronHealth({
       crons,
       staleCrons,
@@ -508,6 +517,26 @@ export function createApp(options?: CreateAppOptions) {
     });
     const criticalStaleCrons = staleCrons
       .filter((cron) => {
+        // INF-1091: a cron whose staleness is measured against a persisted,
+        // pre-boot lastRunAt has not had a chance to run since this process
+        // booted. Give it the same boot grace the never-run path (startup
+        // readiness) already has, so a >24h cold restart does not serve 503
+        // from boot until the first sweep — the deploy-pipeline deadlock. The
+        // cron still appears in staleCrons/requiredCrons reporting; only the
+        // 503 gate is suppressed during the grace window. Applied before the
+        // required/threshold branches so it covers required crons too, exactly
+        // as the never-run grace does.
+        if (
+          isCronWithinBootGrace({
+            lastRunAt: cron.lastRunAt,
+            intervalMs: cron.intervalMs,
+            bootedAt,
+            now,
+            bootGraceMs,
+          })
+        ) {
+          return false;
+        }
         if (isRequiredCron(cron.name)) {
           return !requiredCronRetirements.has(cron.name);
         }

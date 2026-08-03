@@ -137,6 +137,12 @@ describe("health endpoint — empty-roster guard (AI-1767)", () => {
       bagDbPath: path.join(dir, "pending-bag.db"),
       agentQueueDbPath: path.join(dir, "agent-queue.db"),
       operationalEventsDbPath: path.join(dir, "operational-events.db"),
+      // INF-1091: a persisted-stale cron is boot-graced for max(intervalMs,
+      // bootGraceMs) after boot. This test asserts the steady-state gate (a
+      // process that has been up well past the grace window), so pin bootedAt
+      // 2h ago — comfortably past the 5m interval grace — to prove a genuinely
+      // stale cron still degrades /health once grace has elapsed.
+      bootedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
     });
 
     registerCron("critical-stale-driver", "every 5m");
