@@ -10,5 +10,6 @@ export { StuckDelegateDetector, PromptCounter, buildRePrompt, type StuckDelegate
 export { ManagingPoller, parseManagingInterval, isDue, type ManagingPollerConfig, type ManagingPollerDeps, type PollerCycleResult, type LinearManagingIssue } from "./managing-poller.js";
 export { buildManagingWakeMessage, sendManagingWakeSignal, type ManagingWakeTicket } from "./managing-wake.js";
 export { HoldRetryTracker, type HoldRetryConfig } from "./hold-retry-tracker.js";
-export { DoneTicketDetector, type DoneTicketDetectorConfig, type DoneTicketDetectorDeps, type DoneTicketCycleResult, type LinearApi, type GitApi, type LinearIssue, type LinearCreateIssueInput } from "./done-ticket-detector.js";
+export { DoneTicketDetector, type DoneTicketDetectorConfig, type DoneTicketDetectorDeps, type DoneTicketCycleResult, type LinearApi, type LinearIssue, type LinearCreateIssueInput } from "./done-ticket-detector.js";
+export { makeDeployVerdictApi, deriveVerdict, extractHallmarkSymbol, HALLMARK_LABEL_PREFIX, DEFAULT_SHIPPED_REF, type DeployVerdictApi, type DeployVerdictDeps, type DeployVerdict, type DeployVerdictStatus, type CodePresence } from "./deploy-verdict.js";
 export { GlobalRedispatchBudget, type RedispatchBudgetConfig } from "./global-redispatch-budget.js";

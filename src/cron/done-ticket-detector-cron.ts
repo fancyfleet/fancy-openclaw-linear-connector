@@ -11,7 +11,7 @@
  */
 
 import { createLogger, componentLogger } from "../logger.js";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { getAccessToken } from "../agents.js";
 import { formatIntervalMs, registerCron } from "./registry.js";
 import {
@@ -20,8 +20,12 @@ import {
   type LinearApi,
   type LinearIssue,
   type LinearCreateIssueInput,
-  type GitApi,
 } from "../bag/done-ticket-detector.js";
+import {
+  makeDeployVerdictApi,
+  type DeployVerdictApi,
+  type CodePresence,
+} from "../bag/deploy-verdict.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "done-ticket-detector-cron");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
@@ -42,6 +46,11 @@ export interface DoneDetectorCronOptions {
    * process.env.LINEAR_OAUTH_TOKEN or process.env.LINEAR_API_KEY.
    */
   linearToken?: string;
+  /**
+   * Live `/health` endpoint URL to read the deployed running commit from
+   * (INF-1099). Default: process.env.HEALTH_CHECK_URL.
+   */
+  healthUrl?: string;
 }
 
 // ── Real Linear API implementation ───────────────────────────────────────────
@@ -288,57 +297,72 @@ export function createLinearApi(linearToken?: string): LinearApi {
   };
 }
 
-// ── Real Git API implementation ──────────────────────────────────────────────
+// ── Real live-signal deploy verdict implementation (INF-1099) ────────────────
 
-/** Create a real GitApi implementation backed by execSync git commands. */
-export function createGitApi(repoPath: string): GitApi {
-  return {
-    async ticketIdInMainLog(ticketId: string, afterDate: Date): Promise<boolean> {
-      try {
-        // AC7: Simple string match in git log --oneline. No ancestry matching.
-        // Search commit messages on origin/main for the ticket ID as a word.
-        // The --after filter reduces the search window but is not authoritative.
-        const after = afterDate.toISOString().replace("T", " ").replace(/\..*$/, "");
-        const cmd = [
-          "git",
-          "-C",
-          repoPath,
-          "log",
-          "origin/main",
-          `--after="${after}"`,
-          "--oneline",
-          "--grep",
-          ticketId,
-          "-1",
-        ].join(" ");
-        const output = execSync(cmd, { encoding: "utf-8", timeout: 30000 }).trim();
-        return output.length > 0;
-      } catch {
-        // AC8: Git errors are advisory — log and return false
-        return false;
-      }
-    },
+/**
+ * Tri-state `git grep` of a hallmark symbol at a ref: `true` present, `false`
+ * absent, `null` indeterminate (the ref is not fetched into the clone). We use
+ * `git cat-file -e <ref>^{commit}` to distinguish "ref unknown to this clone"
+ * (→ null, do not treat as a stall) from "ref present but symbol absent"
+ * (→ false). `--fixed-strings` keeps the symbol a literal, not a regex.
+ */
+function gitGrepSymbolAt(repoPath: string, symbol: string, ref: string): CodePresence {
+  try {
+    execFileSync("git", ["-C", repoPath, "cat-file", "-e", `${ref}^{commit}`], {
+      stdio: "pipe",
+      timeout: 15_000,
+    });
+  } catch {
+    return null; // ref not present in this clone — cannot determine presence.
+  }
+  try {
+    execFileSync(
+      "git",
+      ["-C", repoPath, "grep", "-q", "--fixed-strings", "--", symbol, ref],
+      { stdio: "pipe", timeout: 30_000 },
+    );
+    return true;
+  } catch (err) {
+    // `git grep -q` exits 1 when the symbol is absent (a real "absent" signal)
+    // and >1 on an actual error. Treat only exit-1 as a definitive absence.
+    const status = (err as { status?: number }).status;
+    return status === 1 ? false : null;
+  }
+}
 
-    async hasBranchForTicket(ticketId: string): Promise<boolean> {
-      try {
-        // Check if any remote branch matches the ticket ID pattern
-        const cmd = [
-          "git",
-          "-C",
-          repoPath,
-          "ls-remote",
-          "--heads",
-          "origin",
-          `*${ticketId}*`,
-        ].join(" ");
-        const output = execSync(cmd, { encoding: "utf-8", timeout: 30000 }).trim();
-        return output.length > 0;
-      } catch {
-        // Git errors are advisory
-        return false;
-      }
-    },
-  };
+/**
+ * Read the running commit the deployed connector reports on `/health`.
+ * Mirrors deploy-probe.ts: parse `commit` from the JSON body; null when the
+ * URL is unconfigured or the probe fails (fail open — never a false stall).
+ */
+async function fetchHealthCommit(healthUrl: string | undefined): Promise<string | null> {
+  if (!healthUrl) return null;
+  try {
+    const res = await fetch(healthUrl, { signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) return null;
+    const body = await res.text();
+    try {
+      const json = JSON.parse(body) as { commit?: string };
+      return json.commit && json.commit !== "unknown" ? json.commit : null;
+    } catch {
+      const trimmed = body.trim();
+      return trimmed && trimmed !== "unknown" ? trimmed.slice(0, 40) : null;
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Create a real DeployVerdictApi backed by git grep + a live `/health` fetch.
+ * `healthUrl` defaults to HEALTH_CHECK_URL (the same env deploy-probe reads).
+ */
+export function createDeployVerdictApi(repoPath: string, healthUrl?: string): DeployVerdictApi {
+  const url = healthUrl ?? process.env.HEALTH_CHECK_URL;
+  return makeDeployVerdictApi({
+    symbolPresentAt: (symbol, ref) => gitGrepSymbolAt(repoPath, symbol, ref),
+    fetchHealthCommit: () => fetchHealthCommit(url),
+  });
 }
 
 // ── Registration ─────────────────────────────────────────────────────────────
@@ -370,7 +394,7 @@ export function registerDoneDetectorCron(options?: DoneDetectorCronOptions): voi
   // Build real dependencies
   const deps = {
     linear: createLinearApi(options?.linearToken),
-    git: createGitApi(repoPath),
+    deploy: createDeployVerdictApi(repoPath, options?.healthUrl),
     config: {
       lookbackDays,
       graceHours,

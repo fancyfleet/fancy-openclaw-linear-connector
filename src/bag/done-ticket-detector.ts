@@ -1,12 +1,15 @@
 /**
  * DoneTicketDetector — cron-based detector for Done dev-impl tickets
- * whose fix hasn't landed on main.
+ * whose fix is not present in the LIVE deployed artifact.
  *
- * STUB: Tests are written against this interface. Implementation is pending.
+ * INF-1099: the verdict is derived from live signals — the running commit read
+ * from `/health` and a code-level `git grep` of the fix's hallmark symbol —
+ * never from the ticket's identifier/title/`Done` label. See ./deploy-verdict.ts.
  */
 
 import { createLogger, componentLogger } from "../logger.js";
 import { markCronRun } from "../cron/registry.js";
+import type { DeployVerdict, DeployVerdictApi } from "./deploy-verdict.js";
 
 const log = componentLogger(createLogger(), "done-ticket-detector");
 
@@ -54,14 +57,10 @@ export interface LinearApi {
   hasExistingComment(issueId: string, bodyPrefix: string): Promise<boolean>;
 }
 
-export interface GitApi {
-  ticketIdInMainLog(ticketId: string, afterDate: Date): Promise<boolean>;
-  hasBranchForTicket(ticketId: string): Promise<boolean>;
-}
-
 export interface DoneTicketDetectorDeps {
   linear: LinearApi;
-  git: GitApi;
+  /** Derives the deploy verdict from live /health + code-level grep (INF-1099). */
+  deploy: DeployVerdictApi;
   config: DoneTicketDetectorConfig;
 }
 
@@ -70,6 +69,8 @@ export interface DoneTicketCycleResult {
   flagged: number;
   skippedLabeled: number;
   skippedUnbranched: number;
+  /** Tickets with no live signal to verify against (no hallmark / /health down). */
+  skippedUnverifiable: number;
   reLandCreated: number;
   errors: string[];
 }
@@ -128,6 +129,7 @@ export class DoneTicketDetector {
       flagged: 0,
       skippedLabeled: 0,
       skippedUnbranched: 0,
+      skippedUnverifiable: 0,
       reLandCreated: 0,
       errors: [],
     };
@@ -177,12 +179,23 @@ export class DoneTicketDetector {
       return false;
     }
 
-    // AC7: Simple string-match ticketId in git log — no ancestry matching
+    // INF-1099: derive the verdict from LIVE signals — /health running commit +
+    // code-level hallmark grep — never from the ticket identifier/title/label.
     const doneDate = ticket.doneAt ? new Date(ticket.doneAt) : new Date(ticket.createdAt);
-    const found = await this.deps.git.ticketIdInMainLog(ticket.identifier, doneDate);
+    const verdict = await this.deps.deploy.verify({
+      identifier: ticket.identifier,
+      labels: ticket.labels,
+    });
 
-    if (found) {
-      // Ticket is present in main — no action needed
+    if (verdict.deployed) {
+      // Fix confirmed live in the deployed artifact — no action needed.
+      return false;
+    }
+
+    if (!verdict.stall) {
+      // No concrete negative live signal (no hallmark label, or /health
+      // unreachable). Do NOT flag from ticket text — fail open (AC4).
+      result.skippedUnverifiable++;
       return false;
     }
 
@@ -191,10 +204,10 @@ export class DoneTicketDetector {
       return false;
     }
 
-    // AC3: Apply label and post comment
+    // AC3: Apply label and post comment asserting the concrete divergence.
     await this.deps.linear.applyLabel(ticket.id, "needs-merge-verify");
 
-    const commentBody = this.buildFlagComment(ticket.identifier, doneDate);
+    const commentBody = this.buildFlagComment(ticket.identifier, doneDate, verdict);
     await this.deps.linear.postComment(ticket.id, commentBody);
     this.commentedTickets.add(ticket.id);
 
@@ -221,16 +234,20 @@ export class DoneTicketDetector {
   }
 
   /**
-   * Build the flagging comment body.
-   * Includes the ticket identifier and Done timestamp.
+   * Build the flagging comment body (AC3).
+   * Quotes the concrete LIVE evidence — the running /health commit and the
+   * hallmark-symbol code-presence result — never the ticket title or status.
    */
-  private buildFlagComment(identifier: string, doneAt: Date): string {
+  private buildFlagComment(identifier: string, doneAt: Date, verdict: DeployVerdict): string {
     return (
-      `## Done but not on main\n\n` +
-      `**${identifier}** was marked Done at ${doneAt.toISOString()} but its fix ` +
-      `was not found in \`origin/main\` commit history. A re-land ticket has ` +
-      `been created to track re-applying this fix.\n\n` +
-      `_This is an automated advisory from the Done-ticket detector._`
+      `## Done but not deployed\n\n` +
+      `**${identifier}** was marked Done at ${doneAt.toISOString()}, but a live ` +
+      `deploy check found its fix is not running in production:\n\n` +
+      `> ${verdict.evidence}\n\n` +
+      `A re-land ticket has been created to track re-applying/redeploying this fix.\n\n` +
+      `_This is an automated advisory from the Done-ticket detector — the verdict ` +
+      `is derived from the live \`/health\` commit and a code-level hallmark grep, ` +
+      `not from the ticket's title or \`Done\` label (INF-1099)._`
     );
   }
 }
