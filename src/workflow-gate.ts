@@ -1597,15 +1597,19 @@ async function fetchIssueWithLabels(
   delegateId: string | null;
   assigneeId: string | null;
   nativeStateId: string | null;
+  requesterUserId: string | null;
 } | null> {
   // INF-979 (AC2): also read the live delegate so setStateAtomic can detect a
   // null-delegate husk and bootstrap-seat the workflow role owner instead of
   // re-writing null on a governed redispatch.
+  // INF-1170: also read the creator so multi-body requester roles can pin to
+  // the issue-bound requester instead of failing closed on ambiguity.
   const query = `
     query IssueWithLabels($id: String!) {
       issue(id: $id) {
         id
         identifier
+        creator { id }
         team { id key name }
         labels { nodes { id name team { id } } }
         delegate { id }
@@ -1625,6 +1629,7 @@ async function fetchIssueWithLabels(
         issue?: {
           id: string;
           identifier: string;
+          creator?: { id?: string | null } | null;
           team: { id: string; key?: string; name?: string };
           labels: { nodes: LabelNode[] };
           delegate?: { id: string } | null;
@@ -1646,12 +1651,22 @@ async function fetchIssueWithLabels(
       delegateId: issue.delegate?.id ?? null,
       assigneeId: issue.assignee?.id ?? null,
       nativeStateId: issue.state?.id ?? null,
+      requesterUserId: issue.creator?.id ?? null,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log.warn(`workflow-gate: issue fetch failed for ${issueId}: ${msg}`);
     return null;
   }
+}
+
+function resolveIssueBoundRequesterDelegate(roleBodies: string[], requesterUserId: string | null): string | null {
+  if (!requesterUserId) return null;
+  for (const body of roleBodies) {
+    const agent = getAgent(body);
+    if (agent?.linearUserId === requesterUserId) return requesterUserId;
+  }
+  return null;
 }
 
 /**
@@ -6731,6 +6746,19 @@ export async function applyStateTransition(
         }
       }
 
+      // INF-1170: break-glass is the recovery path. It must not be stranded by
+      // destination role ambiguity; route the recoverable state back to the
+      // invoking body when that body has a Linear identity.
+      if (resolvedDelegateId === undefined && intent === breakGlassCommand && options?.bodyId) {
+        const invokingAgent = getAgent(options.bodyId);
+        if (invokingAgent?.linearUserId) {
+          resolvedDelegateId = invokingAgent.linearUserId;
+          log.info(
+            `workflow-gate: B2 apply: ${issueId} ${intent} — break-glass delegate pinned to invoking body '${options.bodyId}'`,
+          );
+        }
+      }
+
       // (b) Deterministic prior-implementer routing (def-driven).
       if (resolvedDelegateId === undefined && wantsPriorImplementer) {
         const priorImplementer = await getImplementer(issueId);
@@ -6844,21 +6872,33 @@ export async function applyStateTransition(
               });
             }
           } else if (roleBodies.length > 1) {
-            log.error(
-              `workflow-gate: B2 apply: FAIL-CLOSED — multi-body role '${destOwnerRole}' (${roleBodies.join(", ")}) on '${intent}' for ${issueId} requires a CLI --target${wantsPriorImplementer ? " (no prior implementer recorded)" : ""} but none was supplied. Transition aborted.`,
-            );
-            return await failDelegateUnresolved({
-              issueId: issue.internalId,
-              authToken,
-              detail: `multi-body role '${destOwnerRole}' requires a --target`,
-              remedy:
-                `'${intent}' routes to role '${destOwnerRole}', which is filled by ${roleBodies.length} bodies ` +
-                `(${roleBodies.join(", ")}), so the connector will not guess which one` +
-                `${wantsPriorImplementer ? " and no prior implementer is recorded on this ticket" : ""}. ` +
-                `Re-run with \`--target <body>\`, naming one of: ${roleBodies.join(", ")}.`,
-              from: currentStateName,
-              to: toStateName,
-            });
+            // INF-1170: for the requester role, try to pin to the issue-bound
+            // creator before failing closed on multi-body ambiguity.
+            const requesterDelegateId = destOwnerRole === "requester"
+              ? resolveIssueBoundRequesterDelegate(roleBodies, issue.requesterUserId)
+              : null;
+            if (requesterDelegateId) {
+              resolvedDelegateId = requesterDelegateId;
+              log.info(
+                `workflow-gate: B2 apply: ${issueId} ${intent} — requester role pinned to issue creator delegate=${requesterDelegateId}`,
+              );
+            } else {
+              log.error(
+                `workflow-gate: B2 apply: FAIL-CLOSED — multi-body role '${destOwnerRole}' (${roleBodies.join(", ")}) on '${intent}' for ${issueId} requires a CLI --target${wantsPriorImplementer ? " (no prior implementer recorded)" : ""} but none was supplied. Transition aborted.`,
+              );
+              return await failDelegateUnresolved({
+                issueId: issue.internalId,
+                authToken,
+                detail: `multi-body role '${destOwnerRole}' requires a --target`,
+                remedy:
+                  `'${intent}' routes to role '${destOwnerRole}', which is filled by ${roleBodies.length} bodies ` +
+                  `(${roleBodies.join(", ")}), so the connector will not guess which one` +
+                  `${wantsPriorImplementer ? " and no prior implementer is recorded on this ticket" : ""}. ` +
+                  `Re-run with \`--target <body>\`, naming one of: ${roleBodies.join(", ")}.`,
+                from: currentStateName,
+                to: toStateName,
+              });
+            }
           } else if (await isSyntheticNoBodyRole(destOwnerRole!)) {
             // INF-673: the destination is an explicitly declared synthetic
             // no_body (engine/runtime) role — a phase driven by the engine

@@ -115,7 +115,7 @@ const TEAM_LABELS = [
   { id: "wf-task-label", name: "wf:task" },
   { id: "state-intake-label", name: "state:intake" },
   { id: "state-merge-label", name: "state:merge" },
-  { id: "state-sign-off-label", name: "state:sign-off" },
+  { id: "state:sign-off-label", name: "state:sign-off" },
   { id: "state-done-label", name: "state:done" },
 ];
 
