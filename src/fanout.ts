@@ -156,6 +156,8 @@ export interface Finding {
   classification?: string;
   /** INF-359: capability this entry traces to, when classification requires one. */
   capability?: string;
+  /** INF-1172: existing ticket identifier to adopt instead of minting a child. */
+  adopt_identifier?: string;
 }
 
 /**
@@ -1488,6 +1490,176 @@ async function createChildIssue(
   }
 }
 
+type AdoptableIssue = {
+  internalId: string;
+  identifier: string;
+  labels: Array<{ id: string; name: string }>;
+};
+
+function extractAdoptIdentifier(finding: Finding): string | null {
+  if (finding.adopt_identifier?.trim()) return finding.adopt_identifier.trim();
+  const material = `${finding.title}\n${finding.description ?? ""}`;
+  const explicit = /\badopt\s*:\s*([A-Z][A-Z0-9]+-\d+(?:-[A-Z0-9]+)*)\b/i.exec(material);
+  if (explicit) return explicit[1].toUpperCase();
+  return null;
+}
+
+async function fetchIssueByIdentifier(
+  identifier: string,
+  authToken: string,
+): Promise<AdoptableIssue | null> {
+  const query = `
+    query IssueByIdentifier($identifier: String!) {
+      issue(id: $identifier) {
+        id
+        identifier
+        labels { nodes { id name } }
+        parent { id }
+        team { id }
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { identifier } }),
+    });
+    type Resp = {
+      data?: {
+        issue?: {
+          id: string;
+          identifier: string;
+          labels?: { nodes?: Array<{ id?: string | null; name?: string | null }> } | null;
+        } | null;
+      };
+    };
+    const data = (await res.json()) as Resp;
+    const issue = data.data?.issue;
+    if (!issue) return null;
+    return {
+      internalId: issue.id,
+      identifier: issue.identifier,
+      labels: (issue.labels?.nodes ?? [])
+        .filter((label): label is { id: string; name: string } =>
+          typeof label.id === "string" && label.id.trim() !== "" &&
+          typeof label.name === "string" && label.name.trim() !== "",
+        )
+        .map((label) => ({ id: label.id, name: label.name })),
+    };
+  } catch (err) {
+    log.warn(`fanout: failed to fetch adopt candidate ${identifier}: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+async function updateIssueForAdoption(
+  issueInternalId: string,
+  parentInternalId: string,
+  labelIds: string[],
+  authToken: string,
+): Promise<boolean> {
+  const mutation = `
+    mutation AdoptExistingChild($issueId: String!, $input: IssueUpdateInput!) {
+      issueUpdate(id: $issueId, input: $input) { success }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({
+        query: mutation,
+        variables: {
+          issueId: issueInternalId,
+          input: { parentId: parentInternalId, labelIds },
+        },
+      }),
+    });
+    type Resp = { data?: { issueUpdate?: { success?: boolean } } };
+    const data = (await res.json()) as Resp;
+    return data.data?.issueUpdate?.success === true;
+  } catch (err) {
+    log.warn(`fanout: failed to adopt existing child ${issueInternalId}: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
+async function adoptExistingChildren(
+  findings: Finding[],
+  parentCtx: { internalId: string; teamId: string },
+  authToken: string,
+  childWorkflowLabel: string,
+): Promise<FanoutResult> {
+  const result: FanoutResult = {
+    created: 0,
+    childIdentifiers: [],
+    errors: [],
+    preview: null,
+    refused: false,
+    pendingApproval: false,
+    unmatchedChildren: [],
+    attempted: 0,
+    specMatchedChildren: [],
+    createdChildDelegates: [],
+  };
+
+  const workflowLabelId = await findLabel(parentCtx.teamId, childWorkflowLabel, authToken);
+  if (!workflowLabelId) {
+    result.refused = true;
+    result.errors.push({
+      findingIndex: -1,
+      message: `Refusing adopt: workflow label '${childWorkflowLabel}' does not exist in team ${parentCtx.teamId}`,
+    });
+    return result;
+  }
+
+  for (let i = 0; i < findings.length; i++) {
+    const identifier = extractAdoptIdentifier(findings[i]);
+    if (!identifier) {
+      result.errors.push({
+        findingIndex: i,
+        message: `Refusing adopt: spec entry "${findings[i].title}" does not name an existing ticket via 'adopt: <ID>'`,
+      });
+      continue;
+    }
+
+    const issue = await fetchIssueByIdentifier(identifier, authToken);
+    if (!issue) {
+      result.errors.push({
+        findingIndex: i,
+        message: `Refusing adopt: existing ticket '${identifier}' was not found`,
+      });
+      continue;
+    }
+
+    const labelIds = new Set<string>(issue.labels.map((label) => label.id));
+    labelIds.add(workflowLabelId);
+
+    const adopted = await updateIssueForAdoption(
+      issue.internalId,
+      parentCtx.internalId,
+      [...labelIds],
+      authToken,
+    );
+    if (!adopted) {
+      result.errors.push({
+        findingIndex: i,
+        message: `Failed to adopt existing ticket '${issue.identifier}'`,
+      });
+      continue;
+    }
+
+    result.specMatchedChildren.push(issue.identifier);
+    log.info(`fanout: adopted existing child ${issue.identifier} under ${parentCtx.internalId}`);
+  }
+
+  if (result.specMatchedChildren.length === 0 && result.errors.length > 0) {
+    result.refused = true;
+  }
+  return result;
+}
+
 /**
  * AI-1992: create a "blocks" relation between two child issues (best-effort).
  * Used when a fanout state declares `block_siblings: true`. Fail-open — a failed
@@ -1656,6 +1828,9 @@ export async function executeFanout(
       message: `No '${config.spec_source}' entries found — fan-out requires at least one parseable spec entry`,
     });
     return result;
+  }
+  if (config.adopt_existing === true) {
+    return adoptExistingChildren(findings, parentCtx, authToken, childWorkflowLabel);
   }
   if (config.spec_source.toLowerCase() === "solicitations" && childWorkflowLabel === "wf:task") {
     const engineeringSolicitations = findings.filter(isEngineeringSolicitFinding);
@@ -2429,7 +2604,7 @@ export function shouldTriggerFanout(
   intent: string,
 ): FanoutConfig | null {
   const state = def?.states?.find((s) => s.id === currentState);
-  if (!state || !state.fanout) return null;
+  if (!state) return null;
   // Never fan out on the break-glass (escape) edge out of a fanout state.
   const breakGlass = def.break_glass?.command ?? "escape";
   if (intent === breakGlass) return null;
@@ -2446,6 +2621,10 @@ export function shouldTriggerFanout(
   // already-spawned sprint (LSO-1) this edge exists to close. Route it past the
   // spawn gate to its declared gates.
   if (transition.requires_children_terminal) return null;
+  if (transition.adopt_existing_children && transition.fanout?.adopt_existing) {
+    return transition.fanout;
+  }
+  if (!state.fanout) return null;
   return state.fanout;
 }
 

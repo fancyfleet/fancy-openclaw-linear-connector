@@ -3,7 +3,7 @@
 # The canonical fixture is a mirror of the registered-def (INF-723 single-source rule).
 
 id: dev-sprint
-version: 12
+version: 13
 archetype: orchestrator
 entry_state: intake
 
@@ -101,6 +101,16 @@ states:
       - command: continue
         to: spawn-impl
         generic: continue
+      - command: adopt
+        to: managing-impl
+        generic: continue
+        requires_comment: true
+        adopt_existing_children: true
+        fanout:
+          spec_source: findings
+          child_workflow: wf:dev-impl
+          initial_delegate: astrid
+          adopt_existing: true
       # INF-504: governed completion when implementation shipped out-of-band.
       # `continue` here mints a redundant impl arm (INF-271 debt); `converge`
       # is the terminal edge for a sprint whose tracked work is already Done.

@@ -168,6 +168,10 @@ export interface WorkflowTransition {
   requires_implementation_child?: boolean;
   /** Generic transition role: 'continue' maps to `linear continue-workflow`, 'revision' maps to `linear request-revision`. */
   generic?: 'continue' | 'revision';
+  /** INF-1172: this transition adopts existing child tickets through fanout instead of minting duplicates. */
+  adopt_existing_children?: boolean;
+  /** INF-1172: transition-scoped fanout directive for adopt edges. */
+  fanout?: FanoutConfig;
 }
 
 function hasMergeEvidenceReference(commentBody: string | null | undefined): boolean {
@@ -214,6 +218,8 @@ export interface FanoutConfig {
   child_workflow: string;
   /** Optional body id to delegate each spawned child to at creation time. */
   initial_delegate?: string;
+  /** INF-1172: enroll named existing tickets as children instead of minting. */
+  adopt_existing?: boolean;
   /** When true, create sibling blocking relations between the spawned children
    *  at spawn time (each sibling blocks the next). */
   block_siblings?: boolean;

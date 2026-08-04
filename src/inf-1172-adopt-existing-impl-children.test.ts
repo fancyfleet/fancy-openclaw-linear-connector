@@ -79,6 +79,17 @@ type ExistingTicket = {
   nativeState?: string;
 };
 
+const LABEL_ID_BY_NAME = new Map([
+  ["wf:dev-impl", "wf-dev-impl-label"],
+  ["state:todo", "state-todo-label"],
+  ["state:write-tests", "state-write-tests-label"],
+  ["state:implementation", "state-implementation-label"],
+  ["state:code-review", "state-code-review-label"],
+  ["state:routing", "state-routing-label"],
+  ["state:done", "state-done-label"],
+  ["cross-functional", "cross-functional-label"],
+]);
+
 const ADOPT_CONFIG = {
   spec_source: "findings",
   child_workflow: "wf:dev-impl",
@@ -224,7 +235,7 @@ function makeAdoptFetch(existingTickets: ExistingTicket[]) {
                   identifier: ticket.identifier,
                   title: ticket.title,
                   state: { name: ticket.nativeState ?? "Doing" },
-                  labels: { nodes: ticket.labels.map((name) => ({ name })) },
+                  labels: { nodes: ticket.labels.map((name) => ({ id: LABEL_ID_BY_NAME.get(name) ?? `label-${name}`, name })) },
                   parent: null,
                   team: { id: "team-id" },
                 }
@@ -318,9 +329,45 @@ describe("INF-1172 AC1: ac-definition adopt edge shape", () => {
 });
 
 describe("INF-1172 AC1/AC3: adopt existing impl tickets without minting duplicates", () => {
+  let dir: string;
   let originalFetch: typeof globalThis.fetch;
 
+  beforeAll(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-1172-adopt-regression-"));
+
+    const policyFile = path.join(dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const defsDir = path.join(dir, "defs");
+    fs.mkdirSync(defsDir);
+    fs.copyFileSync(DEV_SPRINT_PATH, path.join(defsDir, "dev-sprint.yaml"));
+    process.env.WORKFLOW_DEFS_DIR = defsDir;
+
+    const agentsFile = path.join(dir, "agents.json");
+    fs.writeFileSync(
+      agentsFile,
+      JSON.stringify({
+        agents: [
+          { name: "astrid", linearUserId: ASTRID_UUID, clientId: "a", clientSecret: "a", accessToken: "a", refreshToken: "a" },
+        ],
+      }),
+      "utf8",
+    );
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+  });
+
+  afterAll(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    delete process.env.CAPABILITY_POLICY_PATH;
+    delete process.env.WORKFLOW_DEFS_DIR;
+    delete process.env.AGENTS_FILE;
+  });
+
   beforeEach(() => {
+    resetWorkflowCache();
+    resetPolicyCache();
     originalFetch = globalThis.fetch;
   });
 
@@ -330,7 +377,7 @@ describe("INF-1172 AC1/AC3: adopt existing impl tickets without minting duplicat
 
   it("adopts named existing tickets by setting parent and records them for the barrier", async () => {
     const tickets: ExistingTicket[] = [
-      { identifier: "INF-1159-A", internalId: "child-a-id", title: "Review guard", labels: ["wf:dev-impl", "state:code-review"] },
+      { identifier: "INF-1159-A", internalId: "child-a-id", title: "Review guard", labels: ["wf:dev-impl", "state:code-review", "cross-functional"] },
       { identifier: "INF-1159-B", internalId: "child-b-id", title: "Routing guard", labels: ["wf:dev-impl", "state:routing"] },
     ];
 
@@ -350,6 +397,11 @@ describe("INF-1172 AC1/AC3: adopt existing impl tickets without minting duplicat
     for (const update of parentUpdates) {
       expect(update.input).toMatchObject({ parentId: "parent-internal-id" });
       expect(update.input?.labelIds).toEqual(expect.arrayContaining(["wf-dev-impl-label"]));
+      if (update.variables.issueId === "child-a-id") {
+        expect(update.input?.labelIds).toEqual(expect.arrayContaining(["state-code-review-label", "cross-functional-label"]));
+      } else {
+        expect(update.input?.labelIds).toEqual(expect.arrayContaining(["state-routing-label"]));
+      }
     }
   });
 

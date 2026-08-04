@@ -1,4 +1,4 @@
-# dev-sprint — Sprint Execution Workflow (v12)
+# dev-sprint — Sprint Execution Workflow (v13)
 # owner: steward (Astrid), engine (spawn-arms, spawn-impl)
 # last-updated: 2026-07-26
 # status: v8 deployed to production (INF-359 sprint coherence)
@@ -45,6 +45,9 @@
 #   The new gate requires >=1 COMPLETED implementation child (`wf:dev-impl`/`wf:task`
 #   in a terminal state) so convergence is structurally impossible without shipped
 #   code that ran its own AC/validation gate to done. Break-glass still bypasses.
+# v13 (2026-08-03): added governed `adopt` from ac-definition to managing-impl
+#   for enrolling named pre-existing impl tickets under the sprint without
+#   minting duplicates (INF-1172).
 #
 # Registered-def copy for CI conformance validation (INF-42). The canonical
 # source is the vault markdown spec at:
@@ -60,7 +63,7 @@
 #   → 5. ac-definition → 6. spawn-impl → 7. managing-impl → 8. validation → done
 
 id: dev-sprint
-version: 12
+version: 13
 archetype: orchestrator
 entry_state: intake
 
@@ -158,6 +161,16 @@ states:
       - command: continue
         to: spawn-impl
         generic: continue
+      - command: adopt
+        to: managing-impl
+        generic: continue
+        requires_comment: true
+        adopt_existing_children: true
+        fanout:
+          spec_source: findings
+          child_workflow: wf:dev-impl
+          initial_delegate: astrid
+          adopt_existing: true
       # INF-504: governed completion when implementation shipped out-of-band.
       # `continue` here mints a redundant impl arm (INF-271 debt); `converge`
       # is the terminal edge for a sprint whose tracked work is already Done.

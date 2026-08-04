@@ -104,8 +104,11 @@ function isBarrier(state: WorkflowState): boolean {
 }
 
 /** Check if a state has a fanout section. */
-function hasFanout(state: WorkflowState): boolean {
-  return state.fanout !== undefined && state.fanout !== null;
+function hasFanout(state: WorkflowState, transition?: { fanout?: unknown }): boolean {
+  return (
+    (state.fanout !== undefined && state.fanout !== null) ||
+    (transition?.fanout !== undefined && transition.fanout !== null)
+  );
 }
 
 /**
@@ -245,11 +248,11 @@ function checkFanoutBeforeBarrier(
       if (!t.to) continue;
       if (barrierStateIds.has(t.to)) {
         if (isTerminalTransition(t, stateIndex.get(t.to))) continue;
-        if (!hasFanout(state)) {
+        if (!hasFanout(state, t)) {
           errors.push({
             invariant: "fanout-before-barrier",
-            message: `State '${state.id}' transitions to barrier state '${t.to}' but has no 'fanout:' section. ` +
-              `Every direct predecessor of a barrier:true state must declare a fanout.`,
+            message: `State '${state.id}' transitions to barrier state '${t.to}' but neither the state nor transition declares a 'fanout:' section. ` +
+              `Every direct predecessor of a barrier:true state must declare a fanout, or use a transition-scoped governed fanout.`,
             state: state.id,
           });
         }
@@ -293,29 +296,35 @@ function checkChildWorkflowSync(
   const registeredIds = getRegisteredDefIdsSync();
 
   for (const state of def.states) {
-    if (!state.fanout) continue;
-    const childWf = state.fanout.child_workflow;
-    if (!childWf) continue;
+    const fanouts = [
+      state.fanout,
+      ...(state.transitions ?? []).map((transition) => transition.fanout),
+    ].filter((fanout): fanout is NonNullable<typeof state.fanout> => fanout !== undefined && fanout !== null);
 
-    // Must have wf: prefix
-    if (typeof childWf !== "string" || !wfLabelPattern.test(childWf)) {
-      errors.push({
-        invariant: "child-workflow-resolution",
-        message: `State '${state.id}' fanout.child_workflow '${String(childWf)}' is not a valid wf:* label.`,
-        state: state.id,
-      });
-      continue;
-    }
+    for (const fanout of fanouts) {
+      const childWf = fanout.child_workflow;
+      if (!childWf) continue;
 
-    // If we have a cached registry, check resolution
-    if (registeredIds) {
-      const defId = childWf.slice(3); // "wf:dev-impl" → "dev-impl"
-      if (!registeredIds.has(defId)) {
+      // Must have wf: prefix
+      if (typeof childWf !== "string" || !wfLabelPattern.test(childWf)) {
         errors.push({
           invariant: "child-workflow-resolution",
-          message: `State '${state.id}' fanout.child_workflow '${childWf}' resolves to '${defId}' which is not a registered workflow def.`,
+          message: `State '${state.id}' fanout.child_workflow '${String(childWf)}' is not a valid wf:* label.`,
           state: state.id,
         });
+        continue;
+      }
+
+      // If we have a cached registry, check resolution
+      if (registeredIds) {
+        const defId = childWf.slice(3); // "wf:dev-impl" -> "dev-impl"
+        if (!registeredIds.has(defId)) {
+          errors.push({
+            invariant: "child-workflow-resolution",
+            message: `State '${state.id}' fanout.child_workflow '${childWf}' resolves to '${defId}' which is not a registered workflow def.`,
+            state: state.id,
+          });
+        }
       }
     }
   }
