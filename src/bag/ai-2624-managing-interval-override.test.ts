@@ -27,6 +27,7 @@ import { ManagingStateStore } from "../store/managing-state-store.js";
 import { OperationalEventStore } from "../store/operational-event-store.js";
 import { ManagingPoller, isDue, parseManagingInterval, type LinearManagingIssue, type PollerCycleResult } from "./managing-poller.js";
 import type { ManagingWakeTicket } from "./managing-wake.js";
+import { DispatchAckTracker } from "./dispatch-ack-tracker.js";
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -40,17 +41,21 @@ interface AgentLike {
 function makeStores(): {
   store: ManagingStateStore;
   ops: OperationalEventStore;
+  ackTracker: DispatchAckTracker;
   cleanup: () => void;
 } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-2624-managing-"));
   const store = new ManagingStateStore(path.join(dir, "managing.db"));
   const ops = new OperationalEventStore(path.join(dir, "ops.db"));
+  const ackTracker = new DispatchAckTracker(path.join(dir, "acks.db"));
   return {
     store,
     ops,
+    ackTracker,
     cleanup: () => {
       store.close();
       ops.close();
+      ackTracker.close();
       fs.rmSync(dir, { recursive: true, force: true });
     },
   };
@@ -63,6 +68,7 @@ function makeStores(): {
 function createPoller(opts: {
   store: ManagingStateStore;
   ops: OperationalEventStore;
+  ackTracker: DispatchAckTracker;
   agents: AgentLike[];
   issues: LinearManagingIssue[];
   sendWake: ReturnType<typeof jest.fn>;
@@ -71,7 +77,7 @@ function createPoller(opts: {
   cycleMs?: number;
 }): ManagingPoller {
   const {
-    store, ops, agents, issues, sendWake, now,
+    store, ops, ackTracker, agents, issues, sendWake, now,
     defaultIntervalMs = 30 * 60 * 1000,
     cycleMs = 60_000,
   } = opts;
@@ -80,6 +86,7 @@ function createPoller(opts: {
     {
       store,
       operationalEventStore: ops,
+      ackTracker,
       resolveDeliveryConfig: () => ({ nodeBin: "node" }),
       listAgents: () => agents as never,
       fetchManagingTickets: async () => issues,
@@ -133,6 +140,7 @@ describe("AI-2624 AC1: regression — multi-cycle respects 4h Managing-interval"
     const poller1 = createPoller({
       store: stores.store,
       ops: stores.ops,
+      ackTracker: stores.ackTracker,
       agents,
       issues,
       sendWake,
@@ -150,6 +158,7 @@ describe("AI-2624 AC1: regression — multi-cycle respects 4h Managing-interval"
     const poller2 = createPoller({
       store: stores.store,
       ops: stores.ops,
+      ackTracker: stores.ackTracker,
       agents,
       issues,
       sendWake,
@@ -170,6 +179,7 @@ describe("AI-2624 AC1: regression — multi-cycle respects 4h Managing-interval"
     const poller3 = createPoller({
       store: stores.store,
       ops: stores.ops,
+      ackTracker: stores.ackTracker,
       agents,
       issues,
       sendWake,
@@ -203,6 +213,7 @@ describe("AI-2624 AC1: regression — multi-cycle respects 4h Managing-interval"
     const poller = createPoller({
       store: stores.store,
       ops: stores.ops,
+      ackTracker: stores.ackTracker,
       agents,
       issues,
       sendWake,
@@ -248,6 +259,7 @@ describe("AI-2624 AC2: default cadence honored (no Managing-interval marker)", (
     const poller = createPoller({
       store: stores.store,
       ops: stores.ops,
+      ackTracker: stores.ackTracker,
       agents,
       issues,
       sendWake,
@@ -276,6 +288,7 @@ describe("AI-2624 AC2: default cadence honored (no Managing-interval marker)", (
     const poller = createPoller({
       store: stores.store,
       ops: stores.ops,
+      ackTracker: stores.ackTracker,
       agents,
       issues,
       sendWake,
@@ -326,6 +339,7 @@ describe("AI-2624 AC3: per-ticket override honored end-to-end in poller cycle", 
     const poller = createPoller({
       store: stores.store,
       ops: stores.ops,
+      ackTracker: stores.ackTracker,
       agents,
       issues,
       sendWake,
@@ -359,6 +373,7 @@ describe("AI-2624 AC3: per-ticket override honored end-to-end in poller cycle", 
     const poller = createPoller({
       store: stores.store,
       ops: stores.ops,
+      ackTracker: stores.ackTracker,
       agents,
       issues,
       sendWake,
@@ -438,6 +453,7 @@ describe("AI-2624 AC5: single scheduler instance guard", () => {
     const poller = createPoller({
       store: stores.store,
       ops: stores.ops,
+      ackTracker: stores.ackTracker,
       agents: [{ name: "astrid", linearUserId: "u1", openclawAgent: "astrid" }],
       issues: [{ identifier: "AI-1", title: "T", description: null }],
       sendWake,
@@ -464,6 +480,7 @@ describe("AI-2624 AC5: single scheduler instance guard", () => {
     const poller = createPoller({
       store: stores.store,
       ops: stores.ops,
+      ackTracker: stores.ackTracker,
       agents: [{ name: "astrid", linearUserId: "u1", openclawAgent: "astrid" }],
       issues: [{ identifier: "AI-1", title: "T", description: null }],
       sendWake,
