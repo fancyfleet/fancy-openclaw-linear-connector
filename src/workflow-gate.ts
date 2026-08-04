@@ -55,7 +55,7 @@ import { fetchLastCommentByUser } from "./linear-helpers.js";
 import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store.js";
 import { parseCodeArtifact } from "./artifact.js";
 import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./config-health.js";
-import { captureAc, extractAcFromDescription, removeAcRecord } from "./ac-record-store.js";
+import { captureAc, extractAcFromDescription, getAcRecord, removeAcRecord } from "./ac-record-store.js";
 import { validateDefStateRemovals } from "./def-state-migration.js";
 import { readDefStateSnapshot, writeDefStateSnapshot } from "./store/def-state-snapshot-store.js";
 import { recordImplementer, getImplementer, removeImplementer, getBinding, recordBinding, clearTicketBindings } from "./implementer-store.js";
@@ -6548,13 +6548,24 @@ export async function applyStateTransition(
   // from the issue description and store it as the immutable AC of record.
   // This closes the gap where Ai's paraphrase silently becomes the de-facto spec.
   if (matchedTransition?.capture_ac && intent === 'accept') {
+    // INF-1147 (T2): AC-of-record capture at accept is a GATE, not a mere signal.
+    // If the description yields no verbatim AC AND no prior record exists, the
+    // forward transition is DECLINED with an explicit, repairable reason rather
+    // than silently advancing a task into write-tests with no AC of record (the
+    // INF-1143 defect where sign-off is later judged against a paraphrase). The
+    // in-seat repair path is the `recapture-ac` verb (admin `/admin/api/recapture-ac`),
+    // which captures the AC from the current description once an Acceptance Criteria
+    // section is present; the same normal verb then proceeds. A transient
+    // description-fetch failure is NOT hard-gated (an infra hiccup must not wedge
+    // accepts) — it stays a fail-visible warning as before.
     try {
+      const existingAcRecord = await getAcRecord(issueId).catch(() => null);
       const { description, fetchFailed } = await fetchIssueDescription(issueId, authToken);
       if (fetchFailed) {
         log.warn(`workflow-gate: H-7: description fetch failed for ${issueId} — AC capture skipped, delivery message will note incomplete capture`);
         // AI-1776 AC2: fail-visible — post a warning comment so the steward knows
         // the AC of record was not captured and why. Signal, not gate: the
-        // transition still proceeds below.
+        // transition still proceeds below (transient read failure must not wedge).
         await postAcCaptureWarningComment(issue.internalId, issueId, authToken,
           'description fetch failed — could not retrieve the issue description to extract acceptance criteria');
       } else {
@@ -6567,11 +6578,24 @@ export async function applyStateTransition(
             source: 'description',
           });
           log.info(`workflow-gate: H-7: captured verbatim AC for ${issueId} (${verbatimAc.length} chars)`);
+        } else if (existingAcRecord) {
+          // A prior AC of record exists (e.g. recaptured, or description edited
+          // after an earlier capture) — proceed on the record already on file.
+          log.info(`workflow-gate: H-7: description has no AC section for ${issueId} but a prior AC record exists (captured by ${existingAcRecord.capturedBy}) — proceeding`);
         } else {
-          log.warn(`workflow-gate: H-7: no AC section header found in description for ${issueId} — AC capture skipped (description has no '### Acceptance' or '### AC' section)`);
-          // AI-1776 AC2: fail-visible — no AC section header found.
+          log.warn(`workflow-gate: H-7: no AC section header found in description for ${issueId} and no prior AC record — BLOCKING accept (INF-1147 T2)`);
+          // AI-1776 AC2 / INF-1147 T2: fail LOUDLY and gate — no AC of record can
+          // be captured and none exists. Decline the transition with a repairable
+          // reason instead of advancing without an AC of record.
           await postAcCaptureWarningComment(issue.internalId, issueId, authToken,
             "no acceptance criteria header found in the ticket description — the AC of record was not captured. Add an '## Acceptance Criteria' or '### AC' section and use the recapture verb to create the record.");
+          return {
+            status: "blocked",
+            code: "ac-of-record-missing",
+            detail: `no AC of record for ${issueId}: the description has no Acceptance Criteria section and no prior record exists. Add an '## Acceptance Criteria' section and run 'recapture-ac' (admin /admin/api/recapture-ac) to capture the AC of record, then re-run the transition.`,
+            from: currentStateName,
+            to: toStateName,
+          };
         }
       }
     } catch (err) {
