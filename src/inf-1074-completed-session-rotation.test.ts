@@ -113,19 +113,26 @@ describe("INF-1074 completed-status session rotation at deliver.ts re-dispatch e
     store: SessionSpawnIdempotencyStore,
     sessionId = BOUND_COMPLETED_SESSION_ID,
   ): void {
+    // INF-1088 interaction: the bound claim must be FRESH (inside
+    // LIVE_CLAIM_TTL_MS) so it stays replayable and the re-dispatch reaches the
+    // INF-1074 `return-existing` rotation probe. A hardcoded past timestamp is
+    // older than the 30-min live-claim TTL, so beginOrGetExisting treats it as
+    // an expired corpse and force-respawns (`start-new`) before the probe ever
+    // runs — bypassing rotation entirely and dropping the rotation metadata.
+    // Fresh timestamps model a genuinely in-flight session, which is what every
+    // AC here exercises: AC1/AC2/AC4 rotate a live-but-dead binding via the
+    // probe; AC3 replays a live-and-productive one.
     const bound = store.beginOrGetExisting({
       ticketId: TICKET,
       taskKey: TASK_KEY,
       runtime: "openclaw-acp",
       agentId: AGENT,
       sessionKey: SESSION_KEY,
-      requestedAt: "2026-08-02T11:59:00.000Z",
     });
     store.markSpawned(bound.record.id, {
       runId: "prior-completed-run",
       sessionId,
       state: "live",
-      observedAt: "2026-08-02T11:59:30.000Z",
       runtimeStatePath: "/tmp/openclaw/sessions.json",
     });
   }
