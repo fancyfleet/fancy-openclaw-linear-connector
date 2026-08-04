@@ -25,6 +25,57 @@ if [ "${1:-}" = "--dry-run" ]; then
   DRY_RUN=1
 fi
 
+# ── INF-1090: body-aware deploy health gate ──────────────────────────────────
+#
+# /health returns 503 ("degraded") whenever ANY background cron is critically
+# stale (>24h since last run). Cron run-stamps are PERSISTED to disk and
+# inherited by a fresh boot (registerCron seeds lastRunAt from the stamp file),
+# so after a prolonged host stall starves e.g. oob-reconcile-sweep past 24h,
+# EVERY fresh warm-standby inherits the stale stamp, self-reports 503, and the
+# old `curl -sf` gate killed it as WARM_STANDBY_FAILED before its first ~10-min
+# tick could clear the stamp. Deploy could never pass — the exact fix that would
+# restore the box could never land. Self-block (perma-503).
+#
+# A fresh build is DEPLOYABLE when it is reachable AND has a loaded roster AND
+# cron *startup* readiness is ok — even if /health reports `degraded` solely
+# because a background cron is stale. Proof it is solely stale crons: /health's
+# healthy flag is `agents>0 && cronReadiness.status=="ok" && criticalStaleCrons==0`,
+# so (degraded AND agents>0 AND cronReadiness ok) ⟺ stale crons are the ONLY
+# cause. The fresh process re-runs the cron on its interval and /health
+# self-heals to 200. Any OTHER cause of degradation — empty roster (the AI-1767
+# guard) or cron-startup-not-ready — still fails the gate. This changes only the
+# deploy decision; /health semantics (a stale cron IS a real signal) are untouched.
+#
+# jq is a hard dependency here, same as curl (both live in /usr/bin). If it is
+# ever absent the function fails closed (returns non-zero) — a re-deadlock, but
+# never a bad deploy.
+health_deployable() {
+  # $1 = health URL, $2 = curl --max-time seconds (default 3).
+  # Returns 0 if the build is safe to deploy, non-zero otherwise. Emits a NOTE
+  # to the deploy log on the accept-degraded path so a 503 is never silent.
+  local url="$1" maxt="${2:-3}" resp code body verdict
+  resp=$(curl -s --max-time "$maxt" -w $'\n%{http_code}' "$url" 2>/dev/null) || return 1
+  code="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+  case "$code" in
+    200) return 0 ;;
+    503)
+      command -v jq >/dev/null 2>&1 || return 1
+      verdict=$(printf '%s' "$body" | jq -r '
+        if (.agents // 0) > 0 and (.cronReadiness.status == "ok")
+        then "DEPLOYABLE " + ((.criticalStaleCrons // []) | map(.name) | join(","))
+        else "BLOCK" end' 2>/dev/null) || return 1
+      case "$verdict" in
+        DEPLOYABLE*)
+          echo "        NOTE: /health degraded (503) but DEPLOYABLE — sole cause is stale background cron(s): ${verdict#DEPLOYABLE } (INF-1090)"
+          echo "              roster loaded + cron-startup ok; the fresh process re-runs the cron and /health self-heals to 200."
+          return 0 ;;
+        *) return 1 ;;
+      esac ;;
+    *) return 1 ;;
+  esac
+}
+
 {
   echo "=== linear-connector deploy $(date -Is) ==="
 
@@ -391,7 +442,7 @@ fi
   WARM_OK=
   for i in $(seq 1 10); do
     sleep 1
-    if curl -sf --max-time 2 "http://127.0.0.1:$ALT_PORT/health" >/dev/null 2>&1; then
+    if health_deployable "http://127.0.0.1:$ALT_PORT/health" 2; then
       WARM_OK=1
       echo "        warm standby healthy after ${i}s (pid=$WARM_PID)"
       break
@@ -431,7 +482,7 @@ fi
   SERVICE_OK=
   for i in $(seq 1 10); do
     sleep 2
-    if curl -sf --max-time 3 http://127.0.0.1:3100/health >/dev/null 2>&1; then
+    if health_deployable "http://127.0.0.1:3100/health" 3; then
       SERVICE_OK=1
       break
     fi
@@ -454,7 +505,11 @@ fi
   fi
 
   SHARED_WT=$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null)@$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)
-  HEALTH_JSON=$(curl -sf --max-time 3 http://127.0.0.1:3100/health 2>/dev/null) || HEALTH_JSON=
+  # INF-1090: use `-s` (not `-sf`) so the commit + fixtureDrift are still
+  # extractable from a 503-but-deployable body (degraded solely by a stale
+  # background cron); `-f` would blank HEALTH_JSON on 503 and false-trip
+  # COMMIT_MISMATCH. A genuine connection failure still empties it (curl!=0).
+  HEALTH_JSON=$(curl -s --max-time 3 http://127.0.0.1:3100/health 2>/dev/null) || HEALTH_JSON=
   LIVE_COMMIT=$(printf '%s' "$HEALTH_JSON" | sed -n 's/.*"commit":"\([^"]*\)".*/\1/p')
   case "$LIVE_COMMIT" in
     "$DEPLOY_COMMIT"*)
