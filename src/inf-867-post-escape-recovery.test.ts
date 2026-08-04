@@ -117,6 +117,28 @@ function makeContextFetch(delegateId: string | null): typeof globalThis.fetch {
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
+    if (body.includes("IssueBranchAndPR")) {
+      return new Response(
+        JSON.stringify({
+          data: {
+            issue: {
+              description: "",
+              comments: { nodes: [] },
+              attachments: {
+                nodes: [
+                  {
+                    url: "https://github.com/fancyfleet/life-os/pull/92",
+                    sourceType: "github",
+                    metadata: { status: "merged" },
+                  },
+                ],
+              },
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
     return new Response(JSON.stringify({ data: {} }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
