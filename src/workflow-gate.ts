@@ -45,6 +45,7 @@ import { isTerminalIssueState } from "./linear-actionable.js";
 import type { ObservationStore } from "./store/observation-store.js";
 import { recordObservation } from "./store/observation-write-path.js";
 import { getAgent, getAgents } from "./agents.js";
+import { writeDelegate } from "./delegate-write.js";
 import { executeFanout, shouldTriggerFanout, validateFanoutSpec, extractSpecFindings, autoDeriveArmFindings, deriveSpecFromPriorChildren, deriveStructuredFromChildren, upsertDerivedSpecSection, updateIssueDescription, type FanoutResult, type Finding } from "./fanout.js";
 import { recordFanoutOutcome } from "./fanout-outcome-store.js";
 import type { DispatchRecordStore } from "./liveness-channel/dispatch-record-store.js";
@@ -7029,14 +7030,36 @@ export async function applyStateTransition(
     }
   }
 
+  // INF-761: the governed sign-off auto-assign seats the *original requester* as
+  // delegate. When that requester is one of our app users (agents), Linear
+  // silently drops the delegate if it is written BUNDLED with the label +
+  // native-state in a single issueUpdate — even with assigneeId:null carried
+  // alongside (that clear is NOT the differentiator; live repro INF-739 at
+  // 21:53:17Z: bundled write reported success, delegate read back null). This is
+  // the terminal-desync window the LSO-20 re-regression exploited. INF-728
+  // proved the STANDALONE issueUpdate (delegateId + assigneeId:null, read-back
+  // verified) persists an app-user delegate. So for this one path, keep the
+  // delegate OUT of the bundle and seat it separately through the raw verified
+  // writeDelegate chokepoint after the label/native write lands. Scoped to
+  // selection_criteria:original-requester (and to an app-user target) so the
+  // AI-1762 bundled-delegate contract — worker/prior-implementer seating, which
+  // Linear does persist in-bundle — is left exactly as it was.
+  const seatRequesterViaRawDelegatePath =
+    matchedTransition?.assign?.selection_criteria === "original-requester" &&
+    resolvedDelegateId != null &&
+    getAgents().some((a) => a.linearUserId === resolvedDelegateId);
+  const bundledDelegateId = seatRequesterViaRawDelegatePath ? undefined : resolvedDelegateId;
+
   // Step 5: Apply the FULL transition atomically (labels + delegate + native state in one
   // mutation), verified read-after-write with bounded internal retry (AI-1762) — Linear can
   // report success while silently dropping facets (live: app-user delegateId, AI-1759).
+  // INF-761: for the sign-off requester carve-out, `bundledDelegateId` is undefined so the
+  // bundle writes label + native only; the delegate is seated via the raw path below.
   const writeOutcome = await issueUpdateAtomicVerified(
     issue.internalId,
     newLabelIds,
     authToken,
-    resolvedDelegateId,
+    bundledDelegateId,
     resolvedNativeStateId,
     toStateName,
     issue.identifier,
@@ -7063,6 +7086,48 @@ export async function applyStateTransition(
   const applied = writeOutcome.ok;
 
   if (applied) {
+    // INF-761: the label/native write has landed; now seat the app-user
+    // requester delegate that was deliberately kept out of the bundle above.
+    // Route it through the raw verified writeDelegate chokepoint (INF-728's
+    // proven-persisting path: standalone delegateId + assigneeId:null with a
+    // read-back). writeDelegate returns ok:false ONLY on a definite failure —
+    // a rejected write or a read-back that PROVED a silent revert — so an
+    // ok:false here is exactly the drop this ticket exists to close. Fail
+    // loudly (operational event + explicit error) rather than leave a terminal
+    // ticket with the requester delegate silently missing.
+    if (seatRequesterViaRawDelegatePath && resolvedDelegateId) {
+      const delegateWrite = await writeDelegate(issue.internalId, resolvedDelegateId, authToken);
+      if (!delegateWrite.ok) {
+        const divergent = [
+          `delegate expected '${resolvedDelegateId}' got '${delegateWrite.persistedDelegateId ?? "null"}'`,
+        ];
+        log.error(
+          `workflow-gate: INF-761: raw requester-delegate write did not persist for ${issueId} ` +
+          `(delegate=${resolvedDelegateId}): ${delegateWrite.error ?? "unknown"}`,
+        );
+        emitTransitionWriteFailure({
+          identifier: issue.identifier ?? issueId,
+          from: currentStateName,
+          to: toStateName,
+          intent,
+          agent: options?.bodyId ?? null,
+          outcome: { ok: false, attempts: 1, failureKind: "verification", divergent, unverified: false },
+          operationalEventStore: options?.operationalEventStore,
+        });
+        return {
+          status: "failed",
+          code: "transition-write-unverified",
+          detail: `sign-off requester delegate write did not persist — ${delegateWrite.error ?? "unknown"}`,
+          from: currentStateName,
+          to: toStateName,
+        };
+      }
+      log.info(
+        `workflow-gate: INF-761: seated app-user requester delegate=${resolvedDelegateId} via raw verified path for ${issueId}` +
+        (delegateWrite.verified ? " (read-back confirmed)" : " (accepted unverified — read-back unavailable, INF-984)"),
+      );
+    }
+
     // AI-1534: record the authoritative destination state so the outbound
     // per-step delivery prefers it over a lag-prone live label read. Keyed by
     // the human identifier to match build-message's lookup key.
