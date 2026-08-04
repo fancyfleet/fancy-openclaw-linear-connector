@@ -112,7 +112,7 @@ const TEAM_ID = "team-uuid";
 
 interface Captured {
   comments: Array<{ issueId: string; body: string }>;
-  writes: Array<{ query: string; labelIds?: string[] }>;
+  writes: Array<{ query: string; labelIds?: string[]; stateId?: string | null; delegateId?: string | null; assigneeId?: string | null }>;
 }
 
 let captured: Captured;
@@ -123,6 +123,7 @@ function json(payload: unknown): Response {
 
 /** `currentLabelNames` is read fresh on every IssueWithLabels call — callers reassign it between lifecycle steps. */
 function makeFetch(currentLabelNames: () => string[]): typeof globalThis.fetch {
+  let lastWrite: Captured["writes"][number] | null = null;
   return (async (url: unknown, init?: RequestInit) => {
     if (typeof url !== "string" || !url.includes("api.linear.app")) {
       throw new Error(`unexpected fetch call: ${String(url)}`);
@@ -171,6 +172,23 @@ function makeFetch(currentLabelNames: () => string[]): typeof globalThis.fetch {
       });
     }
 
+    if (query.includes("VerifyTransitionWrite")) {
+      const labelIds = lastWrite?.labelIds ?? [];
+      const labelNames = labelIds
+        .map((id) => TEAM_LABELS.find((label) => label.id === id)?.name)
+        .filter((name): name is string => Boolean(name));
+      return json({
+        data: {
+          issue: {
+            labels: { nodes: labelNames.map((name) => ({ name })) },
+            delegate: lastWrite?.delegateId ? { id: lastWrite.delegateId } : null,
+            assignee: lastWrite?.assigneeId ? { id: lastWrite.assigneeId } : null,
+            state: lastWrite?.stateId ? { id: lastWrite.stateId } : null,
+          },
+        },
+      });
+    }
+
     if (query.includes("issueLabelCreate")) {
       return json({ data: { issueLabelCreate: { success: true, issueLabel: { id: "new-label-id" } } } });
     }
@@ -194,7 +212,14 @@ function makeFetch(currentLabelNames: () => string[]): typeof globalThis.fetch {
     }
 
     if (query.includes("issueUpdate") || query.includes("ApplyAtomicTransition") || query.includes("UpdateDelegate")) {
-      captured.writes.push({ query: query.slice(0, 60), labelIds: (vars as { labelIds?: string[] }).labelIds });
+      lastWrite = {
+        query: query.slice(0, 60),
+        labelIds: (vars as { labelIds?: string[] }).labelIds,
+        stateId: (vars as { stateId?: string | null }).stateId,
+        delegateId: (vars as { delegateId?: string | null }).delegateId,
+        assigneeId: (vars as { assigneeId?: string | null }).assigneeId,
+      };
+      captured.writes.push(lastWrite);
       return json({ data: { issueUpdate: { success: true } } });
     }
 
