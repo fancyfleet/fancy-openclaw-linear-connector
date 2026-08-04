@@ -12,14 +12,24 @@
  * Config-driven dimension→verifier map (not hardcoded).
  */
 
+import fs from "node:fs";
+import yaml from "js-yaml";
+import { getAgents } from "./agents.js";
+import { defaultCapabilityPolicyPath } from "./instance-config.js";
+
 const LINEAR_API_URL = "https://api.linear.app/graphql";
+const CODE_REVIEW_ROLE = "code-review";
 
 /** Configuration for the verify-owner resolver. */
 export interface VerifyConfig {
-  /** Map of dimension → verifier agent name, e.g. { code: "cra", design: "laren" } */
+  /** Map of dimension → verifier agent name, e.g. { code: "charles", design: "laren" } */
   dimensionMap: Record<string, string>;
   /** Default steward owner (used when no designation is present). */
   defaultOwner: string;
+  /** Capability policy path override. Defaults to live instance config. */
+  capabilityPolicyPath?: string;
+  /** Test seam / precomputed registered agent ids. Defaults to live agents config. */
+  registeredAgentIds?: string[];
 }
 
 /** Result of resolving the verify owner for a ticket. */
@@ -30,6 +40,58 @@ export interface VerifyResolution {
   designated: boolean;
   /** How the owner was determined. */
   source: "none" | "verify-label" | "xfn-derived";
+}
+
+interface PolicyBody {
+  id: string;
+  fills_roles?: string[];
+}
+
+interface CapabilityPolicy {
+  bodies?: PolicyBody[];
+}
+
+function loadCapabilityPolicy(policyPath: string): CapabilityPolicy | null {
+  try {
+    const raw = fs.readFileSync(policyPath, "utf8");
+    return yaml.load(raw) as CapabilityPolicy;
+  } catch {
+    return null;
+  }
+}
+
+function registeredAgentIds(config: VerifyConfig): Set<string> {
+  const configured = config.registeredAgentIds;
+  if (configured) return new Set(configured);
+  return new Set(getAgents().map((agent) => agent.openclawAgent ?? agent.name));
+}
+
+function resolveSingleRegisteredBodyForRole(
+  roleId: string,
+  config: VerifyConfig,
+): { owner: string | null; hasRegistry: boolean } {
+  const policyPath =
+    config.capabilityPolicyPath ??
+    process.env.CAPABILITY_POLICY_PATH ??
+    defaultCapabilityPolicyPath();
+  const policy = loadCapabilityPolicy(policyPath);
+  const registered = registeredAgentIds(config);
+  const hasRegistry = registered.size > 0;
+  const candidates = (policy?.bodies ?? [])
+    .filter((body) => body.fills_roles?.includes(roleId))
+    .map((body) => body.id)
+    .filter((id) => registered.has(id));
+
+  return { owner: candidates.length === 1 ? candidates[0] : null, hasRegistry };
+}
+
+function resolveOwnerForDimension(dimension: string, config: VerifyConfig): string | null {
+  if (dimension === "code") {
+    const live = resolveSingleRegisteredBodyForRole(CODE_REVIEW_ROLE, config);
+    if (live.owner || live.hasRegistry) return live.owner;
+    return config.dimensionMap[dimension] ?? null;
+  }
+  return config.dimensionMap[dimension] ?? null;
 }
 
 /**
@@ -54,7 +116,7 @@ export function resolveVerifyOwner(
   const verifyLabel = labels.find((l) => /^verify:/i.test(l));
   if (verifyLabel) {
     const role = verifyLabel.slice("verify:".length).toLowerCase();
-    const owner = config.dimensionMap[role] ?? null;
+    const owner = resolveOwnerForDimension(role, config);
     if (owner) {
       return { owner, designated: true, source: "verify-label" };
     }
@@ -67,7 +129,7 @@ export function resolveVerifyOwner(
   const xfnLabel = labels.find((l) => /^xfn:/i.test(l));
   if (xfnLabel) {
     const dimension = xfnLabel.slice("xfn:".length).toLowerCase();
-    const owner = config.dimensionMap[dimension] ?? null;
+    const owner = resolveOwnerForDimension(dimension, config);
     if (owner) {
       return { owner, designated: true, source: "xfn-derived" };
     }
