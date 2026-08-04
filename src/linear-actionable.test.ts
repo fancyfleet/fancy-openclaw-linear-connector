@@ -343,6 +343,22 @@ describe("isLinearIssueActionable", () => {
     await expect(isLinearIssueStillRoutedToAgent("linear-INF-1175", "charles", "delegate")).resolves.toBe(false);
   });
 
+  it("drops a stale coalesced delegate wake even when the dispatched agent has no Linear user id", async () => {
+    process.env.AGENTS_FILE = writeRoutingAgentsFile();
+    reloadAgents();
+    process.env.LINEAR_API_KEY = "lin_test_token";
+    global.fetch = okFetch({
+      id: "issue-1175",
+      identifier: "INF-1175",
+      delegate: { id: "user-sage", name: "Sage (Web Frontend)", app: true },
+      assignee: null,
+      state: { name: "Review", type: "started" },
+      relations: { nodes: [] },
+    }) as unknown as typeof fetch;
+
+    await expect(isLinearIssueStillRoutedToAgent("linear-INF-1175", "stale-reviewer", "delegate")).resolves.toBe(false);
+  });
+
   it("keeps an active reviewer actionable when the live delegate still matches", async () => {
     process.env.AGENTS_FILE = writeRoutingAgentsFile();
     reloadAgents();
