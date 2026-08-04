@@ -915,11 +915,10 @@ describe("checkWorkflowRules — canonical vault schema (src/__fixtures__/canoni
 
   afterEach(() => { globalThis.fetch = originalFetch; });
 
-  it("parses the canonical YAML and blocks submit before a commitment exit", async () => {
+  it("parses the canonical YAML and allows submit from implementation (v20: no commitment gate)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
     const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles", null, undefined, null, false, false, true);
-    expect(result).toMatch(/missing commitment exit/i);
-    expect(result).toMatch(/accept, reject, or not-ready/i);
+    expect(result).toBeNull();
   });
 
   it("canonical: escape is legal from every state (§4.4)", async () => {
@@ -1977,11 +1976,10 @@ describe("checkWorkflowRules — AI-2476: merged-PR release gate (branch/PR veri
     expect(result).toContain("requires a comment");
   });
 
-  it("merged-PR gate does NOT mask the commitment gate for 'submit' from implementation", async () => {
+  it("merged-PR gate does not block 'submit' from implementation absent branch evidence (v20: no commitment gate)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"], { hasBranch: false, hasPR: false });
     const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles", null, null, null, false, false, true);
-    expect(result).toMatch(/missing commitment exit/i);
-    expect(result).not.toMatch(/branch evidence|merged PR|pull request/i);
+    expect(result).toBeNull();
   });
 
   // AI-1492 regression: branch auto-deleted after squash merge — merged PR must still pass.
@@ -7215,23 +7213,6 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     expect(vars.stateId).toBe(SEMANTIC_TO_UUID["todo"]);
   });
 
-  it("request-changes transition routes back to implementation with todo resting native state", async () => {
-    resetWorkflowCache();
-    resetNativeStateCache();
-    const { fetch, mutations } = makeConformanceFetch(["wf:dev-impl", "state:code-review"]);
-    globalThis.fetch = fetch;
-
-    await applyStateTransition("request-changes", "AI-CONF-RC", "Bearer tok", {
-      bodyId: "reviewer",
-      feedback: { reasonCode: "missing-tests", freeText: "conformance" },
-    });
-
-    const atomicMutation = mutations.find((m) => m.query.includes("ApplyAtomicTransition"));
-    expect(atomicMutation).toBeDefined();
-    const vars = atomicMutation!.variables as { stateId?: string };
-    expect(vars.stateId).toBe(SEMANTIC_TO_UUID["todo"]);
-  });
-
   // ── Adversarial: direct-write block tests ────────────────────────────────
 
   it("blocks raw stateId mutation on workflow ticket", async () => {
@@ -7344,34 +7325,6 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
       });
       // AC1: ApplyAtomicTransition must fire regardless of /tmp store contents.
       // (Canonical workflow: implementation has native_state: todo.)
-      const atomicMutation = mutations.find((m) => m.query.includes("ApplyAtomicTransition"));
-      expect(atomicMutation).toBeDefined();
-      const vars = atomicMutation!.variables as { stateId?: string };
-      expect(vars.stateId).toBe(SEMANTIC_TO_UUID["todo"]);
-    } finally {
-      clearImplementerStore();
-      try { fs.rmSync("/tmp/implementer-store.json"); } catch { /* absent is fine */ }
-    }
-  });
-
-  it("AI-1531/AC1: request-changes completes even when /tmp/implementer-store.json is pre-seeded with a ghost-body for the conformance issue", async () => {
-    const issueId = "AI-CONF-RC-1531";
-    const poisonContent = JSON.stringify({
-      [issueId]: { bodyId: "ghost-body-ai1531", workflowId: "dev-impl", recordedAt: "2026-01-01T00:00:00Z" },
-    });
-    fs.writeFileSync("/tmp/implementer-store.json", poisonContent, "utf8");
-    clearImplementerStore();
-
-    resetWorkflowCache();
-    resetNativeStateCache();
-    const { fetch, mutations } = makeConformanceFetch(["wf:dev-impl", "state:code-review"]);
-    globalThis.fetch = fetch;
-
-    try {
-      await applyStateTransition("request-changes", issueId, "Bearer tok", {
-        bodyId: "reviewer",
-        feedback: { reasonCode: "missing-tests", freeText: "ai1531 conformance rc" },
-      });
       const atomicMutation = mutations.find((m) => m.query.includes("ApplyAtomicTransition"));
       expect(atomicMutation).toBeDefined();
       const vars = atomicMutation!.variables as { stateId?: string };

@@ -455,15 +455,14 @@ describe("AC4: dev-impl regression — registry-based gate identical to single-d
     expect(result).toContain("not a legal command");
   });
 
-  it("dev-impl: 'submit' from 'implementation' is blocked until a commitment exit is recorded", async () => {
+  it("dev-impl: 'submit' from 'implementation' is allowed (v20: no commitment gate)", async () => {
     process.env.WORKFLOW_DEFS_DIR = registryDir;
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
 
-    // AI-1731: submit now has requires_comment — pass hasComment=true to test legality, not the comment gate
+    // AI-1731: submit has requires_comment — pass hasComment=true to test legality, not the comment gate
     const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles", null, undefined, null, false, false, true);
 
-    expect(result).toMatch(/missing commitment exit/i);
-    expect(result).toMatch(/accept, reject, or not-ready/i);
+    expect(result).toBeNull();
   });
 
   it("dev-impl: 'escape' break-glass is always allowed from any state", async () => {
