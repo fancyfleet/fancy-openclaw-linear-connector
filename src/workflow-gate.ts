@@ -5453,30 +5453,29 @@ async function fetchFanoutSpecDescription(issueId: string, authToken: string, sp
     if (!issue) return null;
 
     const desc = issue.description ?? "";
-    // If we have a specSource, check if the description already has it.
     if (specSource) {
-      const findings = extractSpecFindings(desc, specSource);
-      if (findings.length > 0) {
-        // INF-470: Ensure we don't mint from a stale spec entry.
-        // A section-level content-hash marker (INF-131) in the description
-        // means this section has already fanned out. If the steward is
-        // providing a NEW brief in a comment, the comment should win.
-        const storedHash = /<!--\s*inf-131:spec-hash:(\S+)\s*for\s*(\S+)\s*-->/.exec(desc);
-        if (!storedHash) return desc;
+      const comments = issue.comments?.nodes ?? [];
+      const markerBodies = [desc, ...comments.map((c) => c.body)];
+      const descFindings = extractSpecFindings(desc, specSource);
+      if (descFindings.length > 0 && !hasFanoutSpecMarker(markerBodies, specSource, descFindings)) {
+        return desc;
+      }
+      if (descFindings.length > 0) {
         log.info(`workflow-gate: INF-470: description spec for '${specSource}' has an INF-131 hash; checking comments for a fresh update`);
       }
 
-      // Scan comments for a brief that isn't already fanned out or is newer.
-      const comments = issue.comments?.nodes ?? [];
-      // Search from newest to oldest.
+      // Search from newest to oldest for a brief whose parsed spec hash has not
+      // already been stamped as minted (INF-1106).
       for (let i = comments.length - 1; i >= 0; i--) {
         const body = comments[i].body;
         const findings = extractSpecFindings(body, specSource);
-        if (findings.length > 0) {
-          log.info(`workflow-gate: INF-470: found '${specSource}' spec in comment by ${comments[i].user?.name ?? "unknown"} for ${issueId}`);
-          return body;
-        }
+        if (findings.length === 0) continue;
+        if (hasFanoutSpecMarker(markerBodies, specSource, findings)) continue;
+        log.info(`workflow-gate: INF-470: found '${specSource}' spec in comment by ${comments[i].user?.name ?? "unknown"} for ${issueId}`);
+        return body;
       }
+
+      if (descFindings.length > 0) return null;
     }
 
     return desc || null;
@@ -5484,6 +5483,33 @@ async function fetchFanoutSpecDescription(issueId: string, authToken: string, sp
     log.warn(`workflow-gate: AI-1992: failed to fetch description/comments for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
     return null;
   }
+}
+
+function fanoutSpecHash(findings: Finding[]): string {
+  const material = findings.map((f) => f.id ?? `${f.title}\n${f.description ?? ""}`).join("\n");
+  let h = 0x811c9dc5;
+  for (let i = 0; i < material.length; i++) {
+    h ^= material.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
+
+function hasFanoutSpecMarker(bodies: string[], specSource: string, findings: Finding[]): boolean {
+  const hash = fanoutSpecHash(findings);
+  const escapedSource = specSource.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`<!--\\s*inf-131:spec-hash:${hash}\\s*for\\s*${escapedSource}\\s*-->`, "i");
+  return bodies.some((body) => re.test(body));
+}
+
+async function postFanoutSpecMarker(
+  internalIssueId: string,
+  specSource: string,
+  findings: Finding[],
+  authToken: string,
+): Promise<void> {
+  const hash = fanoutSpecHash(findings);
+  await postComment(internalIssueId, `<!-- inf-131:spec-hash:${hash} for ${specSource} -->`, authToken);
 }
 
 /**
@@ -6041,7 +6067,7 @@ export async function applyStateTransition(
   // or empty spec refuses the transition outright — no state change, no partial
   // spawn — and posts an actionable error comment. The validated findings are
   // stashed and reused post-transition so the engine never re-guesses the spec.
-  let pendingFanout: { config: FanoutConfig; findings: Finding[] } | null = null;
+  let pendingFanout: { config: FanoutConfig; findings: Finding[]; specSource: string } | null = null;
   const fanoutConfig = intent === breakGlassCommand
     ? null
     : shouldTriggerFanout(def, currentStateName ?? "", intent);
@@ -6059,7 +6085,7 @@ export async function applyStateTransition(
       }
       const validation = validateFanoutSpec(specDescription, fanoutConfig, registeredWorkflows);
       if (validation.ok) {
-        pendingFanout = { config: fanoutConfig, findings: validation.findings };
+        pendingFanout = { config: fanoutConfig, findings: validation.findings, specSource: fanoutConfig.spec_source };
         break specDescriptionLoop;
       }
 
@@ -7290,6 +7316,14 @@ export async function applyStateTransition(
       // Post a summary comment on the parent ticket with the fan-out result.
       if (fanoutResult.created > 0) {
         await postFanoutSummaryComment(issue.internalId, fanoutResult, authToken);
+        if (
+          pendingFanout &&
+          fanoutResult.errors.length === 0 &&
+          !fanoutResult.refused &&
+          !fanoutResult.pendingApproval
+        ) {
+          await postFanoutSpecMarker(issue.internalId, pendingFanout.specSource, pendingFanout.findings, authToken);
+        }
       }
 
       // ── INF-28: Record fanout outcome to store ────────────────────────

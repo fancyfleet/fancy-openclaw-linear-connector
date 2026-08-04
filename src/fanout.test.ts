@@ -11,7 +11,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { extractFindings, executeFanout, shouldTriggerFanout, type Finding } from "./fanout.js";
+import { extractFindings, extractSpecFindings, executeFanout, shouldTriggerFanout, type Finding } from "./fanout.js";
 import { applyStateTransition, resetWorkflowCache, type WorkflowDef, type FanoutConfig } from "./workflow-gate.js";
 import { reloadAgents } from "./agents.js";
 import { resetPolicyCache } from "./escalation-gate.js";
@@ -23,6 +23,21 @@ const CANONICAL_UX_AUDIT_FIXTURE = path.resolve(process.cwd(), "src/__fixtures__
 // AI-1992: the fan-out is now config-driven. The canonical dev-impl child config
 // (spec_source=findings, wf:dev-impl child) that ux-audit/sprint migrated to.
 const DEV_IMPL_FANOUT_CONFIG = { spec_source: "findings", child_workflow: "wf:dev-impl" } as FanoutConfig;
+
+function fanoutSpecHashForTest(description: string, specSource: string): string {
+  const findings = extractSpecFindings(description, specSource);
+  const material = findings.map((f) => f.id ?? `${f.title}\n${f.description ?? ""}`).join("\n");
+  let h = 0x811c9dc5;
+  for (let i = 0; i < material.length; i++) {
+    h ^= material.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
+
+function fanoutSpecMarkerForTest(description: string, specSource: string): string {
+  return `<!-- inf-131:spec-hash:${fanoutSpecHashForTest(description, specSource)} for ${specSource} -->`;
+}
 
 // ── Test capability policy with ux-audit roles ────────────────────────────
 
@@ -795,6 +810,14 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
       path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml"),
       path.join(uxDir, "canonical-dev-impl.yaml"),
     );
+    fs.copyFileSync(
+      path.resolve(process.cwd(), "src/__fixtures__/canonical-sprint-spawner.yaml"),
+      path.join(uxDir, "canonical-sprint-spawner.yaml"),
+    );
+    fs.copyFileSync(
+      path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-sprint.yaml"),
+      path.join(uxDir, "canonical-dev-sprint.yaml"),
+    );
     process.env.WORKFLOW_DEFS_DIR = uxDir;
     delete process.env.WORKFLOW_DEF_PATH;
   });
@@ -842,6 +865,16 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     teamLabels?: Array<{ id: string; name: string }>;
     /** Parent issue description. */
     parentDescription?: string;
+    /** Recent parent comments, oldest to newest. */
+    parentComments?: Array<{ body: string; user?: { name: string } | null }>;
+    /** Existing children returned to the fan-out dedupe query. */
+    existingChildren?: Array<{
+      identifier: string;
+      title?: string | null;
+      description?: string | null;
+      state?: { name?: string } | null;
+      labels?: { nodes?: Array<{ name?: string }> } | null;
+    }>;
     /** Parent issue title. */
     parentTitle?: string;
     /** When false, child issueCreate returns a Linear refusal. */
@@ -855,6 +888,8 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     const teamLabels = opts.teamLabels ?? [];
     const parentTitle = opts.parentTitle ?? "UX Audit";
     const parentDescription = opts.parentDescription ?? "## Findings\n- **Finding A**: Desc A\n- **Finding B**: Desc B\n";
+    const parentComments = opts.parentComments ?? [];
+    const existingChildren = opts.existingChildren ?? [];
     const childCreateSucceeds = opts.childCreateSucceeds ?? true;
     const childCreateError = opts.childCreateError ?? "Title must match <icon> <Project> Cycle <N> - <Theme>";
     let childCount = 0;
@@ -877,7 +912,7 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
               issue: {
                 id: "parent-internal-id",
                 description: parentDescription,
-                comments: { nodes: [] },
+                comments: { nodes: parentComments },
               },
             },
           }),
@@ -981,7 +1016,7 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
       // Fan-out: existing child dedupe query.
       if (query.includes("FanoutChildren")) {
         return new Response(
-          JSON.stringify({ data: { issue: { children: { nodes: [] } } } }),
+          JSON.stringify({ data: { issue: { children: { nodes: existingChildren } } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
@@ -1056,6 +1091,93 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     expect(commentCall).toBeDefined();
     const commentVars = commentCall!.body.variables as Record<string, unknown>;
     expect(commentVars.issueId).toBe("parent-internal-id");
+  });
+
+  it("INF-1106: stamped stale sprint spec retries mint zero duplicate children", async () => {
+    const staleSprint = "## sprint\n- **🔵 LifeOS Cycle 11 — Quiet House Signal**: completed scope\n";
+    globalThis.fetch = makeIntegrationFetch({
+      parentLabels: [
+        { id: "wf-lbl", name: "wf:sprint-spawner" },
+        { id: "state-lbl", name: "state:launching" },
+      ],
+      teamLabels: [
+        { id: "existing-wf-dev-sprint", name: "wf:dev-sprint" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ],
+      parentTitle: "LifeOS sprint spawner",
+      parentDescription: staleSprint,
+      parentComments: [
+        { body: fanoutSpecMarkerForTest(staleSprint, "sprint"), user: { name: "Igor" } },
+      ],
+      existingChildren: [
+        {
+          identifier: "LIF-349",
+          title: "🔵 LifeOS Cycle 11 — Quiet House Signal",
+          description: "Parent: LIF-45\ncompleted scope",
+          state: { name: "Done" },
+          labels: { nodes: [{ name: "wf:dev-sprint" }] },
+        },
+      ],
+    });
+
+    const result = await applyStateTransition("spawn", "LIF-45", "Bearer tok");
+
+    expect(result).toMatchObject({ status: "failed", code: "fanout-spec-invalid" });
+    const childCreateCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
+    expect(childCreateCalls).toHaveLength(0);
+  });
+
+  it("INF-1106: genuinely new signed sprint brief still mints and stamps the spec hash", async () => {
+    const newSprint = "## sprint\n- **🟢 LifeOS Cycle 12 — Listening Room**: new scope\n";
+    globalThis.fetch = makeIntegrationFetch({
+      parentLabels: [
+        { id: "wf-lbl", name: "wf:sprint-spawner" },
+        { id: "state-lbl", name: "state:launching" },
+      ],
+      teamLabels: [
+        { id: "existing-wf-dev-sprint", name: "wf:dev-sprint" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ],
+      parentTitle: "LifeOS sprint spawner",
+      parentDescription: newSprint,
+    });
+
+    await expect(applyStateTransition("spawn", "LIF-45", "Bearer tok")).resolves.toMatchObject({ status: "applied" });
+
+    const childCreateCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
+    expect(childCreateCalls).toHaveLength(1);
+    const commentBodies = fetchCalls
+      .filter((c) => (c.body.query ?? "").includes("commentCreate"))
+      .map((c) => ((c.body.variables as Record<string, unknown>).body as string | undefined) ?? "");
+    expect(commentBodies).toContain(fanoutSpecMarkerForTest(newSprint, "sprint"));
+  });
+
+  it("INF-1106: fresh steward comment brief wins over a stamped stale description sprint", async () => {
+    const staleSprint = "## sprint\n- **🔵 LifeOS Cycle 11 — Quiet House Signal**: completed scope\n";
+    const freshSprint = "## sprint\n- **🟣 LifeOS Cycle 12 — Listening Room**: new signed scope\n";
+    globalThis.fetch = makeIntegrationFetch({
+      parentLabels: [
+        { id: "wf-lbl", name: "wf:sprint-spawner" },
+        { id: "state-lbl", name: "state:launching" },
+      ],
+      teamLabels: [
+        { id: "existing-wf-dev-sprint", name: "wf:dev-sprint" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ],
+      parentTitle: "LifeOS sprint spawner",
+      parentDescription: staleSprint,
+      parentComments: [
+        { body: fanoutSpecMarkerForTest(staleSprint, "sprint"), user: { name: "Igor" } },
+        { body: freshSprint, user: { name: "Astrid" } },
+      ],
+    });
+
+    await expect(applyStateTransition("spawn", "LIF-45", "Bearer tok")).resolves.toMatchObject({ status: "applied" });
+
+    const childCreateCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
+    expect(childCreateCalls).toHaveLength(1);
+    const input = (childCreateCalls[0].body.variables as Record<string, unknown>).input as Record<string, unknown>;
+    expect(input.title).toBe("🟣 LifeOS Cycle 12 — Listening Room");
   });
 
   it("INF-624: fails closed when preview succeeds but invalid child title creates zero children", async () => {
