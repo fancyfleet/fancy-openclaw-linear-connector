@@ -118,6 +118,7 @@ type StaleCronEntry = {
   lastRunAt: string | null;
   overdueBy: string;
   overdueByMs: number;
+  intervalMs: number;
 };
 
 function getStaleCronsForTest(opts: { now: Date; stalenessMultiplier?: number }): StaleCronEntry[] {
@@ -154,6 +155,7 @@ describe("INF-339 stale cron detection", () => {
         lastRunAt: null,
         overdueBy: "1m",
         overdueByMs: 60_000,
+        intervalMs: 300_000,
       },
     ]);
   });
@@ -174,6 +176,7 @@ describe("INF-339 stale cron detection", () => {
         lastRunAt: "2026-07-22T12:00:00.000Z",
         overdueBy: "1m",
         overdueByMs: 60_000,
+        intervalMs: 600_000,
       },
     ]);
   });
@@ -198,6 +201,7 @@ describe("INF-339 stale cron detection", () => {
         lastRunAt: "2026-07-22T12:00:00.000Z",
         overdueBy: "1m",
         overdueByMs: 60_000,
+        intervalMs: 600_000,
       },
     ]);
   });
@@ -243,6 +247,7 @@ describe("INF-339 stale cron detection", () => {
         lastRunAt: null,
         overdueBy: "1m",
         overdueByMs: 60_000,
+        intervalMs: 300_000,
       },
       {
         name: "stale-plain-delegate-sweep",
@@ -250,6 +255,7 @@ describe("INF-339 stale cron detection", () => {
         lastRunAt: null,
         overdueBy: "1m",
         overdueByMs: 60_000,
+        intervalMs: 300_000,
       },
     ]);
   });

@@ -46,6 +46,13 @@ export interface StaleCronEntry {
   lastRunAt: string | null;
   overdueBy: string;
   overdueByMs: number;
+  /**
+   * Resolved schedule interval in ms (the same value staleness was measured
+   * against). Exposed so the /health critical-stale gate can size a boot-grace
+   * window as max(intervalMs, bootGraceMs) without re-parsing the schedule
+   * (INF-1091).
+   */
+  intervalMs: number;
 }
 
 export interface GetStaleCronsOptions {
@@ -312,6 +319,7 @@ export function getStaleCrons(options: GetStaleCronsOptions = {}): StaleCronEntr
         lastRunAt: entry.lastRunAt,
         overdueBy: formatIntervalMs(overdueByMs),
         overdueByMs,
+        intervalMs,
       });
     }
   }

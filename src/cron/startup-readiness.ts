@@ -33,6 +33,51 @@ export function parseCronStartupGraceMs(value: string | undefined): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 }
 
+/**
+ * Boot grace for a cron whose staleness is measured against a *persisted*,
+ * pre-boot `lastRunAt` (INF-1091).
+ *
+ * `evaluateCronStartupReadiness` only graces crons that have *never* run
+ * (`lastRunAt === null`) — it short-circuits on the first line of its loop. A
+ * cron with a `lastRunAt` restored from the run-stamp file before a restart is
+ * skipped by that grace and falls straight into the critical-stale 503 gate.
+ * The sharp case: a process that was down > ~24h boots with a >24h-old
+ * persisted stamp and cannot run its first sweep until +interval, so /health
+ * serves 503 from boot until then — the exact long-outage scenario where the
+ * health gate should let the fleet recover instead of crashlooping it.
+ *
+ * This mirrors the never-run grace for the persisted-stale case: a cron whose
+ * last run predates this boot has not had a chance to run since `bootedAt`, so
+ * it must not count toward the critical-stale gate until `max(intervalMs,
+ * bootGraceMs)` has elapsed since boot. A cron that has run since boot is
+ * legitimately stale if overdue and is *not* graced.
+ */
+export function isCronWithinBootGrace(options: {
+  lastRunAt: string | null;
+  intervalMs: number;
+  bootedAt: Date;
+  now: Date;
+  bootGraceMs: number;
+}): boolean {
+  // Never-run crons are the domain of evaluateCronStartupReadiness, not this.
+  if (options.lastRunAt === null) return false;
+
+  const bootedAtMs = options.bootedAt.getTime();
+  const nowMs = options.now.getTime();
+  const lastRunMs = Date.parse(options.lastRunAt);
+  if (!Number.isFinite(bootedAtMs) || !Number.isFinite(nowMs) || !Number.isFinite(lastRunMs)) {
+    return false;
+  }
+  if (!Number.isFinite(options.intervalMs) || options.intervalMs <= 0) return false;
+
+  // Only grace crons whose last run predates this boot (bootedAt more recent
+  // than lastRunAt). A cron that ran since boot is genuinely live-or-stale.
+  if (lastRunMs >= bootedAtMs) return false;
+
+  const graceMs = Math.max(options.intervalMs, options.bootGraceMs);
+  return nowMs - bootedAtMs < graceMs;
+}
+
 export function evaluateCronStartupReadiness(options: {
   crons: CronRegistryEntry[];
   bootedAt: Date;
