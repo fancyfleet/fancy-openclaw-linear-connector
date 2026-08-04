@@ -569,6 +569,9 @@ const DEV_IMPL_DEPLOYMENT_RESPONSE = {
 const DEV_IMPL_DEPLOYMENT_RESPONSE_HANZO_DELEGATE = {
   data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:deployment" }] }, delegate: { id: "u2" } } },
 };
+const DEV_IMPL_CODE_REVIEW_RESPONSE_CHARLES_DELEGATE = {
+  data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:code-review" }] }, delegate: { id: "u1" } } },
+};
 
 describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
   let dir: string;
@@ -978,6 +981,34 @@ const TEAM_LABELS_WITH_CR = {
   },
 };
 
+const DEV_IMPL_CODE_REVIEW_WITH_IDS = {
+  data: {
+    issue: {
+      id: "internal-uuid",
+      team: { id: "team-uuid" },
+      labels: {
+        nodes: [
+          { id: "wf-lbl", name: "wf:dev-impl" },
+          { id: "state-review-lbl", name: "state:code-review" },
+        ],
+      },
+    },
+  },
+};
+
+const TEAM_LABELS_WITH_DEPLOYMENT = {
+  data: {
+    team: {
+      labels: {
+        nodes: [
+          { id: "review-lbl", name: "state:code-review" },
+          { id: "deployment-lbl", name: "state:deployment" },
+        ],
+      },
+    },
+  },
+};
+
 describe("proxy enforcement — B2 state-label transition application", () => {
   let dir: string;
   let appState: ReturnType<typeof createApp>;
@@ -1115,6 +1146,39 @@ describe("proxy enforcement — B2 state-label transition application", () => {
     expect(vars.issueId).toBe("internal-uuid");
     expect(vars.labelIds).toContain("cr-lbl");
     expect(vars.labelIds).not.toContain("state-lbl");
+  });
+
+  it("lets an active reviewer approve multiple live-delegated review tickets", async () => {
+    const { fetch: mock, calls } = makeB2Fetch({
+      b1LabelResponse: DEV_IMPL_CODE_REVIEW_RESPONSE_CHARLES_DELEGATE,
+      b2IssueResponse: DEV_IMPL_CODE_REVIEW_WITH_IDS,
+      b2TeamLabels: TEAM_LABELS_WITH_DEPLOYMENT,
+    });
+    globalThis.fetch = mock;
+
+    for (const id of ["INF-1103", "INF-1104", "INF-1069"]) {
+      const res = await request(appState.app)
+        .post("/proxy/graphql")
+        .set("Authorization", "Bearer test-token")
+        .set("X-Openclaw-Agent", "charles")
+        .set("X-Openclaw-Linear-Intent", "approve")
+        .send({
+          query: "mutation Approve($id: String!) { issueUpdate(id: $id, input: {}) { success } }",
+          variables: { id },
+        });
+
+      expect(res.status).toBe(200);
+      expect(res.body.errors).toBeUndefined();
+      expect(res.body.data).toBeDefined();
+    }
+
+    const transitionCalls = calls.filter((c) => c.query.includes("ApplyAtomicTransition"));
+    expect(transitionCalls).toHaveLength(3);
+    for (const call of transitionCalls) {
+      const vars = call.variables as { labelIds: string[] };
+      expect(vars.labelIds).toContain("deployment-lbl");
+      expect(vars.labelIds).not.toContain("state-review-lbl");
+    }
   });
 
   it("does NOT apply transition on a blocked command", async () => {

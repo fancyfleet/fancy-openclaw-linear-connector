@@ -1,4 +1,8 @@
 import { jest } from "@jest/globals";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { reloadAgents } from "./agents.js";
 import { checkLinearIssueRouting, isBlockedByOpenIssue, isHumanLinearUser, isLinearIssueActionable, isLinearIssueStillRoutedToAgent, isParkedIssueState } from "./linear-actionable.js";
 
 const IGOR_LINEAR_USER_ID = "3d6a19fb-037c-4543-a5ca-6219d014a14f";
@@ -22,6 +26,22 @@ function okFetch(issue: unknown) {
     .mockResolvedValue({ ok: true, json: async () => ({ data: { issue } }) });
 }
 
+function writeRoutingAgentsFile(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-actionable-agents-"));
+  const file = path.join(dir, "agents.json");
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      agents: [
+        { name: "charles", linearUserId: "user-charles", accessToken: "tok", openclawAgent: "charles", host: "local" },
+        { name: "sage", linearUserId: "user-sage", accessToken: "tok", openclawAgent: "sage", host: "local" },
+      ],
+    }),
+    "utf8",
+  );
+  return file;
+}
+
 describe("isLinearIssueActionable", () => {
   const originalEnv = process.env;
   const originalFetch = global.fetch;
@@ -33,6 +53,7 @@ describe("isLinearIssueActionable", () => {
   afterEach(() => {
     process.env = originalEnv;
     global.fetch = originalFetch;
+    reloadAgents();
     jest.restoreAllMocks();
   });
 
@@ -304,6 +325,38 @@ describe("isLinearIssueActionable", () => {
     // With a token set, we proceed and return true (has delegate, can't verify identity).
     process.env.LINEAR_API_KEY = "lin_test_token";
     await expect(isLinearIssueStillRoutedToAgent("linear-AI-999", "unknown-agent", "delegate")).resolves.toBe(true);
+  });
+
+  it("drops a stale coalesced delegate wake when the live delegate moved to a known different agent", async () => {
+    process.env.AGENTS_FILE = writeRoutingAgentsFile();
+    reloadAgents();
+    process.env.LINEAR_API_KEY = "lin_test_token";
+    global.fetch = okFetch({
+      id: "issue-1175",
+      identifier: "INF-1175",
+      delegate: { id: "user-sage", name: "Sage (Web Frontend)", app: true },
+      assignee: null,
+      state: { name: "Review", type: "started" },
+      relations: { nodes: [] },
+    }) as unknown as typeof fetch;
+
+    await expect(isLinearIssueStillRoutedToAgent("linear-INF-1175", "charles", "delegate")).resolves.toBe(false);
+  });
+
+  it("keeps an active reviewer actionable when the live delegate still matches", async () => {
+    process.env.AGENTS_FILE = writeRoutingAgentsFile();
+    reloadAgents();
+    process.env.LINEAR_API_KEY = "lin_test_token";
+    global.fetch = okFetch({
+      id: "issue-review-1",
+      identifier: "INF-1103",
+      delegate: { id: "user-charles", name: "Charles (Engineering Head)", app: true },
+      assignee: null,
+      state: { name: "Review", type: "started" },
+      relations: { nodes: [] },
+    }) as unknown as typeof fetch;
+
+    await expect(isLinearIssueStillRoutedToAgent("linear-INF-1103", "charles", "delegate")).resolves.toBe(true);
   });
 
   // ── AI-2295: liveness gate applies to every routing reason; human-blocked

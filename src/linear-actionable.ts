@@ -354,6 +354,11 @@ export async function checkLinearIssueRouting(
         log.info(`Dropping stale delegate event for ${identifier}: ticket has no delegate (handed back)`);
         return { actionable: false, failOpen: false };
       }
+      const liveDelegateAgent = issue.delegate.id ? buildAgentMap()[issue.delegate.id] : undefined;
+      if (liveDelegateAgent && liveDelegateAgent !== agentId) {
+        log.info(`Dropping stale delegate event for ${identifier}: live delegate is ${liveDelegateAgent}, not ${agentId}`);
+        return { actionable: false, failOpen: false };
+      }
       if (agent?.linearUserId) {
         const ok = issue.delegate.id === agent.linearUserId;
         if (!ok) log.info(`Dropping stale delegate event for ${identifier}: ${agentId} is no longer delegate`);
@@ -367,6 +372,11 @@ export async function checkLinearIssueRouting(
     if (routingReason === "assignee") {
       if (!issue.assignee) {
         log.info(`Dropping stale assignee event for ${identifier}: ticket has no assignee`);
+        return { actionable: false, failOpen: false };
+      }
+      const liveAssigneeAgent = issue.assignee.id ? buildAgentMap()[issue.assignee.id] : undefined;
+      if (liveAssigneeAgent && liveAssigneeAgent !== agentId) {
+        log.info(`Dropping stale assignee event for ${identifier}: live assignee is ${liveAssigneeAgent}, not ${agentId}`);
         return { actionable: false, failOpen: false };
       }
       if (agent?.linearUserId) {
