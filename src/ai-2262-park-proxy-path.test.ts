@@ -150,10 +150,11 @@ describe("AI-2262 AC3: applyStateTransition(\"park\", ...) behavior", () => {
   });
 
   it("T-AC1: park demotes wf-enrolled ticket to __ad_hoc__", async () => {
+    let appliedVariables: Record<string, unknown> | null = null;
     globalThis.fetch = async (url, init) => {
       const bodyText = typeof init?.body === "string" ? init.body : "";
       if (typeof url === "string" && url.includes("api.linear.app")) {
-        const parsed = JSON.parse(bodyText) as { query?: string };
+        const parsed = JSON.parse(bodyText) as { query?: string; variables?: Record<string, unknown> };
         const q = parsed.query ?? "";
 
         if (q.includes("IssueWithLabels")) {
@@ -174,12 +175,24 @@ describe("AI-2262 AC3: applyStateTransition(\"park\", ...) behavior", () => {
 
         if (q.includes("TeamStates")) {
           return new Response(
-            JSON.stringify({ data: { team: { states: { nodes: [{ id: "st-todo", name: "Todo", type: "unstarted" }] } } } }),
+            JSON.stringify({
+              data: {
+                team: {
+                  states: {
+                    nodes: [
+                      { id: "st-backlog", name: "Backlog", type: "backlog" },
+                      { id: "st-todo", name: "Todo", type: "unstarted" },
+                    ],
+                  },
+                },
+              },
+            }),
             { status: 200, headers: { "Content-Type": "application/json" } },
           );
         }
 
         if (q.includes("ApplyAtomicTransition")) {
+          appliedVariables = parsed.variables ?? null;
           return new Response(
             JSON.stringify({ data: { issueUpdate: { success: true } } }),
             { status: 200, headers: { "Content-Type": "application/json" } },
@@ -196,6 +209,13 @@ describe("AI-2262 AC3: applyStateTransition(\"park\", ...) behavior", () => {
     expect(result.status).toBe("applied");
     expect(result.code).toBe("demoted-ad-hoc");
     expect(result).toMatchObject({ from: "intake", to: "__ad_hoc__" });
+    expect(appliedVariables).toMatchObject({
+      issueId: "internal-uuid",
+      labelIds: [],
+      delegateId: null,
+      assigneeId: null,
+      stateId: "st-backlog",
+    });
   });
 
   it("T-AC2: park on ad-hoc ticket returns noop", async () => {

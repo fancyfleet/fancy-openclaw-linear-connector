@@ -5888,10 +5888,17 @@ export async function applyStateTransition(
   // Ticket is demoted out of the workflow — remove state:* and wf:* labels.
   if (toStateName === "__ad_hoc__") {
     const keepIds = retainedLabelIdsForIssue(issue.labels, issue.teamId, { stripWorkflowLabels: true });
-    const labelsApplied = await issueUpdateLabels(issue.internalId, keepIds, authToken);
-    if (!labelsApplied) {
+    const backlogStateId = await resolveNativeStateId(issue.teamId, "backlog", authToken);
+    if (!backlogStateId) {
       log.error(
-        `workflow-gate: B2 apply: FAILED — ${issueId} demoted to __ad_hoc__ but label mutation returned false`,
+        `workflow-gate: B2 apply: FAILED — ${issueId} demoted to __ad_hoc__ but native Backlog state could not be resolved`,
+      );
+      return { status: "failed", code: "native-state-unresolved", detail: `could not resolve native Backlog state`, from: currentStateName, to: "__ad_hoc__" };
+    }
+    const demoteApplied = await issueUpdateAtomic(issue.internalId, keepIds, authToken, null, backlogStateId);
+    if (!demoteApplied) {
+      log.error(
+        `workflow-gate: B2 apply: FAILED — ${issueId} demoted to __ad_hoc__ but label/native mutation returned false`,
       );
       emitTransitionWriteFailure({
         identifier: issue.identifier ?? issueId,
@@ -5902,7 +5909,7 @@ export async function applyStateTransition(
         outcome: { ok: false, attempts: 1, failureKind: "mutation", divergent: [], unverified: false },
         operationalEventStore: options?.operationalEventStore,
       });
-      return { status: "failed", code: "atomic-mutation-failed", detail: `__ad_hoc__ demote label mutation did not apply`, from: currentStateName, to: "__ad_hoc__" };
+      return { status: "failed", code: "atomic-mutation-failed", detail: `__ad_hoc__ demote label/native mutation did not apply`, from: currentStateName, to: "__ad_hoc__" };
     }
     // AI-1534: ticket left the workflow — drop any cached state so it can't
     // override a later live read.
@@ -5910,7 +5917,7 @@ export async function applyStateTransition(
     // AI-1799: mirror — mark the ticket as having left the workflow.
     options?.enrolledTicketsStore?.demoteEnrolled(issue.identifier ?? issueId);
     log.info(
-      `workflow-gate: B2 apply: ${issueId} demoted to __ad_hoc__ — removed state:* and wf:* labels`,
+      `workflow-gate: B2 apply: ${issueId} demoted to __ad_hoc__ — removed state:* and wf:* labels and set native Backlog`,
     );
     return { status: "applied", code: "demoted-ad-hoc", from: currentStateName, to: "__ad_hoc__" };
   }
@@ -8372,6 +8379,7 @@ export interface IssueWorkflowSnapshot {
   identifier: string;
   teamId: string;
   labels: LabelNode[];
+  nativeStateId: string | null;
   workflowId: string | null;
   currentState: string | null;
   entryState: string | null;

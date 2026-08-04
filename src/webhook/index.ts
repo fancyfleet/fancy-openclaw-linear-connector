@@ -29,7 +29,7 @@ import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgent
 import { checkAgentLiveness, type LivenessConfig } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
 import { checkRoleGuardAndBlock, type LinearUserIdResolver } from "../routing-guard.js";
-import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, autoEnrollPlainDelegation, markAutoEnrollRegistered, markCommitmentActivityObserverRegistered, applyStateTransition, type WorkflowInstanceContext } from "../workflow-gate.js";
+import { fetchIssueWorkflowSnapshot, fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, autoEnrollPlainDelegation, markAutoEnrollRegistered, markCommitmentActivityObserverRegistered, applyStateTransition, loadWorkflowDefById, resolveNativeStateId, setStateAtomic, type WorkflowInstanceContext } from "../workflow-gate.js";
 import { checkLabelSyncForTicket, emitLabelSyncWarning } from "../transition-audit.js";
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets, type NoActivityDetector } from "../bag/index.js";
@@ -342,6 +342,37 @@ function resolveWorkflowStateFromEvent(event: LinearEvent): {
     };
   }
   return { workflowState: null, source: null, nativeState: null, staleNativeState: null };
+}
+
+async function reconcileNativeStateBeforeDispatch(
+  ticketId: string,
+  authToken: string,
+): Promise<{ reconciled: boolean; reason?: string }> {
+  const issueIdentifier = ticketId.replace(/^linear-/, "");
+  const snapshot = await fetchIssueWorkflowSnapshot(issueIdentifier, authToken);
+  if (!snapshot?.workflowId || !snapshot.currentState) return { reconciled: false };
+
+  const def = await loadWorkflowDefById(snapshot.workflowId);
+  const stateDef = def?.states.find((s) => s.id === snapshot.currentState);
+  const nativeProjection = stateDef?.native_state;
+  if (!nativeProjection) return { reconciled: false };
+
+  const expectedNativeStateId = await resolveNativeStateId(snapshot.teamId, nativeProjection, authToken);
+  if (!expectedNativeStateId || snapshot.nativeStateId === expectedNativeStateId) {
+    return { reconciled: false };
+  }
+
+  const repaired = await setStateAtomic(issueIdentifier, snapshot.currentState, undefined, authToken);
+  if (!repaired.ok) {
+    return {
+      reconciled: true,
+      reason: `native-state drift detected but repair failed: ${repaired.error}`,
+    };
+  }
+  return {
+    reconciled: true,
+    reason: `native-state drift repaired for ${snapshot.workflowId}:${snapshot.currentState}`,
+  };
 }
 
 async function checkDelegatePingPong(
@@ -1388,6 +1419,36 @@ export function createWebhookRouter(
       if (!routingCheck.actionable) {
         appendOperationalEvent(operationalEventStore, { outcome: "dedup-suppressed", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "stale-route" });
         return;
+      }
+
+      const stateTruthToken =
+        getAccessToken(route.agentId) ??
+        process.env.LINEAR_OAUTH_TOKEN ??
+        process.env.LINEAR_API_KEY;
+      if (stateTruthToken) {
+        try {
+          const stateTruth = await reconcileNativeStateBeforeDispatch(ticketId, stateTruthToken);
+          if (stateTruth.reconciled) {
+            log.warn(
+              `state-truth-guard: dispatch skipped for ${route.agentId} [${ticketId}] — ` +
+              (stateTruth.reason ?? "native-state drift reconciled"),
+            );
+            appendOperationalEvent(operationalEventStore, {
+              outcome: "dedup-suppressed",
+              type: event.type,
+              agent: route.agentId,
+              key: ticketId,
+              sessionKey: ticketId,
+              deliveryMode: "state-truth-reconcile",
+              plane: "connector",
+              detail: { reason: stateTruth.reason ?? "native-state drift reconciled" },
+            });
+            return;
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.warn(`state-truth-guard: failed for ${ticketId}: ${msg} — continuing fail-open`);
+        }
       }
 
       // ── 9b. Nudge deduplication + coalescing (atomic) ────────────────────

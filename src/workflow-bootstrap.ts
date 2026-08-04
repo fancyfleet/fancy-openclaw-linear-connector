@@ -15,7 +15,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { componentLogger, createLogger } from "./logger.js";
-import { loadWorkflowRegistry, type WorkflowDef } from "./workflow-gate.js";
+import { loadWorkflowRegistry, resolveNativeStateId, type WorkflowDef } from "./workflow-gate.js";
 import { resolveBodiesForRole, roleResolutionScopeForOwnerRole } from "./escalation-gate.js";
 import { findOrCreateLabel, postComment } from "./linear-helpers.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
@@ -250,18 +250,22 @@ export async function issueUpdateAtomic(
   authToken: string,
   delegateId?: string | null,
   assigneeId?: string | null,
+  nativeStateId?: string | null,
 ): Promise<boolean> {
   const hasDelegate = delegateId !== undefined;
   const hasAssignee = assigneeId !== undefined;
+  const hasStateId = nativeStateId !== undefined;
   const inputParts: string[] = ["labelIds: $labelIds"];
   if (hasDelegate) inputParts.push("delegateId: $delegateId");
   if (hasAssignee) inputParts.push("assigneeId: $assigneeId");
+  if (hasStateId) inputParts.push("stateId: $stateId");
 
   const varDecls = [
     "$issueId: String!",
     "$labelIds: [String!]!",
     ...(hasDelegate ? ["$delegateId: String"] : []),
     ...(hasAssignee ? ["$assigneeId: String"] : []),
+    ...(hasStateId ? ["$stateId: String"] : []),
   ];
 
   const mutation = `
@@ -274,6 +278,7 @@ export async function issueUpdateAtomic(
   const variables: Record<string, unknown> = { issueId: internalId, labelIds };
   if (hasDelegate) variables.delegateId = delegateId;
   if (hasAssignee) variables.assigneeId = assigneeId;
+  if (hasStateId) variables.stateId = nativeStateId;
 
   try {
     const res = await fetch(LINEAR_API_URL, {
@@ -375,8 +380,9 @@ export async function maybeBootstrapWorkflow(
   if (removedIds.length > 0 && !currentWfLabelNode && currentStateLabels.length > 0) {
     const stateLabelIds = new Set(currentStateLabels.map((n) => n.id));
     const newLabelIds = currentLabelIds.filter((id) => !stateLabelIds.has(id));
+    const backlogStateId = await resolveNativeStateId(issue.teamId, "backlog", effectiveToken);
 
-    await issueUpdateAtomic(issue.id, newLabelIds, effectiveToken);
+    await issueUpdateAtomic(issue.id, newLabelIds, effectiveToken, undefined, undefined, backlogStateId ?? undefined);
 
     log.info(
       `workflow-bootstrap: demoted ${issueEvent.data.id} — removed [${currentStateLabels.map((n) => n.name).join(", ")}]`,

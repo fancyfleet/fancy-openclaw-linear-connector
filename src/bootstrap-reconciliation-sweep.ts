@@ -36,7 +36,7 @@ import {
   fetchIssueContext,
   applyBootstrapToIssue,
 } from "./workflow-bootstrap.js";
-import { loadWorkflowRegistry, type WorkflowDef } from "./workflow-gate.js";
+import { loadWorkflowRegistry, resolveNativeStateId, type WorkflowDef } from "./workflow-gate.js";
 import { isTerminalIssueState } from "./linear-actionable.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { getRateLimitClient } from "./linear-rate-limit-client.js";
@@ -140,7 +140,7 @@ type ReconciliationCandidate = {
   delegateId: string | null;
   teamId: string;
   /** INF-608: native Linear state, for the native-terminality guard (symmetric to INF-584). */
-  nativeState?: { name?: string; type?: string } | null;
+  nativeState?: { id?: string; name?: string; type?: string } | null;
 };
 
 function workflowDefForLabel(registry: Map<string, WorkflowDef> | undefined, workflowLabel: string): WorkflowDef | undefined {
@@ -454,6 +454,38 @@ async function reconcileTerminalNativeState(
 }
 
 /**
+ * Reconcile an enrolled ticket whose workflow label projects to one native
+ * Linear state but whose native state is currently elsewhere. The connector
+ * workflow label is the source of truth; this writes only Linear's native state.
+ */
+async function reconcileProjectedNativeState(
+  issueId: string,
+  nativeStateId: string,
+  authToken: string,
+  fetchFn: typeof fetch,
+): Promise<boolean> {
+  const mutation = `
+    mutation ReconcileProjectedNativeState($issueId: String!, $stateId: String!) {
+      issueUpdate(id: $issueId, input: { stateId: $stateId }) {
+        success
+      }
+    }
+  `;
+  try {
+    const res = await fetchFn(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: mutation, variables: { issueId, stateId: nativeStateId } }),
+    });
+    type MResp = { data?: { issueUpdate?: { success: boolean } } };
+    const data = (await res.json()) as MResp;
+    return data.data?.issueUpdate?.success ?? false;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * INF-753 (Mode 2 mis-seat heal): clear a stray delegate that was mis-seated onto
  * a terminal-labeled ticket whose native state is ALREADY terminal. Writes only
  * `delegateId: null` — it does NOT touch the native state (already completed) or
@@ -509,7 +541,7 @@ async function queryUnenrolledTickets(
     labels: { nodes: Array<{ id: string; name: string }> };
     delegate: { id: string } | null;
     team: { id: string };
-    state: { name: string; type: string } | null;
+    state: { id?: string; name: string; type: string } | null;
   };
   type Resp = {
     errors?: Array<{ message: string }>;
@@ -540,7 +572,7 @@ async function queryUnenrolledTickets(
             labels { nodes { id name } }
             delegate { id }
             team { id }
-            state { name type }
+            state { id name type }
             title
           }
           pageInfo {
@@ -829,7 +861,76 @@ export async function runBootstrapReconciliationSweep(
     }
   }
 
-  // ── Pass 4: Terminal workflow label but active native state (INF-497) ────────
+  // ── Pass 4: Enrolled workflow label/native-state drift ─────────────────────
+  // The workflow label is connector-terminal reality. If an enrolled ticket's
+  // state:* label projects to a native Linear state that does not match the live
+  // native state, repair native Linear state before any future dispatch can rely
+  // on the divergent board column.
+  for (const ticket of candidates) {
+    const workflowLabel = ticket.labels.find((l) => l.name.startsWith("wf:"))?.name;
+    const stateLabel = ticket.labels.find((l) => l.name.startsWith("state:"))?.name;
+    if (!workflowLabel || !stateLabel) continue;
+    if (isTerminalIssueState(ticket.nativeState)) continue;
+
+    const def = workflowDefForLabel(workflowRegistry, workflowLabel);
+    const stateName = stateLabel.replace(/^state:/, "");
+    const stateDef = def?.states.find((s) => s.id === stateName);
+    const nativeProjection = stateDef?.native_state;
+    if (!nativeProjection) continue;
+
+    try {
+      const expectedNativeStateId = await resolveNativeStateId(ticket.teamId, nativeProjection, authToken);
+      if (!expectedNativeStateId) {
+        result.errors.push(`native-state drift: could not resolve '${nativeProjection}' for ${ticket.identifier}`);
+        continue;
+      }
+
+      const stateData = await queryEnrolledTicketState(ticket.id, authToken, fetchFn);
+      if (!stateData?.state?.id || stateData.state.id === expectedNativeStateId) continue;
+      if (isTerminalIssueState(stateData.state)) continue;
+
+      const reconciled = await reconcileProjectedNativeState(ticket.id, expectedNativeStateId, authToken, fetchFn);
+      if (reconciled) {
+        result.healed++;
+        log.info(
+          `bootstrap-reconciliation: reconciled native drift for ${ticket.identifier}` +
+          ` (${workflowLabel} ${stateLabel}; native ${stateData.state.name} → ${nativeProjection})`,
+        );
+        alertBus.notify({
+          severity: "warning",
+          source: "bootstrap-reconciled",
+          title: `Bootstrap reconciliation repaired native-state drift on ${ticket.identifier}`,
+          detail: {
+            mode: "native-state-drift-reconcile",
+            ticket: ticket.identifier,
+            issueId: ticket.id,
+            workflowLabel,
+            stateLabel,
+            fromNativeState: stateData.state.name,
+            toNativeState: nativeProjection,
+            toStateId: expectedNativeStateId,
+          },
+          ticket: ticket.identifier,
+        });
+      } else {
+        result.errors.push(`native-state drift reconcile mutation failed for ${ticket.identifier}`);
+        log.warn(`bootstrap-reconciliation: native-state drift reconcile returned false for ${ticket.identifier}`);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      result.errors.push(`native-state drift reconcile failed for ${ticket.identifier}: ${msg}`);
+      log.error(`bootstrap-reconciliation: native-state drift reconcile error for ${ticket.identifier}: ${msg}`);
+      alertBus.notify({
+        severity: "warning",
+        source: "bootstrap-reconciled",
+        title: `Bootstrap reconciliation native-state drift error for ${ticket.identifier}`,
+        detail: { error: msg },
+        ticket: ticket.identifier,
+      });
+    }
+  }
+
+  // ── Pass 5: Terminal workflow label but active native state (INF-497) ────────
   // The mirror image of Pass 3. Pass 3 closes tickets that are native-Done but
   // still carry live workflow labels. Pass 4 handles the inverse: the workflow
   // record already reached terminal `done` (label `state:done`) but the native
@@ -940,7 +1041,7 @@ export async function runBootstrapReconciliationSweep(
     }
   }
 
-  // ── Pass 5: Actionable null-delegate tickets → auto-seat role owner (INF-739 Mode 1) ─
+  // ── Pass 6: Actionable null-delegate tickets → auto-seat role owner (INF-739 Mode 1) ─
   // The INF-735 shape: `wf:*` + a non-terminal `state:*` label, native state
   // still active, but NO delegate. The workflow record is correctly enrolled and
   // actionable — the only defect is that no agent owns the next move, so it stalls
