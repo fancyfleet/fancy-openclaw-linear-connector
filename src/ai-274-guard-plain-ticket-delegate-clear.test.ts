@@ -47,6 +47,7 @@ jest.unstable_mockModule("./workflow-gate.js", () => ({
   fetchTicketVerification: jest.fn(),
   resolveSignoffWakeTargets: jest.fn(),
   SIGNOFF_WAKE_DISPATCHED_PHRASE: "A signoff wake has been dispatched",
+  UNMERGED_CLOSE_BLOCK_PHRASE: "cannot close unmerged work",
 }));
 
 jest.unstable_mockModule("./barrier.js", () => ({

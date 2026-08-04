@@ -113,19 +113,20 @@ describe("INF-1074 completed-status session rotation at deliver.ts re-dispatch e
     store: SessionSpawnIdempotencyStore,
     sessionId = BOUND_COMPLETED_SESSION_ID,
   ): void {
+    const now = new Date().toISOString();
     const bound = store.beginOrGetExisting({
       ticketId: TICKET,
       taskKey: TASK_KEY,
       runtime: "openclaw-acp",
       agentId: AGENT,
       sessionKey: SESSION_KEY,
-      requestedAt: "2026-08-02T11:59:00.000Z",
+      requestedAt: now,
     });
     store.markSpawned(bound.record.id, {
       runId: "prior-completed-run",
       sessionId,
       state: "live",
-      observedAt: "2026-08-02T11:59:30.000Z",
+      observedAt: now,
       runtimeStatePath: "/tmp/openclaw/sessions.json",
     });
   }
