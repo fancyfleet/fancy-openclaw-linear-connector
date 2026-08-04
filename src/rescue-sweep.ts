@@ -22,7 +22,7 @@ import { writeDelegate } from "./delegate-write.js";
 import yaml from "js-yaml";
 import { createLogger, componentLogger } from "./logger.js";
 import { defaultCapabilityPolicyPath } from "./instance-config.js";
-import { getLinearUserIdForAgent } from "./agents.js";
+import { getAgents, getLinearUserIdForAgent } from "./agents.js";
 import { boundSeatFor } from "./implementer-store.js";
 import type { OperationalEventInput } from "./store/operational-event-store.js";
 
@@ -200,9 +200,12 @@ function loadCapabilityPolicy(policyPath: string): CapabilityPolicy | null {
  * compares against `ticket.delegateId` (a Linear UUID) and feeds candidates to `setDelegate`
  * (which requires a UUID). So each body id is translated to its Linear user UUID here — once,
  * at build time — rather than leaking short names into the classifier comparison or the
- * mutation. A body that cannot be resolved falls back to its raw id (so a single unmapped body
- * does not silently shrink a role and mis-classify its correctly-delegated siblings) and is
- * WARN-logged, since delegate mutations for it will fail until the mapping is fixed.
+ * mutation. If a role has at least one live registered body, unresolved bodies
+ * are omitted from that candidate pool; carrying a stale short name forward
+ * would make the role ambiguous and block rescue for the real registered body.
+ * When no agents registry is loaded at all, keep the old raw-id fallback so
+ * isolated tests and non-mutating classification fixtures are not silently
+ * collapsed.
  */
 function buildRoleResolver(
   policy: CapabilityPolicy | null,
@@ -210,22 +213,33 @@ function buildRoleResolver(
 ): (roleId: string) => string[] {
   if (!policy?.bodies) return () => [];
   const bodies = policy.bodies;
+  const hasAgentRegistry = getAgents().length > 0;
 
   // Resolve body id → Linear user UUID once. Warn on any unmapped body.
   const resolved = new Map<string, string>();
+  const unresolved = new Set<string>();
   for (const b of bodies) {
     const uuid = bodyIdToLinearUserId(b.id);
     if (!uuid) {
       log.warn(
-        `rescue-sweep: no Linear user id for body "${b.id}"; falling back to raw id — ` +
-          `delegate mutations for this body will fail until it is mapped in agents config`,
+        `rescue-sweep: no Linear user id for body "${b.id}"; will ignore it when a live ` +
+          `registered candidate fills the same role`,
       );
+      unresolved.add(b.id);
+      continue;
     }
-    resolved.set(b.id, uuid ?? b.id);
+    resolved.set(b.id, uuid);
   }
 
-  return (roleId: string) =>
-    bodies.filter((b) => b.fills_roles?.includes(roleId)).map((b) => resolved.get(b.id)!);
+  return (roleId: string) => {
+    const roleBodies = bodies.filter((b) => b.fills_roles?.includes(roleId));
+    const liveCandidates = roleBodies
+      .map((b) => resolved.get(b.id))
+      .filter((id): id is string => Boolean(id));
+    if (liveCandidates.length > 0) return liveCandidates;
+    if (hasAgentRegistry) return [];
+    return roleBodies.map((b) => b.id).filter((id) => unresolved.has(id));
+  };
 }
 
 // ── Linear API helpers ─────────────────────────────────────────────────────
