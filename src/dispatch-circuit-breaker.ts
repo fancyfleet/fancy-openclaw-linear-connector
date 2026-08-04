@@ -604,6 +604,37 @@ export function recordFailedWake(
 }
 
 /**
+ * INF-1157: Gate a cron-driven re-poke (stale-session recovery, first-action
+ * watchdog, reconciliation re-dispatch) on the circuit breaker.
+ *
+ * The webhook dispatch path already records against and checks the breaker
+ * (webhook/index.ts §9). The cron re-dispatch paths did NOT — so a ticket
+ * wedged on the same workflow state (the exact off-spine `state:doing` shape:
+ * its only forward verb resolves to a transition the bare re-poke can never
+ * satisfy, so `continue-workflow` is declined every cycle) was re-poked
+ * forever. The breaker would trip, but nothing on the cron path consulted it.
+ *
+ * This records THIS re-poke against the SAME per-ticket counter the webhook
+ * path uses (so webhook wakes and cron re-pokes accumulate together toward one
+ * no-progress ceiling) and reports whether the breaker is now tripped. When it
+ * is, the caller drops the re-poke; the trip already emits the loud
+ * `transition-stuck` alert (see recordDispatch), so the wedge escalates to a
+ * steward instead of looping silently.
+ *
+ * `stateLabel` must be the same normalized form the webhook path records — the
+ * `state:*` id(s) WITHOUT the `state:` prefix, lowercased, sorted, comma-joined
+ * (or null when the ticket carries no `state:*` label). A null label is treated
+ * as ad-hoc and never suppresses.
+ */
+export function recordRepokeAndCheckBreaker(
+  ticketId: string,
+  stateLabel: string | null,
+): { suppress: boolean; state: TicketBreakerState } {
+  const state = recordDispatch(ticketId, stateLabel);
+  return { suppress: checkBreaker(ticketId).blocked, state };
+}
+
+/**
  * Check if the breaker is tripped for a ticket.
  * Returns `{ blocked: true, state }` if the breaker is open and dispatch should
  * be suppressed. Returns `{ blocked: false }` otherwise.

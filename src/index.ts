@@ -40,7 +40,7 @@ import {
 import { checkLinearIssueRouting } from "./linear-actionable.js";
 import { assertDispatchTargetFetchable } from "./delivery/index.js";
 import { markDispatchIntegrityGateActive, getDispatchIntegrityState } from "./dispatch-integrity-state.js";
-import { getCircuitBreakerHealth } from "./dispatch-circuit-breaker.js";
+import { getCircuitBreakerHealth, recordRepokeAndCheckBreaker } from "./dispatch-circuit-breaker.js";
 import { getRemediationHealth } from "./remediation/remediation-state.js";
 import { getCommentStats, getTransitionCommentLogicHealth } from "./transition-comment-logic.js";
 import { getStewardStateRedispatchLiveness, registerStewardStateRedispatch } from "./steward-state-redispatch.js";
@@ -1045,20 +1045,55 @@ export function createApp(options?: CreateAppOptions) {
           errorSummary: reason,
         });
       } else {
-        const rePokeMsg =
-          `Your session for ${ticketId.replace(/^linear-/, "")} stalled before producing output. ` +
-          `Resume now and run the pending transition verb to hand off. Do NOT reply HEARTBEAT_OK.`;
-        log.info(`Stale C4 re-poke: re-waking ${stale.agentId} for ${ticketId}`);
-        const delivered = await deliverMessageToAgent(stale.agentId, sessionKey, rePokeMsg, wakeConfigForAgent(stale.agentId));
-        operationalEventStore.append({
-          outcome: delivered.dispatched ? "stale-c4-repoke" : "stale-c4-repoke-failed",
-          agent: stale.agentId,
-          key: sessionKey,
-          sessionKey,
-          deliveryMode: "stale-c4-repoke",
-          attemptCount: 1,
-          errorSummary: delivered.dispatched ? null : "C4 re-poke delivery failed",
-        });
+        // INF-1157: gate the re-poke on the dispatch circuit breaker. The webhook
+        // dispatch path records + checks the breaker, but this cron re-poke path
+        // bypassed it — so a ticket wedged on the same workflow state (the off-spine
+        // `state:doing` shape, whose only forward verb resolves to a transition the
+        // bare re-poke can never satisfy → `continue-workflow` declined every cycle)
+        // was re-poked forever. Record THIS re-poke against the same per-ticket
+        // counter the webhook path uses; if the breaker has tripped, drop the re-poke
+        // and let its `transition-stuck` alert escalate to a steward instead of looping.
+        // The state:* label is normalized to match the webhook path (webhook/index.ts
+        // §9): the id(s) after `state:`, lowercased, sorted, comma-joined, or null.
+        const repokeStateLabel =
+          (linearState?.labels?.nodes ?? [])
+            .map((l) => l.name)
+            .filter((name) => /^state:/i.test(name))
+            .map((name) => name.slice(name.indexOf(":") + 1).toLowerCase())
+            .sort()
+            .join(",") || null;
+        const breaker = recordRepokeAndCheckBreaker(sessionKey, repokeStateLabel);
+        if (breaker.suppress) {
+          const reason =
+            `circuit breaker tripped: ${breaker.state.wakeCount} consecutive re-pokes on ` +
+            `state=${breaker.state.lastStateLabel ?? "unknown"} with no forward progress — ` +
+            `dropping re-poke to break the loop (steward escalation via transition-stuck alert)`;
+          log.warn(`Stale C4 re-poke DROPPED for ${ticketId} → ${stale.agentId}: ${reason}`);
+          operationalEventStore.append({
+            outcome: "stale-c4-repoke-dropped",
+            agent: stale.agentId,
+            key: sessionKey,
+            sessionKey,
+            deliveryMode: "stale-c4-repoke",
+            attemptCount: 0,
+            errorSummary: reason,
+          });
+        } else {
+          const rePokeMsg =
+            `Your session for ${ticketId.replace(/^linear-/, "")} stalled before producing output. ` +
+            `Resume now and run the pending transition verb to hand off. Do NOT reply HEARTBEAT_OK.`;
+          log.info(`Stale C4 re-poke: re-waking ${stale.agentId} for ${ticketId}`);
+          const delivered = await deliverMessageToAgent(stale.agentId, sessionKey, rePokeMsg, wakeConfigForAgent(stale.agentId));
+          operationalEventStore.append({
+            outcome: delivered.dispatched ? "stale-c4-repoke" : "stale-c4-repoke-failed",
+            agent: stale.agentId,
+            key: sessionKey,
+            sessionKey,
+            deliveryMode: "stale-c4-repoke",
+            attemptCount: 1,
+            errorSummary: delivered.dispatched ? null : "C4 re-poke delivery failed",
+          });
+        }
       }
     }
 

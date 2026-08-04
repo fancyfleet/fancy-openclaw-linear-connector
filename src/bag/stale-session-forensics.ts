@@ -870,6 +870,10 @@ interface LinearIssueState {
   comments: { nodes: Array<{ id: string; createdAt: string }> };
   trashed?: boolean | null;
   archivedAt?: string | null;
+  // INF-1157: workflow `state:*` labels, used by the C4 re-poke path to key the
+  // dispatch circuit breaker on the ticket's workflow position (so a ticket
+  // wedged on the same state trips the breaker instead of being re-poked forever).
+  labels?: { nodes: Array<{ name: string }> } | null;
 }
 
 /**
@@ -903,6 +907,7 @@ export async function fetchLinearTicketState(
             state { name type }
             trashed
             archivedAt
+            labels { nodes { name } }
             comments(first: 1, orderBy: createdAt) { nodes { id createdAt } }
           }
         }`,
