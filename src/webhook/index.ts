@@ -29,7 +29,8 @@ import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgent
 import { checkAgentLiveness, type LivenessConfig } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
 import { checkRoleGuardAndBlock, type LinearUserIdResolver } from "../routing-guard.js";
-import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, autoEnrollPlainDelegation, markAutoEnrollRegistered, markCommitmentActivityObserverRegistered, applyStateTransition, type WorkflowInstanceContext } from "../workflow-gate.js";
+import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, autoEnrollPlainDelegation, markAutoEnrollRegistered, markCommitmentActivityObserverRegistered, applyStateTransition, getWorkflowId, getCurrentState, getCommitmentGateState, loadWorkflowDefById, type WorkflowInstanceContext } from "../workflow-gate.js";
+import { getAppliedState } from "../store/applied-state-store.js";
 import { checkLabelSyncForTicket, emitLabelSyncWarning } from "../transition-audit.js";
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets, type NoActivityDetector } from "../bag/index.js";
@@ -471,7 +472,12 @@ async function autoAcceptCommitmentOnActivity(
     (sessionIssue.id as string | undefined) ??
     issueIdentifierFromEvent(event);
   if (!issueId) return;
-  const claimKey = issueIdentifierFromEvent(event) ?? issueId;
+  const identifier = issueIdentifierFromEvent(event);
+  const claimKey = identifier ?? issueId;
+  // Claim synchronously, before any await: concurrent Comment/AgentSessionEvent
+  // deliveries for the same ticket must dedupe here (the pre-INF-1195
+  // invariant), not after the async gate check — two events racing the gate
+  // would otherwise both pass and double-fire the accept.
   if (commitmentAutoAcceptClaims.has(claimKey)) return;
   commitmentAutoAcceptClaims.add(claimKey);
   const token = getAccessToken(bodyId) ?? getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
@@ -479,6 +485,56 @@ async function autoAcceptCommitmentOnActivity(
     commitmentAutoAcceptClaims.delete(claimKey);
     return;
   }
+
+  // INF-1195: gate the trigger by state, and make it lag-safe. Previously this
+  // fired `accept` on ANY agent Comment/AgentSessionEvent with no guard, so a
+  // comment on a ticket whose live label still read a pre-gate state (e.g.
+  // `intake` under Linear read-after-write lag, right after a force-deploy to
+  // `deploy`) matched that state's `accept` edge and re-entered a finished
+  // ticket at the top of the dev cycle (GEN-337, 2026-08-04).
+  //
+  // Two guards, both evaluated before firing (the dedup claim above is released
+  //   whenever we skip, so a later genuine gate-state comment can still fire):
+  //   AC1 state-gate: fire only when the ticket's authoritative current state IS
+  //     the workflow's commitment-gate state — never from `intake` or any
+  //     post-gate state (code-review/merge/deploy/done).
+  //   AC2 lag-safe: the authoritative state is the applied-state store
+  //     (getAppliedState) when present — it wins over a stale state:* label, the
+  //     same applied-state-wins-over-stale-label principle as the AI-2035
+  //     terminal-reentry guard and the INF-820 commitment logic. If the applied
+  //     state is already at/past the gate, skip.
+  // Fail-CLOSED: if we cannot determine the state (label fetch error, no
+  // workflow def, no commitment gate), skip the auto-accept — an un gated
+  // accept is the defect being fixed; a missed genuine gate accept is
+  // recoverable (the delegate accepts explicitly).
+  let gateStateId: string | null = null;
+  try {
+    if (!identifier) { commitmentAutoAcceptClaims.delete(claimKey); return; } // need the human identifier for labels + applied-state key
+    const labels = await fetchWorkflowLabels(identifier, token);
+    const workflowId = getWorkflowId(labels);
+    if (!workflowId) { commitmentAutoAcceptClaims.delete(claimKey); return; } // not a governed ticket — nothing to auto-accept
+    const def = await loadWorkflowDefById(workflowId);
+    if (!def) { commitmentAutoAcceptClaims.delete(claimKey); return; }
+    const gateState = getCommitmentGateState(def);
+    if (!gateState) { commitmentAutoAcceptClaims.delete(claimKey); return; } // workflow has no commitment gate — never auto-accept
+    gateStateId = gateState.id;
+    const liveState = getCurrentState(labels, def);
+    const authoritativeState = getAppliedState(identifier) ?? liveState;
+    if (authoritativeState !== gateStateId) {
+      log.info(
+        `Commitment gate auto-accept skipped for ${identifier}: authoritative state ` +
+        `'${authoritativeState ?? "unknown"}' is not the commitment-gate state '${gateStateId}' ` +
+        `(applied='${getAppliedState(identifier) ?? "none"}', live='${liveState ?? "none"}')`,
+      );
+      commitmentAutoAcceptClaims.delete(claimKey);
+      return;
+    }
+  } catch (err) {
+    commitmentAutoAcceptClaims.delete(claimKey);
+    log.warn(`Commitment gate auto-accept state check failed for ${identifier ?? issueId} (fail-closed, skipping): ${errorSummary(err)}`);
+    return;
+  }
+
   try {
     const result = await applyStateTransition("accept", issueId, token, {
       bodyId,

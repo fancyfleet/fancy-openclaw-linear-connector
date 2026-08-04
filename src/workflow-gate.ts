@@ -500,7 +500,7 @@ function validateCommitmentGate(def: WorkflowDef): string[] {
   return errors;
 }
 
-function getCommitmentGateState(def: WorkflowDef): WorkflowState | undefined {
+export function getCommitmentGateState(def: WorkflowDef): WorkflowState | undefined {
   return def.states.find((s) => !!s.commitment_gate);
 }
 
