@@ -93,7 +93,7 @@ import { boundSeatFor } from "./implementer-store.js";
 import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
 import { onAlert as onConfigHealthAlert } from "./config-health.js";
 import { getRegistryPolicyStatus, startRegistryPolicyCheck } from "./registry-policy.js";
-import { resolveStartupCommit } from "./startup-commit.js";
+import { resolveStartupCommit, resolveCommitDrift, type CommitDrift } from "./startup-commit.js";
 import { LINEAR_PROXY_PROTOCOL_VERSION, proxyCompatibilityPayload } from "./proxy-compatibility.js";
 import { getAccessToken, getAgent, getLinearUserIdForAgent, getAllTokenStatuses, isPolledForLinear } from "./agents.js";
 import { loadUniversalCanon, getCanonLiveness } from "./policy/universal-canon.js";
@@ -125,6 +125,45 @@ function parseCriticalStaleCronMs(env: NodeJS.ProcessEnv = process.env): number 
 let startupCommit: string = "unknown";
 function setStartupCommit(hash: string) { startupCommit = hash; }
 function getStartupCommit(): string { return startupCommit; }
+
+// ── Commit-drift guard (INF-1201) ───────────────────────────────────
+// The running process caches its commit at boot (startupCommit). A deploy can
+// later re-stamp dist/DEPLOY_COMMIT and check out a new commit WITHOUT
+// restarting this process — the "marked-deployed but not live" class defect
+// (INF-1147/INF-1176) that deletes its own alarm: every observer reads the
+// marker and believes the fix is live while the old code keeps running.
+// computeAndLatchCommitDrift() live-compares the running commit against the
+// on-disk marker + git HEAD; /health projects the result, and the first
+// observed drift logs loudly and fires a warning alert (re-armed once a
+// restart clears it).
+let commitDriftAlarmed = false;
+async function computeAndLatchCommitDrift(): Promise<CommitDrift | null> {
+  try {
+    const drift = await resolveCommitDrift(getStartupCommit());
+    if (drift.drift && !commitDriftAlarmed) {
+      commitDriftAlarmed = true;
+      log.warn(
+        `COMMIT DRIFT (INF-1201): running=${drift.running} deployMarker=${drift.deployMarker} ` +
+          `gitHead=${drift.gitHead} — a newer commit was stamped/checked-out but this process was ` +
+          `never restarted onto it. The running code is NOT what the deploy marker claims; restart ` +
+          `the connector to load it. Observable at /health.commitDrift.drift=true.`,
+      );
+      notify({
+        severity: "warning",
+        source: "lifecycle",
+        title: `commit drift: running ${drift.running} ≠ marker ${drift.deployMarker} — connector needs restart`,
+        dedupKey: "lifecycle|commit-drift",
+      });
+    } else if (!drift.drift && commitDriftAlarmed) {
+      commitDriftAlarmed = false; // restart / reverted marker resolved the gap — re-arm
+      log.info(`commit drift cleared: running=${drift.running} now matches deploy marker/git HEAD.`);
+    }
+    return drift;
+  } catch {
+    // Drift-checking must never break /health or startup.
+    return null;
+  }
+}
 
 /**
  * Constant-time secret comparison to prevent timing attacks.
@@ -549,6 +588,10 @@ export function createApp(options?: CreateAppOptions) {
       ...(cron.required === true ? { required: true } : {}),
     })));
 
+    // INF-1201: live deploy-marker-vs-running-commit drift check (latched loud
+    // log/alert on first drift). Never allowed to break /health.
+    const commitDrift = await computeAndLatchCommitDrift();
+
     res.status(healthy ? 200 : 503).json({
       status: healthy ? "ok" : "degraded",
       // AI-2008: operational warnings surfaced at /health (dispatch-undeliverable
@@ -574,6 +617,11 @@ export function createApp(options?: CreateAppOptions) {
       service: "fancy-openclaw-linear-connector",
       deployment: DEPLOYMENT_NAME,
       commit: getStartupCommit(),
+      // INF-1201: `commit` above is what THIS process booted with. `commitDrift`
+      // live-compares it to the on-disk deploy marker + git HEAD, so a deploy
+      // that was stamped/checked-out but never restarted onto (marked-but-not-
+      // live) is observable here instead of silently running stale code.
+      commitDrift,
       agents: agents.length,
       agentNames: agents.map((a) => a.name),
       offLinearAgentNames: agents.filter((a) => !isPolledForLinear(a)).map((a) => a.name),
@@ -2898,6 +2946,9 @@ if (isEntryPoint) {
     // working tree may be on a feature branch and its HEAD is not what runs.
     resolveStartupCommit().then(({ commit, source }) => {
       setStartupCommit(commit);
+      // INF-1201: startup drift check — fail loudly at boot if the marker/HEAD
+      // already disagree with the commit we booted with.
+      void computeAndLatchCommitDrift();
       notify({
         severity: "warning",
         source: "lifecycle",
