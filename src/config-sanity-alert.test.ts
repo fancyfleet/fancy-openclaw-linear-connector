@@ -20,10 +20,12 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from
 
 import {
   dedupKeyForFinding,
+  contentHashForFinding,
   readWatchdogJson,
   processWatchdogOutput,
   runCycle,
   getConfigSanityAlertLiveness,
+  getConfigSanityFindings,
   _resetConfigSanityAlertForTests,
   WATCHDOG_JSON_PATH,
   type WatchdogFinding,
@@ -338,15 +340,14 @@ describe("AI-2620: git-remote-liveness critical suppression window override", ()
   });
 
   /**
-   * AC4: Regression test — a non-git-remote-liveness critical finding
-   * still fires separate pushes when called 30 minutes apart because its
-   * severity-based suppression window (15min for critical) is narrower than
-   * the cron cadence.
-   *
-   * This is the exact failure mode this ticket fixes for git-remote-liveness,
-   * but other dedup keys must remain on severity-based windows.
+   * INF-458 item 4 (supersedes the old AC4 regression test): before the
+   * content-hash fix, a non-git-remote-liveness critical finding fired a
+   * fresh push every 30-min cycle even when nothing changed, because the
+   * severity-based window (15min for critical) is narrower than the cron
+   * cadence. With content-hash dedup, an UNCHANGED finding now folds into
+   * the existing burst regardless of elapsed time.
    */
-  it("AC4: non-git-remote-liveness critical findings 30min apart produce two pushes (regression)", async () => {
+  it("INF-458: unchanged non-git-remote-liveness critical finding 30min apart folds into one burst", async () => {
     _resetAlertBusForTests();
     _resetConfigSanityAlertForTests();
 
@@ -379,16 +380,72 @@ describe("AI-2620: git-remote-liveness critical suppression window override", ()
     // First cycle at T+0
     processWatchdogOutput({ ok: false, findings }, new Date(nowMs));
 
-    // Advance 30 minutes (= one cron cycle, well beyond the 15min critical window)
+    // Advance 30 minutes (= one cron cycle, beyond the 15min critical window)
     nowMs += 30 * 60_000;
     processWatchdogOutput({ ok: false, findings }, new Date(nowMs));
 
     await new Promise((r) => setImmediate(r));
 
-    // Two pushes — the second call creates a new burst because 15min < 30min
+    // Content is identical — folds into the existing burst, one push.
+    expect(pushes).toHaveLength(1);
+
+    const stored = store.query({ severity: "critical" });
+    expect(stored).toHaveLength(1);
+    expect(stored[0].count).toBe(2);
+
+    _resetAlertBusForTests();
+    _resetConfigSanityAlertForTests();
+  });
+
+  /**
+   * INF-458 item 4: a finding whose content actually CHANGES between cycles
+   * must still start a fresh, visible burst — content-hash dedup only folds
+   * genuine repeats, not real changes.
+   */
+  it("INF-458: changed non-git-remote-liveness critical finding 30min apart produces two pushes", async () => {
+    _resetAlertBusForTests();
+    _resetConfigSanityAlertForTests();
+
+    const store = new AlertStore(":memory:");
+    const pushes: string[] = [];
+    const pushFn = jest.fn(async (message: string) => {
+      pushes.push(message);
+    });
+
+    const t0 = new Date("2026-07-20T00:00:00.000Z");
+    let nowMs = t0.getTime();
+
+    initAlertBus({
+      store,
+      pushFn,
+      pushEnabled: true,
+      pushMinSeverity: "critical",
+      now: () => new Date(nowMs),
+    });
+
+    processWatchdogOutput(
+      {
+        ok: false,
+        findings: [{ check: "config-json", severity: "critical", message: "Host openclaw.json won't parse" }],
+      },
+      new Date(nowMs)
+    );
+
+    nowMs += 30 * 60_000;
+    processWatchdogOutput(
+      {
+        ok: false,
+        // Same check/severity, different message — a genuine content change.
+        findings: [{ check: "config-json", severity: "critical", message: "Host openclaw.json: unexpected token at line 42" }],
+      },
+      new Date(nowMs)
+    );
+
+    await new Promise((r) => setImmediate(r));
+
+    // Content changed — a fresh, visible burst, two pushes.
     expect(pushes).toHaveLength(2);
 
-    // Also verify store reflects two separate bursts
     const stored = store.query({ severity: "critical" });
     expect(stored).toHaveLength(2);
 
@@ -397,12 +454,13 @@ describe("AI-2620: git-remote-liveness critical suppression window override", ()
   });
 
   /**
-   * AC1—AC2 cross-check: a git-remote-liveness warning finding (non-critical)
-   * still uses severity-based suppression. Two warning findings 30min apart
-   * fold into one burst (1h window), but a second burst after 90min fires
-   * a new push.
+   * INF-458 item 4 supersedes this AC2 case: non-critical git-remote-liveness
+   * findings now fold on content-hash dedup like everything else, not just
+   * the severity-based window. An unchanged warning finding folds into the
+   * same burst even past the old 1h severity window; a changed one still
+   * starts a fresh burst.
    */
-  it("AC2: non-critical git-remote-liveness findings still use severity-based suppress window", async () => {
+  it("INF-458: unchanged non-critical git-remote-liveness finding folds past the old severity window", async () => {
     _resetAlertBusForTests();
     _resetConfigSanityAlertForTests();
 
@@ -434,7 +492,7 @@ describe("AI-2620: git-remote-liveness critical suppression window override", ()
     // First cycle at T+0
     processWatchdogOutput({ ok: false, findings }, new Date(nowMs));
 
-    // Advance 30 minutes — still within the 1h warning window → fold
+    // Advance 30 minutes — still within the old 1h warning window → fold
     nowMs += 30 * 60_000;
     processWatchdogOutput({ ok: false, findings }, new Date(nowMs));
 
@@ -443,13 +501,36 @@ describe("AI-2620: git-remote-liveness critical suppression window override", ()
     // Only one push — folded within warning's 1h window
     expect(pushes).toHaveLength(1);
 
-    // Advance another 61 minutes — beyond 1h window → new burst
+    // Advance another 61 minutes — beyond the OLD 1h window, but content is
+    // still unchanged, so content-hash dedup keeps it folded (no new push).
     nowMs += 61 * 60_000;
     processWatchdogOutput({ ok: false, findings }, new Date(nowMs));
 
     await new Promise((r) => setImmediate(r));
 
+    expect(pushes).toHaveLength(1);
+
+    const stored = store.query();
+    expect(stored).toHaveLength(1);
+    expect(stored[0].count).toBe(3);
+
+    // Now the content changes — a fresh, visible burst even though the
+    // dedup key is the same.
+    nowMs += 10 * 60_000;
+    processWatchdogOutput(
+      {
+        ok: false,
+        findings: [
+          { check: "git-remote-liveness", severity: "warning", message: "SSH-AUTH: 5 repos with SSH auth failures" },
+        ],
+      },
+      new Date(nowMs)
+    );
+
+    await new Promise((r) => setImmediate(r));
+
     expect(pushes).toHaveLength(2);
+    expect(store.query()).toHaveLength(2);
 
     _resetAlertBusForTests();
     _resetConfigSanityAlertForTests();
@@ -504,5 +585,115 @@ describe("AI-2620: git-remote-liveness critical suppression window override", ()
 
     _resetAlertBusForTests();
     _resetConfigSanityAlertForTests();
+  });
+});
+
+// ── INF-458 item 2: category A suppression ──────────────────────────────
+
+describe("INF-458 item 2: category A suppression", () => {
+  beforeEach(() => {
+    _resetAlertBusForTests();
+    _resetConfigSanityAlertForTests();
+  });
+  afterEach(() => {
+    _resetAlertBusForTests();
+    _resetConfigSanityAlertForTests();
+  });
+
+  it("retrieval-canary info findings never reach the alert store", () => {
+    const store = new AlertStore(":memory:");
+    initAlertBus({ store, pushEnabled: false });
+
+    processWatchdogOutput({
+      ok: true,
+      findings: [{ check: "retrieval-canary", severity: "info", message: "not yet searchable... not a miss" }],
+    });
+
+    expect(store.query()).toHaveLength(0);
+  });
+
+  it("gen-token findings never reach the alert store regardless of severity", () => {
+    const store = new AlertStore(":memory:");
+    initAlertBus({ store, pushEnabled: false });
+
+    processWatchdogOutput({
+      ok: true,
+      findings: [{ check: "gen-token", severity: "info", message: "permission denied reading /proc/123/environ" }],
+    });
+
+    expect(store.query()).toHaveLength(0);
+  });
+
+  it("heartbeat-model-override findings are downgraded to info severity", () => {
+    const store = new AlertStore(":memory:");
+    initAlertBus({ store, pushEnabled: false });
+
+    processWatchdogOutput({
+      ok: true,
+      findings: [{ check: "heartbeat-model-override", severity: "warning", message: "agent foo on non-default model" }],
+    });
+
+    const rows = store.query();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].severity).toBe("info");
+  });
+
+  it("suppressed category-A findings still count toward lastFindingCount and getConfigSanityFindings", () => {
+    processWatchdogOutput({
+      ok: true,
+      findings: [
+        { check: "retrieval-canary", severity: "info", message: "not a miss" },
+        { check: "gen-token", severity: "info", message: "permission denied" },
+      ],
+    });
+
+    expect(getConfigSanityAlertLiveness().lastFindingCount).toBe(2);
+    expect(getConfigSanityFindings()).toHaveLength(2);
+  });
+
+  it("stale-sessions findings fold across a 30-min cycle gap via the weekly-digest window", async () => {
+    const store = new AlertStore(":memory:");
+    const pushes: string[] = [];
+    const pushFn = jest.fn(async (message: string) => { pushes.push(message); });
+    const t0 = new Date("2026-07-20T00:00:00.000Z");
+    let nowMs = t0.getTime();
+    initAlertBus({ store, pushFn, pushEnabled: true, pushMinSeverity: "warning", now: () => new Date(nowMs) });
+
+    const findings: WatchdogFinding[] = [
+      { check: "stale-sessions", severity: "warning", message: "12 session index entries >14d old" },
+    ];
+    processWatchdogOutput({ ok: true, findings }, new Date(nowMs));
+
+    nowMs += 30 * 60_000;
+    processWatchdogOutput({ ok: true, findings }, new Date(nowMs));
+
+    await new Promise((r) => setImmediate(r));
+
+    expect(pushes).toHaveLength(1);
+    const rows = store.query();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].count).toBe(2);
+  });
+});
+
+// ── INF-458 item 4: contentHashForFinding ────────────────────────────────
+
+describe("INF-458 item 4: contentHashForFinding", () => {
+  it("produces the same hash for identical findings", () => {
+    const a: WatchdogFinding = { check: "config-json", severity: "critical", message: "won't parse" };
+    const b: WatchdogFinding = { check: "config-json", severity: "critical", message: "won't parse" };
+    expect(contentHashForFinding(a)).toBe(contentHashForFinding(b));
+  });
+
+  it("produces a different hash when the message changes", () => {
+    const a: WatchdogFinding = { check: "config-json", severity: "critical", message: "won't parse" };
+    const b: WatchdogFinding = { check: "config-json", severity: "critical", message: "unexpected token at line 3" };
+    expect(contentHashForFinding(a)).not.toBe(contentHashForFinding(b));
+  });
+
+  it("produces a different hash when detail changes", () => {
+    const a: WatchdogFinding = { check: "git-remote-https-host", severity: "warning", message: "x", detail: { repo: "a" } };
+    const b: WatchdogFinding = { check: "git-remote-https-host", severity: "warning", message: "x", detail: { repo: "b" } };
+    expect(contentHashForFinding(a)).not.toBe(contentHashForFinding(b));
   });
 });
