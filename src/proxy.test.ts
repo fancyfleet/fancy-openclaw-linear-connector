@@ -1485,6 +1485,65 @@ describe("proxy — Layer 2 raw mutation interception (AI-1387)", () => {
     expect(res.body.data).toBeDefined();
   });
 
+  it.each([
+    ["complete", "state-done-uuid"],
+    ["cancel", "state-invalid-uuid"],
+  ])("keeps %s terminal stateId/delegate clears on ad-hoc tickets", async (intent, stateId) => {
+    const calls: Array<{ query: string; variables: unknown }> = [];
+    globalThis.fetch = async (url, init) => {
+      if (typeof url !== "string" || !url.includes("api.linear.app")) {
+        return originalFetch(url, init);
+      }
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(bodyText) as { query?: string; variables?: unknown };
+      calls.push({ query: parsed.query ?? "", variables: parsed.variables });
+      const q = parsed.query ?? "";
+
+      if ((q.includes("IssueContext") || q.includes("IssueLabels")) && !q.includes("IssueWithLabels")) {
+        return new Response(JSON.stringify(NON_WORKFLOW_LABEL_RESPONSE), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (q.includes("IssueWithLabels")) {
+        return new Response(JSON.stringify({
+          data: {
+            issue: {
+              id: "internal-uuid",
+              identifier: "INF-1125",
+              team: { id: "team-ai", key: "AI", name: "AI" },
+              labels: { nodes: [{ id: "bug-lbl", name: "bug" }] },
+            },
+          },
+        }), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ data: { issueUpdate: { success: true } } }), {
+        status: 200, headers: { "Content-Type": "application/json" },
+      });
+    };
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", intent)
+      .send({
+        query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+        variables: { id: "issue-uuid", input: { stateId, delegateId: null, assigneeId: null } },
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+    const forwarded = calls.find((c) =>
+      c.query.includes("issueUpdate") && !c.query.includes("ApplyAtomicTransition")
+    );
+    expect(forwarded).toBeDefined();
+    const vars = forwarded!.variables as { input: Record<string, unknown> };
+    expect(vars.input).toMatchObject({ stateId, delegateId: null, assigneeId: null });
+    expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(false);
+  });
+
   it("allows raw mutations without stateId/assigneeId on workflow tickets", async () => {
     globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
 

@@ -611,9 +611,9 @@ export const _stripNativeStateFieldForTests = stripNativeStateField;
 function stripNullDelegateAssigneeFields(body: GraphQLRequestBody | null, effectiveIntent: string | null): void {
   const input = issueUpdateInput(body);
   if (!input) return;
-  // AI-2067: needs-human, complete, and park legitimately send delegateId:null as
+  // AI-2067: needs-human, complete, cancel, and park legitimately send delegateId:null as
   // part of their documented contract — don't block it.
-  if (effectiveIntent === 'needs-human' || effectiveIntent === 'complete' || effectiveIntent === 'park') {
+  if (effectiveIntent === 'needs-human' || effectiveIntent === 'complete' || effectiveIntent === 'cancel' || effectiveIntent === 'park') {
     return;
   }
   if (input.delegateId === null) delete input.delegateId;
@@ -1413,6 +1413,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // (from the delegate pre-resolution), but needs to survive for use in the
       // applyStateTransition call further down, which is outside that block.
       let delegateOverride: string | null | undefined;
+      let intentTicketHasWorkflowLabel = false;
 
       // INF-1147: true when the matched transition is a governed dev-impl forward
       // transition tagged `generic: continue` (i.e. `submit` / `continue-workflow`).
@@ -1441,6 +1442,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       if (issueId) {
         try {
           const preLabels = await fetchWorkflowLabels(issueId, authorization);
+          intentTicketHasWorkflowLabel = getWorkflowId(preLabels) !== null;
           // AI-2094: def-aware most-advanced resolution — see the auth-snapshot
           // capture above. A stale state:* label must not become the source override.
           const srcWfId = getWorkflowId(preLabels);
@@ -1478,7 +1480,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         // tuple as the state:* label and delegate. Strip the CLI's forwarded
         // native stateId and let applyStateTransition write the resolved
         // destination atomically after delegate resolution succeeds.
-        if (isIssueUpdateMutation(body)) {
+        if (isIssueUpdateMutation(body) && intentTicketHasWorkflowLabel) {
           const strippedNativeState = stripNativeStateField(body);
           if (strippedNativeState) {
             log.info(`native-state-strip agent=${agentId} intent=${effectiveIntent}${ticketCtx}: stripped stateId — applyStateTransition is sole native-state writer`);
