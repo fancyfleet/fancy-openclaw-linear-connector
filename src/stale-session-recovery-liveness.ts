@@ -18,12 +18,15 @@ export interface StaleSessionRecoveryLiveness {
   staleSessionHandlerSubscribed: boolean;
   /** The governed-redispatch delegate re-seat guard (setStateAtomic bootstrap-seat) is active in this build. */
   governedRedispatchReseatActive: boolean;
+  /** The governed stale-session recovery path uses atomic workflow writes in this build. */
+  governedAtomicRecoveryActive: boolean;
 }
 
 const state: StaleSessionRecoveryLiveness = {
   driverRegistered: false,
   staleSessionHandlerSubscribed: false,
   governedRedispatchReseatActive: false,
+  governedAtomicRecoveryActive: false,
 };
 
 /** Marked at SessionTracker construction — the recovery driver exists in prod. */
@@ -41,6 +44,11 @@ export function markGovernedRedispatchReseatActive(): void {
   state.governedRedispatchReseatActive = true;
 }
 
+/** Marked when the governed stale-session atomic recovery path is wired. */
+export function markGovernedAtomicRecoveryActive(): void {
+  state.governedAtomicRecoveryActive = true;
+}
+
 export function getStaleSessionRecoveryLiveness(): StaleSessionRecoveryLiveness {
   return { ...state };
 }
@@ -50,4 +58,5 @@ export function resetStaleSessionRecoveryLiveness(): void {
   state.driverRegistered = false;
   state.staleSessionHandlerSubscribed = false;
   state.governedRedispatchReseatActive = false;
+  state.governedAtomicRecoveryActive = false;
 }

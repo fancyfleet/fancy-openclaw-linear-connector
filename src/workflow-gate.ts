@@ -7710,6 +7710,7 @@ interface VerifiedWriteOptions {
   requireReadableVerification?: boolean;
   allowStateLabelLagFallback?: boolean;
   unreadableVerificationDetail?: string;
+  assigneeIdOverride?: string | null;
 }
 
 /**
@@ -7749,7 +7750,14 @@ async function issueUpdateAtomicVerified(
     if (attempt > 1 && retryDelayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, retryDelayMs * (attempt - 1)));
     }
-    const applied = await issueUpdateAtomic(internalId, labelIds, authToken, delegateId, nativeStateId);
+    const applied = await issueUpdateAtomic(
+      internalId,
+      labelIds,
+      authToken,
+      delegateId,
+      nativeStateId,
+      options?.assigneeIdOverride,
+    );
     if (!applied) {
       failureKind = "mutation";
       divergent = [];
@@ -7770,7 +7778,7 @@ async function issueUpdateAtomicVerified(
       {
         stateName: expectedStateName,
         delegateId,
-        assigneeId: delegateId !== undefined ? null : undefined,
+        assigneeId: delegateId !== undefined ? options?.assigneeIdOverride ?? null : undefined,
         nativeStateId,
       },
       authToken,
@@ -8406,6 +8414,8 @@ export interface SetStateAtomicOptions {
   nativeStateOverride?: string;
   /** Exact native Linear state UUID to write when preserving an existing terminal state. */
   nativeStateIdOverride?: string;
+  /** Explicit assignee projection to carry in the same atomic mutation as delegate/state. */
+  assigneeIdOverride?: string | null;
   /** Observable source for redispatch-capable state repairs. */
   transitionSource?: string;
 }
@@ -8644,6 +8654,11 @@ export async function setStateAtomic(
     resolvedDelegateId,
     resolvedNativeStateId,
     targetState,
+    undefined,
+    undefined,
+    {
+      assigneeIdOverride: options?.assigneeIdOverride,
+    },
   );
   if (!writeOutcome.ok) {
     emitTransitionWriteFailure({

@@ -18,6 +18,7 @@ import os from "node:os";
 import { createLogger, componentLogger } from "../logger.js";
 import { getAccessToken, getAgent, getLinearUserIdForAgent, getOpenclawAgentName } from "../agents.js";
 import { tryNormalizeSessionKey } from "../session-key.js";
+import { setStateAtomic } from "../workflow-gate.js";
 import { GlobalRedispatchBudget } from "./global-redispatch-budget.js";
 import { StaleRedispatchCounter } from "./stale-redispatch-counter.js";
 
@@ -179,6 +180,12 @@ interface RecoveryRoleContext {
   state?: string;
   role?: string;
   failure?: string;
+}
+
+interface RecoveryLabelNode {
+  id?: string;
+  name?: string;
+  team?: { id?: string } | null;
 }
 
 interface SameKeyRecoveryContext {
@@ -975,6 +982,137 @@ async function fetchWorkflowStates(
   }
 }
 
+async function fetchTeamLabels(teamId: string, authHeader: string): Promise<Array<{ id: string; name: string }>> {
+  try {
+    const res = await fetch("https://api.linear.app/graphql", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: authHeader },
+      body: JSON.stringify({
+        query: `query TeamLabels($teamId: String!) { team(id: $teamId) { labels { nodes { id name team { id } } } } }`,
+        variables: { teamId },
+      }),
+    });
+    const body = (await res.json()) as {
+      data?: { team?: { labels?: { nodes?: Array<{ id?: string; name?: string }> } } | null };
+    };
+    return body.data?.team?.labels?.nodes
+      ?.filter((label): label is { id: string; name: string } =>
+        typeof label.id === "string" && typeof label.name === "string",
+      ) ?? [];
+  } catch {
+    return [];
+  }
+}
+
+async function applyGovernedRecoveryAtomicWrite(args: {
+  issueId: string;
+  identifier: string;
+  teamId: string;
+  existingLabels: RecoveryLabelNode[];
+  targetWorkflowState: string;
+  nativeStateName: string | null;
+  delegateId?: string | null;
+  assigneeId?: string | null;
+  authHeader: string;
+}): Promise<{ ok: true } | { ok: false; error: string }> {
+  const teamLabels = await fetchTeamLabels(args.teamId, args.authHeader);
+  const targetLabelName = `state:${args.targetWorkflowState}`;
+  const targetStateLabel = teamLabels.find((label) => label.name === targetLabelName);
+  if (!targetStateLabel) return { ok: false, error: `could not resolve governed label '${targetLabelName}'` };
+
+  const retainedLabelIds = args.existingLabels
+    .filter((label) => typeof label.id === "string" && typeof label.name === "string")
+    .filter((label) => !label.name?.startsWith("state:"))
+    .filter((label) => !label.team?.id || label.team.id === args.teamId)
+    .map((label) => label.id as string);
+  const labelIds = Array.from(new Set([...retainedLabelIds, targetStateLabel.id]));
+
+  let nativeStateId: string | undefined;
+  if (args.nativeStateName) {
+    const nativeStateName = args.nativeStateName;
+    const states = await fetchWorkflowStates(args.teamId, args.identifier);
+    const state = states.find((s) => s.name === nativeStateName) ??
+      states.find((s) => s.name.toLowerCase() === nativeStateName.toLowerCase());
+    if (!state) return { ok: false, error: `could not resolve native state '${nativeStateName}'` };
+    nativeStateId = state.id;
+  }
+
+  const hasDelegate = args.delegateId !== undefined;
+  const inputParts = ["labelIds: $labelIds"];
+  if (nativeStateId !== undefined) inputParts.push("stateId: $stateId");
+  if (hasDelegate) {
+    inputParts.push("delegateId: $delegateId");
+    inputParts.push("assigneeId: $assigneeId");
+  }
+  const mutation = `
+    mutation ApplyAtomicTransition($issueId: String!, $labelIds: [String!]!${nativeStateId !== undefined ? ", $stateId: String" : ""}${hasDelegate ? ", $delegateId: String, $assigneeId: String" : ""}) {
+      issueUpdate(id: $issueId, input: { ${inputParts.join(", ")} }) {
+        success
+      }
+    }
+  `;
+  const variables: Record<string, unknown> = { issueId: args.issueId, labelIds };
+  if (nativeStateId !== undefined) variables.stateId = nativeStateId;
+  if (hasDelegate) {
+    variables.delegateId = args.delegateId ?? null;
+    variables.assigneeId = args.assigneeId ?? null;
+  }
+  const writeRes = await fetch("https://api.linear.app/graphql", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: args.authHeader },
+    body: JSON.stringify({ query: mutation, variables }),
+  });
+  const writeBody = (await writeRes.json()) as { data?: { issueUpdate?: { success?: boolean } } };
+  if (writeBody.data?.issueUpdate?.success !== true) {
+    return { ok: false, error: "atomic issueUpdate mutation failed" };
+  }
+
+  const verifyRes = await fetch("https://api.linear.app/graphql", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: args.authHeader },
+    body: JSON.stringify({
+      query: `query VerifyTransitionWrite($id: String!) {
+        issue(id: $id) {
+          labels { nodes { name } }
+          delegate { id }
+          assignee { id }
+          state { id }
+        }
+      }`,
+      variables: { id: args.issueId },
+    }),
+  });
+  const verifyBody = (await verifyRes.json()) as {
+    data?: {
+      issue?: {
+        labels?: { nodes?: Array<{ name?: string }> };
+        delegate?: { id?: string } | null;
+        assignee?: { id?: string } | null;
+        state?: { id?: string } | null;
+      } | null;
+    };
+  };
+  const issue = verifyBody.data?.issue;
+  if (!issue) return { ok: false, error: "transition write could not be verified" };
+  const labelNames = issue.labels?.nodes?.map((label) => label.name).filter((name): name is string => typeof name === "string") ?? [];
+  const divergent: string[] = [];
+  if (!labelNames.includes(targetLabelName)) {
+    divergent.push(`state-label expected '${targetLabelName}' got '${labelNames.find((name) => name.startsWith("state:")) ?? "none"}'`);
+  }
+  if (nativeStateId !== undefined && issue.state?.id !== nativeStateId) {
+    divergent.push(`native-state expected '${nativeStateId}' got '${issue.state?.id ?? "null"}'`);
+  }
+  if (hasDelegate && (issue.delegate?.id ?? null) !== (args.delegateId ?? null)) {
+    divergent.push(`delegate expected '${args.delegateId ?? "null"}' got '${issue.delegate?.id ?? "null"}'`);
+  }
+  if (hasDelegate && (issue.assignee?.id ?? null) !== (args.assigneeId ?? null)) {
+    divergent.push(`assignee expected '${args.assigneeId ?? "null"}' got '${issue.assignee?.id ?? "null"}'`);
+  }
+  return divergent.length === 0
+    ? { ok: true }
+    : { ok: false, error: `consistency check failed: ${divergent.join("; ")}` };
+}
+
 // ── Recovery actions ────────────────────────────────────────────────────────
 
 export interface RecoveryResult {
@@ -1159,13 +1297,29 @@ export async function recoverTicket(
       method: "POST",
       headers: { "content-type": "application/json", authorization: authHeader },
       body: JSON.stringify({
-        query: `query IssueWithTeam($id: String!) { issue(id: $id) { id team { id } state { name type } delegate { id } } }`,
+        query: `query IssueWithTeam($id: String!) {
+          issue(id: $id) {
+            id
+            team { id }
+            state { name type }
+            delegate { id }
+            labels { nodes { id name team { id } } }
+          }
+        }`,
         variables: { id: identifier },
       }),
     });
 
     const issueBody = (await issueRes.json()) as {
-      data?: { issue?: { id: string; team: { id: string }; state?: { name?: string; type?: string } | null; delegate?: { id: string } | null } | null };
+      data?: {
+        issue?: {
+          id: string;
+          team: { id: string };
+          state?: { name?: string; type?: string } | null;
+          delegate?: { id: string } | null;
+          labels?: { nodes?: Array<{ id?: string; name?: string; team?: { id?: string } | null }> } | null;
+        } | null;
+      };
     };
     const issueId = issueBody.data?.issue?.id;
     const teamId = issueBody.data?.issue?.team?.id;
@@ -1181,6 +1335,14 @@ export async function recoverTicket(
     // ticket is already terminal. (Linear state.type: completed | canceled.)
     const liveStateType = issueBody.data?.issue?.state?.type;
     const liveStateName = issueBody.data?.issue?.state?.name ?? "(unknown)";
+    const liveLabels = issueBody.data?.issue?.labels?.nodes ?? [];
+    const liveLabelNames = liveLabels
+      ?.map((label) => label.name)
+      .filter((name): name is string => typeof name === "string") ?? [];
+    const workflowLabel = liveLabelNames.find((name) => name.startsWith("wf:")) ?? null;
+    const currentWorkflowState = stateLabelIdFromName(
+      liveLabelNames.find((name) => name.startsWith("state:")) ?? null,
+    );
     if (liveStateType === "completed" || liveStateType === "canceled") {
       log.info(
         `Recovery for ${identifier}: ticket already terminal (state="${liveStateName}", type=${liveStateType}) — skipping recovery to avoid clobbering completed work`,
@@ -1297,6 +1459,111 @@ export async function recoverTicket(
     const effectiveTargetStateName = needsHuman
       ? (process.env.STALE_RECOVERY_NEEDS_HUMAN_STATE ?? "Needs Human")
       : targetStateName;
+
+    if (workflowLabel) {
+      if (preserveDelegate) {
+        log.info(
+          `Recovery for ${identifier}: governed ${workflowLabel} still owned by ${agentId}; ` +
+          `comment posted, delegate preserved, re-dispatching in place at ${currentWorkflowState ?? "current state"}`,
+        );
+        return {
+          success: true,
+          action: `re-dispatch-in-place classify=${snapshot.classification}+delegate-preserved`,
+          rePoke: true,
+          detail: `${STALE_CLASS_NAMES[snapshot.classification]} — governed ticket remains owned by ${agentId}`,
+        };
+      }
+
+      const targetWorkflowState = needsHuman
+        ? stateLabelIdFromName(effectiveTargetStateName)
+        : currentWorkflowState;
+
+      if (!targetWorkflowState) {
+        log.warn(
+          `Recovery for ${identifier}: governed ${workflowLabel} has no resolvable target state; ` +
+          `leaving state untouched after recovery comment`,
+        );
+        return {
+          success: false,
+          action: "governed-recovery-unverified",
+          detail: `No governed recovery target state was resolvable for ${identifier}`,
+        };
+      }
+      if (!teamId) {
+        return {
+          success: false,
+          action: "governed-recovery-unverified",
+          detail: `No Linear team was resolvable for governed recovery on ${identifier}`,
+        };
+      }
+
+      let atomicResult = await setStateAtomic(
+        identifier,
+        targetWorkflowState,
+        needsHuman ? null : undefined,
+        authHeader,
+        {
+          assigneeIdOverride: needsHuman ? (humanId ?? null) : undefined,
+          transitionSource: "stale-session-recovery",
+        },
+      );
+      const canUseLocalGovernedFallback =
+        !atomicResult.ok &&
+        /could not load workflow registry|unknown target state/i.test(atomicResult.error ?? "");
+      if (canUseLocalGovernedFallback) {
+        const fallbackNativeStateName = needsHuman
+          ? effectiveTargetStateName
+          : targetWorkflowState === "doing"
+            ? "Doing"
+            : targetStateName;
+        const fallbackResult = await applyGovernedRecoveryAtomicWrite({
+          issueId,
+          identifier,
+          teamId,
+          existingLabels: liveLabels,
+          targetWorkflowState,
+          nativeStateName: fallbackNativeStateName,
+          delegateId: needsHuman ? null : undefined,
+          assigneeId: needsHuman ? (humanId ?? null) : undefined,
+          authHeader,
+        });
+        if (fallbackResult.ok) {
+          atomicResult = { ok: true, ticketId: identifier, from: currentWorkflowState, to: targetWorkflowState };
+        } else {
+          atomicResult = {
+            ok: false,
+            ticketId: identifier,
+            from: currentWorkflowState,
+            to: targetWorkflowState,
+            error: fallbackResult.error,
+          };
+        }
+      }
+      if (!atomicResult.ok) {
+        log.warn(
+          `Recovery for ${identifier}: governed ${workflowLabel} atomic recovery failed — ${atomicResult.error ?? "unknown error"}`,
+        );
+        return {
+          success: false,
+          action: `atomic-mutation-failed classify=${snapshot.classification}`,
+          detail: atomicResult.error ?? "governed atomic recovery failed",
+        };
+      }
+
+      const className = STALE_CLASS_NAMES[snapshot.classification];
+      const ownershipTag = needsHuman
+        ? (humanId ? "+needs-human(assignee+delegate-cleared)" : "+delegate-cleared")
+        : "+redispatch-atomic";
+      log.info(
+        `Recovery for ${identifier}: class=${snapshot.classification} (${className}), ` +
+        `comment posted, governed state atomically set to ${targetWorkflowState}, ${ownershipTag}`,
+      );
+      return {
+        success: true,
+        action: `classify=${snapshot.classification} comment+atomic-state(${targetWorkflowState})${ownershipTag}`,
+        detail: `${className} — ${comment.slice(0, 200)}`,
+      };
+    }
 
     // Build combined update input: ownership + optional state transition.
     // Using a single issueUpdate mutation instead of two sequential calls avoids the
@@ -1563,6 +1830,15 @@ function getRecoveryTargetStateName(cls: StaleClass): string | null {
      // also falls back to resolving by state type if a team labels it differently.
      return process.env.STALE_RECOVERY_STATE_DEFAULT ?? "To Do";
  }
+}
+
+function stateLabelIdFromName(name: string | null): string | null {
+  if (!name) return null;
+  return name
+    .replace(/^state:/i, "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-");
 }
 
 // ── Digest aggregation ──────────────────────────────────────────────────────
