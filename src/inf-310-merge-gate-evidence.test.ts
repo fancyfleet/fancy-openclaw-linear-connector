@@ -58,6 +58,7 @@ capabilities:
   - id: deploy:execute
   - id: infra:ssh
   - id: workflow:break-glass
+  - id: workflow:force-deploy
 
 containers:
   - id: dev
@@ -65,7 +66,7 @@ containers:
   - id: deployment
     grants: [linear:transition, deploy:execute]
   - id: steward
-    grants: [linear:transition, human:escalate, workflow:break-glass]
+    grants: [linear:transition, human:escalate, workflow:break-glass, workflow:force-deploy]
   - id: host-deploy
     grants: [linear:transition, infra:ssh]
 
@@ -312,6 +313,32 @@ function runDeployGate(opts: MockFetchOpts) {
   );
 }
 
+function runForceDeployGate(opts: MockFetchOpts) {
+  globalThis.fetch = makeMockFetch({
+    issueLabels: [
+      { id: "lbl-wf", name: "wf:dev-impl" },
+      { id: "lbl-state", name: "state:intake" },
+    ],
+    delegateId: "astrid-uuid",
+    ...opts,
+  });
+  return checkWorkflowRules(
+    "force-deploy",
+    ISSUE_ID,
+    AUTH_TOKEN,
+    "astrid",
+    null,
+    "astrid-uuid",
+    null,
+    false,
+    false,
+    true,
+    undefined,
+    undefined,
+    "Verified merge evidence: https://github.com/fancymatt/repo/pull/42",
+  );
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 describe("INF-310: Merge-gate PR-evidence check with non-Linear branch names", () => {
@@ -423,5 +450,33 @@ describe("INF-310: Merge-gate PR-evidence check with non-Linear branch names", (
     });
     expect(result).not.toBeNull();
     expect(result).toContain("blocked");
+  });
+
+  it("INF-1181: force-deploy from intake blocks an attached PR that is not merged", async () => {
+    const result = await runForceDeployGate({
+      attachments: [
+        {
+          url: "https://github.com/fancymatt/repo/pull/42",
+          sourceType: "github",
+          metadata: { status: "open" },
+        },
+      ],
+    });
+    expect(result).not.toBeNull();
+    expect(result).toContain("blocked");
+    expect(result).toContain("pull request not yet merged");
+  });
+
+  it("INF-1181: force-deploy from intake allows verified merged PR evidence", async () => {
+    const result = await runForceDeployGate({
+      attachments: [
+        {
+          url: "https://github.com/fancymatt/repo/pull/42",
+          sourceType: "github",
+          metadata: { status: "merged" },
+        },
+      ],
+    });
+    expect(result).toBeNull();
   });
 });

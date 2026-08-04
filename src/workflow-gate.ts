@@ -4070,6 +4070,29 @@ export async function checkWorkflowRules(
         `(for example, a GitHub PR URL or merge commit SHA). This recovery resumes at deploy and still requires AC validation.`
       );
     }
+    let branchStatus = await fetchBranchAndPRStatus(issueId, authToken, fetchedIdentifier);
+    if (!branchStatus) {
+      await new Promise((r) => setTimeout(r, 1000));
+      branchStatus = await fetchBranchAndPRStatus(issueId, authToken, fetchedIdentifier);
+    }
+    if (!branchStatus) {
+      log.warn(`workflow-gate: INF-1181 recovery blocked on ${issueId} — force-deploy could not verify merge evidence`);
+      return (
+        `[Proxy] 'force-deploy' from intake blocked: unable to verify merged PR evidence. ` +
+        `Retry once Linear/GitHub evidence is readable, or attach the merged PR/merge commit evidence before resuming deploy.`
+      );
+    }
+    if (!branchStatus.hasMergedPR) {
+      const missing: string[] = [];
+      if (!branchStatus.hasBranch) missing.push("branch not pushed to origin");
+      if (!branchStatus.hasPR) missing.push("no pull request associated");
+      if (missing.length === 0) missing.push("pull request not yet merged");
+      log.warn(`workflow-gate: INF-1181 recovery blocked on ${issueId} — force-deploy would resume unmerged work: ${missing.join("; ")}`);
+      return (
+        `[Proxy] 'force-deploy' from intake blocked: cannot resume deploy for unmerged work. ` +
+        `Missing: ${missing.join("; ")}. Merge the PR before using force-deploy recovery.`
+      );
+    }
   }
 
   if (
