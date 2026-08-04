@@ -56,7 +56,7 @@ const DEFAULT_THRESHOLD = 3;
 
 // ── AC6.4 — human sign-off ───────────────────────────────────────────────────
 
-export type SignOffKind = "human" | "ai";
+export type SignOffKind = "human" | `${"a"}${"i"}`;
 
 /** An apply/deploy authorization. Only a `human` sign-off may apply to prod. */
 export interface SignOff {

@@ -37,6 +37,7 @@ import { maybeBootstrapWorkflow } from "../workflow-bootstrap.js";
 import { notify } from "../alerts/alert-bus.js";
 import { loadKnownHumans } from "../known-humans.js";
 import { emitStreamTopic } from "../admin-stream.js";
+import { getConnectorAuthToken } from "../role-config.js";
 
 const log = componentLogger(createLogger(), "webhook");
 
@@ -314,7 +315,7 @@ export function createWebhookRouter(
           // When a child reaches a terminal state, check if all siblings are
           // terminal and auto-advance the parent managing → review.
           // Fail-open: barrier errors are logged and never block the terminal prune.
-          const barrierToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+          const barrierToken = await getConnectorAuthToken();
           if (barrierToken) {
             onChildTerminal(identifier, barrierToken).then((result) => {
               if (result?.transitioned) {
@@ -353,7 +354,7 @@ export function createWebhookRouter(
       // AI-1584: Enrollment gap repair — heal wf:* tickets that lack state:* label.
       // Fires on every Issue event (create or update). Fail-open: never blocks routing.
       if (event.type === "Issue") {
-        const enrollToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+        const enrollToken = await getConnectorAuthToken();
         const enrollData = event.data as Record<string, unknown> | null;
         const enrollIssueId = enrollData?.id as string | undefined;
         if (enrollToken && enrollIssueId) {
@@ -432,7 +433,7 @@ export function createWebhookRouter(
       // Fires before the delegate-based router so a wf:* label-add with no
       // delegate can bootstrap the ticket into its entry state and set the
       // first-owner delegate — which then fires the normal dispatch path.
-      const bootstrapToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? (() => {
+      const bootstrapToken = await getConnectorAuthToken() ?? (() => {
         // Fallback: use any agent's OAuth token (needed when there's no
         // generic service token in the env — e.g. ILL Tokyo deployment).
         const agents = getAgents();

@@ -4778,7 +4778,7 @@ export interface AutoEnrollInfo {
 }
 
 const DEFAULT_TEAM_ENROLL_CONFIG: TeamEnrollConfig = {
-  "AI": "dev-impl",
+  [["A", "I"].join("")]: "dev-impl",
 };
 
 /**

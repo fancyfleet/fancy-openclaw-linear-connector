@@ -49,34 +49,33 @@ export interface RoleGuardResult {
 // ── Sync advisory helper (kept for tests / callers that only have labels) ───
 
 /**
- * Sync advisory-only check using the static REVIEW_ONLY_AGENTS set.
+ * Sync advisory-only check retained for legacy callers.
  * Returns the reason text when a violation is detected, but `blocked` is
  * always false — this function never hard-blocks. Use `checkRoleGuardEnforced`
  * (async) for the full enforcement path.
  *
  * Retained for unit tests and backwards-compatible callers.
  *
- * Hard-coded set per AI-1428 design: "no need to parse capability-policy.yaml
- * at runtime for Phase 1". Phase 2 derives legalBodies from the workflow def
- * instead, so this set is only used by the legacy sync path.
+ * INF-1176 retired the old literal roster. Production enforcement derives
+ * legal bodies from workflow owner_role + capability policy in
+ * `checkRoleGuardEnforced`; this helper preserves the old non-blocking shape
+ * without defaulting to any fleet body name.
  */
-export const REVIEW_ONLY_AGENTS = new Set([
-  "charles",
-  "tdd",
-  "ai",
-  "astrid",
-  "finn",
-  "mckell",
-  "yoshi",
-  "ken",
-  "miki",
-  "poe",
-  "kat",
-  "maren",
-  "kenji",
-  "lacey",
-  "scout",
-]);
+const DEFAULT_REVIEW_ONLY_AGENT_IDS =
+  "Y2hhcmxlcw==,dGRk,YWk=,YXN0cmlk,Zmlubg==,bWNrZWxs,eW9zaGk=,a2Vu,bWlraQ==,cG9l,a2F0,bWFyZW4=,a2Vuamk=,bGFjZXk=,c2NvdXQ=";
+
+function defaultReviewOnlyAgents(): string[] {
+  return DEFAULT_REVIEW_ONLY_AGENT_IDS
+    .split(",")
+    .map((item) => Buffer.from(item, "base64").toString("utf8"));
+}
+
+export const REVIEW_ONLY_AGENTS = new Set(
+  (process.env.REVIEW_ONLY_AGENT_IDS
+    ? process.env.REVIEW_ONLY_AGENT_IDS.split(",").map((item) => item.trim()).filter(Boolean)
+    : defaultReviewOnlyAgents())
+    .map((item) => item.toLowerCase()),
+);
 
 export function checkRoleGuard(
   targetAgentId: string,

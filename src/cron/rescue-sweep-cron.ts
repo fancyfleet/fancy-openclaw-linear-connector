@@ -8,7 +8,7 @@
  * Pattern mirrors src/cron/p4-metrics-distillation.ts.
  *
  * AI-1970 fix:
- *   - Auth now uses getAccessToken("ai") ?? env (matching every sibling caller),
+ *   - Auth now uses configured service-body token ?? env (matching every sibling caller),
  *     fixing the bug where the deployment's encrypted token was never read.
  *   - Skip and fail outcomes are recorded to /health state so a dead safety net
  *     no longer looks identical to a never-due one.
@@ -21,7 +21,7 @@ import type { OperationalEventStore } from "../store/operational-event-store.js"
 import { loadWorkflowRegistry } from "../workflow-gate.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { registerCron, formatIntervalMs } from "./registry.js";
-import { getAccessToken } from "../agents.js";
+import { getConnectorAuthToken } from "../role-config.js";
 import {
   recordRescueSweepRun,
   recordRescueSweepSkip,
@@ -59,9 +59,8 @@ const DEFAULT_INTERVAL_MS = parseIntervalMs(process.env.RESCUE_SWEEP_INTERVAL ??
  */
 async function runSweepIteration(operationalEventStore?: OperationalEventStore): Promise<void> {
   try {
-    // AI-1970: canonical auth pattern — getAccessToken("ai") ?? env, matching every sibling.
     const authToken =
-      getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+      await getConnectorAuthToken() ?? "";
     if (!authToken) {
       const reason = "No LINEAR_OAUTH_TOKEN or LINEAR_API_KEY configured";
       log.warn(`[rescue-sweep] ${reason} — skipping sweep`);

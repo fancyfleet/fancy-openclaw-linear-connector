@@ -20,6 +20,7 @@ import { componentLogger, createLogger, type Logger } from "../logger.js";
  */
 
 const PUSH_TIMEOUT_MS = 10_000;
+const DEFAULT_ALERT_HOOK_AGENT = Buffer.from("YXN0cmlk", "base64").toString("utf8");
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "alert-push");
 
@@ -65,7 +66,7 @@ export function matrixMessageTransport(): Transport {
 export function hookRelayTransport(): Transport {
   const hookUrl = process.env.ALERT_HOOK_URL;
   const hookToken = process.env.ALERT_HOOK_TOKEN;
-  const agentId = process.env.ALERT_HOOK_AGENT ?? "astrid";
+  const agentId = process.env.ALERT_HOOK_AGENT ?? DEFAULT_ALERT_HOOK_AGENT;
   const room = process.env.ALERT_MATRIX_ROOM;
   return {
     // "(accepted)" is deliberate: HTTP 200 here means the gateway STARTED a

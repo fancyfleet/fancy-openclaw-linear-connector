@@ -12,7 +12,7 @@
 
 import { createLogger, componentLogger } from "../logger.js";
 import { execSync } from "node:child_process";
-import { getAccessToken } from "../agents.js";
+import { getServiceAccessToken } from "../role-config.js";
 import {
   DoneTicketDetector,
   type DoneTicketDetectorConfig,
@@ -37,7 +37,7 @@ export interface DoneDetectorCronOptions {
   /** Poll interval in ms. Default: 1 hour or process.env.DONE_DETECTOR_POLL_INTERVAL_MS */
   pollIntervalMs?: number;
   /**
-   * Token for Linear API calls. Default: getAccessToken("ai") or
+   * Token for Linear API calls. Default: configured service-body token or
    * process.env.LINEAR_OAUTH_TOKEN or process.env.LINEAR_API_KEY.
    */
   linearToken?: string;
@@ -45,29 +45,32 @@ export interface DoneDetectorCronOptions {
 
 // ── Real Linear API implementation ───────────────────────────────────────────
 
-function resolveToken(token?: string): string | undefined {
-  return token ?? getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+async function resolveToken(token?: string): Promise<string | undefined> {
+  return token ?? await getServiceAccessToken() ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
 }
 
 /** Create a real LinearApi implementation backed by fetch to api.linear.app. */
 export function createLinearApi(linearToken?: string): LinearApi {
-  const getToken = () => {
-    const t = resolveToken(linearToken);
+  const getToken = async () => {
+    const t = await resolveToken(linearToken);
     if (!t) {
       throw new Error("No Linear API token available for done-ticket-detector");
     }
     return t;
   };
 
-  const authHeaders = () => ({
-    "content-type": "application/json",
-    authorization: /^Bearer\s+/i.test(getToken()) ? getToken() : `Bearer ${getToken()}`,
-  });
+  const authHeaders = async () => {
+    const token = await getToken();
+    return {
+      "content-type": "application/json",
+      authorization: /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`,
+    };
+  };
 
   async function graphQL<T>(query: string, variables: Record<string, unknown>): Promise<T> {
     const res = await fetch(LINEAR_API_URL, {
       method: "POST",
-      headers: authHeaders(),
+      headers: await authHeaders(),
       body: JSON.stringify({ query, variables }),
     });
     if (!res.ok) {

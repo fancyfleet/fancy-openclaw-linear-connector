@@ -167,7 +167,7 @@ export function resolveRoute(
   }
 
   // 3. Steward escalation — the match failed; a person (the steward) takes over.
-  const steward = roster?.steward ?? "astrid";
+  const steward = roster?.steward ?? process.env.DEPARTMENT_ROSTER_STEWARD_FALLBACK ?? "";
   return { target: steward, reason: "steward-escalation", escalated: true };
 }
 

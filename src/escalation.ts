@@ -13,6 +13,7 @@
 import { createLogger, componentLogger } from "./logger.js";
 import { getAccessToken, getAgent, getLinearUserIdForAgent } from "./agents.js";
 import { notify } from "./alerts/alert-bus.js";
+import { resolveStewardBody } from "./role-config.js";
 
 const log = componentLogger(createLogger(), "escalation");
 
@@ -74,14 +75,17 @@ export async function emitDelegateUnavailable(
   // but delegateChanged was never set — the comment landed and nothing
   // re-fired until something else touched the ticket. The delegate write
   // itself emits a webhook, which routes to Ai and wakes her.
-  const stewardUserId = getAgent(STEWARD_AGENT_ID)?.linearUserId ?? getLinearUserIdForAgent(STEWARD_AGENT_ID);
-  if (stewardUserId && targetAgentId !== STEWARD_AGENT_ID) {
+  const stewardAgentId = await resolveEscalationSteward();
+  const stewardUserId = stewardAgentId
+    ? getAgent(stewardAgentId)?.linearUserId ?? getLinearUserIdForAgent(stewardAgentId)
+    : undefined;
+  if (stewardUserId && targetAgentId !== stewardAgentId) {
     result.delegateChanged = await updateDelegate(internalId, stewardUserId, authHeader);
     if (!result.delegateChanged) {
-      log.error(`escalation: failed to reassign delegate to ${STEWARD_AGENT_ID} on ${issueIdentifier}`);
+      log.error(`escalation: failed to reassign delegate to ${stewardAgentId} on ${issueIdentifier}`);
     }
   } else if (!stewardUserId) {
-    log.error(`escalation: steward '${STEWARD_AGENT_ID}' has no linearUserId in the registry — cannot reassign`);
+    log.error("escalation: configured steward has no linearUserId in the registry — cannot reassign");
   }
 
   // 4. Structured log event.
@@ -95,7 +99,7 @@ export async function emitDelegateUnavailable(
     severity: "warning",
     source: "dispatch",
     title: result.delegateChanged
-      ? `delegate unreachable — delivery skipped, ticket reassigned to ${STEWARD_AGENT_ID} (${reason})`
+      ? `delegate unreachable — delivery skipped, ticket reassigned to ${stewardAgentId ?? "configured steward"} (${reason})`
       : `delegate unreachable — delivery skipped and reassignment FAILED, ticket is stranded on a dead agent (${reason})`,
     agent: targetAgentId,
     ticket: issueIdentifier,
@@ -105,7 +109,9 @@ export async function emitDelegateUnavailable(
 }
 
 /** Steward who inherits tickets stranded on unreachable delegates. */
-const STEWARD_AGENT_ID = process.env.DELEGATE_UNAVAILABLE_STEWARD ?? "ai";
+async function resolveEscalationSteward(): Promise<string | undefined> {
+  return process.env.DELEGATE_UNAVAILABLE_STEWARD ?? await resolveStewardBody();
+}
 
 /** Set the issue's delegate. Fail-open: returns false on any error. */
 async function updateDelegate(

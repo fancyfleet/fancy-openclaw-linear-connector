@@ -56,6 +56,7 @@ import { onAlert as onConfigHealthAlert } from "./config-health.js";
 import { getRegistryPolicyStatus, startRegistryPolicyCheck } from "./registry-policy.js";
 import { resolveStartupCommit } from "./startup-commit.js";
 import { getAccessToken, getAgent, getLinearUserIdForAgent, getAllTokenStatuses, isPolledForLinear } from "./agents.js";
+import { getConnectorAuthTokenSync, getServiceAgentConfig, resolveServiceBody, STEWARD_ROLE, getAccessTokenForRole } from "./role-config.js";
 import { loadUniversalCanon, getCanonLiveness } from "./policy/universal-canon.js";
 import { loadRoster, getRoutingFunctionaryLiveness } from "./department-roster.js";
 import { createGuidanceRouter, getDocsLiveness } from "./docs/guidance-router.js";
@@ -653,8 +654,9 @@ export function createApp(options?: CreateAppOptions) {
     // Agent token remains a fallback so a steward-token outage can't silence
     // the failure path. (Original bug here: $issueId declared ID! where
     // Linear expects String — every call 400'd silently until 2026-07-04.)
+    const stewardToken = await getAccessTokenForRole(STEWARD_ROLE);
     const tokenCandidates: Array<{ source: string; token: string | undefined }> = [
-      { source: "steward:astrid", token: getAccessToken("astrid") },
+      { source: "steward-role", token: stewardToken },
       { source: agentId, token: getAccessToken(agentId) },
       { source: "env", token: process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY },
     ];
@@ -1157,7 +1159,7 @@ export function createApp(options?: CreateAppOptions) {
   // liveness surfaced at /health.workflowMigrations. Fetches nothing unless a
   // registered def actually declares a migration map.
   const migrationAuthToken =
-    getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+    getConnectorAuthTokenSync() ?? "";
   const migrationWakeFn = async (agentName: string, ticketIdentifier: string) => {
     const sessionKey = normalizeSessionKey(ticketIdentifier);
     // AI-2313: guard against re-dispatch when a session is already live for this (agent, ticket).
@@ -1313,7 +1315,7 @@ if (isEntryPoint) {
   // DeliveryMessage + deliverMessageToAgent), so a healed ticket is not just
   // labeled-and-delegated but actually surfaced to its owner.
   const reconciliationAuthToken =
-    getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+    getConnectorAuthTokenSync() ?? "";
   const reconciliationWakeFn = async (agentName: string, ticketIdentifier: string) => {
     const sessionKey = normalizeSessionKey(ticketIdentifier);
     // AI-2313: guard against re-dispatch when a session is already live for this (agent, ticket).
@@ -1536,13 +1538,14 @@ if (isEntryPoint) {
   const slaWorkflowDefPath = process.env.WORKFLOW_DEFS_DIR ?? process.env.WORKFLOW_DEF_PATH ?? defaultWorkflowDefPath;
   const slaDataDir = process.env.DATA_DIR ?? resolveStatePath("data");
   const slaBreachStorePath = process.env.SLA_BREACH_STORE_PATH ?? path.join(slaDataDir, "sla-breaches.db");
-  const slaAuthToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  const slaAuthToken = getConnectorAuthTokenSync() ?? "";
   const slaCadenceMs = process.env.SLA_SWEEP_CADENCE_MS ? parseInt(process.env.SLA_SWEEP_CADENCE_MS, 10) : undefined;
 
   if (slaAuthToken) {
     const slaWakeAgent = async (identifier: string) => {
       const sessionKey = normalizeSessionKey(identifier);
-      const agentCfg = getAgent("ai");
+      const serviceBody = await resolveServiceBody();
+      const agentCfg = await getServiceAgentConfig();
       const deliveryConfig: DeliveryConfig = {
         nodeBin: process.execPath,
         hooksUrl: agentCfg?.hooksUrl ?? process.env.OPENCLAW_HOOKS_URL,
@@ -1557,7 +1560,9 @@ if (isEntryPoint) {
       const message =
         (await buildWorkflowAwareDeliveryMessage(identifier, slaAuthToken, actionText)) ??
         actionText;
-      await deliverMessageToAgent("ai", sessionKey, message, deliveryConfig);
+      if (serviceBody) {
+        await deliverMessageToAgent(serviceBody, sessionKey, message, deliveryConfig);
+      }
     };
 
     const slaTimer = registerSlaSweepCron({

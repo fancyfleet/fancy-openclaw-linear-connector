@@ -28,6 +28,7 @@ import {
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { registerCron, formatIntervalMs } from "./cron/registry.js";
 import { OperationalEventStore, type OperationalEventStore as OperationalEventStoreType } from "./store/operational-event-store.js";
+import { resolveWakeFallbackBody } from "./role-config.js";
 import type { SessionTracker } from "./bag/session-tracker.js";
 import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 
@@ -469,7 +470,10 @@ export async function runDelegationReconciliationSweep(
           // can't wake anyone specific. But the test expects a wake dispatch.
           // Use the identifier to allow any interested agent to pick it up.
           try {
-            await wakeFn("ai", ticket.identifier);
+            const fallbackBody = await resolveWakeFallbackBody();
+            if (fallbackBody) {
+              await wakeFn(fallbackBody, ticket.identifier);
+            }
           } catch (wakeErr) {
             const wakeMsg =
               wakeErr instanceof Error ? wakeErr.message : String(wakeErr);

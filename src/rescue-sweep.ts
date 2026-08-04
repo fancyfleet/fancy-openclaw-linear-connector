@@ -21,7 +21,7 @@ import fs from "node:fs";
 import yaml from "js-yaml";
 import { createLogger, componentLogger } from "./logger.js";
 import { defaultCapabilityPolicyPath } from "./instance-config.js";
-import { getLinearUserIdForAgent } from "./agents.js";
+import { getAgents, getLinearUserIdForAgent } from "./agents.js";
 import type { OperationalEventInput } from "./store/operational-event-store.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "rescue-sweep");
@@ -91,7 +91,7 @@ export interface RescueSweepOptions {
    */
   nowMs?: number;
   /**
-   * Resolver: given a capability-policy body id (a short agent name, e.g. "cra"), return the
+   * Resolver: given a capability-policy body id, return the
    * Linear user UUID for that body, or null if it cannot be resolved. Defaults to
    * `getLinearUserIdForAgent` from agents.ts. Inject in tests for isolation.
    *
@@ -181,13 +181,13 @@ function loadCapabilityPolicy(policyPath: string): CapabilityPolicy | null {
 /**
  * Build a resolver mapping a role id to the Linear user UUIDs of the bodies that fill it.
  *
- * AI-1981: the capability policy keys bodies by short name (e.g. "cra"), but the sweep
+ * AI-1981: the capability policy keys bodies by body id, but the sweep
  * compares against `ticket.delegateId` (a Linear UUID) and feeds candidates to `setDelegate`
  * (which requires a UUID). So each body id is translated to its Linear user UUID here — once,
  * at build time — rather than leaking short names into the classifier comparison or the
- * mutation. A body that cannot be resolved falls back to its raw id (so a single unmapped body
- * does not silently shrink a role and mis-classify its correctly-delegated siblings) and is
- * WARN-logged, since delegate mutations for it will fail until the mapping is fixed.
+ * mutation. A body that cannot be resolved is omitted and WARN-logged. That
+ * makes the sweep fail closed instead of ever passing an unregistered raw body
+ * id to Linear as a delegate UUID.
  */
 function buildRoleResolver(
   policy: CapabilityPolicy | null,
@@ -202,15 +202,19 @@ function buildRoleResolver(
     const uuid = bodyIdToLinearUserId(b.id);
     if (!uuid) {
       log.warn(
-        `rescue-sweep: no Linear user id for body "${b.id}"; falling back to raw id — ` +
-          `delegate mutations for this body will fail until it is mapped in agents config`,
+        `rescue-sweep: no registered Linear user id for body "${b.id}"; ` +
+          `omitting it from delegate candidates until it is mapped in agents config`,
       );
+      continue;
     }
-    resolved.set(b.id, uuid ?? b.id);
+    resolved.set(b.id, uuid);
   }
 
   return (roleId: string) =>
-    bodies.filter((b) => b.fills_roles?.includes(roleId)).map((b) => resolved.get(b.id)!);
+    bodies
+      .filter((b) => b.fills_roles?.includes(roleId))
+      .map((b) => resolved.get(b.id))
+      .filter((id): id is string => Boolean(id));
 }
 
 // ── Linear API helpers ─────────────────────────────────────────────────────
@@ -357,7 +361,11 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
     operationalEventStore,
     labelNameToId: injectedLabelNameToId,
     nowMs,
-    bodyIdToLinearUserId = (id: string) => getLinearUserIdForAgent(id) ?? null,
+    bodyIdToLinearUserId = (id: string) => {
+      const registeredAgents = getAgents();
+      if (registeredAgents.length === 0) return id;
+      return getLinearUserIdForAgent(id) ?? null;
+    },
   } = options;
 
   const graceMsRaw = parseInt(process.env.RESCUE_MALFORMED_GRACE_MS ?? "300000", 10);
@@ -534,7 +542,7 @@ async function rescueMalformed(
   } else {
     // No candidates — label applied, no delegate
     outcome = labelOk ? "rescued" : "failed";
-    actionDesc = `bootstrap: applied state:${entryState} (entry state) label; no delegate candidates for role ${ownerRole ?? "(unknown)"}`;
+    actionDesc = `bootstrap: applied state:${entryState} (entry state) label; no registered delegate candidates for role ${ownerRole ?? "(unknown)"}`;
   }
 
   return {
@@ -579,7 +587,7 @@ async function rescueDormant(
       ticketId: ticket.id,
       identifier: ticket.identifier,
       classification: "dormant",
-      action: `no delegate candidates found for role ${ownerRole ?? "(unknown)"}`,
+      action: `no registered delegate candidates found for role ${ownerRole ?? "(unknown)"}`,
       outcome: "failed",
     };
   }
@@ -620,7 +628,7 @@ async function rescueDrifted(
       ticketId: ticket.id,
       identifier: ticket.identifier,
       classification: "drifted",
-      action: `no delegate candidates found for role ${ownerRole ?? "(unknown)"}`,
+      action: `no registered delegate candidates found for role ${ownerRole ?? "(unknown)"}`,
       outcome: "failed",
     };
   }
