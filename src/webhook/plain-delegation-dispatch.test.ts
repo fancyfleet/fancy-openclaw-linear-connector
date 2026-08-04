@@ -6,6 +6,7 @@ import path from "node:path";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, test } from "@jest/globals";
 import { reloadAgents } from "../agents.js";
+import { resetWorkflowCache } from "../workflow-gate.js";
 import { createWebhookRouter } from "./index.js";
 
 const SECRET = "inf-334-plain-delegation-secret";
@@ -158,8 +159,10 @@ describe("INF-334 plain delegation webhook dispatch", () => {
       LINEAR_WEBHOOK_SECRET: SECRET,
       LINEAR_API_KEY: "linear-test-token",
       REQUIRE_GATEWAY_DELIVERY: "false",
+      WORKFLOW_DEFS_DIR: path.resolve(process.cwd(), "src/registered-defs"),
     };
     reloadAgents();
+    resetWorkflowCache();
     globalThis.fetch = async (url, init) => {
       if (String(url) !== HOOKS_URL) {
         if (String(url) !== "https://api.linear.app/graphql") {
@@ -224,8 +227,11 @@ describe("INF-334 plain delegation webhook dispatch", () => {
           }), { status: 200, headers: { "Content-Type": "application/json" } });
         }
         if (query.includes("IssueLabels")) {
+          const labels = labelUpdates.length > 0
+            ? [{ name: "wf:task" }, { name: "state:doing" }]
+            : [];
           return new Response(JSON.stringify({
-            data: { issue: { labels: { nodes: [] } } },
+            data: { issue: { labels: { nodes: labels } } },
           }), { status: 200, headers: { "Content-Type": "application/json" } });
         }
         return new Response(JSON.stringify({ data: {} }), {
@@ -248,10 +254,11 @@ describe("INF-334 plain delegation webhook dispatch", () => {
     globalThis.fetch = originalFetch;
     process.env = originalEnv;
     reloadAgents();
+    resetWorkflowCache();
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  test("AC1/AC5: delegate set on a no-wf ticket dispatches a plain wake to that delegate", async () => {
+  test("AC1/AC5: delegate set on a no-wf ticket enrolls before dispatch and sends task workflow guidance", async () => {
     const dispatched: Array<{ agentId: string; ticketId: string }> = [];
     const app = createTestApp((agentId, ticketId) => dispatched.push({ agentId, ticketId }));
 
@@ -263,11 +270,10 @@ describe("INF-334 plain delegation webhook dispatch", () => {
     expect(deliveries[0].agentId).toBe("igor");
     expect(deliveries[0].sessionKey).toBe("linear-DSN-334");
     expect(deliveries[0].message).toContain("You were delegated DSN-334");
-    expect(deliveries[0].message).toContain("linear consider-work DSN-334");
-    expect(deliveries[0].message).not.toContain("This is a [");
-    expect(deliveries[0].message).not.toContain("Your legal action(s)");
-    expect(deliveries[0].message).not.toContain("state: **");
-    await waitFor(() => labelUpdates.length === 1);
+    expect(deliveries[0].message).toContain("This is a [task] managed workflow ticket");
+    expect(deliveries[0].message).toContain("state: **doing**");
+    expect(deliveries[0].message).toContain("linear continue-workflow DSN-334");
+    expect(deliveries[0].message).not.toContain("linear consider-work DSN-334");
     expect(labelUpdates).toEqual([["label-wf-task", "label-state-doing"]]);
   });
 

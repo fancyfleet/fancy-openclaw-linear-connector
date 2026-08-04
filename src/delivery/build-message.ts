@@ -292,6 +292,16 @@ async function buildDelegationMessage(
 
 function eventKnowsTicketIsPlain(route: RouteResult): boolean {
   const data = (route.event.data ?? {}) as Record<string, unknown>;
+  const updatedFrom = (route.event as { updatedFrom?: Record<string, unknown> }).updatedFrom;
+  const delegate = data.delegate as { id?: string } | null | undefined;
+  const delegateSetEvent =
+    route.event.type === "Issue" &&
+    route.event.action === "update" &&
+    delegate?.id &&
+    updatedFrom !== undefined &&
+    ("delegateId" in updatedFrom || "delegate" in updatedFrom);
+  if (delegateSetEvent) return false;
+
   const labels = data.labels as { nodes?: Array<{ name?: string | null }> } | undefined;
   const labelNames = Array.isArray(labels?.nodes)
     ? labels.nodes.map((label) => label.name).filter((name): name is string => typeof name === "string")

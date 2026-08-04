@@ -827,29 +827,30 @@ export function createWebhookRouter(
           if (delegateChanged && delegateId) {
             const mappedAgentName = buildAgentMap()[delegateId];
             const delegateAgentName = mappedAgentName ? getOpenclawAgentName(mappedAgentName) : null;
-            autoEnrollPlainDelegation(enrollIssueId, enrollToken, (info) => {
-              appendOperationalEvent(operationalEventStore, {
-                outcome: "auto-enrolled",
-                type: event.type,
-                key: enrollIdentifier,
-                sessionKey: normalizeSessionKey(enrollIdentifier),
-                detail: {
-                  workflowId: info.workflowId,
-                  entryState: info.entryState,
-                  mode: "plain-delegation",
-                  delegate: info.delegateAgentName ?? null,
-                },
-              });
-            }, enrolledTicketsStore, delegateAgentName).then((result) => {
+            try {
+              const result = await autoEnrollPlainDelegation(enrollIssueId, enrollToken, (info) => {
+                appendOperationalEvent(operationalEventStore, {
+                  outcome: "auto-enrolled",
+                  type: event.type,
+                  key: enrollIdentifier,
+                  sessionKey: normalizeSessionKey(enrollIdentifier),
+                  detail: {
+                    workflowId: info.workflowId,
+                    entryState: info.entryState,
+                    mode: "plain-delegation",
+                    delegate: info.delegateAgentName ?? null,
+                  },
+                });
+              }, enrolledTicketsStore, delegateAgentName);
               if (result.enrolled) {
                 log.info(
                   `Plain delegation auto-enrolled: stamped wf:${result.workflowId ?? "task"} + ` +
                   `state:${result.entryState ?? "doing"} on ${enrollIssueId}`,
                 );
               }
-            }).catch((err) => {
+            } catch (err) {
               log.warn(`autoEnrollPlainDelegation failed for ${enrollIssueId}: ${err instanceof Error ? err.message : String(err)}`);
-            });
+            }
           }
 
           // ── AI-2554: On-webhook label-sync audit ──────────────────────────
