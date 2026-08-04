@@ -1327,6 +1327,37 @@ describe("applyStateTransition — normal state advance", () => {
     }
   });
 
+  it("INF-1190: 'reseat-merge' advances state:deploy → state:merge", async () => {
+    process.env.WORKFLOW_DEFS_DIR = path.resolve(process.cwd(), "src/__fixtures__");
+    resetWorkflowCache();
+    try {
+      const { fetch: mock, calls } = makeTransitionFetch({
+        issueLabels: [
+          { id: "wf-lbl", name: "wf:dev-impl" },
+          { id: "state-lbl", name: "state:deploy" },
+          { id: "other-lbl", name: "priority:high" },
+        ],
+        teamLabels: [
+          { id: "merge-lbl", name: "state:merge" },
+        ],
+        branchStatus: { hasBranch: true, hasPR: true, hasMergedPR: false },
+      });
+      globalThis.fetch = mock;
+      const result = await applyStateTransition("reseat-merge", "issue-uuid", "Bearer tok");
+
+      const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+      expect(updateCall).toBeDefined();
+      const vars = updateCall!.body.variables as { labelIds: string[] };
+      expect(vars.labelIds).toContain("merge-lbl");
+      expect(vars.labelIds).not.toContain("state-lbl");
+      expect(vars.labelIds).toContain("other-lbl");
+      expect(result.to).toBe("merge");
+    } finally {
+      delete process.env.WORKFLOW_DEFS_DIR;
+      resetWorkflowCache();
+    }
+  });
+
   it("creates the target state label when it does not exist in the team", async () => {
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
@@ -1920,6 +1951,30 @@ describe("checkWorkflowRules — AI-2476: merged-PR release gate (branch/PR veri
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deploy"], { hasBranch: false, hasPR: false });
     const result = await checkWorkflowRules("reject", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, true);
     expect(result).toBeNull();
+  });
+
+  it("INF-1190: allows deploy to reseat unmerged reviewed work back to merge with evidence", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deploy"], { hasBranch: true, hasPR: true, hasMergedPR: false });
+    const result = await checkWorkflowRules(
+      "reseat-merge",
+      "issue-uuid",
+      "Bearer tok",
+      "hanzo",
+      null,
+      null,
+      null,
+      false,
+      false,
+      true,
+    );
+    expect(result).toBeNull();
+  });
+
+  it("INF-1190: reseat-merge requires an evidence comment", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deploy"], { hasBranch: true, hasPR: true, hasMergedPR: false });
+    const result = await checkWorkflowRules("reseat-merge", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("requires a comment");
   });
 
   it("merged-PR gate does NOT mask the commitment gate for 'submit' from implementation", async () => {

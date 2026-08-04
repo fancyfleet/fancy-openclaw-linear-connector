@@ -40,6 +40,19 @@ linear continue-workflow {identifier} --comment-file <path>
 The comment should state explicitly: "No deploy needed — [reason]" or "Deployed:
 [version/SHA] — [verification]."
 
+### Artifact not on main
+
+If you discover that the approved artifact is **not actually merged to main**,
+do not continue forward and do not reject back to implementation. Return the
+ticket to the merge gate with evidence:
+
+```
+linear reseat-merge {identifier} --comment-file <path>
+```
+
+Use this only for the "reviewed/approved, but not landed on main" case. Your
+comment should name the PR or SHA you checked and the missing merge evidence.
+
 ## What `continue-workflow` means at the deploy step
 
 `continue-workflow` is the **only** forward verb. It advances deploy →
@@ -60,11 +73,14 @@ linear continue-workflow {identifier} --comment-file <path>
   implementation work. CI flakiness or infra hiccups are not regressions.
 - Do NOT mark the ticket Done — Done requires deployed + verified live (the
   ac-validate gate owns that).
-- Do NOT re-merge the PR — the merge already happened in `merge`.
+- Do NOT manually re-merge the PR from deploy. If the PR is not on main, use
+  `reseat-merge` so the governed merge owner lands it.
 
 ## Context
 
 This state was introduced in AI-1872 (Matt directive, 2026-07-06). It replaces
 the old `host-deploy` state and the `deploy` custom verb. The key design
 principle: `continue-workflow` is the exit whether or not a deploy action
-occurred — the deployer decides what's needed and advances the ticket.
+occurred — the deployer decides what's needed and advances the ticket. INF-1190
+added `reseat-merge` for the exceptional case where deploy discovers the merge
+precondition is false.

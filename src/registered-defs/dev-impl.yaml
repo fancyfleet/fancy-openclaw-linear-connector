@@ -59,9 +59,14 @@
 #   already been squash-merged but branch correlation stranded it back at intake.
 #   The edge requires an evidence comment and resumes at deploy, so AC validation
 #   still runs and test-authoring/implementation are not reopened.
+#
+# v19 (2026-08-04, INF-1190): deploy can reseat unmerged artifacts back to the
+#   merge gate. A break-glass or stale transition can strand a reviewed but
+#   unmerged PR in deploy; `reseat-merge` returns it to Hanzo without discarding
+#   the reviewed position or resetting to implementation/intake.
 
 id: dev-impl
-version: 18
+version: 19
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
 
@@ -311,6 +316,13 @@ states:
             - scope-creep
             - correctness
             - ac-mismatch
+      # INF-1190: recovery for a reviewed artifact that reached deploy before
+      # its PR landed on main. This is not a regression reject; it preserves the
+      # reviewed position and returns to the merge owner to land the approved PR.
+      - command: reseat-merge
+        to: merge
+        requires_comment: true
+        assign: { mode: auto }
       # INF-150: handoff self-loop — re-attach delegate without changing state
       - command: handoff
         to: deploy

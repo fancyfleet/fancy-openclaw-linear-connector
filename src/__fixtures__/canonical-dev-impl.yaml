@@ -3,7 +3,7 @@
 # The canonical fixture is a mirror of the registered-def (INF-723 single-source rule).
 
 id: dev-impl
-version: 18
+version: 19
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
 
@@ -253,6 +253,13 @@ states:
             - scope-creep
             - correctness
             - ac-mismatch
+      # INF-1190: recovery for a reviewed artifact that reached deploy before
+      # its PR landed on main. This is not a regression reject; it preserves the
+      # reviewed position and returns to the merge owner to land the approved PR.
+      - command: reseat-merge
+        to: merge
+        requires_comment: true
+        assign: { mode: auto }
       # INF-150: handoff self-loop — re-attach delegate without changing state
       - command: handoff
         to: deploy
