@@ -103,12 +103,17 @@ function makeRecoveryFetch(opts: {
   nativeStateAfterRawWrite?: string;
   labelStateAfterWrite?: string;
   rawUpdateSuccess?: boolean;
+  atomicWritePersists?: boolean;
 } = {}): { fetch: typeof globalThis.fetch; calls: GraphqlCall[] } {
   const calls: GraphqlCall[] = [];
   const liveDelegateId = opts.liveDelegateId === undefined ? IGOR_LINEAR_ID : opts.liveDelegateId;
-  const nativeStateAfterRawWrite = opts.nativeStateAfterRawWrite ?? "To Do";
-  const labelStateAfterWrite = opts.labelStateAfterWrite ?? "implementation";
+  let currentNativeStateName = opts.nativeStateAfterRawWrite ?? "To Do";
+  let currentNativeStateId = currentNativeStateName === "Doing" ? "state-doing" : currentNativeStateName === "Needs Human" ? "state-needs-human" : "state-todo";
+  let currentLabelState = opts.labelStateAfterWrite ?? "implementation";
+  let currentDelegateId = liveDelegateId;
+  let currentAssigneeId: string | null = null;
   const rawUpdateSuccess = opts.rawUpdateSuccess ?? true;
+  const atomicWritePersists = opts.atomicWritePersists ?? true;
 
   const fetch = (async (_url: unknown, init?: RequestInit) => {
     const parsed = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as GraphqlCall;
@@ -127,7 +132,7 @@ function makeRecoveryFetch(opts: {
             labels: {
               nodes: [
                 { id: "label-wf-dev-impl", name: "wf:dev-impl" },
-                { id: "label-state-implementation", name: "state:implementation" },
+                { id: `label-state-${currentLabelState}`, name: `state:${currentLabelState}` },
               ],
             },
           },
@@ -142,12 +147,12 @@ function makeRecoveryFetch(opts: {
             id: "issue-inf-1198",
             identifier: "INF-1198",
             team: { id: "team-inf" },
-            delegate: liveDelegateId ? { id: liveDelegateId } : null,
-            state: { id: nativeStateAfterRawWrite === "Doing" ? "state-doing" : "state-todo", name: nativeStateAfterRawWrite },
+            delegate: currentDelegateId ? { id: currentDelegateId } : null,
+            state: { id: currentNativeStateId, name: currentNativeStateName },
             labels: {
               nodes: [
                 { id: "label-wf-dev-impl", name: "wf:dev-impl", team: { id: "team-inf" } },
-                { id: `label-state-${labelStateAfterWrite}`, name: `state:${labelStateAfterWrite}`, team: { id: "team-inf" } },
+                { id: `label-state-${currentLabelState}`, name: `state:${currentLabelState}`, team: { id: "team-inf" } },
               ],
             },
           },
@@ -200,17 +205,51 @@ function makeRecoveryFetch(opts: {
     }
 
     if (query.includes("RecoverIssue")) {
+      if (rawUpdateSuccess && typeof parsed.variables?.input === "object" && parsed.variables.input) {
+        const input = parsed.variables.input as Record<string, unknown>;
+        if (input.stateId === "state-doing") {
+          currentNativeStateId = "state-doing";
+          currentNativeStateName = "Doing";
+        } else if (input.stateId === "state-needs-human") {
+          currentNativeStateId = "state-needs-human";
+          currentNativeStateName = "Needs Human";
+        } else if (input.stateId === "state-todo") {
+          currentNativeStateId = "state-todo";
+          currentNativeStateName = "To Do";
+        }
+      }
       return json({
         data: {
           issueUpdate: {
             success: rawUpdateSuccess,
-            issue: { id: "issue-inf-1198", state: { name: nativeStateAfterRawWrite } },
+            issue: { id: "issue-inf-1198", state: { name: currentNativeStateName } },
           },
         },
       });
     }
 
     if (query.includes("ApplyAtomicTransition")) {
+      if (atomicWritePersists) {
+        const labelIds = Array.isArray(parsed.variables?.labelIds) ? parsed.variables.labelIds : [];
+        const stateLabelId = labelIds.find((id): id is string => typeof id === "string" && id.startsWith("label-state-"));
+        if (stateLabelId) currentLabelState = stateLabelId.replace(/^label-state-/, "");
+        if (parsed.variables?.stateId === "state-doing") {
+          currentNativeStateId = "state-doing";
+          currentNativeStateName = "Doing";
+        } else if (parsed.variables?.stateId === "state-needs-human") {
+          currentNativeStateId = "state-needs-human";
+          currentNativeStateName = "Needs Human";
+        } else if (parsed.variables?.stateId === "state-todo") {
+          currentNativeStateId = "state-todo";
+          currentNativeStateName = "To Do";
+        }
+        if (Object.prototype.hasOwnProperty.call(parsed.variables, "delegateId")) {
+          currentDelegateId = typeof parsed.variables.delegateId === "string" ? parsed.variables.delegateId : null;
+        }
+        if (Object.prototype.hasOwnProperty.call(parsed.variables, "assigneeId")) {
+          currentAssigneeId = typeof parsed.variables.assigneeId === "string" ? parsed.variables.assigneeId : null;
+        }
+      }
       return json({ data: { issueUpdate: { success: true } } });
     }
 
@@ -218,10 +257,10 @@ function makeRecoveryFetch(opts: {
       return json({
         data: {
           issue: {
-            labels: { nodes: [{ name: "wf:dev-impl" }, { name: `state:${labelStateAfterWrite}` }] },
-            delegate: liveDelegateId ? { id: liveDelegateId } : null,
-            assignee: null,
-            state: { id: nativeStateAfterRawWrite === "Doing" ? "state-doing" : "state-todo" },
+            labels: { nodes: [{ name: "wf:dev-impl" }, { name: `state:${currentLabelState}` }] },
+            delegate: currentDelegateId ? { id: currentDelegateId } : null,
+            assignee: currentAssigneeId ? { id: currentAssigneeId } : null,
+            state: { id: currentNativeStateId },
           },
         },
       });
@@ -351,7 +390,8 @@ describe("INF-1198 stale-session recovery atomicity", () => {
     const { fetch, calls } = makeRecoveryFetch({
       liveDelegateId: null,
       nativeStateAfterRawWrite: "To Do",
-      labelStateAfterWrite: "implementation",
+      labelStateAfterWrite: "doing",
+      atomicWritePersists: false,
     });
     globalThis.fetch = fetch;
 
