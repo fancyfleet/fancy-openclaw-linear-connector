@@ -1552,6 +1552,8 @@ interface LabelNode {
   team?: { id: string };
 }
 
+const INF_1197_ACTIVE_LANE_WF_TASK_FREEZE = true;
+
 interface TicketContext {
   labels: string[];
   /** Linear user ID of the current delegate, or null if unset. */
@@ -1653,6 +1655,8 @@ async function fetchIssueWithLabels(
 ): Promise<{
   internalId: string;
   identifier: string;
+  title?: string | null;
+  description?: string | null;
   teamId: string;
   teamKey?: string;
   teamName?: string;
@@ -1661,6 +1665,8 @@ async function fetchIssueWithLabels(
   assigneeId: string | null;
   nativeStateId: string | null;
   requesterUserId: string | null;
+  nativeStateName?: string | null;
+  nativeStateType?: string | null;
 } | null> {
   // INF-979 (AC2): also read the live delegate so setStateAtomic can detect a
   // null-delegate husk and bootstrap-seat the workflow role owner instead of
@@ -1673,11 +1679,13 @@ async function fetchIssueWithLabels(
         id
         identifier
         creator { id }
+        title
+        description
         team { id key name }
         labels { nodes { id name team { id } } }
         delegate { id }
         assignee { id }
-        state { id }
+        state { id name type }
       }
     }
   `;
@@ -1693,11 +1701,13 @@ async function fetchIssueWithLabels(
           id: string;
           identifier: string;
           creator?: { id?: string | null } | null;
+          title?: string | null;
+          description?: string | null;
           team: { id: string; key?: string; name?: string };
           labels: { nodes: LabelNode[] };
           delegate?: { id: string } | null;
           assignee?: { id: string } | null;
-          state?: { id: string } | null;
+          state?: { id: string; name?: string | null; type?: string | null } | null;
         };
       };
     };
@@ -1707,6 +1717,8 @@ async function fetchIssueWithLabels(
     return {
       internalId: issue.id,
       identifier: issue.identifier,
+      title: issue.title,
+      description: issue.description,
       teamId: issue.team.id,
       teamKey: issue.team.key,
       teamName: issue.team.name,
@@ -1715,6 +1727,8 @@ async function fetchIssueWithLabels(
       assigneeId: issue.assignee?.id ?? null,
       nativeStateId: issue.state?.id ?? null,
       requesterUserId: issue.creator?.id ?? null,
+      nativeStateName: issue.state?.name ?? null,
+      nativeStateType: issue.state?.type ?? null,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -8500,6 +8514,51 @@ export interface PlainDelegationEnrollInfo {
   delegateAgentName?: string | null;
 }
 
+const PLAIN_DELEGATION_PR_URL_RE = /https?:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/i;
+const PLAIN_DELEGATION_PR_HASH_RE = /\bPR\s*#?\d+\b/i;
+const PLAIN_DELEGATION_PULL_REQUEST_RE = /\bpull request\b/i;
+const PLAIN_DELEGATION_DIFF_RE = /(?:^|\n)\s*diff --git\s+/;
+const PLAIN_DELEGATION_SOURCE_PATH_RE =
+  /\b[\w.-]+\/[\w./-]*\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|rb|php|c|cc|cpp|h|hpp|cs|sh|sql|ya?ml|json|toml)\b/i;
+const PLAIN_DELEGATION_ENG_DOMAIN_MARKER_RE = /\bengineering-domain\s*:/i;
+const PLAIN_DELEGATION_BRANCH_NAME_RE = /\b(?:feature|fix|bugfix|hotfix|chore|refactor)\/[A-Za-z0-9._-]+/;
+const PLAIN_DELEGATION_CHORE_SIGNAL_RE =
+  /\b(?:operational|operations|runbook|archive|cleanup|clean up|notes?|handoff|schedule|triage|inventory|document|docs?|no code changes?)\b/i;
+
+function classifyPlainDelegationActiveLane(issue: {
+  title?: string | null;
+  description?: string | null;
+  nativeStateName?: string | null;
+  nativeStateType?: string | null;
+}): "dev-impl" | "chore" | "ambiguous" | "inactive" {
+  const stateName = issue.nativeStateName?.trim().toLowerCase();
+  const stateType = issue.nativeStateType?.trim().toLowerCase();
+  if (stateType === "backlog" || stateName === "backlog") return "inactive";
+
+  const hasNativeStateMetadata = Boolean(stateName || stateType);
+  const isActiveTodo = !hasNativeStateMetadata || stateType === "unstarted" || stateName === "to do" || stateName === "todo";
+  if (!isActiveTodo) return "inactive";
+
+  if (issue.title === undefined && issue.description === undefined) {
+    return "chore";
+  }
+
+  const text = `${issue.title ?? ""}\n${issue.description ?? ""}`;
+  if (
+    PLAIN_DELEGATION_PR_URL_RE.test(text) ||
+    PLAIN_DELEGATION_PR_HASH_RE.test(text) ||
+    PLAIN_DELEGATION_PULL_REQUEST_RE.test(text) ||
+    PLAIN_DELEGATION_DIFF_RE.test(text) ||
+    PLAIN_DELEGATION_SOURCE_PATH_RE.test(text) ||
+    PLAIN_DELEGATION_ENG_DOMAIN_MARKER_RE.test(text) ||
+    PLAIN_DELEGATION_BRANCH_NAME_RE.test(text)
+  ) {
+    return "dev-impl";
+  }
+
+  return PLAIN_DELEGATION_CHORE_SIGNAL_RE.test(text) ? "chore" : "ambiguous";
+}
+
 const DEFAULT_TEAM_ENROLL_CONFIG: TeamEnrollConfig = {
   "AI": "dev-impl",
 };
@@ -8620,11 +8679,10 @@ export async function autoEnrollByTeam(
 }
 
 /**
- * INF-334: promote an already-delegated ad-hoc ticket into the task workflow.
+ * INF-334: promote an already-delegated ad-hoc ticket into a governed workflow.
  *
- * Plain ticket delegation already chooses the worker via Linear's delegate
- * field. Enrolling at task:doing preserves that ownership while making the
- * ticket visible to governed capacity/rearm/rescue machinery.
+ * INF-1197: new active-lane plain delegation must never mint deprecated
+ * `wf:task`; classify To Do into dev-impl/chore and leave Backlog untouched.
  */
 export async function autoEnrollPlainDelegation(
   issueId: string,
@@ -8634,9 +8692,6 @@ export async function autoEnrollPlainDelegation(
   delegateAgentName?: string | null,
   delegateSetTimestamp?: string | null,
 ): Promise<{ enrolled: boolean; entryState?: string; workflowId?: string }> {
-  const workflowId = "task";
-  const entryState = "doing";
-
   if (delegateAgentName) {
     try {
       const workerBodies = await resolveBodiesForRole("worker");
@@ -8646,14 +8701,14 @@ export async function autoEnrollPlainDelegation(
       if (!isWorkerDelegate) {
         log.info(
           `workflow-gate: autoEnrollPlainDelegation: skipping ${issueId} because ` +
-            `delegate '${delegateAgentName}' is not a worker body for task:doing`,
+            `delegate '${delegateAgentName}' is not a worker body for active-lane enrollment`,
         );
         return { enrolled: false };
       }
     } catch (err) {
       log.warn(
         `workflow-gate: autoEnrollPlainDelegation: worker role resolution failed for ${issueId} — ` +
-          `skipping task:doing promotion: ${err instanceof Error ? err.message : String(err)}`,
+          `skipping active-lane enrollment: ${err instanceof Error ? err.message : String(err)}`,
       );
       return { enrolled: false };
     }
@@ -8670,6 +8725,44 @@ export async function autoEnrollPlainDelegation(
   if (existingWorkflowId) {
     return { enrolled: false };
   }
+
+  const classification = classifyPlainDelegationActiveLane(issue);
+  if (classification === "inactive") {
+    log.info(
+      `workflow-gate: autoEnrollPlainDelegation: skipping ${issue.identifier} because ` +
+        `native Linear state '${issue.nativeStateName ?? issue.nativeStateType ?? issue.nativeStateId ?? "unknown"}' is not active To Do`,
+    );
+    return { enrolled: false };
+  }
+  if (classification === "ambiguous") {
+    log.warn(
+      `workflow-gate: autoEnrollPlainDelegation: cannot determine active-lane workflow for ${issue.identifier}; ` +
+        `refusing deprecated wf:task fallback. Add an explicit workflow or enough signal to choose wf:chore or wf:dev-impl.`,
+    );
+    return { enrolled: false };
+  }
+
+  const workflowId = classification;
+  let def: WorkflowDef | undefined;
+  try {
+    const registry = await loadWorkflowRegistry();
+    def = registry.get(workflowId);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: autoEnrollPlainDelegation: registry load failed for ${issueId}: ${msg} — skipping`);
+    return { enrolled: false };
+  }
+
+  if (!def?.entry_state && workflowId === "chore") {
+    log.warn(
+      `workflow-gate: autoEnrollPlainDelegation: workflow def for chore is missing on ${issueId}; ` +
+        `using freeze-policy intake fallback`,
+    );
+  } else if (!def?.entry_state) {
+    log.warn(`workflow-gate: autoEnrollPlainDelegation: no entry_state in def for ${workflowId} on ${issueId} — skipping`);
+    return { enrolled: false };
+  }
+  const entryState = def?.entry_state ?? "intake";
 
   // INF-334: A re-delegation timestamp can bypass a stale demoted tombstone.
   if (enrolledTicketsStore?.wasDemoted(issue.identifier, delegateSetTimestamp ?? undefined)) {
