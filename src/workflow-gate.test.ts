@@ -30,6 +30,7 @@ import {
   resetWorkflowCache,
   validateNativeStateMappings,
   validateGateAnchorDefs,
+  resolveTransitionDelegate,
   resolveStakesLevel,
   resolveNativeStateId,
   resetNativeStateCache,
@@ -6519,6 +6520,8 @@ roles:
     requires: [linear:transition]
   - id: steward
     requires: [human:escalate]
+  - id: requester
+    requires: [linear:transition]
 
 bodies:
   - id: felix
@@ -6532,7 +6535,10 @@ bodies:
     fills_roles: [test-author]
   - id: astrid
     container: steward
-    fills_roles: [steward]
+    fills_roles: [steward, requester]
+  - id: ai
+    container: steward
+    fills_roles: [requester]
 `;
 
 describe("applyStateTransition — AI-1709 multi-body role cliTarget resolution", () => {
@@ -6564,6 +6570,7 @@ describe("applyStateTransition — AI-1709 multi-body role cliTarget resolution"
         { name: "igor", linearUserId: "igor-linear-uuid", clientId: "c", clientSecret: "s", accessToken: "t", refreshToken: "r" },
         { name: "tdd", linearUserId: "tdd-linear-uuid", clientId: "c", clientSecret: "s", accessToken: "t", refreshToken: "r" },
         { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "c", clientSecret: "s", accessToken: "t", refreshToken: "r" },
+        { name: "ai", linearUserId: "ai-linear-uuid", clientId: "c", clientSecret: "s", accessToken: "t", refreshToken: "r" },
       ],
     }, null, 2), "utf8");
     ai1709OriginalAgentsFile = process.env.AGENTS_FILE;
@@ -6678,6 +6685,30 @@ describe("applyStateTransition — AI-1709 multi-body role cliTarget resolution"
     expect(atomicCall).toBeDefined();
     const vars = atomicCall!.body.variables as { delegateId?: string };
     expect(vars.delegateId).toBe("felix-linear-uuid");
+  });
+
+  it("INF-854: break-glass to a multi-body requester state resolves to the caller when legal", async () => {
+    const delegateId = await resolveTransitionDelegate(
+      "intake",
+      undefined,
+      {
+        id: "task",
+        version: 1,
+        archetype: "single-task",
+        entry_state: "intake",
+        break_glass: { command: "escape", to: "intake", owner_role: "steward" },
+        states: [
+          { id: "intake", owner_role: "requester", kind: "normal", native_state: "todo", transitions: [] },
+          { id: "review", owner_role: "department-head", kind: "normal", native_state: "todo", transitions: [] },
+          { id: "done", kind: "terminal", native_state: "done", transitions: [] },
+        ],
+      },
+      "INF-854",
+      undefined,
+      "astrid",
+    );
+
+    expect(delegateId).toBe("astrid-linear-uuid");
   });
 });
 

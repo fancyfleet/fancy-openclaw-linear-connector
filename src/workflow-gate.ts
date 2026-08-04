@@ -2041,6 +2041,7 @@ export async function resolveTransitionTargets(
  * 1. Explicit CLI target
  * 2. Prior implementer (if transition has assign.default: prior-implementer)
  * 3. Singleton role auto-assign
+ * 4. Caller-as-destination when the caller fills a multi-body destination role
  */
 export async function resolveTransitionDelegate(
   toStateName: string,
@@ -2049,6 +2050,7 @@ export async function resolveTransitionDelegate(
   issueId: string,
   cliTarget?: string,
   context?: WorkflowInstanceContext,
+  callerBodyId?: string,
 ): Promise<string | null | undefined> {
   const destStateNode = def.states.find((s) => s.id === toStateName);
   if (!destStateNode) return undefined;
@@ -2091,13 +2093,20 @@ export async function resolveTransitionDelegate(
     }
   }
 
-  // (3) Role-based resolution (singleton only).
+  // (3) Role-based resolution. Singletons auto-route; multi-body break-glass
+  // can route back to the caller when the destination role explicitly allows it.
   try {
     const roleBodies = await resolveBodiesForOwnerRoleInContext(destOwnerRole, def, context);
     if (roleBodies.length === 1) {
       const agent = getAgent(roleBodies[0]);
       if (agent?.linearUserId) {
         return agent.linearUserId;
+      }
+    }
+    if (callerBodyId && roleBodies.includes(callerBodyId)) {
+      const callerAgent = getAgent(callerBodyId);
+      if (callerAgent?.linearUserId) {
+        return callerAgent.linearUserId;
       }
     }
   } catch {

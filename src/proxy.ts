@@ -710,6 +710,10 @@ function isCommentCreateMutation(body: GraphQLRequestBody | null): boolean {
   return !!body?.query && /\bcommentCreate\s*\(/.test(body.query);
 }
 
+function isWorkflowTransitionMutation(body: GraphQLRequestBody | null): boolean {
+  return isIssueUpdateMutation(body) || isCommentCreateMutation(body);
+}
+
 /**
  * AI-1583: True only when the request's GraphQL operation is a mutation.
  *
@@ -1546,11 +1550,18 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           }
         }
 
-        // AI-1977: Pre-resolve the delegateId and inject it into the forwarded mutation
-        // BEFORE the forward, so webhook #1 carries the correct delegate from the start.
+        // AI-1977: Pre-resolve the delegateId before the forward, so workflow
+        // commands fail closed before any upstream side effect when their
+        // destination delegate cannot be determined.
+        //
+        // For issueUpdate, also inject the delegateId into the forwarded mutation
+        // so webhook #1 carries the correct delegate from the start.
         // Previously applyStateTransition set the delegate as a separate API call after
         // the forward, meaning webhook #1 fired with the OLD delegate — the new delegate
         // was invisible until webhook #2 (which sometimes never arrived or was misrouted).
+        // INF-854: commentCreate can be the command-carrying mutation. It cannot
+        // carry delegateId itself, but it still must pre-resolve delegateOverride
+        // or block ambiguity before the comment posts.
         //
         // This block:
         //   1. Resolves the delegate using the same def-driven logic as applyStateTransition
@@ -1559,7 +1570,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         //
         // If resolution fails (multi-body, no target), we skip injection and let
         // applyStateTransition handle it the old way.
-        if (isIssueUpdateMutation(body) && issueId && effectiveIntent !== 'migrate-state') {
+        if (isWorkflowTransitionMutation(body) && issueId && effectiveIntent !== 'migrate-state') {
           try {
             const preLabels = sourceStateOverride
               ? [] // we already have pre-forward labels
@@ -1583,13 +1594,18 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
                     : stateNode?.transitions?.find(
                     (t) => t.command === effectiveIntent,
                   );
-                  if (matchedTransition) {
+                  const delegateDestination =
+                    matchedTransition?.to ??
+                    (effectiveIntent === breakGlassCommand ? def.break_glass?.to ?? "escape" : undefined);
+                  if (delegateDestination) {
                     const resolved = await resolveTransitionDelegate(
-                      matchedTransition.to,
+                      delegateDestination,
                       matchedTransition,
                       def,
                       issueId,
                       target ?? undefined,
+                      undefined, // context — not available in proxy pre-resolve path
+                      agentId, // callerBodyId
                     );
                     if (resolved !== undefined) {
                       delegateOverride = resolved;
@@ -1602,6 +1618,20 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
                           `delegate-pre-resolve agent=${agentId} intent=${effectiveIntent}${ticketCtx}: injected delegateId=${resolved} and assigneeId:null into forwarded mutation`,
                         );
                       }
+                    } else if (
+                      effectiveIntent === breakGlassCommand &&
+                      def.states.some((s) => s.id === delegateDestination && !!s.owner_role && s.kind !== "terminal")
+                    ) {
+                      log.warn(`delegate-pre-resolve blocked agent=${agentId} intent=${effectiveIntent}${ticketCtx}: destination delegate requires --target`);
+                      res.status(200).json({
+                        errors: [{
+                          message:
+                            `[Proxy] '${effectiveIntent}' blocked before posting a workflow comment: ` +
+                            `break-glass target state '${delegateDestination}' has an ambiguous owner. ` +
+                            `Re-run with --target <agent>.`,
+                        }],
+                      });
+                      return;
                     }
                   }
                 }

@@ -79,6 +79,57 @@ bodies:
     fills_roles: [code-review]
 `;
 
+const TEST_POLICY_WITH_REQUESTER_YAML = `
+capabilities:
+  - id: human:escalate
+  - id: workflow:break-glass
+  - id: linear:transition
+containers:
+  - id: steward
+    grants: [linear:transition, human:escalate, workflow:break-glass]
+  - id: requester
+    grants: [linear:transition]
+roles:
+  - id: steward
+    requires: [human:escalate]
+  - id: requester
+    requires: [linear:transition]
+bodies:
+  - id: astrid
+    container: steward
+    fills_roles: [steward, requester]
+  - id: ai
+    container: requester
+    fills_roles: [requester]
+`;
+
+const TEST_POLICY_WITH_STEWARD_ONLY_YAML = `
+capabilities:
+  - id: human:escalate
+  - id: workflow:break-glass
+  - id: linear:transition
+containers:
+  - id: steward
+    grants: [linear:transition, human:escalate, workflow:break-glass]
+  - id: requester
+    grants: [linear:transition]
+roles:
+  - id: steward
+    requires: [human:escalate]
+  - id: requester
+    requires: [linear:transition]
+bodies:
+  - id: charles
+    container: steward
+    fills_roles: [steward]
+  - id: astrid
+    container: requester
+    fills_roles: [requester]
+  - id: ai
+    container: requester
+    fills_roles: [requester]
+`;
+
 const TEST_WORKFLOW_YAML = `
 id: dev-impl
 version: 1
@@ -126,12 +177,48 @@ states:
     transitions: []
 `;
 
+const TEST_TASK_ESCAPE_WORKFLOW_YAML = `
+id: task
+version: 1
+archetype: single-task
+entry_state: intake
+break_glass:
+  command: escape
+  to: intake
+  owner_role: steward
+states:
+  - id: intake
+    owner_role: requester
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: request
+        to: review
+  - id: review
+    owner_role: steward
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: approve
+        to: done
+  - id: done
+    kind: terminal
+    native_state: done
+    transitions: []
+`;
+
 // Minimal agents.json so createApp() doesn't complain.
 function writeAgents(dir: string): string {
   const file = path.join(dir, "agents.json");
   fs.writeFileSync(
     file,
-    JSON.stringify({ agents: [{ name: "charles", linearUserId: "u1", openclawAgent: "charles", accessToken: "tok", host: "local" }, { name: "hanzo", linearUserId: "u2", openclawAgent: "hanzo", accessToken: "tok2", host: "local" }, { name: "cra", linearUserId: "u3", openclawAgent: "cra", accessToken: "tok3", host: "local" }] }),
+    JSON.stringify({ agents: [
+      { name: "charles", linearUserId: "u1", openclawAgent: "charles", accessToken: "tok", host: "local" },
+      { name: "hanzo", linearUserId: "u2", openclawAgent: "hanzo", accessToken: "tok2", host: "local" },
+      { name: "astrid", linearUserId: "u3", openclawAgent: "astrid", accessToken: "tok3", host: "local" },
+      { name: "ai", linearUserId: "u4", openclawAgent: "ai", accessToken: "tok4", host: "local" },
+      { name: "cra", linearUserId: "u5", openclawAgent: "cra", accessToken: "tok5", host: "local" },
+    ] }),
     "utf8"
   );
   return file;
@@ -146,6 +233,13 @@ function writePolicyFile(dir: string, content = TEST_POLICY_YAML): string {
 function writeWorkflowFile(dir: string): string {
   const file = path.join(dir, "dev-impl.yaml");
   fs.writeFileSync(file, TEST_WORKFLOW_YAML, "utf8");
+  process.env.WORKFLOW_DEF_PATH = file;
+  return file;
+}
+
+function writeTaskEscapeWorkflowFile(dir: string): string {
+  const file = path.join(dir, "task.yaml");
+  fs.writeFileSync(file, TEST_TASK_ESCAPE_WORKFLOW_YAML, "utf8");
   process.env.WORKFLOW_DEF_PATH = file;
   return file;
 }
@@ -1172,6 +1266,173 @@ describe("proxy enforcement — B2 state-label transition application", () => {
     expect(res.body.errors).toBeUndefined();
     expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(true);
   });
+
+  it("INF-854: escape to multi-body requester re-enters intake with caller delegate", async () => {
+    process.env.CAPABILITY_POLICY_PATH = writePolicyFile(dir, TEST_POLICY_WITH_REQUESTER_YAML);
+    writeTaskEscapeWorkflowFile(dir);
+    resetPolicyCache();
+    resetWorkflowCache();
+    reloadAgents();
+
+    const { fetch: mock, calls } = makeB2Fetch({
+      b1LabelResponse: {
+        data: {
+          issue: {
+            labels: { nodes: [{ name: "wf:task" }, { name: "state:review" }] },
+            delegate: { id: "u3" },
+          },
+        },
+      },
+      b2IssueResponse: {
+        data: {
+          issue: {
+            id: "task-internal-uuid",
+            identifier: "INF-854",
+            team: { id: "team-uuid" },
+            labels: {
+              nodes: [
+                { id: "wf-task-lbl", name: "wf:task" },
+                { id: "review-lbl", name: "state:review" },
+              ],
+            },
+          },
+        },
+      },
+      b2TeamLabels: {
+        data: {
+          team: {
+            labels: {
+              nodes: [
+                { id: "intake-lbl", name: "state:intake" },
+                { id: "review-lbl", name: "state:review" },
+              ],
+            },
+          },
+        },
+      },
+    });
+    globalThis.fetch = mock;
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "astrid")
+      .set("X-Openclaw-Linear-Intent", "escape")
+      .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+    const atomic = calls.find((c) => c.query.includes("ApplyAtomicTransition"));
+    expect(atomic).toBeDefined();
+    const vars = atomic!.variables as { issueId: string; labelIds: string[]; delegateId?: string };
+    expect(vars.issueId).toBe("task-internal-uuid");
+    expect(vars.labelIds).toContain("intake-lbl");
+    expect(vars.labelIds).not.toContain("review-lbl");
+    expect(vars.delegateId).toBe("u3");
+  });
+
+  it("INF-854: commentCreate escape to multi-body requester pre-resolves caller delegate before posting", async () => {
+    process.env.CAPABILITY_POLICY_PATH = writePolicyFile(dir, TEST_POLICY_WITH_REQUESTER_YAML);
+    writeTaskEscapeWorkflowFile(dir);
+    resetPolicyCache();
+    resetWorkflowCache();
+    reloadAgents();
+
+    const { fetch: mock, calls } = makeB2Fetch({
+      b1LabelResponse: {
+        data: {
+          issue: {
+            labels: { nodes: [{ name: "wf:task" }, { name: "state:review" }] },
+            delegate: { id: "u3" },
+          },
+        },
+      },
+      b2IssueResponse: {
+        data: {
+          issue: {
+            id: "task-internal-uuid",
+            identifier: "INF-854",
+            team: { id: "team-uuid" },
+            labels: {
+              nodes: [
+                { id: "wf-task-lbl", name: "wf:task" },
+                { id: "review-lbl", name: "state:review" },
+              ],
+            },
+          },
+        },
+      },
+      b2TeamLabels: {
+        data: {
+          team: {
+            labels: {
+              nodes: [
+                { id: "intake-lbl", name: "state:intake" },
+                { id: "review-lbl", name: "state:review" },
+              ],
+            },
+          },
+        },
+      },
+    });
+    globalThis.fetch = mock;
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "astrid")
+      .set("X-Openclaw-Linear-Intent", "escape")
+      .send({
+        query: "mutation M($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } } }",
+        variables: { issueId: "issue-uuid", body: "Escaping this stuck review." },
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+    expect(calls.some((c) => c.query.includes("commentCreate"))).toBe(true);
+    const atomic = calls.find((c) => c.query.includes("ApplyAtomicTransition"));
+    expect(atomic).toBeDefined();
+    const vars = atomic!.variables as { issueId: string; labelIds: string[]; delegateId?: string };
+    expect(vars.issueId).toBe("task-internal-uuid");
+    expect(vars.labelIds).toContain("intake-lbl");
+    expect(vars.labelIds).not.toContain("review-lbl");
+    expect(vars.delegateId).toBe("u3");
+  });
+
+  it("INF-854: commentCreate escape blocks ambiguous requester routing before posting", async () => {
+    process.env.CAPABILITY_POLICY_PATH = writePolicyFile(dir, TEST_POLICY_WITH_STEWARD_ONLY_YAML);
+    writeTaskEscapeWorkflowFile(dir);
+    resetPolicyCache();
+    resetWorkflowCache();
+    reloadAgents();
+
+    const { fetch: mock, calls } = makeB2Fetch({
+      b1LabelResponse: {
+        data: {
+          issue: {
+            labels: { nodes: [{ name: "wf:task" }, { name: "state:review" }] },
+            delegate: { id: "u1" },
+          },
+        },
+      },
+    });
+    globalThis.fetch = mock;
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "escape")
+      .send({
+        query: "mutation M($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } } }",
+        variables: { issueId: "issue-uuid", body: "Escaping this stuck review." },
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors?.[0]?.message).toContain("blocked before posting a workflow comment");
+    expect(calls.some((c) => c.query.includes("commentCreate"))).toBe(false);
+    expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(false);
+  });
 });
 
 // ── AI-1612: proxy is the sole writer of the state:* label ───────────────
@@ -1723,14 +1984,20 @@ describe("proxy — Phase 6.5 fail-closed (AI-1476)", () => {
     };
   }
 
-  // AC1: With the proxy stopped (upstream unreachable), a workflow command is refused.
-  // (e.g., config is broken). The proxy still runs but rejects wf:* commands.
+  // AC1: With a missing workflow definition, a workflow command is refused.
+  // Two fail-closed reasons can surface for the same missing-def condition and
+  // which one the request sees is timing-dependent: the config-health poller
+  // started by createApp may record the load failure (→ "config artifacts are
+  // degraded") before the request's own registry load reaches the try/catch
+  // (→ "workflow definition could not be loaded"). Both are the same fail-closed
+  // posture with a break-glass hint, so assert the contract, not the racing
+  // reason. (INF-854: this assertion was pinned to a single reason and flaked CI.)
   it("rejects workflow commands when config is degraded (config-load fail-closed §16.0)", async () => {
     // Point the workflow def to a non-existent file so loadWorkflowDef fails
     process.env.WORKFLOW_DEF_PATH = path.join(dir, "nonexistent-workflow.yaml");
     resetWorkflowCache();
 
-    // The proxy should still work — it'll load config and record the failure
+    // The proxy should still work — it'll try to load config, record the failure, and fail closed.
     globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
 
     const res = await request(appState.app)
@@ -1743,7 +2010,7 @@ describe("proxy — Phase 6.5 fail-closed (AI-1476)", () => {
     expect(res.status).toBe(200);
     expect(res.body.errors).toBeDefined();
     expect(res.body.errors[0].message).toContain("[Proxy]");
-    expect(res.body.errors[0].message).toContain("could not be loaded");
+    expect(res.body.errors[0].message).toMatch(/could not be loaded|config artifacts are degraded/);
     expect(res.body.errors[0].message).toContain("break-glass");
   });
 
@@ -1766,7 +2033,9 @@ describe("proxy — Phase 6.5 fail-closed (AI-1476)", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.errors).toBeDefined();
-    expect(res.body.errors[0].message).toContain("could not be loaded");
+    expect(res.body.errors[0].message).toContain("[Proxy]");
+    expect(res.body.errors[0].message).toMatch(/could not be loaded|config artifacts are degraded/);
+    expect(res.body.errors[0].message).toContain("break-glass");
   });
 
   // AC2 (G-13a / AI-1551): steward can break-glass to move a wedged ticket.
