@@ -42,7 +42,7 @@
 #   nothing implemented. That is how LIF-291 reached `done` from `ac-definition`
 #   (3 scope arms terminal → converge passed) skipping implementation + validation,
 #   and auto-advanced parent LIF-45 `managing → releasing` on an empty increment.
-#   The new gate requires >=1 COMPLETED implementation child (`wf:dev-impl`/`wf:task`
+#   The new gate requires >=1 COMPLETED implementation child (`wf:dev-impl`/`wf:chore`
 #   in a terminal state) so convergence is structurally impossible without shipped
 #   code that ran its own AC/validation gate to done. Break-glass still bypasses.
 #
@@ -152,7 +152,7 @@ states:
     native_state: doing
     description: >
       Synthesize arm outputs → sprint-level AC of record + impl spawn spec:
-      enumerated impl tickets (wf:dev-impl or wf:task), titles, AC, scope labels,
+      enumerated impl tickets (wf:dev-impl or wf:chore), titles, AC, scope labels,
       blocking relations. Must include >=1 debt/refactor ticket or documented waiver.
     transitions:
       - command: continue
@@ -179,7 +179,7 @@ states:
     native_state: doing
     description: >
       Fanout phase 2: create impl tickets from spec. Children are wf:dev-impl
-      (default) or wf:task. Both are registered defs.
+      (default) or wf:chore. Both are registered defs.
     fanout:
       spec_source: findings
       child_workflow: wf:dev-impl

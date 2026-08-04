@@ -76,7 +76,7 @@ states:
     native_state: doing
     fanout:
       spec_source: solicitations
-      child_workflow: wf:task
+      child_workflow: wf:chore   # INF-1164: wf:task deprecated → route solicitation children to wf:chore
       barrier: all-responded
     transitions:
       - command: synthesize

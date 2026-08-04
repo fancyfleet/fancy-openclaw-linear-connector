@@ -84,6 +84,14 @@ const TASK_WORKFLOW_ID = "task";
 const DEV_IMPL_WORKFLOW_ID = "dev-impl";
 
 /**
+ * INF-1164: `wf:chore` is the replacement for the deprecated `wf:task`. Any new
+ * enrollment still resolving to `task` (that was not redirected to dev-impl for
+ * code signals) is routed here — the `task` def stays registered so in-flight
+ * tickets finish (grandfather); only new bootstrap enrollment is blocked.
+ */
+const CHORE_WORKFLOW_ID = "chore";
+
+/**
  * INF-594 / INF-1023: signals that a ticket's text describes a code change. The
  * original INF-594 set — a GitHub PR URL, a "PR #123" mention, an inline "pull
  * request" phrase, or a conventional git branch name — is extended by INF-1023
@@ -476,6 +484,19 @@ export async function applyBootstrapToIssue(
     );
     redirectedFromLabelId = wfLabelNode.id;
     workflowId = DEV_IMPL_WORKFLOW_ID;
+  }
+
+  // INF-1164: wf:task is deprecated. Any NEW enrollment still resolving to
+  // `task` (that was not already redirected to dev-impl for code signals above)
+  // is redirected to `chore`. The `task` def stays registered so in-flight
+  // tickets finish (grandfather); only new bootstrap enrollment is blocked here.
+  if (workflowId === TASK_WORKFLOW_ID) {
+    log.info(
+      `workflow-bootstrap: INF-1164 — ${issue.identifier ?? issue.id} requested deprecated wf:task; ` +
+        `redirecting new enrollment to wf:chore`,
+    );
+    if (redirectedFromLabelId === undefined) redirectedFromLabelId = wfLabelNode.id;
+    workflowId = CHORE_WORKFLOW_ID;
   }
 
   let registry: Map<string, WorkflowDef>;

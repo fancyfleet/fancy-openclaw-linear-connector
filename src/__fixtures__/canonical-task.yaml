@@ -3,10 +3,20 @@
 # The canonical fixture is a mirror of the registered-def (INF-723 single-source rule).
 
 id: task
-version: 4                      # INF-942: department scope is instance-resolved from enrollment context
-                              #   (no hardcoded DSN/Design default)
+version: 5                      # INF-1164: wf:task deprecated in favor of wf:chore; def stays
+                              #   registered so in-flight tickets finish (grandfather).
+                              #   (v4, INF-942: department scope is instance-resolved from enrollment context)
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
+
+# INF-1164: wf:task is deprecated in favor of wf:chore. The def stays fully
+#   registered and loadable so in-flight tickets can finish (grandfather); new
+#   enrollment is blocked in the bootstrap/fanout paths, not here.
+deprecated:
+  replacement: "wf:chore"
+  new_enrollment: false
+  reason: "INF-1164: wf:task deprecated in favor of wf:chore; def stays registered so in-flight tickets finish (grandfather)."
+  since: "2026-08-03"
 
 # department_scope is resolved from ticket enrollment context at runtime
 # (see deriveWorkflowInstanceScope in workflow-gate.ts). The static default

@@ -148,6 +148,26 @@ states:
     native_state: done
 `;
 
+// INF-1164: wf:chore is the replacement track for the deprecated wf:task. A
+// non-code request that used to enroll at wf:task now redirects here.
+const CHORE_YAML = `
+id: chore
+version: 1
+entry_state: intake
+states:
+  - id: intake
+    owner_role: requester
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: accept
+        to: done
+        generic: continue
+  - id: done
+    kind: terminal
+    native_state: done
+`;
+
 const POLICY_YAML = `
 capabilities:
   - id: linear:transition
@@ -229,6 +249,7 @@ const ISSUE_INTERNAL_ID = "issue-internal-inf-1023";
 const TEAM_ID = "team-inf-1023";
 const WF_TASK_LABEL_ID = "label-wf-task";
 const WF_DEV_IMPL_LABEL_ID = "label-wf-dev-impl";
+const WF_CHORE_LABEL_ID = "label-wf-chore";
 const STATE_INTAKE_LABEL_ID = "label-state-intake";
 const STATE_ROUTING_LABEL_ID = "label-state-routing";
 const STATE_REVIEW_LABEL_ID = "label-state-review";
@@ -244,6 +265,7 @@ beforeAll(async () => {
   await fs.mkdir(defsDir);
   await fs.writeFile(path.join(defsDir, "task.yaml"), TASK_YAML);
   await fs.writeFile(path.join(defsDir, "dev-impl.yaml"), DEV_IMPL_YAML);
+  await fs.writeFile(path.join(defsDir, "chore.yaml"), CHORE_YAML);
   await fs.writeFile(path.join(tmpDir, "policy.yaml"), POLICY_YAML);
   await fs.writeFile(path.join(tmpDir, "agents.json"), AGENTS_JSON);
 
@@ -275,6 +297,7 @@ function installFetch(): void {
   const teamLabels = [
     { id: WF_TASK_LABEL_ID, name: "wf:task" },
     { id: WF_DEV_IMPL_LABEL_ID, name: "wf:dev-impl" },
+    { id: WF_CHORE_LABEL_ID, name: "wf:chore" },
     { id: STATE_INTAKE_LABEL_ID, name: "state:intake" },
     { id: STATE_ROUTING_LABEL_ID, name: "state:routing" },
     { id: STATE_REVIEW_LABEL_ID, name: "state:review" },
@@ -393,8 +416,13 @@ describe("INF-1023 AC1/AC2/AC5: code-signaled wf:task intake is redirected or re
   });
 });
 
-describe("INF-1023 AC3: non-code Design/media requests still use wf:task unchanged", () => {
-  it("bootstraps an ordinary Design request at wf:task intake with no dev-impl refusal", async () => {
+describe("INF-1023 AC3 (superseded by INF-1164): non-code Design/media requests redirect to wf:chore", () => {
+  it("redirects an ordinary non-code wf:task request to wf:chore intake (no dev-impl refusal)", async () => {
+    // INF-1023 originally kept non-code Design/media requests on wf:task. INF-1164
+    // deprecates wf:task entirely and redirects ALL new enrollment to wf:chore
+    // (the code-signal path to dev-impl still runs first). The dev-impl guardrail
+    // must NOT fire here — there are no code signals — so the redirect target is
+    // wf:chore, not dev-impl.
     const result = await applyBootstrapToIssue(
       makeTaskIssue({
         title: "Design social launch images",
@@ -405,15 +433,17 @@ describe("INF-1023 AC3: non-code Design/media requests still use wf:task unchang
 
     expect(result).toMatchObject({
       action: "bootstrapped",
-      workflowId: "task",
+      workflowId: "chore",
       entryState: "intake",
       delegateAgentName: "ai",
     });
     expect(commentText()).toBe("");
     expect(issueUpdateVariables()).toMatchObject({
-      labelIds: expect.arrayContaining([WF_TASK_LABEL_ID, STATE_INTAKE_LABEL_ID]),
+      labelIds: expect.arrayContaining([WF_CHORE_LABEL_ID, STATE_INTAKE_LABEL_ID]),
       delegateId: "agent-ai-user",
     });
+    const labelIds = ((issueUpdateVariables()?.labelIds ?? []) as string[]);
+    expect(labelIds).not.toContain(WF_TASK_LABEL_ID);
   });
 });
 

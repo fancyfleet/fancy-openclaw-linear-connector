@@ -95,7 +95,7 @@ states:
     native_state: doing
     description: >
       Synthesize arm outputs → sprint-level AC of record + impl spawn spec:
-      enumerated impl tickets (wf:dev-impl or wf:task), titles, AC, scope labels,
+      enumerated impl tickets (wf:dev-impl or wf:chore), titles, AC, scope labels,
       blocking relations. Must include >=1 debt/refactor ticket or documented waiver.
     transitions:
       - command: continue
@@ -122,7 +122,7 @@ states:
     native_state: doing
     description: >
       Fanout phase 2: create impl tickets from spec. Children are wf:dev-impl
-      (default) or wf:task. Both are registered defs.
+      (default) or wf:chore. Both are registered defs.
     fanout:
       spec_source: findings
       child_workflow: wf:dev-impl

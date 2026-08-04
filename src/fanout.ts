@@ -1086,6 +1086,21 @@ export function validateFanoutSpec(
   // entry refuses the entire transition (no partial spawn).
   if (registeredWorkflows) {
     for (const f of findings) {
+      // INF-1164: wf:task is deprecated and no longer accepts new enrollment.
+      // Reject any fan-out entry targeting it before the registration check
+      // (the def stays registered so in-flight tickets finish — grandfather).
+      // This catches both the parsed per-entry child_workflow marker AND a
+      // trailing `[wf:task ...]` marker that lands in the finding's raw text.
+      const parsedTaskChild =
+        f.child_workflow === "wf:task" || f.child_workflow === "task";
+      const textRequestsTask = /\[\s*wf:\s*task\b/.test(`${f.title}\n${f.description ?? ""}`);
+      if (parsedTaskChild || textRequestsTask) {
+        return {
+          ok: false,
+          reason: `fan-out spec entry "${f.title}" targets deprecated child workflow 'wf:task' (INF-1164). ` +
+            `wf:task no longer accepts new enrollment — use 'wf:dev-impl' for code implementation or 'wf:chore' for non-code/operational work.`,
+        };
+      }
       if (f.child_workflow) {
         // Strip the 'wf:' prefix to get the raw def id
         const defId = f.child_workflow.startsWith("wf:") ? f.child_workflow.slice(3) : f.child_workflow;
@@ -1107,6 +1122,15 @@ export function validateFanoutSpec(
     const hasMarkerLessFindings = findings.some((f) => !f.child_workflow);
     if (hasMarkerLessFindings && config.child_workflow) {
       const defId = config.child_workflow.startsWith("wf:") ? config.child_workflow.slice(3) : config.child_workflow;
+      // INF-1164: defensive — no live config still defaults to wf:task after the
+      // dept-engine/dev-sprint repoint, but reject it consistently if one does.
+      if (defId === "task") {
+        return {
+          ok: false,
+          reason: `fan-out config default child_workflow 'wf:task' is deprecated (INF-1164) and no longer accepts new enrollment. ` +
+            `Use 'wf:dev-impl' for code implementation or 'wf:chore' for non-code/operational work.`,
+        };
+      }
       if (!registeredWorkflows.has(config.child_workflow) && !registeredWorkflows.has(defId)) {
         return {
           ok: false,
