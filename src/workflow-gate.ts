@@ -986,6 +986,7 @@ export async function reloadWorkflowDefs(): Promise<
           t.assign &&
             (
               Boolean(t.assign.default) ||
+              t.assign.mode === "none" ||
               Boolean(t.assign.constraint) ||
               (typeof t.assign.selection_criteria === "string" && t.assign.selection_criteria.trim().length > 0)
             ),
@@ -2070,6 +2071,7 @@ export async function resolveTransitionDelegate(
   const destOwnerRole = destStateNode.owner_role;
   const isTerminal = destStateNode.kind === 'terminal' || !destOwnerRole;
   if (isTerminal) return null;
+  if (matchedTransition?.assign?.mode === "none") return undefined;
 
   const wantsPriorImplementer = matchedTransition?.assign?.default === 'prior-implementer';
 
@@ -6660,6 +6662,7 @@ export async function applyStateTransition(
   const destStateNode = def.states.find((s) => s.id === toStateName);
   const destOwnerRole = destStateNode?.owner_role;
   const isTerminal = destStateNode?.kind === 'terminal' || !destOwnerRole;
+  const preserveDelegate = !isTerminal && matchedTransition?.assign?.mode === 'none';
   let resolvedDelegateId: string | null | undefined = undefined;
 
   // AI-1977: delegate override — skip resolution entirely when pre-computed by proxy.
@@ -6676,7 +6679,7 @@ export async function applyStateTransition(
   // When delegateOverride is provided, the proxy already set delegateId in the
   // forwarded mutation — skip the full resolution path to avoid conflicting with
   // the pre-forward determination or overwriting a terminal null.
-  if (options?.delegateOverride === undefined) {
+  if (options?.delegateOverride === undefined && !preserveDelegate) {
     // Rebuild WS2 (2026-07-03): delegate routing is DEF-DRIVEN, not state-name-
     // driven. The matched transition's `assign.default: prior-implementer` marks
     // deterministic return-to-worker routing (dev-impl: → implementation; task:
@@ -6951,6 +6954,10 @@ export async function applyStateTransition(
         }
       }
     }
+  } else if (preserveDelegate) {
+    log.info(
+      `workflow-gate: B2 apply: ${issueId} ${intent} — assign.mode=none; preserving existing delegate`,
+    );
   }
 
   // INF-996: capture the bound-role binding on entry to a bound state, so

@@ -61,7 +61,7 @@ const REJECT_EDGES: Array<{ from: string; to: string; actor: string; delegate: s
   { from: "write-tests", to: "intake", actor: "tdd", delegate: "lin-tdd" },
   { from: "implementation", to: "write-tests", actor: "igor", delegate: "lin-igor" },
   { from: "code-review", to: "implementation", actor: "charles", delegate: "lin-charles" },
-  { from: "merge", to: "implementation", actor: "hanzo", delegate: "lin-hanzo" },
+  { from: "merge", to: "code-review", actor: "hanzo", delegate: "lin-hanzo" },
   { from: "deploy", to: "implementation", actor: "grover", delegate: "lin-grover" },
   { from: "ac-validate", to: "implementation", actor: "astrid", delegate: "lin-astrid" },
 ];
@@ -176,7 +176,8 @@ function json(payload: unknown): Response {
 
 function installTransitionFetch(sourceState: string, delegateId: string): { calls: GraphqlCall[] } {
   const calls: GraphqlCall[] = [];
-  const labelNodes = [
+  let currentDelegateId = delegateId;
+  let labelNodes = [
     { id: "label-wf-dev-impl", name: "wf:dev-impl", team: { id: "team-lif" } },
     { id: `label-state-${sourceState}`, name: `state:${sourceState}`, team: { id: "team-lif" } },
     { id: "label-workflow-version-19", name: "workflow-version:19", team: { id: "team-lif" } },
@@ -222,7 +223,7 @@ function installTransitionFetch(sourceState: string, delegateId: string): { call
             identifier: "LIF-375",
             team: { id: "team-lif", key: "LIF", name: "LifeOS" },
             labels: { nodes: labelNodes },
-            delegate: { id: delegateId },
+            delegate: currentDelegateId ? { id: currentDelegateId } : null,
             state: { id: "native-todo", name: "Todo", type: "unstarted" },
             assignee: null,
           },
@@ -230,6 +231,13 @@ function installTransitionFetch(sourceState: string, delegateId: string): { call
       });
     }
     if (query.includes("issueUpdate")) {
+      const nextLabelIds = (parsed.variables?.labelIds ?? []) as string[];
+      labelNodes = teamLabels
+        .filter((label) => nextLabelIds.includes(label.id))
+        .map((label) => ({ ...label, team: { id: "team-lif" } }));
+      if (typeof parsed.variables?.delegateId === "string") {
+        currentDelegateId = parsed.variables.delegateId;
+      }
       return json({ data: { issueUpdate: { success: true } } });
     }
     if (query.includes("commentCreate")) {
