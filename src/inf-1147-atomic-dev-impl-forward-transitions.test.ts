@@ -37,6 +37,11 @@ const TEAM_ID = "team-ai";
 const IGOR_LINEAR_ID = "user-igor";
 const CHARLES_LINEAR_ID = "user-charles";
 const ASTRID_LINEAR_ID = "user-astrid";
+// INF-1147 T2: production fills the `test-author` (write-tests owner) role with the
+// TDD singleton, which HAS a linearUserId — so the accept→write-tests forward resolves
+// a real delegate. The original T2 fixture left this role unfilled, so nothing was ever
+// injected and the split-brain on `accept` was invisible (Charles's PR #650 review).
+const TDD_LINEAR_ID = "user-tdd";
 const VALID_BRANCH = "feature/INF-1147-atomic-dev-impl-forward-transitions";
 const VALID_SHA = "0123456789abcdef0123456789abcdef01234567";
 
@@ -50,12 +55,16 @@ containers:
     grants: [linear:transition]
   - id: code-review
     grants: [linear:transition]
+  - id: test-author
+    grants: [linear:transition]
   - id: steward
     grants: [linear:transition, human:escalate, workflow:break-glass]
 roles:
   - id: dev
     requires: [linear:transition]
   - id: code-review
+    requires: [linear:transition]
+  - id: test-author
     requires: [linear:transition]
   - id: steward
     requires: [human:escalate]
@@ -66,6 +75,9 @@ bodies:
   - id: charles
     container: code-review
     fills_roles: [code-review]
+  - id: tdd
+    container: test-author
+    fills_roles: [test-author]
   - id: astrid
     container: steward
     fills_roles: [steward]
@@ -189,6 +201,7 @@ function writeConfig(dir: string): void {
       agents: [
         { name: "igor", linearUserId: IGOR_LINEAR_ID, openclawAgent: "igor", accessToken: "tok-igor", host: "local" },
         { name: "charles", linearUserId: CHARLES_LINEAR_ID, openclawAgent: "charles", accessToken: "tok-charles", host: "local" },
+        { name: "tdd", linearUserId: TDD_LINEAR_ID, openclawAgent: "tdd", accessToken: "tok-tdd", host: "local" },
         { name: "astrid", linearUserId: ASTRID_LINEAR_ID, openclawAgent: "astrid", accessToken: "tok-astrid", host: "local" },
       ],
     }),
@@ -220,7 +233,9 @@ function makeLinearFetch(opts: {
     { id: "label-repo-connector", name: "repo:fancy-openclaw-linear-connector", team: { id: TEAM_ID } },
   ];
   const destination = opts.sourceState === "intake" ? "write-tests" : "code-review";
-  const destinationDelegate = destination === "write-tests" ? null : CHARLES_LINEAR_ID;
+  // INF-1147 T2: write-tests is owned by `test-author`, filled by the TDD singleton
+  // (production parity) — the accept forward advances the delegate to TDD, not null.
+  const destinationDelegate = destination === "write-tests" ? TDD_LINEAR_ID : CHARLES_LINEAR_ID;
 
   const fetch = (async (url: unknown, init?: RequestInit) => {
     const urlText = String(url);
@@ -588,6 +603,29 @@ describe("INF-1147 governed dev-impl atomic forward transitions", () => {
     expect(blocked.body._workflowTransition.detail).toMatch(/recapture/i);
     expect(transport.transitionWrites()).toHaveLength(0);
     expect(await getAcRecord("INF-1147")).toBeNull();
+
+    // INF-1147 T2 split-brain guard (the assertion the original fixture lacked —
+    // Charles's PR #650 review). Production fills `test-author` with the TDD
+    // singleton, so `accept` resolves a real delegate. The gate then declines the
+    // state write. The forwarded upstream mutation MUST NOT carry that delegate,
+    // or we get delegate-advanced-to-TDD / state-stuck-at-intake — the exact
+    // split-brain this ticket kills. Assert the forward carries no delegate/assignee.
+    const blockedForwardInputs = transport
+      .upstreamIssueUpdates()
+      .map((call) => call.variables.input as Record<string, unknown>);
+    for (const input of blockedForwardInputs) {
+      expect(input).not.toHaveProperty("delegateId");
+      expect(input).not.toHaveProperty("assigneeId");
+    }
+    expect(blockedForwardInputs).not.toContainEqual(
+      expect.objectContaining({ delegateId: TDD_LINEAR_ID }),
+    );
+
+    // AC #2 — the decline is LOUD: an explicit error envelope with the repair
+    // reason, never a false success payload beside a non-applied transition.
+    expect(blocked.body.data).toBeUndefined();
+    expect(blocked.body.errors?.[0]?.message).toMatch(/declined|recapture|ac of record/i);
+    expect(JSON.stringify(blocked.body)).not.toMatch(/no partial state was written/i);
 
     transport.setDescription(DESCR_WITH_AC);
     const repaired = await request(appState.app)
