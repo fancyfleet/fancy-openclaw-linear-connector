@@ -253,6 +253,58 @@ describe("INF-339 stale cron detection", () => {
       },
     ]);
   });
+
+  test("INF-836: persisted pre-restart stamps do not make a freshly registered cron stale", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cron-run-stamps-inf-836-"));
+    const originalStampPath = process.env.CRON_RUN_STAMP_PATH;
+    const stampPath = path.join(dir, "stamps.json");
+    process.env.CRON_RUN_STAMP_PATH = stampPath;
+    fs.writeFileSync(
+      stampPath,
+      JSON.stringify({
+        version: 1,
+        stamps: {
+          "leaked-credential-sweep": "2026-07-27T01:58:29.569Z",
+        },
+      }),
+      "utf8",
+    );
+
+    try {
+      jest.setSystemTime(new Date("2026-07-27T04:54:14.398Z"));
+      registerCron("leaked-credential-sweep", "every 1h");
+
+      expect(getRegisteredCrons()).toEqual([
+        expect.objectContaining({
+          name: "leaked-credential-sweep",
+          lastRunAt: "2026-07-27T01:58:29.569Z",
+        }),
+      ]);
+
+      expect(getStaleCronsForTest({
+        now: new Date("2026-07-27T04:59:00.000Z"),
+      })).toEqual([]);
+
+      expect(getStaleCronsForTest({
+        now: new Date("2026-07-27T05:55:00.000Z"),
+      })).toEqual([
+        {
+          name: "leaked-credential-sweep",
+          schedule: "every 1h",
+          lastRunAt: "2026-07-27T01:58:29.569Z",
+          overdueBy: "45602ms",
+          overdueByMs: 45_602,
+        },
+      ]);
+    } finally {
+      if (originalStampPath === undefined) {
+        delete process.env.CRON_RUN_STAMP_PATH;
+      } else {
+        process.env.CRON_RUN_STAMP_PATH = originalStampPath;
+      }
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("driver registrars self-register (AI-1810)", () => {

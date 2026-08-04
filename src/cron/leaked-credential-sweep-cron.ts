@@ -22,6 +22,7 @@ import { SEC_LEAKED_CREDENTIAL_LABEL } from "../leaked-credential-artifact.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "leaked-credential-sweep-cron");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
+const CRON_NAME = "leaked-credential-sweep";
 
 export interface LeakedCredSweepCronOptions {
   lookbackDays?: number;
@@ -182,12 +183,25 @@ export function registerLeakedCredentialSweepCron(options?: LeakedCredSweepCronO
   const pollIntervalMs = options?.pollIntervalMs ?? parseInt(process.env.LEAKED_CRED_SWEEP_POLL_INTERVAL_MS ?? String(60 * 60 * 1000), 10);
   const maxReopensPerCycle = options?.maxReopensPerCycle ?? parseInt(process.env.LEAKED_CRED_SWEEP_MAX_REOPENS ?? "10", 10);
 
-  registerCron("leaked-credential-sweep", `every ${formatIntervalMs(pollIntervalMs)}`);
+  registerCron(CRON_NAME, `every ${formatIntervalMs(pollIntervalMs)}`);
   const sweep = new LeakedCredentialSweep({
     linear: createSweepLinearApi(options?.linearToken),
     config: { lookbackDays, pollIntervalMs, maxReopensPerCycle },
   });
-  sweep.start(() => markCronRun("leaked-credential-sweep"));
+  sweep.start(() => markCronRun(CRON_NAME));
+  void sweep.runCycle()
+    .then((r) => {
+      if (r.reopened > 0 || r.errors.length > 0) {
+        log.warn(
+          `startup sweep cycle: scanned=${r.scanned} reopened=${r.reopened} ` +
+          `skippedConfirmed=${r.skippedConfirmed} errors=${r.errors.length}`,
+        );
+      }
+    })
+    .catch((err) => {
+      log.error(`startup sweep cycle error: ${err instanceof Error ? err.message : String(err)}`);
+    })
+    .finally(() => markCronRun(CRON_NAME));
   log.info(`leaked-credential reopen sweep armed — lookbackDays=${lookbackDays} pollInterval=${formatIntervalMs(pollIntervalMs)}`);
   return sweep;
 }
