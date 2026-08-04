@@ -8014,6 +8014,12 @@ export interface AutoEnrollLiveness {
   active: boolean;
   enrolledCount: number;
   suppressedDemotedCount: number;
+  /**
+   * INF-576: count of plain delegations we declined to enroll into `wf:task`
+   * because the delegate fills no `wf:task` owner role (would otherwise be
+   * structurally unroutable — see autoEnrollPlainDelegation).
+   */
+  suppressedUnroutableCount: number;
   lastEnrolledAt: string | null;
   lastSuppressedAt: string | null;
 }
@@ -8022,6 +8028,7 @@ let autoEnrollLiveness: AutoEnrollLiveness = {
   active: false,
   enrolledCount: 0,
   suppressedDemotedCount: 0,
+  suppressedUnroutableCount: 0,
   lastEnrolledAt: null,
   lastSuppressedAt: null,
 };
@@ -8182,6 +8189,59 @@ export async function autoEnrollByTeam(
 }
 
 /**
+ * INF-576: does `delegateAgentName` fill ANY owner role declared by the given
+ * workflow def?
+ *
+ * Auto-enrolling a plain delegation into `wf:task` is only safe when the
+ * delegate can legally hold the ticket in at least one of the workflow's
+ * states. If it fills none — e.g. the merge gate (Hanzo), which fills the
+ * `deployment` role but none of `wf:task`'s requester / department-head /
+ * worker roles — then enrolling manufactures an unroutable ticket: the
+ * routing-guard rejects every `handoff-work` to that body and the delegate
+ * ping-pongs until it locks to steward. See INF-573 for the concrete trap.
+ *
+ * Fails OPEN (returns true) on any ambiguity — unknown delegate, def with no
+ * declared roles, or an empty union of legal bodies (a minimal/misconfigured
+ * capability policy) — so we never silently suppress legitimate enrollment.
+ * The suppression only fires when we positively determine the delegate fills
+ * no role.
+ */
+async function delegateFillsAnyWorkflowRole(
+  def: WorkflowDef,
+  delegateAgentName: string | null | undefined,
+): Promise<boolean> {
+  // No delegate to check → can't prove unroutable → fail open (enroll).
+  if (!delegateAgentName) return true;
+
+  const ownerRoles = new Set<string>();
+  for (const state of def.states) {
+    if (state.owner_role) ownerRoles.add(state.owner_role);
+  }
+  if (ownerRoles.size === 0) return true; // def declares no roles → fail open.
+
+  const legalBodies = new Set<string>();
+  for (const role of ownerRoles) {
+    try {
+      for (const body of await resolveBodiesForRole(role)) {
+        legalBodies.add(body.toLowerCase());
+      }
+    } catch (err) {
+      // Role resolution failed (missing/minimal policy, load error) → fail
+      // open rather than suppress on incomplete information.
+      log.warn(`workflow-gate: delegateFillsAnyWorkflowRole: failed to resolve bodies for role '${role}' — failing open: ${err instanceof Error ? err.message : String(err)}`);
+      return true;
+    }
+  }
+
+  // Empty union → policy models no bodies for these roles (minimal test policy
+  // or misconfiguration). Fail open, mirroring routing-guard's "no bodies
+  // registered → fail open" stance, so enrollment is never silently dropped.
+  if (legalBodies.size === 0) return true;
+
+  return legalBodies.has(delegateAgentName.toLowerCase());
+}
+
+/**
  * INF-334: promote an already-delegated ad-hoc ticket into the task workflow.
  *
  * Plain ticket delegation already chooses the worker via Linear's delegate
@@ -8241,6 +8301,29 @@ export async function autoEnrollPlainDelegation(
       lastSuppressedAt: new Date().toISOString(),
     };
     log.info(`workflow-gate: autoEnrollPlainDelegation: skipping ${issue.identifier} because last enrolled-ticket event is demoted`);
+    return { enrolled: false };
+  }
+
+  // INF-576: do not enroll a plain-delegated ticket into `wf:task` when the
+  // delegate fills NO `wf:task` owner role. Enrolling such a ticket manufactures
+  // a structurally-unroutable trap: the routing-guard rejects every handoff to
+  // that body, the delegate ping-pongs, and the cycle detector locks it to
+  // steward — who also has no verb to reach the required role (INF-573). Leaving
+  // the ticket ad-hoc keeps its delegation un-gated so `handoff-work` just works.
+  let taskDef: WorkflowDef | null = null;
+  try {
+    taskDef = await loadWorkflowDefById(workflowId);
+  } catch (err) {
+    // Fail open: a def-load error must never silently drop enrollment.
+    log.warn(`workflow-gate: autoEnrollPlainDelegation: failed to load def '${workflowId}' for routability check — proceeding: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (taskDef && !(await delegateFillsAnyWorkflowRole(taskDef, delegateAgentName))) {
+    autoEnrollLiveness = {
+      ...autoEnrollLiveness,
+      suppressedUnroutableCount: autoEnrollLiveness.suppressedUnroutableCount + 1,
+      lastSuppressedAt: new Date().toISOString(),
+    };
+    log.info(`workflow-gate: autoEnrollPlainDelegation: skipping ${issue.identifier} — delegate '${delegateAgentName}' fills no wf:${workflowId} owner role (would be structurally unroutable; leaving ad-hoc)`);
     return { enrolled: false };
   }
 
