@@ -899,6 +899,49 @@ export function createApp(options?: CreateAppOptions) {
     },
   };
 
+  // INF-1043: extend the INF-982 `:rN` fresh-session-key mechanism to the webhook
+  // synchronous stale-drain path. INF-982 only threaded fresh recovery keys
+  // through the interval-timer forensics path (processStaleSession → step 7 below).
+  // The webhook drain (webhook/index.ts) re-signals stale sessions directly and
+  // was still dispatching under the base key `linear-INF-XXXX`, so a code-review
+  // session that went stale after Charles posted a review REPLAYED that stale
+  // review on the recovered dispatch. This helper mints a versioned key per
+  // drained ticket — using the same shared redispatch budget for a monotonic
+  // attempt number (consistent with forensics) — so the recovered session is a
+  // fresh OpenClaw session that re-derives the review from fresh state. It also
+  // registers each key into the shared recoveryFreshKeys cache so the forensics
+  // path stays coherent if it later drains the same agent.
+  function buildStaleRecoveryKeys(
+    agentId: string,
+    ticketIds: string[],
+  ): Map<string, Map<string, string>> | undefined {
+    const agentKeys = new Map<string, string>();
+    for (const rawTicketId of ticketIds) {
+      let ticketId: string;
+      try {
+        ticketId = normalizeSessionKey(rawTicketId);
+      } catch {
+        // A non-normalizable pending entry can't be dispatched under a fresh key;
+        // skip it so resignal falls back to its existing handling for that ticket.
+        continue;
+      }
+      // Count the stale re-drain as a redispatch attempt against the unified
+      // INF-982 budget; the returned attempt number also guarantees a monotonic
+      // `:rN` suffix distinct from the stale session's key.
+      const attemptNumber = globalRedispatchBudget.consume(ticketId);
+      const freshKey = makeFreshSessionKey(ticketId, attemptNumber);
+      agentKeys.set(ticketId, freshKey);
+      let existing = recoveryFreshKeys.get(agentId);
+      if (!existing) {
+        existing = new Map();
+        recoveryFreshKeys.set(agentId, existing);
+      }
+      existing.set(ticketId, freshKey);
+      log.info(`[INF-1043] Webhook stale-drain fresh key for ${ticketId}: ${freshKey} (agent=${agentId}, attempt=${attemptNumber})`);
+    }
+    return agentKeys.size > 0 ? new Map([[agentId, agentKeys]]) : undefined;
+  }
+
   function buildSameKeySessionReplay(stale: StaleSessionDetail): NonNullable<ForensicsConfig["sameKeySessionReplay"]> {
     const indexedReplay = collectSameKeySessionReplay(stale.agentId, stale.sessionKey, forensicsConfig);
     const activeReplay = sessionTracker.getActiveAgents().flatMap((activeAgentId) =>
@@ -1887,6 +1930,9 @@ export function createApp(options?: CreateAppOptions) {
     dispatchInFlightStore,
     sessionSpawnStore,
     noActivityDetector,
+    // INF-1043: fresh `:rN` recovery keys for the webhook synchronous stale-drain
+    // path, so a stale code-review session does not replay its Charles review.
+    buildStaleRecoveryKeys,
   ));
 
   // ── v1.1: Session-end callback endpoint ──────────────────────────────

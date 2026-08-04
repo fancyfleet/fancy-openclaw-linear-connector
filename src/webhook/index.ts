@@ -538,6 +538,12 @@ export function createWebhookRouter(
   dispatchInFlightStore?: DispatchInFlightStore,
   sessionSpawnStore?: SessionSpawnIdempotencyStore,
   noActivityDetector?: Pick<NoActivityDetector, "recordAdmissionDeferral">,
+  // INF-1043: mint fresh `:rN` recovery session keys for the webhook synchronous
+  // stale-drain path. INF-982 threaded fresh keys only through the interval-timer
+  // forensics path (processStaleSession); this callback extends the same
+  // mechanism to the webhook drain so a stale code-review session does not replay
+  // its pre-recovery Charles review on re-dispatch. Wired in createApp.
+  buildStaleRecoveryKeys?: (agentId: string, ticketIds: string[]) => Map<string, Map<string, string>> | undefined,
 ): Router {
   const router = Router();
   const delegatePingPongDetector = new DelegatePingPongDetector(undefined, undefined, operationalEventStore);
@@ -1639,10 +1645,17 @@ export function createWebhookRouter(
         const staleSessions = sessionTracker.cleanupStale();
         for (const stale of staleSessions) {
           log.info(`Webhook stale-session drain: re-signaling ${stale.agentId} for ${stale.pendingTickets.length} ticket(s)`);
+          // INF-1043: mint versioned `:rN` recovery keys for this drain so the
+          // recovered dispatch opens a FRESH OpenClaw session instead of reusing
+          // the stale session key. Without this, a code-review session that went
+          // stale after Charles posted a review re-emitted that stale review on
+          // recovery (the residual defect INF-982's fresh-key fix left on the
+          // review-replay path — it only covered the forensics drain).
+          const staleRecoveryKeys = buildStaleRecoveryKeys?.(stale.agentId, stale.pendingTickets);
           await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, {
             ...wakeConfigForAgent(stale.agentId),
             sessionSpawnStore,
-          }, { markActive: true, onDispatched });
+          }, { markActive: true, onDispatched, staleRecoveryKeys });
         }
 
         if (sessionTracker.isActiveForTicket(agentName, normalizedTicketId)) {

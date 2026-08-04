@@ -222,7 +222,13 @@ export async function sendWakeUpSignal(
     taskKey,
     runtime: deliveryRuntime(config),
     agentId,
-    sessionKey: normalizedKey,
+    // INF-1043: record the ACTUAL session label. For a normal wake `sessionKey`
+    // equals `normalizedKey`, so this is a no-op; for a stale-recovery dispatch it
+    // is the versioned `:rN` key (INF-982), so the spawn record reflects the fresh
+    // OpenClaw session rather than the stale base key. Idempotency dedup is keyed on
+    // (ticketId, taskKey) — both derived from the normalized base — so cross-version
+    // tracking stays coherent; only the recorded session label carries the version.
+    sessionKey,
   });
   // INF-1003 / INF-1074: re-dispatch rotation guard on the pending-bag path.
   // Mirrors deliverToAgent exactly — a bound session that produces no new turn on
