@@ -759,8 +759,8 @@ export function createApp(options?: CreateAppOptions) {
       dispatchWatchdog: {
         scheduled: true,
         config: {
-          exponentialBackoffMs: (watchdog as any).config?.exponentialBackoffMs ?? 0,
-          maxResignals: (watchdog as any).config?.maxResignals ?? 0,
+          exponentialBackoffMs: watchdog.getConfig().exponentialBackoffMs ?? 0,
+          maxResignals: watchdog.getConfig().maxResignals ?? 0,
           preconditionGuards: {
             resolveCheck: true,
             delegateMatch: true,

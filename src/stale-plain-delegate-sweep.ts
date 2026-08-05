@@ -334,7 +334,7 @@ export async function runStalePlainDelegateSweep(
       }
 
       operationalEventStore.append({
-        outcome: "stale-delegate-escalated" as any,
+        outcome: "stale-delegate-escalated",
         agent: agentName,
         key: `linear-${ticketId}`,
         detail: { ticket: ticketId, delegate: agentName, state: ticket.state.name, attemptCount },
@@ -380,7 +380,7 @@ export async function runStalePlainDelegateSweep(
       });
 
       operationalEventStore.append({
-        outcome: "stale-plain-delegate-redispatch" as any,
+        outcome: "stale-plain-delegate-redispatch",
         agent: agentName,
         key: `linear-${ticketId}`,
         detail: { ticket: ticketId, delegate: agentName, state: ticket.state.name, attemptCount: attemptCount + 1 },
@@ -399,7 +399,7 @@ export async function runStalePlainDelegateSweep(
       });
 
       operationalEventStore.append({
-        outcome: "stale-plain-delegate-redispatch-failed" as any,
+        outcome: "stale-plain-delegate-redispatch-failed",
         agent: agentName,
         key: `linear-${ticketId}`,
         errorSummary: msg,
