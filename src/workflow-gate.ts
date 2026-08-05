@@ -5408,10 +5408,13 @@ export async function checkRawMutationInterception(
   }
 
   // Build per-command help strings with assignment info.
+  // INF-1218: route each transition through cliVerbFor so agents see the
+  // routine verbs (continue-workflow / request-revision), not the literal
+  // spine verbs (approve / request-rework / submit / …).
   const helpLines = await Promise.all(
     (stateNode.transitions ?? []).map(async (t) => {
       const { bodies, mode } = await resolveTransitionTargets(t, workflowDef);
-      let cmd = `linear ${t.command} ${issueId}`;
+      let cmd = `linear ${cliVerbFor(t, workflowDef, currentState)} ${issueId}`;
       if (mode === "required") {
         cmd += ` <${bodies.join("|")}>`;
       }

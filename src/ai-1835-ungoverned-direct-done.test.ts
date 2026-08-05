@@ -395,7 +395,7 @@ describe("AI-1835 AC(a): complete verb blocked on wf-enrolled tickets", () => {
     const result = await checkWorkflowRules("complete", "issue-uuid", "Bearer tok", "charles");
     expect(result).not.toBeNull();
     // Should mention legal alternatives
-    expect(result).toContain("submit");
+    expect(result).toContain("continue-workflow");
   });
 });
 

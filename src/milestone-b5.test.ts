@@ -477,7 +477,7 @@ describe("AC2: Proxy-validated transitions — illegal moves rejected with legal
     expect(rejection).not.toBeNull();
     expect(rejection).toContain("not a legal command");
     expect(rejection).toContain("intake");
-    expect(rejection).toContain("accept");
+    expect(rejection).toContain("continue-workflow");
     expect(rejection).toContain("escape");
   });
 
@@ -523,8 +523,11 @@ describe("AC2: Proxy-validated transitions — illegal moves rejected with legal
     expect(rejection).not.toBeNull();
     expect(rejection).toContain("Direct status changes are blocked");
     expect(rejection).toContain("review");
-    expect(rejection).toContain("approve");
-    expect(rejection).toContain("request-rework");
+    // INF-1218: review's forward edge (approve→done) collapses to
+    // continue-workflow; its send-back edge (request-rework→spawning)
+    // collapses to request-revision.
+    expect(rejection).toContain("continue-workflow");
+    expect(rejection).toContain("request-revision");
   });
 
   it("allows raw mutation on ad-hoc ticket (no wf: label)", async () => {
@@ -817,20 +820,25 @@ describe("Integration: full state machine walk — all states visited", () => {
   it("rejects all illegal commands at every state", async () => {
     const { checkWorkflowRules } = await import("./workflow-gate.js");
 
-    // Commands that are legal in SOME state but NOT in others
-    const crossStateChecks: Array<{ state: string; legalCommands: string[]; illegalCommands: string[] }> = [
-      { state: "intake", legalCommands: ["accept", "demote"], illegalCommands: ["complete-audit", "spawn", "complete", "approve", "request-rework"] },
-      { state: "auditing", legalCommands: ["complete-audit"], illegalCommands: ["accept", "spawn", "complete", "approve"] },
-      { state: "spawning", legalCommands: ["spawn"], illegalCommands: ["accept", "complete-audit", "complete", "approve"] },
-      { state: "managing", legalCommands: ["complete"], illegalCommands: ["accept", "complete-audit", "spawn", "approve"] },
-      { state: "review", legalCommands: ["approve", "request-rework"], illegalCommands: ["accept", "complete-audit", "spawn", "complete"] },
+    // Commands that are legal in SOME state but NOT in others.
+    // `legalCommands` are the literal transition verbs the engine still accepts
+    // (used for the positive execution check). `legalMovesShown` are the
+    // agent-facing verbs the rejection message surfaces after INF-1218 — the
+    // routine forward/back edges collapse to continue-workflow /
+    // request-revision; special hatches (demote) keep their literal name.
+    const crossStateChecks: Array<{ state: string; legalCommands: string[]; legalMovesShown: string[]; illegalCommands: string[] }> = [
+      { state: "intake", legalCommands: ["accept", "demote"], legalMovesShown: ["continue-workflow", "demote"], illegalCommands: ["complete-audit", "spawn", "complete", "approve", "request-rework"] },
+      { state: "auditing", legalCommands: ["complete-audit"], legalMovesShown: ["continue-workflow"], illegalCommands: ["accept", "spawn", "complete", "approve"] },
+      { state: "spawning", legalCommands: ["spawn"], legalMovesShown: ["continue-workflow"], illegalCommands: ["accept", "complete-audit", "complete", "approve"] },
+      { state: "managing", legalCommands: ["complete"], legalMovesShown: ["continue-workflow"], illegalCommands: ["accept", "complete-audit", "spawn", "approve"] },
+      { state: "review", legalCommands: ["approve", "request-rework"], legalMovesShown: ["continue-workflow", "request-revision"], illegalCommands: ["accept", "complete-audit", "spawn", "complete"] },
     ];
 
     // INF-1217: intake's owner_role ('steward') is filled by astrid, not
     // igor — legal-command checks against intake must run as astrid.
     // Illegal-command checks are unaffected (rejected before the owner_role
     // gate is ever reached, on the "not a legal command" branch).
-    for (const { state, legalCommands, illegalCommands } of crossStateChecks) {
+    for (const { state, legalCommands, legalMovesShown, illegalCommands } of crossStateChecks) {
       const legalCaller = state === "intake" ? "astrid" : "igor";
       const legalCallerLinearUserId = state === "intake" ? "user-astrid" : "user-igor";
 
@@ -848,8 +856,9 @@ describe("Integration: full state machine walk — all states visited", () => {
         expect(rejection).not.toBeNull();
         expect(rejection).toContain("not a legal command");
         expect(rejection).toContain(state);
-        // Verify the rejection names the legal moves
-        for (const legal of legalCommands) {
+        // Verify the rejection names the agent-facing legal moves (post-INF-1218
+        // collapse: routine verbs, not the literal spine verbs).
+        for (const legal of legalMovesShown) {
           expect(rejection).toContain(legal);
         }
       }

@@ -791,7 +791,7 @@ states:
 
     expect(result).toMatch(/not a legal command in state.*intake/i);
     expect(result).toMatch(/legal moves/i);
-    expect(result).toMatch(/accept/);
+    expect(result).toMatch(/continue-workflow/);
   });
 });
 
