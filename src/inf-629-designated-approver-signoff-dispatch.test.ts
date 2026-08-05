@@ -111,6 +111,15 @@ states:
       - command: launch
         to: launching
 
+  - id: launching
+    owner_role: steward
+    kind: normal
+    native_state: doing
+    transitions:
+      - command: spawn
+        to: releasing
+        generic: continue
+
   - id: releasing
     owner_role: steward
     kind: normal
