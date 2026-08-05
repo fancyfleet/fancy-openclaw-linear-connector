@@ -22,7 +22,7 @@ import { createModuleLogger } from "../logging.js";
 import { normalizeSessionKey } from "../session-key.js";
 import { emitStreamTopic } from "../admin-stream.js";
 
-const log = createModuleLogger("dispatch-ack-tracker");
+const log = createModuleLogger("dispatch-ack-tracker", "info");
 
 export type AckStatus = "pending" | "acknowledged" | "unconfirmed" | "escalated" | "deferred";
 

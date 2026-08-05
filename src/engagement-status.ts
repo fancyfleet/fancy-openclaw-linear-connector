@@ -26,7 +26,7 @@
 import { createModuleLogger } from "./logging.js";
 import { resolveNativeStateId, loadWorkflowDefById, getWorkflowId, getCurrentState } from "./workflow-gate.js";
 
-const log = createModuleLogger("engagement-status");
+const log = createModuleLogger("engagement-status", "info");
 
 // AI-2568: when enabled, applyEngagementStatus reads the ticket's workflow
 // state's native_state declaration on "doing" semantics. Enabled at bootstrap

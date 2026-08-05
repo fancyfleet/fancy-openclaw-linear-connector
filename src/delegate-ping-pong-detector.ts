@@ -34,7 +34,7 @@ import { getLinearUserIdForAgent } from "./agents.js";
 import { resolveServiceCredential } from "./service-credential.js";
 import { resolveAgentIdentifiersForRole } from "./escalation-gate.js";
 
-const log = createModuleLogger("delegate-ping-pong-detector");
+const log = createModuleLogger("delegate-ping-pong-detector", "info");
 
 const DEFAULT_MAX_BOUNCES = 3;
 const DEFAULT_WINDOW_MS = 30 * 60 * 1000; // 30 minutes

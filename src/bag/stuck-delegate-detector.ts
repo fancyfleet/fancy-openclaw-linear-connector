@@ -45,7 +45,7 @@ import { deliverMessageToAgent, type DeliveryConfig } from "../delivery/index.js
 import type { DispatchAckTracker } from "./dispatch-ack-tracker.js";
 import { isBlockedByOpenIssue, isHumanLinearUser, type LinearIssueRelation, type LinearUserReference } from "../linear-actionable.js";
 
-const log = createModuleLogger("stuck-delegate-detector");
+const log = createModuleLogger("stuck-delegate-detector", "info");
 
 const DEFAULT_POLL_MS = 5 * 60 * 1000;       // 5 minutes
 const DEFAULT_IDLE_GRACE_MS = 3 * 60 * 1000;  // 3 minutes

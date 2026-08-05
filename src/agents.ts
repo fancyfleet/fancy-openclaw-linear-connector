@@ -16,7 +16,7 @@ import { createModuleLogger } from "./logging.js";
 import { recordSuccess, recordFailure } from "./config-health.js";
 import { notify } from "./alerts/alert-bus.js";
 
-const log = createModuleLogger("agents");
+const log = createModuleLogger("agents", "info");
 
 export interface AgentConfig {
   name: string;

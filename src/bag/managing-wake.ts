@@ -14,7 +14,7 @@ import { deliverMessageToAgent, type DeliveryConfig, type DeliveryResult } from 
 import { normalizeSessionKey } from "../session-key.js";
 import { createModuleLogger } from "../logging.js";
 
-const log = createModuleLogger("managing-wake");
+const log = createModuleLogger("managing-wake", "info");
 
 export interface ManagingWakeTicket {
   identifier: string;

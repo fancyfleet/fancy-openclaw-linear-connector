@@ -27,7 +27,7 @@ import Database from "better-sqlite3";
 import path from "path";
 import { createModuleLogger } from "../logging.js";
 
-const log = createModuleLogger("global-redispatch-budget");
+const log = createModuleLogger("global-redispatch-budget", "info");
 
 const DEFAULT_MAX_ATTEMPTS = 3;
 

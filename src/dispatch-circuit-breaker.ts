@@ -26,7 +26,7 @@
 import { createModuleLogger } from "./logging.js";
 import { notify } from "./alerts/alert-bus.js";
 
-const log = createModuleLogger("dispatch-circuit-breaker");
+const log = createModuleLogger("dispatch-circuit-breaker", "info");
 
 // ---------------------------------------------------------------------------
 // Constants

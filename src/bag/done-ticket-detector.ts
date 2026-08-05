@@ -11,7 +11,7 @@ import { createModuleLogger } from "../logging.js";
 import { markCronRun } from "../cron/registry.js";
 import type { DeployVerdict, DeployVerdictApi } from "./deploy-verdict.js";
 
-const log = createModuleLogger("done-ticket-detector");
+const log = createModuleLogger("done-ticket-detector", "info");
 
 // ── Types ──────────────────────────────────────────────────────────────────
 

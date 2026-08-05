@@ -112,7 +112,7 @@ import crypto from "crypto";
 import path from "path";
 import { resolveStatePath } from "./state-dir.js";
 
-const log = createModuleLogger("server");
+const log = createModuleLogger("server", "info");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3100;
 const DEPLOYMENT_NAME = process.env.DEPLOYMENT_NAME ?? "fancymatt";
 const DEFAULT_CRITICAL_STALE_CRON_MS = 24 * 60 * 60 * 1000;

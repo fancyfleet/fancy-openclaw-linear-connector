@@ -19,7 +19,7 @@
 import { createModuleLogger } from "../logging.js";
 import { normalizeSessionKey } from "../session-key.js";
 
-const log = createModuleLogger("session-tracker");
+const log = createModuleLogger("session-tracker", "info");
 
 const DEFAULT_SESSION_TIMEOUT_MS = 25 * 60 * 1000; // 25 minutes
 

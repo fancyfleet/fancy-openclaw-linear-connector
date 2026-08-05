@@ -33,7 +33,7 @@ import { resignalPendingTickets, type ResignalOptions } from "./resignal.js";
 import type { WakeUpConfig } from "./wake-up.js";
 import { normalizeSessionKey } from "../session-key.js";
 
-const log = createModuleLogger("dispatch-watchdog");
+const log = createModuleLogger("dispatch-watchdog", "info");
 
 const DEFAULT_ACK_TIMEOUT_MS = 10 * 60 * 1000;    // 10 minutes
 const DEFAULT_MAX_RESIGNALS = 3;

@@ -19,7 +19,7 @@ import {
 } from "../store/session-spawn-idempotency-store.js";
 import { probeBoundSessionTerminal } from "../bag/stale-session-forensics.js";
 
-const log = createModuleLogger("delivery");
+const log = createModuleLogger("delivery", "info");
 
 export interface DeliveryConfig {
   nodeBin: string;

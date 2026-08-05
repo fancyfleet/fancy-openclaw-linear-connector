@@ -14,7 +14,7 @@
 
 import { createModuleLogger } from "./logging.js";
 
-const log = createModuleLogger("liveness");
+const log = createModuleLogger("liveness", "info");
 
 export type LivenessResult =
   | { available: true }

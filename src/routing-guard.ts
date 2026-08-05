@@ -34,7 +34,7 @@ import { resolveBodiesForRole, resolveBodiesWithCapability, roleResolutionScopeF
 import { getBinding } from "./implementer-store.js";
 import { notify } from "./alerts/alert-bus.js";
 
-const log = createModuleLogger("routing-guard");
+const log = createModuleLogger("routing-guard", "info");
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 

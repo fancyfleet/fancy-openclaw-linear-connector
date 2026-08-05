@@ -18,7 +18,7 @@ import path from "path";
 import { createModuleLogger } from "../logging.js";
 import { normalizeSessionKey } from "../session-key.js";
 
-const log = createModuleLogger("bag");
+const log = createModuleLogger("bag", "info");
 
 const DEFAULT_TTL_MS = 60 * 60 * 1000; // 60 minutes
 const PRUNE_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes

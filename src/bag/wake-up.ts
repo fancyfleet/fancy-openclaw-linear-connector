@@ -22,7 +22,7 @@ import { randomUUID } from "node:crypto";
 import { COMPLETED_STATUS_ROTATION_REASON, TERMINAL_STOP_ROTATION_REASON, HUSK_ROTATION_REASON, type SessionSpawnIdempotencyStore, type SessionSpawnRuntime } from "../store/session-spawn-idempotency-store.js";
 import { probeBoundSessionTerminal } from "./stale-session-forensics.js";
 
-const log = createModuleLogger("wakeup");
+const log = createModuleLogger("wakeup", "info");
 
 /**
  * AI-2008: minimal structural interface for the acknowledged-delivery front door

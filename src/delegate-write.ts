@@ -1,7 +1,7 @@
 import { LINEAR_API_URL } from "./linear-helpers.js";
 import { createModuleLogger } from "./logging.js";
 
-const log = createModuleLogger("delegate-write");
+const log = createModuleLogger("delegate-write", "info");
 
 export interface WriteDelegateResult {
   /**

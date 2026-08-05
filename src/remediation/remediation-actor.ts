@@ -27,7 +27,7 @@ import type {
   RemediationResult,
 } from "./remediation-types.js";
 
-const log = createModuleLogger("remediation-actor");
+const log = createModuleLogger("remediation-actor", "info");
 
 // ── Configuration ──────────────────────────────────────────────────────────
 

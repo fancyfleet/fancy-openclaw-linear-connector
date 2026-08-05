@@ -44,7 +44,7 @@ import { isLinearIssueActionable } from "../linear-actionable.js";
 import { tryNormalizeSessionKey } from "../session-key.js";
 import { notify } from "../alerts/alert-bus.js";
 
-const log = createModuleLogger("no-activity-detector");
+const log = createModuleLogger("no-activity-detector", "info");
 
 const DEFAULT_WARN_MS = 2 * 60 * 1000;          // 2 minutes
 const DEFAULT_FAIL_MS = 5 * 60 * 1000;           // 5 minutes

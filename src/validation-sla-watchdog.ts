@@ -27,7 +27,7 @@ import { LINEAR_API_URL } from "./linear-helpers.js";
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 
-const log = createModuleLogger("validation-watchdog");
+const log = createModuleLogger("validation-watchdog", "info");
 
 // ── Defaults ──────────────────────────────────────────────────────────────────
 

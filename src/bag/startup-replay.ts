@@ -5,7 +5,7 @@ import { resignalPendingTickets, type ResignalOptions } from "./resignal.js";
 import type { WakeUpConfig } from "./wake-up.js";
 import type { OperationalEventStore } from "../store/operational-event-store.js";
 
-const log = createModuleLogger("startup-replay");
+const log = createModuleLogger("startup-replay", "info");
 
 const DEFAULT_INTER_AGENT_DELAY_MS = 500;
 

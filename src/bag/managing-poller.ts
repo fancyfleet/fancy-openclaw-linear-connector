@@ -29,7 +29,7 @@ import { sendManagingWakeSignal, type ManagingWakeTicket } from "./managing-wake
 import { surfaceStalledChildren, evaluateBarrier, attemptBarrierTransition, isManagedBarrierFromLabels } from "../barrier.js";
 import { notify } from "../alerts/alert-bus.js";
 
-const log = createModuleLogger("managing-poller");
+const log = createModuleLogger("managing-poller", "info");
 
 // Singleton guard (AI-2624 AC5): prevents a second ManagingPoller from being
 // instantiated while one is already active. If two pollers run independently,

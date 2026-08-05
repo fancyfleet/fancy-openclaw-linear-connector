@@ -24,7 +24,7 @@ import {
   type DeliverWithAckOutcome,
 } from "./deliver-with-ack.js";
 
-const log = createModuleLogger("dispatch-delivery-scheduler");
+const log = createModuleLogger("dispatch-delivery-scheduler", "info");
 
 export interface DispatchDeliverySchedulerDeps {
   eventStore: OperationalEventStore;

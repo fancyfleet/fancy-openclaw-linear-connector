@@ -18,7 +18,7 @@ import type {
   RemediationResult,
 } from "./remediation-types.js";
 
-const log = createModuleLogger("remediation-state");
+const log = createModuleLogger("remediation-state", "info");
 
 // ── In-memory store ────────────────────────────────────────────────────────
 

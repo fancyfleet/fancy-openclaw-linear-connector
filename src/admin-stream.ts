@@ -10,7 +10,7 @@ import { EventEmitter } from "node:events";
 import type { Request, Response, Router } from "express";
 import { createModuleLogger } from "./logging.js";
 
-const log = createModuleLogger("admin-stream");
+const log = createModuleLogger("admin-stream", "info");
 
 export type StreamTopic = "board" | "fleet" | "alerts" | "events" | "dead-letters";
 

@@ -20,7 +20,7 @@ import { instanceConfigRoot } from "./instance-config.js";
 import { createModuleLogger } from "./logging.js";
 import yaml from "js-yaml";
 
-const log = createModuleLogger("webhook-routes");
+const log = createModuleLogger("webhook-routes", "info");
 
 // ---------------------------------------------------------------------------
 // Types

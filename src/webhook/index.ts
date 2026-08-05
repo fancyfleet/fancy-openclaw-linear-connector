@@ -47,7 +47,7 @@ import type { DispatchRecordStore } from "../liveness-channel/dispatch-record-st
 import type { GatewayDispatchAck } from "../liveness-channel/gateway-ack-types.js";
 import { extractRejectedWebhookDiagnostic, WebhookSecretDriftTracker } from "./drift.js";
 
-const log = createModuleLogger("webhook");
+const log = createModuleLogger("webhook", "info");
 
 /**
  * INF-1214: minimal structural interface for the acknowledged-delivery front

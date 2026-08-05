@@ -22,7 +22,7 @@ import { setStateAtomic } from "../workflow-gate.js";
 import { GlobalRedispatchBudget } from "./global-redispatch-budget.js";
 import { StaleRedispatchCounter } from "./stale-redispatch-counter.js";
 
-const log = createModuleLogger("stale-forensics");
+const log = createModuleLogger("stale-forensics", "info");
 
 // Re-export the tracker type so callers can use a single import
 export type { StaleSessionDetail } from "./session-tracker.js";

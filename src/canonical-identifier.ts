@@ -12,7 +12,7 @@
 import type { LinearEvent } from "./webhook/schema.js";
 import { createModuleLogger } from "./logging.js";
 
-const log = createModuleLogger("canonical-identifier");
+const log = createModuleLogger("canonical-identifier", "info");
 
 const RESOLVE_QUERY = `query ResolveIdentifier($id: String!) {
   issue(id: $id) {

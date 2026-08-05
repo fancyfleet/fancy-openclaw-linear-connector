@@ -15,7 +15,7 @@ import { writeDelegate } from "./delegate-write.js";
 import { getAccessToken, getAgent, getLinearUserIdForAgent } from "./agents.js";
 import { notify } from "./alerts/alert-bus.js";
 
-const log = createModuleLogger("escalation");
+const log = createModuleLogger("escalation", "info");
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 

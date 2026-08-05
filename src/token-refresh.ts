@@ -22,7 +22,7 @@ import type { AgentConfig } from "./agents.js";
 import { notify } from "./alerts/alert-bus.js";
 import { createModuleLogger } from "./logging.js";
 
-const log = createModuleLogger("token-refresh");
+const log = createModuleLogger("token-refresh", "info");
 
 // ── Constants ──────────────────────────────────────────────────────────────
 

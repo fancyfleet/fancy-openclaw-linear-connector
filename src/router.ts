@@ -15,7 +15,7 @@ import type { RouteResult } from "./types.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { createModuleLogger } from "./logging.js";
 
-const log = createModuleLogger("router");
+const log = createModuleLogger("router", "info");
 
 /**
  * Discriminated union returned by extractAgentTarget.

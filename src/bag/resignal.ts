@@ -5,7 +5,7 @@ import { PendingWorkBag } from "./pending-work-bag.js";
 import { SessionTracker } from "./session-tracker.js";
 import { isLinearIssueActionable, isLinearIssueStillRoutedToAgent, checkLinearIssueRouting, type RoutingReason } from "../linear-actionable.js";
 
-const log = createModuleLogger("resignal");
+const log = createModuleLogger("resignal", "info");
 
 export interface DispatchResult {
   ticketId: string;
