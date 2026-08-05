@@ -30,7 +30,7 @@
 
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
-import { checkEnforcementRules, bodyHasCapability, getCapabilityPolicy } from "./escalation-gate.js";
+import { checkEnforcementRules, bodyHasCapability, getCapabilityPolicy, resolveBodiesForRole } from "./escalation-gate.js";
 import { checkLeakedCredentialGate } from "./leaked-credential-gate.js";
 import { checkStaleSnapshotForTerminal } from "./proxy-cas-check.js";
 import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, setStateAtomic, verifyCommentSatisfiedBy, fetchTicketVerification, resolveSignoffWakeTargets, SIGNOFF_WAKE_DISPATCHED_PHRASE, UNMERGED_CLOSE_BLOCK_PHRASE, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
@@ -498,6 +498,23 @@ async function maybeDemoteCrossFunctionalRequest(
   if (!input) return null;
   const requestedStateId = typeof input.stateId === "string" ? input.stateId : null;
   if (!requestedStateId) return null;
+
+  // INF-1230 (INF-1220 incident): the steward (or a `workflow:break-glass`
+  // holder) deliberately dispatching a cross-functional/recovery ticket to an
+  // explicit delegate is sanctioned cross-agent routing, not ad-hoc board
+  // injection — demoting it strips the delegate and parks the ticket in
+  // dispatch-skipped Backlog, defeating the dispatch. Scoped narrowly to
+  // require an explicit `delegateId` on the mutation: a steward write with no
+  // explicit delegate still demotes normally (this is not a blanket steward
+  // pass-through), and a non-steward, non-break-glass agent setting an
+  // explicit delegateId still gets demoted with the delegate cleared (INF-880
+  // regression guard).
+  if (typeof input.delegateId === "string") {
+    const stewardBodies = await resolveBodiesForRole("steward");
+    if (stewardBodies.includes(agentId) || (await bodyHasCapability(agentId, "workflow:break-glass"))) {
+      return null;
+    }
+  }
 
   // INF-930: a cross-functional bridge delegated to a designated approver (a body
   // holding `sprint:signoff` — the sprint-spawner's Ai sign-off bridge) is a
