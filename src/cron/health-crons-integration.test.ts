@@ -33,6 +33,7 @@ const EXPECTED_CRONS = [
   "bootstrap-reconciliation-sweep",
   "config-sanity-alert", // AI-2619: config-sanity watchdog alert consumer
   "delegation-reconciliation-sweep",
+  "deploy-drift", // INF-1264: live↔main drift detector
   "dispatch-delivery-scheduler", // AI-2008: acknowledged dispatch delivery + retry driver
   "done-ticket-detector", // AI-2576/INF-331: Done-ticket detector cron liveness
   "first-action-watchdog",
