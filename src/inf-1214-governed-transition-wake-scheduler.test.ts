@@ -147,7 +147,7 @@ describe("INF-1214 AC1: post-transition wake dispatched via scheduler (not fire-
 
     // Enroll a ticket so the bag will accept it.
     app.enrolledTicketsStore.enroll({
-      ticketId: "INF-1214-AC1",
+      ticketId: "INF-91941",
       workflow: "dev-impl",
       state: "write-tests",
       delegate: "tdd",
@@ -158,13 +158,13 @@ describe("INF-1214 AC1: post-transition wake dispatched via scheduler (not fire-
     // an event is recorded.
     const bagWake = app.bag as any;
     if (bagWake?.sendWakeUp) {
-      await bagWake.sendWakeUp("igor", ["INF-1214-AC1"]);
+      await bagWake.sendWakeUp("igor", ["INF-91941"]);
     }
 
     // Verify: a delivery outcome MUST exist in the event store.
     // When routed through DispatchDeliveryScheduler, the outcome is "delivered".
     // When still on dispatchWithRetry, the outcome is absent (fire-and-forget).
-    const events = app.operationalEventStore.query({ key: "linear-INF-1214-AC1" });
+    const events = app.operationalEventStore.query({ key: "linear-INF-91941" });
     const hasDeliveryOutcome = events.some(
       (e: any) =>
         e.outcome === "delivered" ||
@@ -185,6 +185,10 @@ describe("INF-1214 AC1: post-transition wake dispatched via scheduler (not fire-
 // ── AC2: LIF-375 regression — cross-agent handoff survives dropped delivery via retry ──
 
 describe("INF-1214 AC2: LIF-375 cross-agent delegate handoff retry (approve → merge)", () => {
+  // bag.sendWakeUp is the real production entry point and uses the
+  // scheduler's default backoff (first retry waits ~5s) rather than a
+  // test-fast override, so this test needs headroom beyond jest's default
+  // 5000ms per-test timeout.
   it("a cross-agent governed transition (approve→merge) survives one dropped delivery attempt via retry", async () => {
     // LIF-375's shape: a governed transition where the delegate changes to a
     // DIFFERENT agent (e.g. approve in review → merge assigned to hanzo).
@@ -217,7 +221,7 @@ describe("INF-1214 AC2: LIF-375 cross-agent delegate handoff retry (approve → 
 
     // Enroll a ticket in review state about to transition to merge.
     app.enrolledTicketsStore.enroll({
-      ticketId: "LIF-375-RETRY",
+      ticketId: "LIF-93751",
       workflow: "dev-impl",
       state: "review",
       delegate: "sage",
@@ -229,7 +233,7 @@ describe("INF-1214 AC2: LIF-375 cross-agent delegate handoff retry (approve → 
     // and the second attempt succeeds — the wake reaches hanzo.
     const bagWake = app.bag as any;
     if (bagWake?.sendWakeUp) {
-      await bagWake.sendWakeUp("hanzo", ["LIF-375-RETRY"]);
+      await bagWake.sendWakeUp("hanzo", ["LIF-93751"]);
     }
 
     // The wake must have been attempted at least twice (first failed, retry
@@ -237,7 +241,7 @@ describe("INF-1214 AC2: LIF-375 cross-agent delegate handoff retry (approve → 
     expect(attempts).toBeGreaterThanOrEqual(2);
 
     // Delivery outcome events must exist — both the failure and the success.
-    const events = app.operationalEventStore.query({ key: "linear-LIF-375-RETRY" });
+    const events = app.operationalEventStore.query({ key: "linear-LIF-93751" });
     const failedEvents = events.filter((e: any) =>
       e.outcome === "delivery-failed" || e.outcome === "delivery-unconfirmed",
     );
@@ -250,7 +254,7 @@ describe("INF-1214 AC2: LIF-375 cross-agent delegate handoff retry (approve → 
     (app as any).operationalEventStore?.close?.();
     fs.rmSync(path.dirname(eventsDbPath), { recursive: true, force: true });
     fs.rmSync(path.dirname(mirrorDbPath), { recursive: true, force: true });
-  });
+  }, 10_000);
 });
 
 // ── AC3: No regression in dispatch-lease / in-flight-guard / idempotent-replay ──
@@ -274,10 +278,13 @@ describe("INF-1214 AC3: no duplicate-dispatch class introduced by routing throug
       // Total calls to the deliver primitive must equal 2 (no extras).
       const outcome = await scheduler.dispatch({
         agentId: "igor",
-        ticketId: "INF-1214-AC3",
+        ticketId: "INF-91943",
         workflowState: "implementation",
         gateway: "grover",
         dispatchId: "disp-ac3-single",
+        // Deterministic, fast retry — this test asserts call counts/ids, not
+        // real backoff timing (matches the AC5 happy-path convention).
+        backoffMs: () => 0,
         deliver: async (ctx) => {
           deliveries.push(ctx);
           if (ctx.attempt === 1) {
@@ -295,7 +302,7 @@ describe("INF-1214 AC3: no duplicate-dispatch class introduced by routing throug
 
       // Ack tracker must have exactly one entry (not double-recorded).
       const acks = ackTracker.listRecent();
-      const ticketAcks = acks.filter((a) => a.ticketId === "linear-INF-1214-AC3");
+      const ticketAcks = acks.filter((a) => a.ticketId === "linear-INF-91943");
       expect(ticketAcks.length).toBe(1);
     } finally {
       scheduler.stop();
@@ -321,10 +328,11 @@ describe("INF-1214 AC3: no duplicate-dispatch class introduced by routing throug
     try {
       await scheduler.dispatch({
         agentId: "igor",
-        ticketId: "INF-1214-AC3-IDEMP",
+        ticketId: "INF-91944",
         workflowState: "implementation",
         gateway: "grover",
         dispatchId: "disp-idemp-stable",
+        backoffMs: () => 0,
         deliver: async ({ attempt, dispatchId }) => {
           seenIds.push(dispatchId);
           if (attempt < 3) return { dispatched: false, hookErrorSummary: "retry-me" };
@@ -363,24 +371,25 @@ describe("INF-1214 AC4: dispatch-undeliverable on retry exhaustion", () => {
       // Every attempt fails → exhaustion.
       const outcome = await scheduler.dispatch({
         agentId: "hanzo",
-        ticketId: "INF-1214-AC4",
+        ticketId: "INF-91945",
         workflowState: "merge",
         gateway: "nakazawa",
         dispatchId: "disp-ac4-exhaust",
         deliver: async () => ({ dispatched: false, hookErrorSummary: "gateway down" }),
         maxRetries: 2,
+        backoffMs: () => 0,
       });
 
       expect(outcome.status).toBe("undeliverable");
       expect(outcome.attempts).toBe(3); // 1 initial + 2 retries
 
-      const events = eventStore.query({ key: "linear-INF-1214-AC4" });
+      const events = eventStore.query({ key: "linear-INF-91945" });
       const undeliverable = events.find((e: any) => e.outcome === "dispatch-undeliverable");
       expect(undeliverable).toBeDefined();
 
       // The loud warning names ticket, state, delegate, and gateway.
       const detail = (undeliverable as any).detail;
-      expect(detail.ticket).toBe("INF-1214-AC4");
+      expect(detail.ticket).toBe("INF-91945");
       expect(detail.state).toBe("merge");
       expect(detail.delegate).toBe("hanzo");
       expect(detail.gateway).toBe("nakazawa");
@@ -410,7 +419,7 @@ describe("INF-1214 AC5: no regression in existing dispatch-lease / in-flight / r
     const calls: number[] = [];
     const result = await deliverWithAck({
       agentId: "sage",
-      ticketId: "INF-1214-AC5",
+      ticketId: "INF-91946",
       workflowState: "implementation",
       gateway: "grover",
       dispatchId: "disp-ac5-regression",
@@ -429,11 +438,11 @@ describe("INF-1214 AC5: no regression in existing dispatch-lease / in-flight / r
     expect(result.attempts).toBe(1);
     expect(calls).toEqual([1]);
 
-    const events = eventStore.query({ key: "linear-INF-1214-AC5" });
+    const events = eventStore.query({ key: "linear-INF-91946" });
     expect(events.some((e: any) => e.outcome === "delivered")).toBe(true);
 
     const acks = ackTracker.listRecent();
-    expect(acks.some((a) => a.agentId === "sage" && a.ticketId === "linear-INF-1214-AC5")).toBe(true);
+    expect(acks.some((a) => a.agentId === "sage" && a.ticketId === "linear-INF-91946")).toBe(true);
 
     eventStore.close();
     ackTracker.close();
@@ -449,12 +458,12 @@ describe("INF-1214 AC5: no regression in existing dispatch-lease / in-flight / r
     const ackTracker = new DispatchAckTracker(path.join(dir, "acks.db"));
 
     // Record first dispatch.
-    ackTracker.recordDispatch("igor", "INF-1214-LEASE");
+    ackTracker.recordDispatch("igor", "INF-91947");
 
     // Query recent — the dispatch must appear.
     const acks = ackTracker.listRecent();
     const ticketAck = acks.find(
-      (a) => a.agentId === "igor" && a.ticketId === "linear-INF-1214-LEASE",
+      (a) => a.agentId === "igor" && a.ticketId === "linear-INF-91947",
     );
     expect(ticketAck).toBeDefined();
 
@@ -485,21 +494,22 @@ describe("INF-1214 AC6: production entry point registers the governed-transition
       "utf8",
     );
 
-    const eventsDb = path.join(dir, "events.db");
-    const mirrorDb = path.join(dir, "mirror.db");
-    const logDb = path.join(dir, "logs.db");
-
     child = spawn(process.execPath, [DIST_ENTRY], {
       cwd: dir,
       env: {
         ...process.env,
-        LINEAR_AGENTS_FILE: agentsFile,
-        OPERATIONAL_EVENTS_DB: eventsDb,
-        ENROLLED_TICKETS_DB: mirrorDb,
-        SESSION_LOG_DB: logDb,
+        // AGENTS_FILE (not LINEAR_AGENTS_FILE) and DATA_DIR (not separate
+        // per-store *_DB vars) are the actual env vars index.ts/agents.ts
+        // read — see ai-2008-bootstrap-wiring.test.ts for the established
+        // pattern this mirrors.
+        AGENTS_FILE: agentsFile,
+        DATA_DIR: path.join(dir, "data"),
         PORT: String(PORT),
         ADMIN_SECRET: "bootstrap-test-secret",
         NODE_ENV: "test",
+        LINEAR_OAUTH_TOKEN: "test-linear-oauth-token",
+        OPENCLAW_HOOKS_URL: `http://127.0.0.1:${PORT}/nonexistent-hooks`,
+        OPENCLAW_HOOKS_TOKEN: "test-token",
         // Suppress non-essential startup noise.
         LOG_LEVEL: "warn",
       },
@@ -519,23 +529,35 @@ describe("INF-1214 AC6: production entry point registers the governed-transition
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it("boots and exposes governed-transition wake scheduler liveness at /health", async () => {
-    const health = await pollHealth(`http://127.0.0.1:${PORT}/health`, 10_000);
+  it(
+    "boots and exposes governed-transition wake scheduler liveness at /health",
+    async () => {
+      let health: Record<string, unknown>;
+      try {
+        health = await pollHealth(`http://127.0.0.1:${PORT}/health`, 10_000);
+      } catch (err) {
+        throw new Error(
+          `entry point never responded on /health: ${err instanceof Error ? err.message : String(err)}\n` +
+          `child stderr:\n${childStderr}`,
+        );
+      }
 
-    // The dispatchDelivery field proves the DispatchDeliveryScheduler is armed.
-    const dd = health.dispatchDelivery as Record<string, unknown> | undefined;
-    expect(dd).toBeDefined();
-    expect(dd?.schedulerActive).toBe(true);
-    expect(typeof dd?.pendingRetries).toBe("number");
+      // The dispatchDelivery field proves the DispatchDeliveryScheduler is armed.
+      const dd = health.dispatchDelivery as Record<string, unknown> | undefined;
+      expect(dd).toBeDefined();
+      expect(dd?.schedulerActive).toBe(true);
+      expect(typeof dd?.pendingRetries).toBe("number");
 
-    // AC7: governedTransitionWakeScheduler liveness field must exist.
-    // The implementation must add a dedicated field showing the
-    // governed-transition wake scheduler is registered/active.
-    const gtw = health.governedTransitionWakeScheduler as Record<string, unknown> | undefined;
-    expect(gtw).toBeDefined();
-    expect(typeof gtw?.active).toBe("boolean");
-    expect(gtw?.active).toBe(true);
-  });
+      // AC7: governedTransitionWakeScheduler liveness field must exist.
+      // The implementation must add a dedicated field showing the
+      // governed-transition wake scheduler is registered/active.
+      const gtw = health.governedTransitionWakeScheduler as Record<string, unknown> | undefined;
+      expect(gtw).toBeDefined();
+      expect(typeof gtw?.active).toBe("boolean");
+      expect(gtw?.active).toBe(true);
+    },
+    15_000,
+  );
 });
 
 // ── AC7: Liveness observable at /health without waiting for trigger condition ──

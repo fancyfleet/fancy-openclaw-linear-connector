@@ -16,7 +16,7 @@ import type { SessionSpawnIdempotencyStore } from "../store/session-spawn-idempo
 import { extractWebhookMutations } from "./mutation-extraction.js";
 import { routeEvent, routeEventAll, unresolvedRoutingCandidates } from "../router.js";
 import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
-import { deliverToAgent, DeliveryThrottle, type DeliveryConfig, assertDispatchTargetFetchable } from "../delivery/index.js";
+import { deliverToAgent, DeliveryThrottle, type DeliveryConfig, type DeliveryResult, assertDispatchTargetFetchable } from "../delivery/index.js";
 import { markDispatchIntegrityGateActive } from "../dispatch-integrity-state.js";
 import {
   checkBreaker,
@@ -48,6 +48,25 @@ import type { GatewayDispatchAck } from "../liveness-channel/gateway-ack-types.j
 import { extractRejectedWebhookDiagnostic, WebhookSecretDriftTracker } from "./drift.js";
 
 const log = componentLogger(createLogger(), "webhook");
+
+/**
+ * INF-1214: minimal structural interface for the acknowledged-delivery front
+ * door (DispatchDeliveryScheduler), mirroring bag/wake-up.ts's
+ * WakeDeliveryScheduler. Declared here rather than imported to keep the
+ * webhook dispatch path free of a hard dependency on the scheduler module.
+ */
+export interface WebhookDeliveryScheduler {
+  dispatch(params: {
+    agentId: string;
+    ticketId: string;
+    workflowState?: string;
+    gateway?: string;
+    dispatchId: string;
+    deliver: (ctx: { attempt: number; dispatchId: string }) => Promise<DeliveryResult>;
+    maxRetries?: number;
+    backoffMs?: (attempt: number) => number;
+  }): Promise<{ status: "delivered" | "delivered-pending-ack" | "undeliverable"; attempts: number; dispatchId: string }>;
+}
 
 export type { LinearEvent } from "./schema.js";
 export { verifyLinearSignature } from "./signature.js";
@@ -519,6 +538,60 @@ async function deliverWithSlot(
   }
 }
 
+/**
+ * INF-1214: route a governed-transition post-transition wake through the
+ * acked/retried DispatchDeliveryScheduler instead of a single fire-and-forget
+ * deliverWithSlot() attempt. Preserves deliverToAgent's own dispatch-lease /
+ * in-flight-guard / idempotent-replay behavior unchanged — the scheduler only
+ * adds retry-with-backoff and delivery-outcome recording on top; every retry
+ * still calls deliverWithSlot (and therefore deliverToAgent) per attempt.
+ *
+ * When no scheduler is wired (e.g. existing unit tests that construct
+ * createWebhookRouter directly without one), falls back to the legacy
+ * single-attempt deliverWithSlot call so existing dispatch coverage is
+ * unaffected (AC5).
+ *
+ * The scheduler's DeliverWithAckOutcome does not carry the underlying
+ * DeliveryResult's runId/canonVersion — callers here need those for
+ * downstream telemetry and the onDispatched() gate, so the last observed
+ * DeliveryResult from the deliver() closure is captured and returned instead
+ * of the scheduler's own outcome value.
+ */
+async function deliverGovernedTransitionWake(
+  route: RouteResult,
+  config: DeliveryConfig,
+  scheduler: WebhookDeliveryScheduler | undefined,
+  throttle?: DeliveryThrottle,
+  dispatchLeaseStore?: DispatchLeaseStore,
+  dispatchInFlightStore?: DispatchInFlightStore,
+  sessionSpawnStore?: SessionSpawnIdempotencyStore,
+): Promise<Awaited<ReturnType<typeof deliverToAgent>>> {
+  if (!scheduler) {
+    return deliverWithSlot(route, config, throttle, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore);
+  }
+
+  let lastResult: DeliveryResult | undefined;
+  const outcome = await scheduler.dispatch({
+    agentId: route.agentId,
+    ticketId: route.sessionKey,
+    dispatchId: `webhook-direct-${route.sessionKey}-${crypto.randomUUID()}`,
+    gateway: getAgent(route.agentId)?.host ?? undefined,
+    deliver: async () => {
+      const result = await deliverWithSlot(
+        route, config, throttle, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore,
+      );
+      lastResult = result;
+      return result;
+    },
+  });
+
+  if (lastResult) return lastResult;
+  // No attempt ever ran a deliver() call (should not happen, deliverWithAck
+  // always calls deliver at least once) — fall back to a synthesized result
+  // consistent with the scheduler's own verdict.
+  return { dispatched: outcome.status !== "undeliverable" };
+}
+
 export function createWebhookRouter(
   eventStore?: EventStore,
   nudgeStore?: NudgeStore,
@@ -539,6 +612,15 @@ export function createWebhookRouter(
   dispatchInFlightStore?: DispatchInFlightStore,
   sessionSpawnStore?: SessionSpawnIdempotencyStore,
   noActivityDetector?: Pick<NoActivityDetector, "recordAdmissionDeferral">,
+  /**
+   * INF-1214: when present, the primary post-transition webhook-triggered
+   * wake ("direct" dispatch below, and its agent-queue-drain counterpart) is
+   * routed through the acked/retried scheduler instead of a single
+   * fire-and-forget deliverWithSlot() attempt. Injected by the production
+   * bootstrap (createApp); absent in existing unit tests that construct this
+   * router directly, which keep the legacy single-attempt path (AC5).
+   */
+  dispatchDeliveryScheduler?: WebhookDeliveryScheduler,
 ): Router {
   const router = Router();
   const delegatePingPongDetector = new DelegatePingPongDetector(undefined, undefined, operationalEventStore);
@@ -1747,7 +1829,7 @@ export function createWebhookRouter(
           await throttle.wait(route.agentId);
           throttle.record(route.agentId);
         }
-        const directResult = await deliverWithSlot(route, deliveryConfig, throttle, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore);
+        const directResult = await deliverGovernedTransitionWake(route, deliveryConfig, dispatchDeliveryScheduler, throttle, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore);
         appendOperationalEvent(operationalEventStore, { outcome: directResult.runId ? "dispatch-accepted" : "delivered", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1, runId: directResult.runId ?? null, wakeId, plane: "connector", detail: directResult.canonVersion ? { canonVersion: directResult.canonVersion } : undefined });
         // Direct deliveries (incl. comment-routed wakes into an existing
         // session) must register the dispatch and flip engagement → Thinking
@@ -1769,7 +1851,7 @@ export function createWebhookRouter(
                 await throttle.wait(route.agentId);
                 throttle.record(route.agentId);
               }
-              const drainResult = await deliverWithSlot(next, deliveryConfig, throttle, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore);
+              const drainResult = await deliverGovernedTransitionWake(next, deliveryConfig, dispatchDeliveryScheduler, throttle, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore);
               appendOperationalEvent(operationalEventStore, { outcome: drainResult.runId ? "dispatch-accepted" : "delivered", type: next.event.type, agent: route.agentId, key: next.sessionKey, sessionKey: next.sessionKey, deliveryMode: "agent-queue-drain", attemptCount: 1, runId: drainResult.runId ?? null, detail: drainResult.canonVersion ? { canonVersion: drainResult.canonVersion } : undefined });
             } catch (err) {
               log.error(`Agent queue: failed to deliver promoted task for ${route.agentId}: ${err instanceof Error ? err.message : String(err)}`);

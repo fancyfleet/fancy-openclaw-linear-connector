@@ -566,6 +566,13 @@ export function createApp(options?: CreateAppOptions) {
         ...dispatchDeliveryScheduler.liveness(),
         undeliverable: undeliverable.length,
       },
+      // INF-1214: liveness for the governed-transition (webhook-triggered
+      // post-transition) wake path specifically — true only once
+      // createWebhookRouter has been constructed with dispatchDeliveryScheduler
+      // wired in, observable at bootstrap without waiting for a real transition.
+      governedTransitionWakeScheduler: {
+        active: governedTransitionWakeSchedulerWired && dispatchDeliveryScheduler.schedulerActive,
+      },
       // INF-923 AC5/AC6: rate-limit-aware client + 429 breaker liveness.
       // `registered` is true only because bootstrap constructed + held the
       // client (never hardcoded); `gatedConsumers`/`cronConsumers` name the
@@ -863,6 +870,44 @@ export function createApp(options?: CreateAppOptions) {
   // INF-982: shared global redispatch budget across all detectors (stale-session forensics,
   // no-activity-detector, dispatch-watchdog). Ensures all three use the same cap.
   const globalRedispatchBudget = new GlobalRedispatchBudget();
+
+  // INF-1214: governed-transition wake entry point, exposed directly on
+  // `bag` so it's independently exercisable (AC1/AC2) without the full
+  // webhook round-trip. Always routes through dispatchDeliveryScheduler —
+  // even in test mode with an injected sendWakeUp stub, which becomes the
+  // single-attempt delivery primitive the scheduler retries around, so
+  // every attempt still records a delivery outcome and a dropped attempt is
+  // retried instead of being fire-and-forget.
+  (bag as unknown as { sendWakeUp: (agentId: string, ticketIds: string[]) => Promise<void> }).sendWakeUp =
+    async (agentId: string, ticketIds: string[]): Promise<void> => {
+      const primaryTicket = ticketIds[0];
+      const outcome = await dispatchDeliveryScheduler.dispatch({
+        agentId,
+        ticketId: primaryTicket,
+        gateway: getAgent(agentId)?.host ?? undefined,
+        dispatchId: `governed-wake-${normalizeSessionKey(primaryTicket)}-${crypto.randomUUID()}`,
+        deliver: async () => {
+          try {
+            if (options?.sendWakeUp) {
+              await options.sendWakeUp(agentId, ticketIds);
+            } else {
+              // Strip deliveryScheduler so sendWakeUpSignal performs exactly
+              // one delivery attempt — retry ownership belongs to the
+              // dispatchDeliveryScheduler.dispatch() call wrapping this
+              // deliver(), not to a second, nested scheduler pass.
+              const { deliveryScheduler: _unused, ...rawConfig } = wakeConfigForAgent(agentId);
+              await sendWakeUpSignal(agentId, ticketIds, rawConfig);
+            }
+            return { dispatched: true };
+          } catch (err) {
+            return { dispatched: false, hookErrorSummary: err instanceof Error ? err.message : String(err) };
+          }
+        },
+      });
+      if (outcome.status === "undeliverable") {
+        throw new Error(`governed-transition wake undeliverable after ${outcome.attempts} attempt(s)`);
+      }
+    };
 
   const resignalOptions = {
     sendWakeUp: options?.sendWakeUp
@@ -1195,6 +1240,15 @@ export function createApp(options?: CreateAppOptions) {
     ackTracker,
   });
   dispatchDeliveryScheduler.start();
+
+  // INF-1214: genuine liveness signal for the governed-transition wake path
+  // specifically (distinct from dispatchDeliveryScheduler.schedulerActive,
+  // which only proves the underlying scheduler is armed — not that the
+  // webhook-triggered post-transition wake is actually routed through it).
+  // Flips true only once createWebhookRouter below is constructed WITH the
+  // scheduler wired in — never a hardcoded literal (the AI-1808
+  // dead-code-in-prod guard this ticket must not repeat).
+  let governedTransitionWakeSchedulerWired = false;
 
   /**
    * Post a comment on a Linear ticket via the GraphQL API.
@@ -1895,7 +1949,12 @@ export function createApp(options?: CreateAppOptions) {
     dispatchInFlightStore,
     sessionSpawnStore,
     noActivityDetector,
+    // INF-1214: route the primary post-transition webhook-triggered wake
+    // through the acked/retried scheduler instead of a single fire-and-forget
+    // deliverWithSlot() attempt.
+    dispatchDeliveryScheduler,
   ));
+  governedTransitionWakeSchedulerWired = true;
 
   // ── v1.1: Session-end callback endpoint ──────────────────────────────
   // The gateway (via plugin) calls this when an agent's session ends.
