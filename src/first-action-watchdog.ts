@@ -698,13 +698,17 @@ export function registerFirstActionWatchdogCron(
   registerCron(CRON_NAME, `every ${formatIntervalMs(cadenceMs)}`);
   markFirstActionWatchdogScheduled();
 
-  const timer = setInterval(() => {
+  const tick = () => {
     runFirstActionWatchdogSweep(opts).catch((err) => {
       console.error(`[${CRON_NAME}] sweep failed:`, err);
     }).finally(() => {
       markCronRun(CRON_NAME);
     });
-  }, cadenceMs);
+  };
+  // INF-1263 AC3: kick off a first sweep immediately so deploy churn cannot
+  // starve it until the first interval tick.
+  setTimeout(tick, 0);
+  const timer = setInterval(tick, cadenceMs);
   if (typeof timer.unref === "function") timer.unref();
   return timer;
 }

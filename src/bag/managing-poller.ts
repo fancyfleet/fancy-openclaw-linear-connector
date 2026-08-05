@@ -279,11 +279,15 @@ export class ManagingPoller {
     log.info(
       `Managing poller started — cycle=${this.config.cycleMs}ms defaultInterval=${this.config.defaultIntervalMs}ms`,
     );
-    this.timer = setInterval(() => {
+    const runCycleTick = () => {
       this.runCycle().catch((err) => {
         log.error(`Managing poller cycle error: ${err instanceof Error ? err.message : String(err)}`);
       });
-    }, this.config.cycleMs);
+    };
+    // INF-1263 AC3: kick off a first cycle immediately so deploy churn cannot
+    // starve the poller until its first interval tick.
+    setTimeout(runCycleTick, 0);
+    this.timer = setInterval(runCycleTick, this.config.cycleMs);
     this.timer.unref();
   }
 

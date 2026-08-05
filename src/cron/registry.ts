@@ -38,6 +38,16 @@ export interface CronRegistryEntry {
    * proves the job actually fires (AI-2037 / AC2.4).
    */
   lastRunAt: string | null;
+  /**
+   * Outcome of the most recent run, or null if the driver has never reported
+   * one (INF-1263). Drivers that only call the legacy liveness-only
+   * `markCronRun` never set this — that is expected, not a bug.
+   */
+  lastOutcome: "success" | "fail" | null;
+  /** Human-readable error from the most recent failed run, or null. */
+  lastError: string | null;
+  /** Consecutive failed runs in a row; reset to 0 on the next success. */
+  failureStreak: number;
 }
 
 export interface StaleCronEntry {
@@ -125,14 +135,27 @@ export function formatIntervalMs(ms: number): string {
  */
 export function registerCron(name: string, schedule: string): void {
   loadPersistedRunStamps();
+  const existing = entries.get(name);
   entries.set(name, {
     id: name,
     name,
     schedule,
     registeredAt: new Date().toISOString(),
     // A hot-reload re-registers the driver but does not un-run it.
-    lastRunAt: entries.get(name)?.lastRunAt ?? persistedLastRunAt.get(name) ?? null,
+    lastRunAt: existing?.lastRunAt ?? persistedLastRunAt.get(name) ?? null,
+    // Same rationale as lastRunAt above: a hot-reload must not erase outcome
+    // history the driver already accumulated this process.
+    lastOutcome: existing?.lastOutcome ?? null,
+    lastError: existing?.lastError ?? null,
+    failureStreak: existing?.failureStreak ?? 0,
   });
+}
+
+function stampRunAt(entry: CronRegistryEntry, now: Date): void {
+  const lastRunAt = now.toISOString();
+  entry.lastRunAt = lastRunAt;
+  persistedLastRunAt.set(entry.name, lastRunAt);
+  persistRunStamps();
 }
 
 /**
@@ -145,10 +168,78 @@ export function markCronRun(name: string, now = new Date()): void {
   loadPersistedRunStamps();
   const entry = entries.get(name);
   if (!entry) return;
-  const lastRunAt = now.toISOString();
-  entry.lastRunAt = lastRunAt;
-  persistedLastRunAt.set(name, lastRunAt);
-  persistRunStamps();
+  stampRunAt(entry, now);
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  return String(error);
+}
+
+/**
+ * Stamp a driver as having just run successfully (INF-1263): clears any prior
+ * error, resets the failure streak, and updates lastRunAt. No-op for an
+ * unregistered name, mirroring markCronRun.
+ */
+export function markCronRunSuccess(name: string, now = new Date()): void {
+  loadPersistedRunStamps();
+  const entry = entries.get(name);
+  if (!entry) return;
+  entry.lastOutcome = "success";
+  entry.lastError = null;
+  entry.failureStreak = 0;
+  stampRunAt(entry, now);
+}
+
+/**
+ * Stamp a driver as having just failed (INF-1263): records the error message
+ * and increments the consecutive-failure streak. No-op for an unregistered
+ * name, mirroring markCronRun.
+ */
+export function markCronRunFailure(name: string, error: unknown, now = new Date()): void {
+  loadPersistedRunStamps();
+  const entry = entries.get(name);
+  if (!entry) return;
+  entry.lastOutcome = "fail";
+  entry.lastError = errorMessage(error);
+  entry.failureStreak += 1;
+  stampRunAt(entry, now);
+}
+
+export interface CriticalCronFailure {
+  name: string;
+  schedule: string;
+  lastOutcome: "fail";
+  lastError: string;
+  failureStreak: number;
+  severity: "critical";
+}
+
+export interface GetCriticalCronFailuresOptions {
+  failureThreshold: number;
+}
+
+/**
+ * Registered crons whose consecutive failure streak has reached the
+ * configured threshold (INF-1263 AC2) — the escalation signal for a cron
+ * that is failing N-in-a-row rather than just having failed once.
+ */
+export function getCriticalCronFailures(options: GetCriticalCronFailuresOptions): CriticalCronFailure[] {
+  const failures: CriticalCronFailure[] = [];
+  for (const entry of getRegisteredCrons()) {
+    if (entry.lastOutcome === "fail" && entry.failureStreak >= options.failureThreshold) {
+      failures.push({
+        name: entry.name,
+        schedule: entry.schedule,
+        lastOutcome: "fail",
+        lastError: entry.lastError as string,
+        failureStreak: entry.failureStreak,
+        severity: "critical",
+      });
+    }
+  }
+  return failures;
 }
 
 /** All drivers registered in this process, sorted by name. */

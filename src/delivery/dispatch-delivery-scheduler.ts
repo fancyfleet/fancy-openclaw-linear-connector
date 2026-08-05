@@ -55,10 +55,14 @@ export class DispatchDeliveryScheduler {
   start(): void {
     if (this.active) return;
     this.active = true;
-    this.heartbeat = setInterval(() => {
+    const beat = () => {
       // Liveness heartbeat only — the retry loop runs inline in dispatch().
       markCronRun("dispatch-delivery-scheduler");
-    }, this.heartbeatMs);
+    };
+    // INF-1263 AC3: kick off an immediate heartbeat so deploy churn cannot
+    // starve liveness until the first interval tick.
+    setTimeout(beat, 0);
+    this.heartbeat = setInterval(beat, this.heartbeatMs);
     this.heartbeat.unref?.();
     registerCron(
       "dispatch-delivery-scheduler",

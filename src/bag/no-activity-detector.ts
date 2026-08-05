@@ -140,13 +140,17 @@ export class NoActivityDetector {
       `No-activity detector started — warn=${this.config.warnMs}ms ` +
       `fail=${this.config.failMs}ms poll=${this.config.pollMs}ms`,
     );
-    this.timer = setInterval(() => {
+    const runCycleTick = () => {
       this.runCycle().catch((err) => {
         log.error(
           `No-activity cycle error: ${err instanceof Error ? err.message : String(err)}`,
         );
       });
-    }, this.config.pollMs);
+    };
+    // INF-1263 AC3: kick off a first cycle immediately so deploy churn cannot
+    // starve the detector until its first interval tick.
+    setTimeout(runCycleTick, 0);
+    this.timer = setInterval(runCycleTick, this.config.pollMs);
     this.timer.unref();
   }
 

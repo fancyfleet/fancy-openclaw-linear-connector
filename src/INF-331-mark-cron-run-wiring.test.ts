@@ -475,6 +475,10 @@ describe("INF-847: merged-evidence-reconciler calls markCronRun", () => {
     resetCronRegistryForTest();
     registerMergedEvidenceReconcilerCron();
 
+    // INF-1263 AC3: the initial stamp is now deferred via setTimeout(..., 0)
+    // (was synchronous) so deploy churn cannot starve it until the first
+    // interval tick — flush it before asserting.
+    await jest.advanceTimersByTimeAsync(0);
     expectLastRunAtStamped(getRegisteredCrons(), "merged-evidence-reconciler");
 
     await jest.advanceTimersByTimeAsync(100);

@@ -1576,7 +1576,7 @@ export function createApp(options?: CreateAppOptions) {
   // its own. unref() so it never holds the process open; try/catch so a sweep
   // error can never crash the server loop.
   const SESSION_SPAWN_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
-  const sessionSpawnSweepTimer = setInterval(() => {
+  const sessionSpawnSweepTick = () => {
     try {
       const { released } = sessionSpawnStore.sweepExpiredClaims();
       if (released > 0) {
@@ -1585,7 +1585,11 @@ export function createApp(options?: CreateAppOptions) {
     } catch (err) {
       log.warn(`session-spawn claim sweep failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-  }, SESSION_SPAWN_SWEEP_INTERVAL_MS);
+  };
+  // INF-1263 AC3: kick off a first sweep immediately so deploy churn cannot
+  // starve it until the first interval tick.
+  setTimeout(sessionSpawnSweepTick, 0);
+  const sessionSpawnSweepTimer = setInterval(sessionSpawnSweepTick, SESSION_SPAWN_SWEEP_INTERVAL_MS);
   sessionSpawnSweepTimer.unref();
 
   // ── Stuck-delegate detector (AI-1578 / AI-1451) ──────────────────────

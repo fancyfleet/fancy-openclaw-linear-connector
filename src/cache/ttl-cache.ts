@@ -252,10 +252,14 @@ export function registerTtlInvalidationCron(
   _ttlSchedulerActive = true;
   registerCron("ttl-cache-invalidation", `every ${formatIntervalMs(intervalMs)}`);
 
-  const timer = setInterval(() => {
+  const tick = () => {
     cache.purgeExpired();
     markCronRun("ttl-cache-invalidation");
-  }, intervalMs);
+  };
+  // INF-1263 AC3: kick off an immediate purge so deploy churn cannot starve
+  // invalidation until the first interval tick.
+  setTimeout(tick, 0);
+  const timer = setInterval(tick, intervalMs);
   timer.unref();
 
   return timer;

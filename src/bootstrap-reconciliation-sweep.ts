@@ -1137,7 +1137,7 @@ export function registerBootstrapReconciliationCron(
     );
   }
 
-  const timer = setInterval(() => {
+  const tick = () => {
     // Fire-and-forget — errors are captured inside the sweep and surfaced
     // via the alert bus, not propagated to the interval handler.
     void runBootstrapReconciliationSweep({
@@ -1150,7 +1150,12 @@ export function registerBootstrapReconciliationCron(
         `bootstrap-reconciliation: unexpected sweep failure: ${err instanceof Error ? err.message : String(err)}`,
       );
     });
-  }, intervalMs);
+  };
+
+  // INF-1263 AC3: kick off a first sweep immediately so deploy churn cannot
+  // starve it until the first interval tick.
+  setTimeout(tick, 0);
+  const timer = setInterval(tick, intervalMs);
 
   timer.unref();
 

@@ -284,6 +284,9 @@ export function registerNativeStateReconcilerCron(
     }
   };
 
+  // INF-1263 AC3: kick off a first sweep immediately so deploy churn cannot
+  // starve it until the first interval tick.
+  setTimeout(() => void runOnce(), 0);
   const timer = setInterval(() => void runOnce(), cadenceMs);
   timer.unref();
 

@@ -881,7 +881,11 @@ describe("AC5 — no per-ticket Linear API fan-out; configurable cadence", () =>
 
   it("resolves authToken on each scheduled tick", async () => {
     jest.useFakeTimers();
-    const tokens = ["Bearer stale-token", "Bearer fresh-token"];
+    // INF-1263 AC3: registerSlaSweepCron now also fires an immediate
+    // startup-kick tick (t=0) before the interval is armed, so the first
+    // 100ms advance below observes both the kick and the first interval
+    // tick — hence three tokens, not two.
+    const tokens = ["Bearer stale-token", "Bearer fresh-token", "Bearer freshest-token"];
     const seenAuth: string[] = [];
     const fetchFn = jest.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
       seenAuth.push(String((init?.headers as Record<string, string>)?.Authorization));
@@ -900,7 +904,7 @@ describe("AC5 — no per-ticket Linear API fan-out; configurable cadence", () =>
     try {
       await jest.advanceTimersByTimeAsync(100);
       await jest.advanceTimersByTimeAsync(100);
-      expect(seenAuth).toEqual(["Bearer stale-token", "Bearer fresh-token"]);
+      expect(seenAuth).toEqual(["Bearer stale-token", "Bearer fresh-token", "Bearer freshest-token"]);
     } finally {
       clearInterval(timer as ReturnType<typeof setInterval>);
       jest.useRealTimers();

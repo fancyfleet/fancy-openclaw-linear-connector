@@ -127,13 +127,17 @@ export class DispatchWatchdog {
       `Dispatch watchdog started — ackTimeout=${this.config.ackTimeoutMs}ms ` +
       `maxResignals=${this.config.maxResignals} cycle=${this.config.cycleIntervalMs}ms`,
     );
-    this.timer = setInterval(() => {
+    const runCycleTick = () => {
       this.runCycle().catch((err) => {
         log.error(
           `Watchdog cycle error: ${err instanceof Error ? err.message : String(err)}`,
         );
       });
-    }, this.config.cycleIntervalMs);
+    };
+    // INF-1263 AC3: kick off a first cycle immediately so deploy churn cannot
+    // starve the watchdog until its first interval tick.
+    setTimeout(runCycleTick, 0);
+    this.timer = setInterval(runCycleTick, this.config.cycleIntervalMs);
     this.timer.unref();
   }
 

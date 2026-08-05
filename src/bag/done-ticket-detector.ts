@@ -94,15 +94,22 @@ export class DoneTicketDetector {
       `graceHours=${config.graceHours} pollInterval=${config.pollIntervalMs}ms ` +
       `repoPath=${config.repoPath}`,
     );
-    this.timer = setInterval(() => {
+    // INF-1263 AC3: self-rescheduling setTimeout instead of setInterval — the
+    // first cycle fires immediately (deploy churn cannot starve it until a
+    // fixed-interval tick), and each subsequent cycle is scheduled only after
+    // the previous one settles, so a single timer handle exists at any time.
+    const runCycleTick = () => {
       this.runCycle().catch((err) => {
         log.error(
           `Done ticket detector cycle error: ${err instanceof Error ? err.message : String(err)}`,
         );
       }).finally(() => {
         markCronRun("done-ticket-detector");
+        this.timer = setTimeout(runCycleTick, config.pollIntervalMs);
+        this.timer.unref();
       });
-    }, config.pollIntervalMs);
+    };
+    this.timer = setTimeout(runCycleTick, 0);
     this.timer.unref();
   }
 

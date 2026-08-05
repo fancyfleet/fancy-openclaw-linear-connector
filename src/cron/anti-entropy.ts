@@ -521,7 +521,7 @@ export function registerAntiEntropyCron(opts?: {
 
   registerCron("anti-entropy", `every ${formatIntervalMs(intervalMs)}`);
 
-  const timer = setInterval(() => {
+  const tick = () => {
     void (async () => {
       try {
         const result = await runAntiEntropyPass({ authToken });
@@ -542,7 +542,12 @@ export function registerAntiEntropyCron(opts?: {
         markCronRun("anti-entropy");
       }
     })();
-  }, intervalMs);
+  };
+
+  // INF-1263 AC3: kick off a first pass immediately so deploy churn cannot
+  // starve anti-entropy detection until the first interval tick.
+  setTimeout(tick, 0);
+  const timer = setInterval(tick, intervalMs);
 
   timer.unref();
   return timer;

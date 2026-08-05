@@ -426,7 +426,7 @@ export function registerStalePlainDelegateCron(opts: {
     `every ${formatIntervalMs(intervalMs)} (stale=${formatIntervalMs(staleTimeoutMs)})`,
   );
 
-  const timer = setInterval(() => {
+  const tick = () => {
     const store = opts.operationalEventStore ?? new OperationalEventStore(":memory:");
     const alert = opts.alertBus ?? getAlertBus();
 
@@ -444,7 +444,12 @@ export function registerStalePlainDelegateCron(opts: {
     }).catch((err: unknown) => {
       log.error(`stale-plain-delegate: sweep error: ${err instanceof Error ? err.message : String(err)}`);
     });
-  }, intervalMs);
+  };
+
+  // INF-1263 AC3: kick off a first sweep immediately so deploy churn cannot
+  // starve it until the first interval tick.
+  setTimeout(tick, 0);
+  const timer = setInterval(tick, intervalMs);
 
   timer.unref();
   log.info(`stale-plain-delegate: cron registered (${intervalMs}ms, stale=${staleTimeoutMs}ms)`);

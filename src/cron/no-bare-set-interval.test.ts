@@ -21,6 +21,23 @@ const SRC_DIR = path.resolve(process.cwd(), "src");
 const NON_CRON_INTERVAL_FILES = new Set<string>([
   // Express/SSE connection heartbeat, not a cron/background driver.
   "admin-stream.ts",
+  // INF-1263: pure in-memory, per-process session tracker — all state resets
+  // on restart, so there is no cross-restart staleness for a startup kick to
+  // recover, and an immediate kick actively races the short-timeout unit
+  // tests that manually drive cleanupStale() (bag/session-tracker.test.ts).
+  "bag/session-tracker.ts",
+  // INF-1263: every cycle unconditionally calls loadWorkflowDef(), which
+  // reads a process-wide, test-mutated cache (workflow-gate.ts's
+  // _registryCache, invalidated via resetWorkflowCache()). createApp() wires
+  // this detector for real (non-fake) timers in hundreds of test files; an
+  // immediate kick races the many tests that assume no concurrent access to
+  // that cache while manipulating WORKFLOW_DEF_PATH — confirmed concretely
+  // via proxy.test.ts's "malformed workflow def YAML" test, which passes in
+  // isolation but fails when the kick is live and other describe blocks in
+  // the same file don't stop this detector between tests. The detector's own
+  // interval already provides restart-churn coverage at a low-risk cadence;
+  // the credential sweeps (AC4) are the ticket's actual dark-cron target.
+  "bag/stuck-delegate-detector.ts",
 ]);
 
 function tsFiles(dir: string): string[] {

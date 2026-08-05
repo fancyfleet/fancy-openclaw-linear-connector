@@ -264,7 +264,11 @@ async function bootOneReconciliationTick(): Promise<NodeJS.Timeout> {
     intervalMs: 100,
     wakeFn: async () => {},
   });
-  await jest.advanceTimersByTimeAsync(100);
+  // INF-1263 AC3: registerBootstrapReconciliationCron now also fires an
+  // immediate startup-kick tick (t=0) before the interval is armed. Advance
+  // only enough to observe that single kick — advancing past the 100ms
+  // interval too would run reconciliation twice against the same fixture.
+  await jest.advanceTimersByTimeAsync(0);
   await Promise.resolve();
   return timer;
 }

@@ -239,8 +239,10 @@ export function registerConfigSanityAlertCron(): void {
   registerCron("config-sanity-alert", `every ${formatIntervalMs(intervalMs)}`);
   scheduled = true;
 
-  // Run the first cycle immediately, then on the interval.
-  setImmediate(() => {
+  // Run the first cycle immediately, then on the interval. INF-1263 AC3:
+  // setTimeout(..., 0) rather than setImmediate so a deploy-churn restart
+  // cannot starve the first cycle until the next interval tick.
+  setTimeout(() => {
     try {
       const count = runCycle();
       if (count > 0) {
@@ -253,7 +255,7 @@ export function registerConfigSanityAlertCron(): void {
     } finally {
       markCronRun("config-sanity-alert");
     }
-  });
+  }, 0);
 
   const timer = setInterval(() => {
     try {

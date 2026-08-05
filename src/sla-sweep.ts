@@ -358,7 +358,7 @@ const DEFAULT_CADENCE_MS = 5 * 60 * 1000; // 5 minutes
 export function registerSlaSweepCron(opts: SlaSweepOptions): ReturnType<typeof setInterval> {
   const cadenceMs = opts.cadenceMs ?? DEFAULT_CADENCE_MS;
   registerCron("sla-sweep", `every ${formatIntervalMs(cadenceMs)}`);
-  const timer = setInterval(() => {
+  const tick = () => {
     runSlaSweep(opts).catch((err) => {
       // Sweep errors are non-fatal (result.errors captures per-ticket issues),
       // but a whole-sweep failure (e.g. unreadable workflowDefPath) must not
@@ -367,7 +367,11 @@ export function registerSlaSweepCron(opts: SlaSweepOptions): ReturnType<typeof s
     }).finally(() => {
       markCronRun("sla-sweep");
     });
-  }, cadenceMs);
+  };
+  // INF-1263 AC3: kick off a first sweep immediately so deploy churn cannot
+  // starve it until the first interval tick.
+  setTimeout(tick, 0);
+  const timer = setInterval(tick, cadenceMs);
   if (typeof timer.unref === "function") timer.unref();
   return timer;
 }

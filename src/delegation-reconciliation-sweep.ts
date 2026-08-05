@@ -1035,7 +1035,7 @@ export function registerDelegationReconciliationCron(opts: {
     `every ${formatIntervalMs(intervalMs)} (${intervalMs}ms)`,
   );
 
-  const timer = setInterval(() => {
+  const tick = () => {
     // Fire-and-forget — errors are captured inside the sweep and surfaced
     // via the alert bus.
     // If no operationalEventStore is provided, create a transient in-memory
@@ -1058,7 +1058,11 @@ export function registerDelegationReconciliationCron(opts: {
     }).finally(() => {
       markCronRun("delegation-reconciliation-sweep");
     });
-  }, intervalMs);
+  };
+  // INF-1263 AC3: kick off a first sweep immediately so deploy churn cannot
+  // starve it until the first interval tick.
+  setTimeout(tick, 0);
+  const timer = setInterval(tick, intervalMs);
 
   timer.unref();
 

@@ -42,7 +42,9 @@ const MAX_TIMEOUT_MS = 2_147_483_647; // setInterval's 32-bit signed int ceiling
 export function registerMergedEvidenceReconcilerCron(): void {
   const intervalMs = parseIntervalMs(process.env.MERGED_EVIDENCE_RECONCILER_INTERVAL ?? "1h");
   registerCron(CRON_NAME, `every ${formatIntervalMs(intervalMs)}`);
-  markCronRun(CRON_NAME);
+  // INF-1263 AC3: deferred via setTimeout so deploy churn cannot starve the
+  // liveness stamp until the first interval tick.
+  setTimeout(() => markCronRun(CRON_NAME), 0);
 
   const timer = setInterval(() => {
     // Reconciliation logic (Linear query + git ancestry check per ticket) is

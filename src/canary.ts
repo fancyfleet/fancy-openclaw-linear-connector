@@ -68,6 +68,7 @@ export type CanaryAlertCallback = (result: CanaryResult) => void;
 // ── Singleton state ────────────────────────────────────────────────────────
 
 let canaryTimer: ReturnType<typeof setInterval> | null = null;
+let canaryInitialCheckTimer: ReturnType<typeof setTimeout> | null = null;
 let canaryConfig: CanaryConfig | null = null;
 let consecutiveFailures = 0;
 let lastResult: CanaryResult | null = null;
@@ -106,10 +107,16 @@ export function startCanary(config: CanaryConfig): void {
 
   log.info(`canary: starting with interval=${intervalMs}ms fixture=${config.fixtureTicketId}`);
 
-  // Run first check immediately.
-  runCheck().catch((err) => {
-    log.error(`canary: initial check threw: ${err instanceof Error ? err.message : String(err)}`);
-  });
+  // Run first check immediately (INF-1263 AC3: deferred via setTimeout so
+  // deploy churn cannot starve it until the first interval tick). Tracked so
+  // stopCanary() can cancel it before it fires (e.g. a stop shortly after
+  // start, as tests do between cases).
+  canaryInitialCheckTimer = setTimeout(() => {
+    canaryInitialCheckTimer = null;
+    runCheck().catch((err) => {
+      log.error(`canary: initial check threw: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }, 0);
 
   canaryTimer = setInterval(() => {
     runCheck().catch((err) => {
@@ -126,6 +133,10 @@ export function stopCanary(): void {
   if (canaryTimer) {
     clearInterval(canaryTimer);
     canaryTimer = null;
+  }
+  if (canaryInitialCheckTimer) {
+    clearTimeout(canaryInitialCheckTimer);
+    canaryInitialCheckTimer = null;
   }
   // Unsubscribe from config-health alerts to prevent leak on restart.
   if (configHealthUnsub) {

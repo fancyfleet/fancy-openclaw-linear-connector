@@ -104,7 +104,7 @@ export function registerLabelSyncAuditCron(opts: LabelSyncAuditOptions): ReturnT
   );
 
   registerCron("label-sync-audit", `every ${formatIntervalMs(intervalMs)}`);
-  const timer = setInterval(() => {
+  const tick = () => {
     void (async () => {
       try {
         const result = await runLabelSyncAuditPass(opts);
@@ -122,7 +122,12 @@ export function registerLabelSyncAuditCron(opts: LabelSyncAuditOptions): ReturnT
         markCronRun("label-sync-audit");
       }
     })();
-  }, intervalMs);
+  };
+
+  // INF-1263 AC3: kick off a first pass immediately so deploy churn cannot
+  // starve the audit until the first interval tick.
+  setTimeout(tick, 0);
+  const timer = setInterval(tick, intervalMs);
 
   timer.unref();
   return timer;

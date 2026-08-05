@@ -705,7 +705,7 @@ describe("AC2 — dropped webhook: anti-entropy detects and reconciles missed ba
 // ── AC3: Cadence, alerting, standing loop ──────────────────────────────────
 
 describe("AC3 — anti-entropy runs on a cadence and alerts on drift", () => {
-  it("registerAntiEntropyCron returns a timer handle that can be cleared", () => {
+  it("registerAntiEntropyCron returns a timer handle that can be cleared", async () => {
     const { fetch } = makeMockFetch({ issues: [] });
     globalThis.fetch = fetch;
 
@@ -714,9 +714,13 @@ describe("AC3 — anti-entropy runs on a cadence and alerts on drift", () => {
     expect(timer).toBeDefined();
     // Must be clearable — no throw on clearInterval.
     expect(() => clearInterval(timer)).not.toThrow();
+    // INF-1263 AC3: registerAntiEntropyCron also fires a real (non-fake-timer)
+    // immediate startup kick; flush it here so its callback settles against
+    // THIS test's harmless mock fetch instead of leaking into a later test.
+    await new Promise((resolve) => setTimeout(resolve, 0));
   });
 
-  it("registerAntiEntropyCron uses ANTI_ENTROPY_INTERVAL env var when no option given", () => {
+  it("registerAntiEntropyCron uses ANTI_ENTROPY_INTERVAL env var when no option given", async () => {
     process.env.ANTI_ENTROPY_INTERVAL = "900000"; // 15 min
     const { fetch } = makeMockFetch({ issues: [] });
     globalThis.fetch = fetch;
@@ -726,11 +730,18 @@ describe("AC3 — anti-entropy runs on a cadence and alerts on drift", () => {
     expect(timer).toBeDefined();
     clearInterval(timer);
     delete process.env.ANTI_ENTROPY_INTERVAL;
+    // INF-1263 AC3: flush the real immediate startup kick before this test
+    // ends (see rationale in the previous test).
+    await new Promise((resolve) => setTimeout(resolve, 0));
   });
 
   it("registerAntiEntropyCron resolves authToken on each scheduled tick", async () => {
     jest.useFakeTimers();
-    const tokens = ["Bearer stale-token", "Bearer fresh-token"];
+    // INF-1263 AC3: registerAntiEntropyCron now also fires an immediate
+    // startup-kick tick (t=0) before the interval is armed, so the first
+    // 100ms advance below observes both the kick and the first interval
+    // tick — hence three tokens, not two.
+    const tokens = ["Bearer stale-token", "Bearer fresh-token", "Bearer freshest-token"];
     const seenAuth: string[] = [];
     globalThis.fetch = jest.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
       seenAuth.push(String((init?.headers as Record<string, string>)?.Authorization));
@@ -745,7 +756,7 @@ describe("AC3 — anti-entropy runs on a cadence and alerts on drift", () => {
     try {
       await jest.advanceTimersByTimeAsync(100);
       await jest.advanceTimersByTimeAsync(100);
-      expect(seenAuth).toEqual(["Bearer stale-token", "Bearer fresh-token"]);
+      expect(seenAuth).toEqual(["Bearer stale-token", "Bearer fresh-token", "Bearer freshest-token"]);
     } finally {
       clearInterval(timer);
       jest.useRealTimers();

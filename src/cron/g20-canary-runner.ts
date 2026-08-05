@@ -89,13 +89,17 @@ export function registerG20CanaryCron(): void {
   // Register only on the scheduling path — a skipped canary (no ticket id)
   // must not appear in /health as if it were live (AI-1810).
   registerCron("g20-canary", `every ${formatIntervalMs(intervalMs)}`);
-  const timer = setInterval(() => {
+  const tick = () => {
     runG20Canary(config).catch((err) => {
       log.error(`[G-20 CANARY] Scheduled run threw: ${err instanceof Error ? err.message : String(err)}`);
     }).finally(() => {
       markCronRun("g20-canary");
     });
-  }, intervalMs);
+  };
+  // INF-1263 AC3: kick off a first run immediately so deploy churn cannot
+  // starve the canary until the first interval tick.
+  setTimeout(tick, 0);
+  const timer = setInterval(tick, intervalMs);
   timer.unref();
   log.info(`[G-20 CANARY] Scheduled every ${intervalMs}ms against ticket ${canaryTicketId} (G20_CANARY_INTERVAL=${process.env.G20_CANARY_INTERVAL ?? "15m"})`);
 }

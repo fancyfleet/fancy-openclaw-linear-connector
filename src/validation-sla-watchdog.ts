@@ -440,15 +440,7 @@ export function registerValidationWatchdogCron(
     `states=${opts.watchedStates ?? DEFAULT_WATCHED_STATES}`,
   );
 
-  void runValidationWatchdog(opts)
-    .then(() => markCronRun("validation-watchdog"))
-    .catch((err) => {
-      console.error(
-        `[validation-watchdog] startup sweep failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    });
-
-  const timer = setInterval(() => {
+  const tick = () => {
     runValidationWatchdog(opts)
       .then(() => markCronRun("validation-watchdog"))
       .catch((err) => {
@@ -456,7 +448,13 @@ export function registerValidationWatchdogCron(
           `[validation-watchdog] sweep failed: ${err instanceof Error ? err.message : String(err)}`,
         );
       });
-  }, cadenceMs);
+  };
+
+  // INF-1263 AC3: startup sweep deferred via setTimeout(..., 0) (was a
+  // synchronous fire-and-forget call) so deploy churn cannot starve it until
+  // the first interval tick.
+  setTimeout(tick, 0);
+  const timer = setInterval(tick, cadenceMs);
   if (typeof timer.unref === "function") timer.unref();
   return timer;
 }
