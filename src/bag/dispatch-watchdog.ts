@@ -102,6 +102,11 @@ export class DispatchWatchdog {
   /** AI-2116: last cycle result summary for /health liveness. */
   lastCycleResult?: { resignaled: number; escalated: number; autoAcknowledged: number };
 
+  /** INF-1272: read-only accessor so callers don't need to cast onto the private config field. */
+  getConfig(): WatchdogConfig {
+    return this.config;
+  }
+
   constructor(deps: WatchdogDeps, config?: Partial<WatchdogConfig>) {
     this.deps = deps;
     this.config = {
