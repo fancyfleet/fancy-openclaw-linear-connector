@@ -321,7 +321,7 @@ describe("G-13 AC1: cap-missing rejection names every legal command", () => {
         cell.caller.linearUserId ?? null,
       );
       expect(result).not.toBeNull();
-      for (const legalCmd of cell.legalCommands) {
+      for (const legalCmd of cell.legalVerbs) {
         expect(result).toContain(legalCmd);
       }
     },
@@ -357,7 +357,7 @@ describe("G-13 AC1: wrong-delegate rejection names every legal command", () => {
         cell.caller.linearUserId ?? null,
       );
       expect(result).not.toBeNull();
-      for (const legalCmd of cell.legalCommands) {
+      for (const legalCmd of cell.legalVerbs) {
         expect(result).toContain(legalCmd);
       }
     },
@@ -393,7 +393,7 @@ describe("G-13 AC1: human-signoff rejection names every legal command", () => {
         cell.caller.linearUserId ?? null,
       );
       expect(result).not.toBeNull();
-      for (const legalCmd of cell.legalCommands) {
+      for (const legalCmd of cell.legalVerbs) {
         expect(result).toContain(legalCmd);
       }
     },
@@ -429,7 +429,7 @@ describe("G-13 AC1: unknown-caller rejection names every legal command", () => {
         null,
       );
       expect(result).not.toBeNull();
-      for (const legalCmd of cell.legalCommands) {
+      for (const legalCmd of cell.legalVerbs) {
         expect(result).toContain(legalCmd);
       }
     },
@@ -453,7 +453,7 @@ describe("G-13 AC2: stale/empty legal set is caught", () => {
   afterEach(() => { globalThis.fetch = originalFetch; });
 
   // Extend the 'deployment' state with a new command that no existing message hardcodes.
-  const NEW_COMMAND = "rollback-g13";
+  const NEW_COMMAND = "handoff-rollback-g13";
   const extendedDef: WorkflowDef = {
     ...testDef,
     states: testDef.states.map((s) => {

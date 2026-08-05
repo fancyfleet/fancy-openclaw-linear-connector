@@ -3298,7 +3298,7 @@ export function resolveStakesLevel(labels: string[], stakesConfig: StakesLevel):
 const SPECIAL_ROUTINE_COMMANDS = new Set([
   "handoff", "force-deploy", "reseat-merge",
   "wait", "waive", "park", "hold",
-  "demote", "retire", "cancel", "abandon", "escalate",
+  "demote", "retire", "cancel", "abandon", "escalate", "needs-human",
   "start-cycle", // begin-workflow entry meta-intent, not a mid-flow continue
 ]);
 /** Native states that mark a state terminal (no routine forward needed). */
@@ -3326,6 +3326,7 @@ function isAbortDestination(def: WorkflowDef, id: string): boolean {
 function isSpecialTransition(def: WorkflowDef, stateId: string, t: WorkflowTransition): boolean {
   if (def.break_glass?.command && t.command === def.break_glass.command) return true;
   if (SPECIAL_ROUTINE_COMMANDS.has(t.command)) return true;
+  if (t.command === "handoff" || t.command.startsWith("handoff-")) return true; // handoff + deprecated aliases (handoff-host-deploy)
   if (t.designated_approver) return true; // opt-in sign-off authority, not a spine verb
   if (typeof t.to === "string" && t.to.startsWith("__")) return true; // __ad_hoc__/park sentinels
   if (t.to === stateId) return true; // self-loop (handoff-style re-seat)
@@ -3440,10 +3441,19 @@ export function resolveRoutineEdge(
       (t) => classifyRoutineTransition(def, node.id, t, r) === "revision",
     );
     if (revs.length === 0) return null;
-    if (revs.length > 1) {
-      return { error: `state '${node.id}' has ${revs.length} revision edges (${revs.map((m) => m.command).join(", ")}) -- send-back must be unique.` };
-    }
-    return { command: revs[0].command };
+    // Send-back is universal; when a state has several backward edges the
+    // connector picks one deterministically: an explicit `generic: revision`
+    // tag wins, else the nearest-prior destination, else declaration order.
+    const tagged = revs.find((t) => t.generic === "revision");
+    if (tagged) return { command: tagged.command };
+    const fromRank = r.get(node.id);
+    const nearest = [...revs].sort((a, b) => {
+      const ra = r.get(a.to); const rb = r.get(b.to);
+      const da = ra === undefined || fromRank === undefined ? Infinity : fromRank - ra;
+      const db = rb === undefined || fromRank === undefined ? Infinity : fromRank - rb;
+      return da - db;
+    })[0];
+    return { command: nearest.command };
   }
   const shape = analyzeStateRoutine(def, node, r);
   if (shape.shape === "linear") return { command: shape.forwardCommand };
@@ -3474,12 +3484,6 @@ function validateRoutineEdges(def: WorkflowDef): string[] {
     const shape = analyzeStateRoutine(def, state, rank);
     if (shape.shape === "ambiguous") {
       errors.push(`workflow '${def.id}': ${shape.detail}`);
-    }
-    const revs = (state.transitions ?? []).filter(
-      (t) => classifyRoutineTransition(def, state.id, t, rank) === "revision",
-    );
-    if (revs.length > 1) {
-      errors.push(`workflow '${def.id}': state '${state.id}' has ${revs.length} revision edges (${revs.map((m) => m.command).join(", ")}) -- send-back must be unique.`);
     }
   }
   return errors;
@@ -4249,7 +4253,7 @@ export async function checkWorkflowRules(
       return null;
     }
 
-    const legalMoves = [...transitions.map((t) => t.command), breakGlassCommand].join(", ");
+    const legalMoves = legalMovesFor(def, stateNode, breakGlassCommand);
     // AI-2055: `needs-human` is not a transition in any workflow def, so a governed
     // ticket rejects it here — before the mutation, so nothing is half-applied and no
     // delegate is stranded. The bare "not a legal command" text left an agent that is
@@ -4354,7 +4358,7 @@ export async function checkWorkflowRules(
   if (match.requires_capability && isCallerKnown && intent !== 'force-deploy') {
     const allowed = await bodyHasCapability(bodyId, match.requires_capability);
     if (!allowed) {
-      const legalMoves = [...transitions.map((t) => t.command), breakGlassCommand].join(", ");
+      const legalMoves = legalMovesFor(def, stateNode, breakGlassCommand);
       // INF-197: designated_approver gates need a more specific message naming
       // the approver so the steward knows who to handoff to (the generic
       // "deployment body" was unactionable).
@@ -4615,7 +4619,7 @@ export async function checkWorkflowRules(
         const isAgent = await isBodyKnown(bodyId);
         if (isAgent) {
           log.warn(`workflow-gate: stakes-threshold gate: ${intent} on ${issueId} blocked — stakes level ${ticketStakesLevel} >= threshold ${def.stakes.threshold}, caller '${bodyId}' is a known AI agent`);
-          const legalMoves = [...transitions.map((t) => t.command), breakGlassCommand].join(", ");
+          const legalMoves = legalMovesFor(def, stateNode, breakGlassCommand);
           return (
             `[Proxy] '${intent}' blocked: this ticket has elevated stakes (level ${ticketStakesLevel}) ` +
             `and requires human sign-off. AI agent '${bodyId}' cannot self-sign-off on high-stakes work. ` +

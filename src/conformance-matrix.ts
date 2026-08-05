@@ -19,6 +19,7 @@
  */
 
 import type { WorkflowDef } from './workflow-gate.js';
+import { cliVerbFor } from './workflow-gate.js';
 
 // ── Public types ───────────────────────────────────────────────────────────
 
@@ -56,6 +57,9 @@ export interface ConformanceCell {
   expected: 'allow' | 'block';
   blockReason?: 'wrong-state' | 'cap-missing' | 'wrong-delegate' | 'human-signoff' | 'unknown-caller' | 'wrong-owner-role';
   legalCommands: string[];
+  /** INF-1218: agent-facing verbs (literal spine verbs collapsed to
+   *  continue-workflow/request-revision) — what rejection messages now show. */
+  legalVerbs: string[];
   requiredCapability?: string;
 }
 
@@ -326,6 +330,12 @@ export function buildConformanceMatrix(
       ...(stateNode.transitions ?? []).map((t) => t.command),
       breakGlassCommand,
     ];
+    const legalVerbs = [
+      ...new Set([
+        ...(stateNode.transitions ?? []).map((t) => cliVerbFor(t, def, stateNode.id)),
+        breakGlassCommand,
+      ]),
+    ];
 
     // Build caller specs once per (state, callerKind) pair
     const specsForState = new Map<CallerKind, CallerSpec | null>(
@@ -362,6 +372,7 @@ export function buildConformanceMatrix(
             },
             expected: outcome.expected,
             legalCommands,
+            legalVerbs,
           };
 
           if (outcome.blockReason) cell.blockReason = outcome.blockReason;

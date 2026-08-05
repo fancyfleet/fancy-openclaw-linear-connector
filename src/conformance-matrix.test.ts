@@ -588,7 +588,7 @@ describe("buildConformanceMatrix — AC2: wrong-state rejection names legal comm
         cell.caller.linearUserId ?? null,
       );
       expect(result).not.toBeNull();
-      for (const legalCmd of cell.legalCommands.filter((c) => c !== cell.command)) {
+      for (const legalCmd of cell.legalVerbs.filter((c) => c !== cell.command)) {
         expect(result).toContain(legalCmd);
       }
     },
