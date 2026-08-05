@@ -94,4 +94,36 @@ describe("checkDeployDrift (AC1/AC4)", () => {
     expect(typeof result.checkedAt).toBe("string");
     expect(Date.parse(result.checkedAt)).toBeGreaterThanOrEqual(before);
   });
+
+  // Production asymmetry (found live on PR #696 / commit 34e8130c): `git rev-parse
+  // --short HEAD` (live side, via resolveStartupCommit) picks a dynamic
+  // disambiguation length that can exceed 7 chars, while resolveMainCommit()
+  // hardcodes .slice(0, 7). Same commit, different abbreviation lengths, must
+  // NOT be reported as drift.
+  it("does not report drift when live and main are different-length abbreviations of the same commit", async () => {
+    const mod = await loadModule();
+    let alerted = false;
+    const result = await mod.checkDeployDrift({
+      getLiveCommit: async () => "34e8130c",
+      getMainCommit: async () => "34e8130",
+      onDrift: () => {
+        alerted = true;
+      },
+    });
+    expect(result.driftDetected).toBe(false);
+    expect(result.alertRaised).toBe(false);
+    expect(alerted).toBe(false);
+    expect(result.liveCommit).toBe("34e8130c");
+    expect(result.mainCommit).toBe("34e8130");
+  });
+
+  it("still reports drift when different-length commits do not share a common prefix", async () => {
+    const mod = await loadModule();
+    const result = await mod.checkDeployDrift({
+      getLiveCommit: async () => "abc1234",
+      getMainCommit: async () => "9999999x",
+    });
+    expect(result.driftDetected).toBe(true);
+    expect(result.alertRaised).toBe(true);
+  });
 });
