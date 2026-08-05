@@ -3,7 +3,7 @@
 # The canonical fixture is a mirror of the registered-def (INF-723 single-source rule).
 
 id: dev-impl
-version: 19
+version: 20
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
 
@@ -32,6 +32,11 @@ break_glass:
   command: escape               # x-openclaw-linear-intent value that triggers break-glass (§4.4)
   to: intake   # AI-1710: escape re-enters at intake, not a terminal
   owner_role: steward           # implicit escape edge from EVERY state (design.md §4.4)
+
+migrations:
+  doing: implementation
+  needs-info: implementation
+  rejected: implementation
 
 states:
 
@@ -71,6 +76,9 @@ states:
     # so an implementer can never fudge test robustness to pass their own work.
     # test-author is NOT a dev body, so it can never be assigned implementation.
     transitions:
+      - command: reject
+        to: intake
+        assign: { mode: none }
       - command: tests-ready
         to: implementation
         assign: { mode: required }     # dev is multi-body (felix/noah/sage/igor) — target required, validated vs dev role
@@ -85,26 +93,13 @@ states:
     kind: normal
     native_state: todo           # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
     sla: 72h                    # G-5: per-state SLA; longer than code-review (days of work vs 24h review cap)
-    # entered from write-tests/tests-ready, code-review/request-changes,
-    # merge/reject, deploy/reject, ac-validate/ac-fail — one dev work-phase,
-    # no awaiting-vs-doing split. Dev makes the failing tests pass.
-    commitment_gate:
-      exits:
-        accept:
-          to: doing
-        reject:
-          to: rejected
-        not-ready:
-          to: needs-info
+    # entered from write-tests/tests-ready, code-review/reject, merge/reject,
+    # deploy/reject, ac-validate/reject — one dev work-phase, no awaiting-vs-doing
+    # split. Dev makes the failing tests pass.
     transitions:
-      - command: accept
-        to: doing
       - command: reject
-        to: rejected
-        requires_comment: true
-      - command: not-ready
-        to: needs-info
-        requires_comment: true
+        to: write-tests
+        assign: { mode: none }
       - command: submit
         to: code-review
         generic: continue
@@ -120,57 +115,23 @@ states:
         to: implementation
         assign:
           mode: required          # caller must specify the delegate target
-
-  - id: doing
-    owner_role: dev
-    kind: normal
-    native_state: doing          # commitment accepted; active implementation work has begun
-    sla: 72h
-    transitions:
-      - command: submit
-        to: code-review
-        generic: continue
-        requires_comment: true
-        assign:
-          mode: required
-          constraint: not-implementer
-      - command: handoff
-        to: doing
-        assign:
-          mode: required
-
-  - id: needs-info
-    owner_role: dev
-    kind: normal
-    native_state: todo
-    transitions:
-      - command: handoff
-        to: needs-info
-        assign:
-          mode: required
-
-  - id: rejected
-    kind: terminal
-    native_state: invalid
-
   - id: code-review
     owner_role: code-review
     kind: normal
     native_state: todo           # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
     sla: 24h                    # time-in-state; breach → stall escalation (design.md §5.5)
-    # Review contract (v8): reviewer runs the FULL test suite. Any red ⇒
-    # request-changes with the failing tests named in feedback. `approve` is
-    # legal only when the suite is green AND code quality satisfies the reviewer.
+    # Review contract (v20): reviewer runs the FULL test suite. Any red ⇒
+    # reject with the failing tests named in feedback. `approve` is legal only
+    # when the suite is green AND code quality satisfies the reviewer.
     # AI-1872: approve now routes to `merge` (not the old `deployment`).
     transitions:
       - command: approve
         to: merge
         assign: { mode: auto }     # merge is singleton (Hanzo) — auto-assign
-      - command: request-changes
+      - command: reject
         to: implementation
         generic: revision
-        requires_comment: true
-        assign: { default: prior-implementer }
+        assign: { mode: none }
         feedback:
           required: true
           category_enum:
@@ -205,9 +166,8 @@ states:
         requires_human_signoff_above_stakes: true
         assign: { mode: auto }     # deploy is singleton (Grover for connector fleet) — auto-assign
       - command: reject
-        to: implementation
-        requires_comment: true
-        assign: { default: prior-implementer }
+        to: code-review
+        assign: { mode: none }
         feedback:
           required: true
           category_enum:
@@ -243,8 +203,7 @@ states:
         assign: { mode: auto }     # ac-validate steward is singleton (Astrid) — auto-assign
       - command: reject
         to: implementation
-        requires_comment: true
-        assign: { default: prior-implementer }
+        assign: { mode: none }
         feedback:
           required: true
           category_enum:
@@ -279,10 +238,9 @@ states:
         to: done
         requires_deploy_probe: true
         # terminal → no assignment
-      - command: ac-fail
+      - command: reject
         to: implementation
-        requires_comment: true
-        assign: { default: prior-implementer }
+        assign: { mode: none }
         feedback:
           required: true
           category_enum:
