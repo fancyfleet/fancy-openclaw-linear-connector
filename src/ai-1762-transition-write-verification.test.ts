@@ -381,7 +381,7 @@ describe("proxy — AI-1762 transition write verification + bounded retry", () =
 
     expect(res.status).toBe(200);
     expect(res.body._workflowTransition.status).toBe("failed");
-    expect(res.body._workflowTransition.code).toBe("transition-write-unverified");
+    expect(res.body._workflowTransition.code).toBe("post-write-diverge");
     expect(res.body._workflowTransition.detail).toMatch(/delegate/);
     // Bounded retry: default policy is 3 forward attempts, then one rollback write.
     expect(forwardAtomicCalls(calls).length).toBe(3);

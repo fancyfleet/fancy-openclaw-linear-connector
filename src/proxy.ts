@@ -1221,8 +1221,9 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           transitionSource: "migrate-state",
         });
         if (!migrateResult.ok) {
-          log.warn(`migrate-state-audit agent=${agentId} authorized=true result=state-write-failed${ticketCtx} target=${migrateTarget}: ${migrateResult.error}`);
-          res.status(200).json({ errors: [{ message: `[Proxy] migrate-state failed: ${migrateResult.error}` }] });
+          const failCode = migrateResult.code ?? "unknown";
+          log.warn(`migrate-state-audit agent=${agentId} authorized=true result=state-write-failed code=${failCode}${ticketCtx} target=${migrateTarget}: ${migrateResult.error}`);
+          res.status(200).json({ errors: [{ message: `[Proxy] migrate-state failed (${failCode}): ${migrateResult.error}` }] });
           return;
         }
 

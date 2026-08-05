@@ -284,7 +284,8 @@ describe("setStateAtomic (AI-1546)", () => {
     });
     const result = await setStateAtomic("AI-9999", "done", undefined, "Bearer test-token", { force: true });
     expect(result.ok).toBe(false);
-    expect(result.error).toMatch(/consistency check failed/);
+    expect(result.error).toMatch(/post-write-diverge/);
+    expect(result.code).toBe("post-write-diverge");
   });
 
   // AC3 — works from terminal source state (escape → implementation re-open)
@@ -322,6 +323,35 @@ describe("setStateAtomic (AI-1546)", () => {
     const result = await setStateAtomic("AI-9999", "done", undefined, "Bearer test-token", { force: true });
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/atomic issueUpdate mutation failed/);
+    expect(result.code).toBe("atomic-mutation-failed");
+  });
+
+  // INF-1268 Phase 2 — structured post-write-diverge code on verification failure
+  it("INF-1268 Phase 2: returns code=post-write-diverge when verification fails after retries", async () => {
+    // Mutation succeeds but the read-back never reflects the target state —
+    // simulating a partial write (label changed but delegate/native dropped).
+    globalThis.fetch = makeSetStateFetch({
+      fromLabels: ["wf:dev-impl", "state:implementation"],
+      updateSuccess: true,
+      consistencyLabels: ["wf:dev-impl", "state:implementation"], // stale — never converges
+    });
+    const result = await setStateAtomic("AI-9999", "done", undefined, "Bearer test-token", { force: true });
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe("post-write-diverge");
+    expect(result.error).toMatch(/post-write-diverge/);
+    expect(result.error).toMatch(/did not persist/);
+  });
+
+  // INF-1268 Phase 2 — mutation failure gets a distinct code from verification failure
+  it("INF-1268 Phase 2: mutation failure returns code=atomic-mutation-failed (not post-write-diverge)", async () => {
+    globalThis.fetch = makeSetStateFetch({
+      fromLabels: ["wf:dev-impl", "state:implementation"],
+      updateSuccess: false,
+    });
+    const result = await setStateAtomic("AI-9999", "done", undefined, "Bearer test-token", { force: true });
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe("atomic-mutation-failed");
+    expect(result.code).not.toBe("post-write-diverge");
   });
 
   // AC4 — network error during mutation also returns ok:false cleanly

@@ -382,7 +382,7 @@ describe("proxy — INF-1222 governed transitions fail loudly + atomically on po
     const res = await flagWithSatisfiedBy();
 
     expect(res.body._workflowTransition?.status).toBe("failed");
-    expect(res.body._workflowTransition?.code).toBe("transition-write-unverified");
+    expect(res.body._workflowTransition?.code).toBe("post-write-diverge");
 
     // AC2: the connector's own atomicity mechanism (rollback-to-snapshot)
     // must actually have fired — the ticket must not be left half-advanced

@@ -7645,7 +7645,10 @@ export async function applyStateTransition(
       operationalEventStore: options?.operationalEventStore,
     });
     if (writeOutcome.failureKind === "verification") {
-      return { status: "failed", code: "transition-write-unverified", detail: `transition write did not persist after ${writeOutcome.attempts} attempt(s) — ${writeOutcome.divergent.join("; ")}`, from: currentStateName, to: toStateName };
+      // INF-1268 Phase 2: surface a structured post-write-diverge code so the
+      // caller (proxy → CLI → agent) sees a loud, machine-readable failure
+      // rather than a silent desync or an opaque string.
+      return { status: "failed", code: "post-write-diverge", detail: `transition write did not persist after ${writeOutcome.attempts} attempt(s) — ${writeOutcome.divergent.join("; ")}`, from: currentStateName, to: toStateName };
     }
     return { status: "failed", code: "atomic-mutation-failed", detail: `atomic issueUpdate (label + delegate + native state) did not apply after ${writeOutcome.attempts} attempt(s)`, from: currentStateName, to: toStateName };
   }
@@ -8725,6 +8728,13 @@ export interface SetStateAtomicResult {
   from: string | null;
   to: string;
   error?: string;
+  /**
+   * INF-1268 Phase 2: machine-readable failure code for structured surfacing.
+   * Set when ok=false and the failure kind is known — lets callers distinguish
+   * a post-write-diverge (verification failed after retries) from a mutation
+   * failure or a validation error, without parsing the human-readable error.
+   */
+  code?: "post-write-diverge" | "atomic-mutation-failed" | "validation-failed";
   /** Body name that received the re-dispatch after the state write, if any. */
   redispatched?: string;
   /** Observable wake path used after the state write. */
@@ -8858,8 +8868,12 @@ export async function setStateAtomic(
   authToken: string,
   options?: SetStateAtomicOptions,
 ): Promise<SetStateAtomicResult> {
-  const fail = (error: string, from: string | null = null): SetStateAtomicResult =>
-    ({ ok: false, ticketId: ticketIdentifier, from, to: targetState, error });
+  const fail = (
+    error: string,
+    from: string | null = null,
+    code?: SetStateAtomicResult["code"],
+  ): SetStateAtomicResult =>
+    ({ ok: false, ticketId: ticketIdentifier, from, to: targetState, error, ...(code ? { code } : {}) });
 
   // Step 1: Fetch current issue.
   const issue = await fetchIssueWithLabels(ticketIdentifier, authToken);
@@ -9024,10 +9038,14 @@ export async function setStateAtomic(
       operationalEventStore: options?.operationalEventStore,
     });
     if (writeOutcome.failureKind === "verification") {
-      log.warn(`workflow-gate: set-state: consistency check FAILED for ${ticketIdentifier} after ${writeOutcome.attempts} attempt(s) — ${writeOutcome.divergent.join("; ")}`);
-      return fail(`consistency check failed: write did not persist after ${writeOutcome.attempts} attempt(s) — ${writeOutcome.divergent.join("; ")}`, fromState);
+      log.warn(`workflow-gate: set-state: post-write-diverge for ${ticketIdentifier} after ${writeOutcome.attempts} attempt(s) — ${writeOutcome.divergent.join("; ")}`);
+      return fail(
+        `post-write-diverge: write did not persist after ${writeOutcome.attempts} attempt(s) — ${writeOutcome.divergent.join("; ")}`,
+        fromState,
+        "post-write-diverge",
+      );
     }
-    return fail("atomic issueUpdate mutation failed", fromState);
+    return fail("atomic issueUpdate mutation failed", fromState, "atomic-mutation-failed");
   }
 
   log.info(

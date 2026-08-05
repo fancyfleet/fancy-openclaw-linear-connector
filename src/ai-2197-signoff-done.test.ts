@@ -304,7 +304,7 @@ describe("AI-2197 — wf:task sign-off→done edge (silent decline fix)", () => 
 
     expect(result).toMatchObject({
       status: "failed",
-      code: "transition-write-unverified",
+      code: "post-write-diverge",
       from: "sign-off",
       to: "done",
     });
@@ -333,7 +333,7 @@ describe("AI-2197 — wf:task sign-off→done edge (silent decline fix)", () => 
 
     expect(result).toMatchObject({
       status: "failed",
-      code: "transition-write-unverified",
+      code: "post-write-diverge",
       from: "sign-off",
       to: "done",
     });
