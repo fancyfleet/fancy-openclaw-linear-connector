@@ -1153,7 +1153,7 @@ describe("proxy enforcement — B2 state-label transition application", () => {
     expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(false);
   });
 
-  it("returns the upstream response even when the B2 transition fails", async () => {
+  it("declines loudly (INF-1222) when the B2 transition fails, instead of passing through the upstream success response", async () => {
     const { fetch: mock, calls } = makeB2Fetch({
       b1LabelResponse: DEV_IMPL_IMPLEMENTATION_RESPONSE,
       updateSuccess: false,
@@ -1167,9 +1167,11 @@ describe("proxy enforcement — B2 state-label transition application", () => {
       .set("X-Openclaw-Linear-Intent", "submit")
       .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
 
-    // Agent response is still 200 even though label update returned non-success.
+    // INF-1222: the atomic write genuinely failed — the caller must be told
+    // loudly instead of seeing a false-success passthrough (the LIF-356 bug).
     expect(res.status).toBe(200);
-    expect(res.body.errors).toBeUndefined();
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.data?.issueUpdate?.success).not.toBe(true);
     expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(true);
   });
 });

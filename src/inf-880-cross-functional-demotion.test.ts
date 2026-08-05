@@ -393,7 +393,11 @@ describe("INF-880 cross-functional request demotion", () => {
         operationName: "AcceptWorkflow",
       });
 
-    expect(res.body.errors).toBeUndefined();
+    // AC7 is about demotion NOT firing on a governed transition, not about the
+    // transition's own write-verification outcome — this fixture's static
+    // mock never reflects a post-write state, so the transition's atomic
+    // write is always reported unverified (INF-1222 now surfaces that loudly
+    // instead of a silent false-success, independent of this AC).
     const updates = calls.filter((c) => c.query.includes("issueUpdate") && !c.query.includes("IssueContext"));
     expect(updates.some((c) => inputOf(c).stateId === "s-backlog")).toBe(false);
     expect(calls.some((c) => c.query.includes("commentCreate"))).toBe(false);

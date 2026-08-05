@@ -2004,27 +2004,38 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           transitionResult.code !== "ad-hoc" &&
           transitionResult.code !== "no-issue-id";
 
-        // INF-1147/INF-1228: a governed dev-impl forward transition (generic:continue
-        // OR the capture_ac accept forward) that does NOT fully apply must decline
-        // loudly — regardless of WHY it didn't apply. That covers both an atomic-write
-        // FAILURE (status: "failed") and a gate BLOCK (status: "blocked", any code —
-        // not just "ac-of-record-missing"; INF-1228 generalized this from the single
-        // code the original fix covered). In every case the forwarded placeholder
-        // mutation may have returned `data.issueUpdate.success: true`, but the
-        // transition tuple did NOT land — returning that success payload beside a
-        // non-applied `_workflowTransition` is the false-success the AC forbids.
+        // INF-1147/INF-1228/INF-1222: a governed transition that does NOT fully apply
+        // must decline loudly — regardless of WHY it didn't apply. Two paths:
+        //
+        // 1. (INF-1147/INF-1228) A governed dev-impl forward transition
+        //    (generic:continue OR capture_ac accept forward) whose atomic write
+        //    FAILED or was BLOCKED (any code). The forwarded placeholder mutation
+        //    may have returned `data.issueUpdate.success: true`, but the transition
+        //    tuple did NOT land — returning that success payload beside a
+        //    non-applied `_workflowTransition` is the false-success the AC forbids.
+        //
+        // 2. (INF-1222) Any other governed transition (peer verbs: submit,
+        //    continue-workflow, etc.) whose atomic write FAILED. Scoped to cases
+        //    with a resolved `to` state (actual write-stage failures, not
+        //    pre-identification) and an issueUpdate mutation body (not
+        //    commentCreate-carried payloads — those preserve their delivered
+        //    comment per AI-1809/AI-2472).
+        //
         // Replace the body with an explicit GraphQL error envelope (no `data`),
-        // carrying the decline reason. The delegate is now written only by the atomic
-        // write (see the strip above), so no split-brain delegate/state was written;
-        // do NOT emit the misleading "no state was changed" phrasing.
+        // carrying the decline reason. The delegate is now written only by the
+        // atomic write (see the strip above), so no split-brain delegate/state
+        // was written; do NOT emit the misleading "no state was changed" phrasing.
         const nonAppliedForward =
           (genericContinueForward || acCaptureAcceptForward) &&
           (transitionResult?.status === "failed" || transitionResult?.status === "blocked");
-        if (
+        const loudPeerFail =
           attachTransition &&
-          transitionResult &&
-          nonAppliedForward
-        ) {
+          !nonAppliedForward &&
+          transitionResult?.status === "failed" &&
+          transitionResult?.to != null &&
+          isIssueUpdateMutation(body);
+        const loudDecline = nonAppliedForward || loudPeerFail;
+        if (loudDecline && transitionResult) {
           const detail = transitionResult.detail
             ? `: ${transitionResult.detail}`
             : "";
