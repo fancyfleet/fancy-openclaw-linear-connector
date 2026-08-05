@@ -1,11 +1,11 @@
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import { PendingWorkBag } from "./pending-work-bag.js";
 import { SessionTracker } from "./session-tracker.js";
 import { resignalPendingTickets, type ResignalOptions } from "./resignal.js";
 import type { WakeUpConfig } from "./wake-up.js";
 import type { OperationalEventStore } from "../store/operational-event-store.js";
 
-const log = componentLogger(createLogger(), "startup-replay");
+const log = createModuleLogger("startup-replay", "info");
 
 const DEFAULT_INTER_AGENT_DELAY_MS = 500;
 

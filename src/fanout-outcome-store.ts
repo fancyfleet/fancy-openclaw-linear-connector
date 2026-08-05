@@ -21,9 +21,9 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "fanout-outcome-store");
+const log = createModuleLogger("fanout-outcome-store");
 
 /**
  * The types of fanout outcomes that can be recorded per parent.

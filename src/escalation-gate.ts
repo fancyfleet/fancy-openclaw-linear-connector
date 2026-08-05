@@ -17,11 +17,11 @@
 
 import fs from "node:fs/promises";
 import yaml from "js-yaml";
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { recordSuccess, recordFailure } from "./config-health.js";
 import { defaultCapabilityPolicyPath } from "./instance-config.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "escalation-gate");
+const log = createModuleLogger("escalation-gate");
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 

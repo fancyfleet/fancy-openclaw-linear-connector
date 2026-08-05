@@ -25,17 +25,14 @@
  *   STALE_PLAIN_DELEGATE_POLL_MS        — check interval (default: 15 min)
  */
 
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
 import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
 import { getRateLimitClient } from "./linear-rate-limit-client.js";
 
-const log = componentLogger(
-  createLogger(process.env.LOG_LEVEL ?? "info"),
-  "stale-plain-delegate",
-);
+const log = createModuleLogger("stale-plain-delegate");
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 

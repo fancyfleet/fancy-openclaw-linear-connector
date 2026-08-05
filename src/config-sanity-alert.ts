@@ -18,12 +18,12 @@
  * (Alert routing §).
  */
 
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { notify } from "./alerts/alert-bus.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
 import fs from "node:fs";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "config-sanity-alert");
+const log = createModuleLogger("config-sanity-alert");
 
 // ── Constants ───────────────────────────────────────────────────────────
 

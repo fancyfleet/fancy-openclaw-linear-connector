@@ -17,14 +17,14 @@
 import { OperationalEventStore } from "../store/operational-event-store.js";
 import { DispatchAckTracker } from "../bag/dispatch-ack-tracker.js";
 import { registerCron, formatIntervalMs, markCronRun } from "../cron/registry.js";
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import {
   deliverWithAck,
   type DeliverWithAckParams,
   type DeliverWithAckOutcome,
 } from "./deliver-with-ack.js";
 
-const log = componentLogger(createLogger(), "dispatch-delivery-scheduler");
+const log = createModuleLogger("dispatch-delivery-scheduler", "info");
 
 export interface DispatchDeliverySchedulerDeps {
   eventStore: OperationalEventStore;

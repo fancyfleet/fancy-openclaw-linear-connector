@@ -5,9 +5,9 @@
  */
 
 import { getAccessToken } from "./agents.js";
-import { createLogger, componentLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 
-const log = componentLogger(createLogger(), "agent-session");
+const log = createModuleLogger("agent-session", "info");
 const LINEAR_API = "https://api.linear.app/graphql";
 
 // Dedup: track recently-created sessions per issue

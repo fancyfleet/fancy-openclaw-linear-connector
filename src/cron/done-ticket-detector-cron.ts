@@ -10,7 +10,7 @@
  * AC11: Liveness observability — start() logs a startup confirmation.
  */
 
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import { execFileSync } from "node:child_process";
 import { resolveServiceCredential } from "../service-credential.js";
 import { formatIntervalMs, registerCron } from "./registry.js";
@@ -27,7 +27,7 @@ import {
   type CodePresence,
 } from "../bag/deploy-verdict.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "done-ticket-detector-cron");
+const log = createModuleLogger("done-ticket-detector-cron");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 // ── Options ──────────────────────────────────────────────────────────────────

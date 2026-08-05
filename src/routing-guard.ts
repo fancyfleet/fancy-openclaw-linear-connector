@@ -19,7 +19,7 @@
  * so a misconfigured connector never silently drops real work.
  */
 
-import { createLogger, componentLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { writeDelegate } from "./delegate-write.js";
 import { getAccessToken } from "./agents.js";
 import {
@@ -34,7 +34,7 @@ import { resolveBodiesForRole, resolveBodiesWithCapability, roleResolutionScopeF
 import { getBinding } from "./implementer-store.js";
 import { notify } from "./alerts/alert-bus.js";
 
-const log = componentLogger(createLogger(), "routing-guard");
+const log = createModuleLogger("routing-guard", "info");
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 

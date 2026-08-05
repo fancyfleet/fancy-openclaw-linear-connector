@@ -12,11 +12,11 @@ import {
   getAgentWorkspaceDir,
   getLinearSecretPath,
 } from "fancy-openclaw-linear-skill-cli";
-import { createLogger, componentLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { recordSuccess, recordFailure } from "./config-health.js";
 import { notify } from "./alerts/alert-bus.js";
 
-const log = componentLogger(createLogger(), "agents");
+const log = createModuleLogger("agents", "info");
 
 export interface AgentConfig {
   name: string;

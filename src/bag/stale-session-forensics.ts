@@ -15,14 +15,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import { getAccessToken, getAgent, getLinearUserIdForAgent, getOpenclawAgentName } from "../agents.js";
 import { tryNormalizeSessionKey } from "../session-key.js";
 import { setStateAtomic } from "../workflow-gate.js";
 import { GlobalRedispatchBudget } from "./global-redispatch-budget.js";
 import { StaleRedispatchCounter } from "./stale-redispatch-counter.js";
 
-const log = componentLogger(createLogger(), "stale-forensics");
+const log = createModuleLogger("stale-forensics", "info");
 
 // Re-export the tracker type so callers can use a single import
 export type { StaleSessionDetail } from "./session-tracker.js";

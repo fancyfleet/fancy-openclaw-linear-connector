@@ -1,4 +1,5 @@
-import { componentLogger, createLogger, type Logger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
+import type { Logger } from "../logger.js";
 import { AlertStore, defaultDedupKey, type AlertInput, type AlertSeverity } from "./alert-store.js";
 import { sendThroughChain } from "./push-transports.js";
 import { emitStreamTopic } from "../admin-stream.js";
@@ -64,7 +65,7 @@ export class AlertBus {
   private now: () => Date;
 
   constructor(options: AlertBusOptions = {}) {
-    this.log = options.log ?? componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "alert");
+    this.log = options.log ?? createModuleLogger("alert");
     let store: AlertStore | null = options.store ?? null;
     if (!store) {
       try {

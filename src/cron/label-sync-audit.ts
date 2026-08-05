@@ -8,12 +8,12 @@
  * Also supports on-webhook trigger (single-ticket check) via checkLabelSyncForTicket.
  */
 
-import { componentLogger, createLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
 import { checkLabelSyncForTicket, emitLabelSyncWarning, type LabelSyncDivergence } from "../transition-audit.js";
 import type { EnrolledTicketsStore } from "../store/enrolled-tickets-store.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "label-sync-audit");
+const log = createModuleLogger("label-sync-audit");
 
 export interface LabelSyncAuditOptions {
   authToken: string | (() => string);

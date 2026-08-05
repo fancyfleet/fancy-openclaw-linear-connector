@@ -14,14 +14,11 @@
  * Folded into the same cron check rather than a separate timer.
  */
 
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
 import { runRegistryPolicyCheck } from "./registry-policy.js";
 
-const log = componentLogger(
-  createLogger(process.env.LOG_LEVEL ?? "info"),
-  "registry-integrity",
-);
+const log = createModuleLogger("registry-integrity");
 
 /** Default cadence: run every 24 hours. */
 const DEFAULT_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h

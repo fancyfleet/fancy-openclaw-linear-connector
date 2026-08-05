@@ -7,11 +7,11 @@
  *   3. Label-sync audit — compare proxy-store (applied-state-store) state against Linear's live state.
  */
 
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { getAppliedState } from "./store/applied-state-store.js";
 import type { TransitionApplyResult } from "./workflow-gate.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "transition-audit");
+const log = createModuleLogger("transition-audit");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 // ── Types ──────────────────────────────────────────────────────────────────

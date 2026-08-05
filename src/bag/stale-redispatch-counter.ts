@@ -1,8 +1,8 @@
 import Database from "better-sqlite3";
 import path from "path";
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 
-const log = componentLogger(createLogger(), "stale-redispatch-counter");
+const log = createModuleLogger("stale-redispatch-counter", "info");
 
 export class StaleRedispatchCounter {
   private db: Database.Database;

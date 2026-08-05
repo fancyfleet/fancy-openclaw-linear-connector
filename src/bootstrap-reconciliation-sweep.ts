@@ -30,7 +30,7 @@
  *   - Error-tolerant: a Linear API error alerts and does not kill the loop.
  */
 
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { writeDelegate } from "./delegate-write.js";
 import {
   fetchIssueContext,
@@ -46,7 +46,7 @@ import { resolveBodiesForRole } from "./escalation-gate.js";
 import { boundSeatFor } from "./implementer-store.js";
 import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "bootstrap-reconciliation");
+const log = createModuleLogger("bootstrap-reconciliation");
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 

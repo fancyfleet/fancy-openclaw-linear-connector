@@ -16,10 +16,10 @@
  * If no callback arrives within a timeout, sessions are assumed ended.
  */
 
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import { normalizeSessionKey } from "../session-key.js";
 
-const log = componentLogger(createLogger(), "session-tracker");
+const log = createModuleLogger("session-tracker", "info");
 
 const DEFAULT_SESSION_TIMEOUT_MS = 25 * 60 * 1000; // 25 minutes
 

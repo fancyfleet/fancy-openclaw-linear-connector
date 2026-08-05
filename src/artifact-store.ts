@@ -12,9 +12,9 @@
  * Design: design.md §5.7 item 1, §14b.
  */
 
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "artifact-store");
+const log = createModuleLogger("artifact-store");
 
 /** A bound artifact record. */
 export interface BoundArtifact {

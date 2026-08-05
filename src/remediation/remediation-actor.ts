@@ -15,7 +15,7 @@
  *  - `healthy-suppressed:*` is exempt from everything — always no-action.
  */
 
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import type {
   FailureClass,
   RemediationAction,
@@ -27,7 +27,7 @@ import type {
   RemediationResult,
 } from "./remediation-types.js";
 
-const log = componentLogger(createLogger(), "remediation-actor");
+const log = createModuleLogger("remediation-actor", "info");
 
 // ── Configuration ──────────────────────────────────────────────────────────
 

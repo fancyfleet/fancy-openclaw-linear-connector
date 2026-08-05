@@ -15,9 +15,9 @@
 import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
-import { componentLogger, createLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "observation-store");
+const log = createModuleLogger("observation-store");
 
 /**
  * The reason codes a row may carry.

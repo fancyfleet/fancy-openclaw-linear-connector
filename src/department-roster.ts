@@ -26,9 +26,9 @@
 import fs from "node:fs/promises";
 import yaml from "js-yaml";
 import { defaultDepartmentRosterPath } from "./instance-config.js";
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "department-roster");
+const log = createModuleLogger("department-roster");
 
 /** A single department entry in the roster. */
 export interface Department {

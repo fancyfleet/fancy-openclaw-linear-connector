@@ -15,13 +15,13 @@
  * en masse.
  */
 
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import {
   SEC_LEAKED_CREDENTIAL_LABEL,
   anyCommentConfirmsRotation,
 } from "./leaked-credential-artifact.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "leaked-credential-sweep");
+const log = createModuleLogger("leaked-credential-sweep");
 
 /**
  * Idempotency marker the sweep posts when it reopens a ticket. Its presence

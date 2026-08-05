@@ -24,13 +24,13 @@
  * the reopen sweep (Layer 2).
  */
 
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import {
   SEC_LEAKED_CREDENTIAL_LABEL,
   anyCommentConfirmsRotation,
 } from "./leaked-credential-artifact.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "leaked-credential-gate");
+const log = createModuleLogger("leaked-credential-gate");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 /**

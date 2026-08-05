@@ -23,7 +23,7 @@
  *   WATCHDOG_CYCLE_INTERVAL_MS — how often the watchdog runs (default: 3 min)
  */
 
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import type { PendingWorkBag } from "./pending-work-bag.js";
 import type { SessionTracker } from "./session-tracker.js";
 import type { DispatchAckTracker } from "./dispatch-ack-tracker.js";
@@ -33,7 +33,7 @@ import { resignalPendingTickets, type ResignalOptions } from "./resignal.js";
 import type { WakeUpConfig } from "./wake-up.js";
 import { normalizeSessionKey } from "../session-key.js";
 
-const log = componentLogger(createLogger(), "dispatch-watchdog");
+const log = createModuleLogger("dispatch-watchdog", "info");
 
 const DEFAULT_ACK_TIMEOUT_MS = 10 * 60 * 1000;    // 10 minutes
 const DEFAULT_MAX_RESIGNALS = 3;

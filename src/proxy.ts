@@ -29,7 +29,7 @@
  */
 
 import type { Request, Response } from "express";
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { checkEnforcementRules, bodyHasCapability, getCapabilityPolicy, resolveBodiesForRole } from "./escalation-gate.js";
 import { checkLeakedCredentialGate } from "./leaked-credential-gate.js";
 import { checkStaleSnapshotForTerminal } from "./proxy-cas-check.js";
@@ -53,7 +53,7 @@ import { recordTransitionCarriedComment } from "./transition-comment-logic.js";
 import { LINEAR_PROXY_PROTOCOL_VERSION, minWorkflowCliVersion } from "./proxy-compatibility.js";
 import { findOrCreateLabel } from "./linear-helpers.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
+const log = createModuleLogger("proxy");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 /**

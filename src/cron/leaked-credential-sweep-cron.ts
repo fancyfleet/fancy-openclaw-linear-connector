@@ -10,7 +10,7 @@
  * inert until the `sec:leaked-credential` label is actually in use.
  */
 
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import { resolveServiceCredential } from "../service-credential.js";
 import { formatIntervalMs, registerCron, markCronRun } from "./registry.js";
 import {
@@ -20,7 +20,7 @@ import {
 } from "../leaked-credential-sweep.js";
 import { SEC_LEAKED_CREDENTIAL_LABEL } from "../leaked-credential-artifact.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "leaked-credential-sweep-cron");
+const log = createModuleLogger("leaked-credential-sweep-cron");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 export interface LeakedCredSweepCronOptions {

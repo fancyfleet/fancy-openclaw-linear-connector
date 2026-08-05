@@ -1,8 +1,8 @@
 import { Request, Response } from "express";
 import { getAgent, upsertAgent, AgentConfig } from "./agents.js";
-import { createLogger, componentLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 
-const log = componentLogger(createLogger(), "oauth-callback");
+const log = createModuleLogger("oauth-callback", "info");
 
 /**
  * Handles the OAuth callback from Linear.

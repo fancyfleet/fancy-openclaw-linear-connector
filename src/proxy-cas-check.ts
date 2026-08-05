@@ -14,9 +14,9 @@
  */
 
 import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
+const log = createModuleLogger("proxy");
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 

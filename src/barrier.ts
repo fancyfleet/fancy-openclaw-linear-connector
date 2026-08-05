@@ -35,7 +35,7 @@
  *   - Children cannot address the parent (asymmetry enforced).
  */
 
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { loadWorkflowDef, loadWorkflowDefById, loadWorkflowRegistry, getWorkflowId, getCurrentState, resolveNativeStateId, type WorkflowDef, type WorkflowState } from "./workflow-gate.js";
 import { getFanoutOutcome } from "./fanout-outcome-store.js";
 import { getAppliedState } from "./store/applied-state-store.js";
@@ -52,7 +52,7 @@ import {
 } from "./linear-helpers.js";
 import { isTerminalIssueState } from "./linear-actionable.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "barrier");
+const log = createModuleLogger("barrier");
 
 /**
  * AI-1992: barrier-ness is now declared per-state in YAML (`barrier: true`), not

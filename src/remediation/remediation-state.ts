@@ -11,14 +11,14 @@
  * the production entry point without needing a real failure_class event.
  */
 
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import type {
   RemediationHealth,
   RemediationRecord,
   RemediationResult,
 } from "./remediation-types.js";
 
-const log = componentLogger(createLogger(), "remediation-state");
+const log = createModuleLogger("remediation-state", "info");
 
 // ── In-memory store ────────────────────────────────────────────────────────
 

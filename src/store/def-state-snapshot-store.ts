@@ -29,9 +29,9 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { componentLogger, createLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "def-state-snapshot");
+const log = createModuleLogger("def-state-snapshot");
 
 /** Map of workflow def id → the state ids active in the last-activated version. */
 export type DefStateSnapshot = Record<string, string[]>;

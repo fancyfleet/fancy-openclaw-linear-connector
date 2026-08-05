@@ -29,12 +29,12 @@ import {
 } from "../workflow-gate.js";
 import { getAcRecord } from "../ac-record-store.js";
 import { getAppliedState } from "../store/applied-state-store.js";
-import { componentLogger, createLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import { defaultGuidanceDir } from "../instance-config.js";
 import { loadUniversalCanon, formatCanonBlock } from "../policy/universal-canon.js";
 import { remediateAgentToken } from "../agents.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "build-message");
+const log = createModuleLogger("build-message");
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" ? value as Record<string, unknown> : undefined;

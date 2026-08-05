@@ -24,7 +24,7 @@
  *   - → done is gated on the parent's own AC — not the sum of children (§5.6).
  */
 
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { fetchChildren, type ChildState } from "./barrier.js";
 import {
   LINEAR_API_URL,
@@ -35,7 +35,7 @@ import {
   fetchIssueWithLabels,
 } from "./linear-helpers.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "review");
+const log = createModuleLogger("review");
 
 // ── Types ─────────────────────────────────────────────────────────────────
 

@@ -18,10 +18,10 @@
  */
 
 import type { Request, Response } from "express";
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { getAgentByProxyToken } from "./agents.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy-upload");
+const log = createModuleLogger("proxy-upload");
 
 /** Maximum response size we'll buffer from uploads.linear.app (50 MB). */
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;

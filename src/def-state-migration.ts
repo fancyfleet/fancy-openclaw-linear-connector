@@ -21,13 +21,13 @@
  * `workflow-gate.ts` (`checkRawMutationInterception`, AC4).
  */
 
-import { createLogger, componentLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import type { WorkflowDef } from "./workflow-gate.js";
 import { getWorkflowId, getCurrentState } from "./workflow-gate.js";
 import { resolveBodiesForRole, roleResolutionScopeForOwnerRole } from "./escalation-gate.js";
 import type { OperationalEventInput } from "./store/operational-event-store.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "def-state-migration");
+const log = createModuleLogger("def-state-migration");
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 

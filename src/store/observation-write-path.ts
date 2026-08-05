@@ -49,9 +49,9 @@ import {
   UNCLASSIFIED_REASON_CODE,
   type ReasonCode,
 } from "./observation-store.js";
-import { componentLogger, createLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "observation-write-path");
+const log = createModuleLogger("observation-write-path");
 
 /** Where a resolved reason code came from. */
 export type ReasonCodeSource = "header" | "comment" | "fallback";

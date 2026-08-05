@@ -27,9 +27,9 @@
 
 import { registerCron, markCronRun, formatIntervalMs } from "./cron/registry.js";
 import { getFirstActionWatchdogState } from "./first-action-watchdog-state.js";
-import { createLogger, componentLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 
-const log = componentLogger(createLogger(), "native-state-reconciler");
+const log = createModuleLogger("native-state-reconciler", "info");
 
 const CRON_NAME = "native-state-reconciler";
 const DEFAULT_CADENCE_MS = 5 * 60 * 1000; // 5m

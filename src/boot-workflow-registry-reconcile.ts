@@ -1,10 +1,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import yaml from "js-yaml";
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { resetWorkflowCache } from "./workflow-gate.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "boot-workflow-registry-reconcile");
+const log = createModuleLogger("boot-workflow-registry-reconcile");
 
 export interface BootWorkflowRegistryReconcileResult {
   canonicalDir: string;

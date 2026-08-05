@@ -14,7 +14,7 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { loadWorkflowRegistry, type WorkflowDef } from "./workflow-gate.js";
 import { resolveBodiesForRole, roleResolutionScopeForOwnerRole } from "./escalation-gate.js";
 import { findOrCreateLabel, postComment } from "./linear-helpers.js";
@@ -23,7 +23,7 @@ import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import type { LinearEvent, LinearIssueCreatedEvent, LinearIssueUpdatedEvent } from "./webhook/schema.js";
 import { getAgents, getAccessToken } from "./agents.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-bootstrap");
+const log = createModuleLogger("workflow-bootstrap");
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 

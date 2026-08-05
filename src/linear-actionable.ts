@@ -1,9 +1,9 @@
 import { buildAgentMap, getAccessToken, getAgent } from "./agents.js";
-import { createLogger, componentLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { normalizeSessionKey } from "./session-key.js";
 import type { LinearEvent } from "./webhook/schema.js";
 
-const log = componentLogger(createLogger(), "linear-actionable");
+const log = createModuleLogger("linear-actionable", "info");
 
 const TERMINAL_STATE_TYPES = new Set(["completed", "canceled", "cancelled", "duplicate"]);
 const TERMINAL_STATE_NAMES = new Set(["done", "canceled", "cancelled", "duplicate"]);

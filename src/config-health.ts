@@ -17,9 +17,9 @@
  * Design: design.md §4.6, §16.0.
  */
 
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "config-health");
+const log = createModuleLogger("config-health");
 
 // ── Types ──────────────────────────────────────────────────────────────────
 

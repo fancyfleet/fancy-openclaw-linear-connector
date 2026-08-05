@@ -25,7 +25,7 @@
  * evaluation result is recorded on FanoutResult for inspection.
  */
 
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { findLabel, findOrCreateLabel } from "./linear-helpers.js";
 import { loadEnrollmentPolicy } from "./enrollment-policy.js";
 import { generateSpawnPreview, checkCaps, formatPreviewComment, formatCapRefusalComment, parseSpawnCaps, type SpawnPreview, type CapCheckResult, type SpawnCaps, type FindingInput } from "./spawn-preview.js";
@@ -33,7 +33,7 @@ import type { FanoutConfig, SpawnIfConfig, WorkflowDef } from "./workflow-gate.j
 import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
 import type { FanoutChildForVerification } from "./post-fanout-child-verification.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "fanout");
+const log = createModuleLogger("fanout");
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 

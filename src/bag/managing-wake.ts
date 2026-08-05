@@ -12,9 +12,9 @@
 
 import { deliverMessageToAgent, type DeliveryConfig, type DeliveryResult } from "../delivery/index.js";
 import { normalizeSessionKey } from "../session-key.js";
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 
-const log = componentLogger(createLogger(), "managing-wake");
+const log = createModuleLogger("managing-wake", "info");
 
 export interface ManagingWakeTicket {
   identifier: string;

@@ -22,7 +22,7 @@
 import { runRescueSweep } from "../rescue-sweep.js";
 import type { OperationalEventStore } from "../store/operational-event-store.js";
 import { loadWorkflowRegistry } from "../workflow-gate.js";
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
 import { resolveServiceCredential } from "../service-credential.js";
 import {
@@ -31,7 +31,7 @@ import {
   recordRescueSweepFail,
 } from "../rescue-sweep-state.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "rescue-sweep-cron");
+const log = createModuleLogger("rescue-sweep-cron");
 
 /** Parse a duration string like "1h", "30m", "3600s" or raw milliseconds. */
 function parseIntervalMs(value: string): number {

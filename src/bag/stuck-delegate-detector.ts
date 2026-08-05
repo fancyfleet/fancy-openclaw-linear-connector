@@ -34,7 +34,7 @@
  *   STUCK_DELEGATE_MAX_PROMPTS      — max re-prompts per ticket (default: 2)
  */
 
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import { getAccessToken, getAgents, isAgentLocal, isPolledForLinear, type AgentConfig } from "../agents.js";
 import { loadWorkflowDef, getCurrentState, getWorkflowId, type WorkflowDef } from "../workflow-gate.js";
 import type { OperationalEventStore } from "../store/operational-event-store.js";
@@ -45,7 +45,7 @@ import { deliverMessageToAgent, type DeliveryConfig } from "../delivery/index.js
 import type { DispatchAckTracker } from "./dispatch-ack-tracker.js";
 import { isBlockedByOpenIssue, isHumanLinearUser, type LinearIssueRelation, type LinearUserReference } from "../linear-actionable.js";
 
-const log = componentLogger(createLogger(), "stuck-delegate-detector");
+const log = createModuleLogger("stuck-delegate-detector", "info");
 
 const DEFAULT_POLL_MS = 5 * 60 * 1000;       // 5 minutes
 const DEFAULT_IDLE_GRACE_MS = 3 * 60 * 1000;  // 3 minutes
