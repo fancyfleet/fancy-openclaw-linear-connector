@@ -25,7 +25,6 @@ import {
   fetchIssueContext,
   applyBootstrapToIssue,
 } from "./workflow-bootstrap.js";
-import { autoEnrollPlainDelegation } from "./workflow-gate.js";
 import { isBlockedByOpenIssue, isTerminalIssueState, type LinearIssueRelation } from "./linear-actionable.js";
 import { getAgentIdForLinearUserId, getOpenclawAgentName } from "./agents.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
@@ -837,58 +836,12 @@ export async function runDelegationReconciliationSweep(
         // Fall through to use ticket.updatedAt as before
       }
 
-      const isPlainDelegation = ticket.plainDelegation || !hasWfLabel(ticket.labels);
-      if (isPlainDelegation) {
-        try {
-          const enrollResult = await autoEnrollPlainDelegation(
-            ticket.id,
-            authToken,
-            (info) => {
-              operationalEventStore.append({
-                outcome: "auto-enrolled",
-                agent: info.delegateAgentName ?? ticket.delegateName,
-                key: `linear-${ticket.identifier}`,
-                detail: {
-                  mode: "plain-delegation-reconciliation",
-                  ticket: ticket.identifier,
-                  workflowId: info.workflowId,
-                  entryState: info.entryState,
-                  delegate: info.delegateAgentName ?? ticket.delegateName,
-                },
-              });
-            },
-            opts.enrolledTicketsStore,
-            delegateAgentName,
-            delegationTimestamp,
-          );
-          if (enrollResult.enrolled) {
-            log.info(
-              `delegation-reconciliation: auto-enrolled plain delegated ticket ` +
-              `${ticket.identifier} → wf:${enrollResult.workflowId ?? "task"} state:${enrollResult.entryState ?? "doing"}`,
-            );
-          }
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          result.errors.push(`plain delegation enrollment failed for ${ticket.identifier}: ${msg}`);
-          operationalEventStore.append({
-            outcome: "delegation-reconciliation-failed",
-            agent: ticket.delegateName,
-            key: `linear-${ticket.identifier}`,
-            errorSummary: msg,
-            detail: {
-              mode: "plain-delegation-enrollment-failure",
-              ticket: ticket.identifier,
-            },
-          });
-          alertBus.notify({
-            severity: "warning",
-            source: "delegation-reconciled",
-            title: `Delegation reconciliation enrollment failed for ${ticket.identifier}`,
-            detail: { error: msg },
-            ticket: ticket.identifier,
-          });
-        }
-      }
+      // INF-1243: plain delegated tickets (no wf:* label) reconcile via the
+      // normal dispatch/wake path below without ever being enrolled into a
+      // workflow. Workflows are opt-in via an explicit wf:* label — there is
+      // no substitute default for plain delegation. (Reverts the enrollment
+      // side-effect added in INF-334 / PR #431; the reconciliation dispatch
+      // fix it also introduced is untouched.)
 
       if (
         hasDispatchSinceDelegation(
