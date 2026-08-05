@@ -116,6 +116,31 @@ const DEFUNCT_TICKET_RESPONSE = {
   },
 };
 
+// Full issue shape returned by setStateAtomic's fetchIssueWithLabels (IssueWithLabels
+// query). The ticket is stranded at state:deployment (a defunct state with no map),
+// which is the case migrate-state exists to rescue.
+const DEFUNCT_ISSUE_WITH_LABELS = {
+  data: {
+    issue: {
+      id: "issue-1857",
+      identifier: "INF-1857",
+      creator: { id: "user-matt" },
+      title: "Stranded ticket",
+      description: "",
+      team: { id: "team-1", key: "INF", name: "Infra" },
+      labels: {
+        nodes: [
+          { id: "lbl-wf", name: "wf:dev-impl", team: { id: "team-1" } },
+          { id: "lbl-deployment", name: "state:deployment", team: { id: "team-1" } },
+        ],
+      },
+      delegate: { id: "user-hanzo" },
+      assignee: null,
+      state: { id: "native-doing", name: "In Progress", type: "started" },
+    },
+  },
+};
+
 const MOCK_MUTATION_SUCCESS = { data: { issueUpdate: { success: true } } };
 
 const MIGRATE_MUTATION = {
@@ -180,15 +205,132 @@ afterEach(() => {
   delete process.env.WORKFLOW_DEF_PATH;
 });
 
+// Post-write issue shape: after the atomic issueUpdate lands, the verification
+// re-fetch (IssueWithLabels) must read back the MIGRATED state so the write verifies.
+const MIGRATED_ISSUE_WITH_LABELS = {
+  data: {
+    issue: {
+      id: "issue-1857",
+      identifier: "INF-1857",
+      creator: { id: "user-matt" },
+      title: "Stranded ticket",
+      description: "",
+      team: { id: "team-1", key: "INF", name: "Infra" },
+      labels: {
+        nodes: [
+          { id: "lbl-wf", name: "wf:dev-impl", team: { id: "team-1" } },
+          { id: "lbl-acvalidate", name: "state:ac-validate", team: { id: "team-1" } },
+        ],
+      },
+      delegate: { id: "user-astrid" },
+      assignee: null,
+      state: { id: "native-doing", name: "In Progress", type: "started" },
+    },
+  },
+};
+
 function makeFetch(labelResponse: object, mutationResponse = MOCK_MUTATION_SUCCESS): typeof globalThis.fetch {
+  // Track whether the atomic issueUpdate write has landed. Before it does,
+  // IssueWithLabels returns the defunct (pre-migration) shape; after it lands,
+  // the verification re-fetch returns the migrated shape so the write verifies.
+  let writeLanded = false;
   return (async (url: unknown, init?: RequestInit) => {
     if (typeof url !== "string" || !url.includes("api.linear.app")) {
       return originalFetch(url as never, init);
     }
     const bodyText = typeof init?.body === "string" ? init.body : "";
     const parsed = bodyText ? (JSON.parse(bodyText) as { query?: string }) : {};
+    // setStateAtomic's fetchIssueWithLabels (and the atomic write's verification
+    // re-fetch) use the IssueWithLabels query — return the full issue shape.
+    if (parsed.query?.includes("IssueWithLabels")) {
+      const shape = writeLanded ? MIGRATED_ISSUE_WITH_LABELS : DEFUNCT_ISSUE_WITH_LABELS;
+      return new Response(JSON.stringify(shape), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    // setStateAtomic's read-after-write consistency check uses VerifyTransitionWrite
+    // (labels/delegate/state by id) — a distinct query from IssueWithLabels. After
+    // the atomic write lands, return the migrated shape so the write verifies.
+    if (parsed.query?.includes("VerifyTransitionWrite") || parsed.query?.includes("PreAuthWriteCheck")) {
+      const migrated = MIGRATED_ISSUE_WITH_LABELS.data.issue;
+      const defunct = DEFUNCT_ISSUE_WITH_LABELS.data.issue;
+      const src = writeLanded ? migrated : defunct;
+      return new Response(
+        JSON.stringify({
+          data: {
+            issue: {
+              labels: { nodes: src.labels.nodes.map((l) => ({ name: l.name })) },
+              delegate: src.delegate ? { id: src.delegate.id } : null,
+              assignee: null,
+              state: src.state,
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    // findOrCreateLabel's TeamLabels lookup — return the existing labels plus the
+    // target state:ac-validate label so resolution succeeds without a create.
+    if (parsed.query?.includes("TeamLabels")) {
+      return new Response(
+        JSON.stringify({
+          data: {
+            team: {
+              labels: {
+                nodes: [
+                  { id: "lbl-wf", name: "wf:dev-impl", isGroup: false, team: { id: "team-1" }, parent: null },
+                  { id: "lbl-deployment", name: "state:deployment", isGroup: false, team: { id: "team-1" }, parent: null },
+                  { id: "lbl-acvalidate", name: "state:ac-validate", isGroup: false, team: { id: "team-1" }, parent: null },
+                ],
+              },
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    // resolveNativeStateId's TeamStates lookup — return the native states so 'doing'
+    // resolves to a native state id.
+    if (parsed.query?.includes("TeamStates")) {
+      return new Response(
+        JSON.stringify({
+          data: {
+            team: {
+              states: {
+                nodes: [
+                  { id: "native-todo", name: "Todo", type: "unstarted" },
+                  { id: "native-doing", name: "In Progress", type: "started" },
+                  { id: "native-done", name: "Done", type: "completed" },
+                ],
+              },
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
     if (parsed.query?.includes("IssueContext") || parsed.query?.includes("IssueLabels") || parsed.query?.includes("delegate")) {
       return new Response(JSON.stringify(labelResponse), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    // The atomic write's post-write verification re-fetch (VerifyTransitionWrite) —
+    // return the migrated shape so the write verifies (labels + delegate + native state).
+    if (parsed.query?.includes("VerifyTransitionWrite")) {
+      return new Response(
+        JSON.stringify({
+          data: {
+            issue: {
+              labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:ac-validate" }] },
+              delegate: { id: "user-astrid" },
+              assignee: null,
+              state: { id: "native-doing" },
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    // The atomic issueUpdate mutation — mark the write as landed so the next
+    // IssueWithLabels verification re-fetch returns the migrated shape.
+    if (parsed.query?.includes("issueUpdate")) {
+      writeLanded = true;
     }
     return new Response(JSON.stringify(mutationResponse), { status: 200, headers: { "Content-Type": "application/json" } });
   }) as typeof globalThis.fetch;

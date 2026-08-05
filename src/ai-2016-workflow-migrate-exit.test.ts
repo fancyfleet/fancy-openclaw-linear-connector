@@ -245,12 +245,30 @@ function proxyFetch(opts: {
   prResponse?: object;
 }): typeof globalThis.fetch {
   const { contextLabels, delegate, withIdsState, nativeState, prResponse } = opts;
+
+  // INF-1268: setStateAtomic now performs a read-after-write consistency check
+  // (VerifyTransitionWrite) after the atomic ApplyAtomicTransition mutation. A
+  // static mock that always returns the pre-state makes that check correctly
+  // report a divergence. Track the written state so the mock reflects the
+  // mutation: once ApplyAtomicTransition lands, subsequent reads return the
+  // migrated-to state/native/delegate. Label/state ids map back to names via
+  // the TEAM_LABELS / TEAM_STATES fixtures.
+  const labelIdToName = new Map<string, string>(
+    TEAM_LABELS.data.team.labels.nodes.map((l) => [l.id, l.name] as [string, string]),
+  );
+  const stateIdToNode = new Map<string, { id: string; name: string; type: string }>(
+    TEAM_STATES.data.team.states.nodes.map((s) => [s.id, s] as [string, { id: string; name: string; type: string }]),
+  );
+  let liveLabels = [...contextLabels];
+  let liveNative = nativeState;
+  let liveDelegate = delegate;
+
   return async (url, init) => {
     if (typeof url !== "string" || !url.includes("api.linear.app")) {
       throw new Error(`unexpected non-Linear fetch: ${url}`);
     }
     const bodyText = typeof init?.body === "string" ? init.body : "{}";
-    const parsed = JSON.parse(bodyText) as { query?: string };
+    const parsed = JSON.parse(bodyText) as { query?: string; variables?: Record<string, unknown> };
     const q = parsed.query ?? "";
 
     const json = (payload: object) =>
@@ -261,11 +279,12 @@ function proxyFetch(opts: {
 
     // Delegate/labels context.
     if ((q.includes("IssueContext") || q.includes("IssueLabels")) && !q.includes("IssueWithLabels") && !q.includes("IssueBranchAndPR")) {
-      return json(contextFor("", delegate, contextLabels, nativeState));
+      return json(contextFor("", liveDelegate, liveLabels, liveNative));
     }
     // Label IDs.
     if (q.includes("IssueWithLabels")) {
-      return json(withIdsFor(withIdsState));
+      const currentState = (liveLabels.find((l) => l.startsWith("state:")) ?? "state:").slice("state:".length);
+      return json(withIdsFor(currentState || withIdsState));
     }
     if (q.includes("TeamLabels")) return json(TEAM_LABELS);
     if (q.includes("TeamStates")) return json(TEAM_STATES);
@@ -273,20 +292,35 @@ function proxyFetch(opts: {
     if (q.includes("IssueBranchAndPR")) {
       return json(prResponse ?? NO_PR_ATTACHMENTS);
     }
-    // Mutations succeed.
+    // The atomic write: flip the mock's live state to whatever was written.
+    if (q.includes("ApplyAtomicTransition")) {
+      const vars = parsed.variables ?? {};
+      const writtenLabelIds = Array.isArray(vars.labelIds) ? (vars.labelIds as string[]) : [];
+      const writtenNames = writtenLabelIds
+        .map((id) => labelIdToName.get(id))
+        .filter((n): n is string => typeof n === "string");
+      const wfLabels = liveLabels.filter((l) => l.startsWith("wf:"));
+      const writtenStateLabel = writtenNames.find((n) => n.startsWith("state:"));
+      liveLabels = [...wfLabels, ...(writtenStateLabel ? [writtenStateLabel] : liveLabels.filter((l) => l.startsWith("state:")))];
+      if (typeof vars.stateId === "string" && stateIdToNode.has(vars.stateId)) {
+        liveNative = stateIdToNode.get(vars.stateId)!;
+      }
+      if (typeof vars.delegateId === "string") {
+        liveDelegate = vars.delegateId;
+      }
+      return json({ data: { issueUpdate: { success: true } } });
+    }
+    // Read-after-write verification reflects the migrated state.
     if (q.includes("VerifyTransitionWrite") || q.includes("PreAuthWriteCheck")) {
       return json({
         data: {
           issue: {
-            labels: { nodes: contextLabels.map((n) => ({ name: n })) },
-            delegate: delegate ? { id: delegate } : null,
-            state: nativeState,
+            labels: { nodes: liveLabels.map((n) => ({ name: n })) },
+            delegate: liveDelegate ? { id: liveDelegate } : null,
+            state: liveNative,
           },
         },
       });
-    }
-    if (q.includes("ApplyAtomicTransition")) {
-      return json({ data: { issueUpdate: { success: true } } });
     }
     return json({ data: { commentCreate: { success: true, comment: { id: "c-1" } }, issueUpdate: { success: true } } });
   };

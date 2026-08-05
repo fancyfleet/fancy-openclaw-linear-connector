@@ -1196,25 +1196,60 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           return;
         }
 
-        // Authorized + valid target — audit like escape and forward the migration.
+        // Authorized + valid target — audit like escape, then carry the migration
+        // through setStateAtomic (INF-1268 Phase 1). The pre-fix path forwarded the
+        // raw mutation body straight to the Linear API, bypassing applyStateTransition
+        // entirely: the label/native state changed on the surface, but the connector
+        // ledger (recordAppliedState), the delegate write, and the dispatch wake were
+        // all skipped — so the very next governed command read desynced state and
+        // no-op'd/blocked (the "fell through / no-op'd" symptom Astrid hit). Routing
+        // through setStateAtomic makes the write atomic and re-dispatches the target
+        // state's owner_role so the migrated ticket actually moves.
         log.warn(`migrate-state-audit agent=${agentId} authorized=true${ticketCtx} target=${migrateTarget}`);
-        deps?.operationalEventStore?.append({ outcome: "def-state-migrated", type: "def-state-migration", agent: agentId, key: issueId ?? undefined, detail: { target: migrateTarget, via: "steward-verb" } });
 
-        let migrateRes: globalThis.Response;
-        try {
-          migrateRes = await fetch(LINEAR_API_URL, {
-            method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: authorization },
-            body: JSON.stringify(body),
-          });
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          log.error(`migrate-state upstream request failed: ${msg}`);
-          res.status(200).json({ errors: [{ message: `Linear API unreachable: ${msg}. No state was changed.`, extensions: { code: "UPSTREAM_TIMEOUT" } }] });
+        const migrateResult = await setStateAtomic(issueId ?? "", migrateTarget, undefined, authorization, {
+          sendWakeUp: deps?.fanoutWakeFn,
+          operationalEventStore: deps?.operationalEventStore,
+          enrolledTicketsStore: deps?.enrolledTicketsStore,
+          transitionSource: "migrate-state",
+        });
+        if (!migrateResult.ok) {
+          log.warn(`migrate-state-audit agent=${agentId} authorized=true result=state-write-failed${ticketCtx} target=${migrateTarget}: ${migrateResult.error}`);
+          res.status(200).json({ errors: [{ message: `[Proxy] migrate-state failed: ${migrateResult.error}` }] });
           return;
         }
-        const migrateText = await migrateRes.text();
-        res.status(migrateRes.status).set("Content-Type", "application/json").send(migrateText);
+
+        log.warn(`migrate-state-audit agent=${agentId} authorized=true${ticketCtx} ${migrateResult.from ?? "(unknown)"}→${migrateTarget}${migrateResult.redispatched ? ` redispatched=${migrateResult.redispatched}` : ""}`);
+        deps?.operationalEventStore?.append({ outcome: "def-state-migrated", type: "def-state-migration", agent: agentId, key: issueId ?? undefined, detail: { from: migrateResult.from, target: migrateTarget, via: "steward-verb", redispatched: migrateResult.redispatched } });
+        deps?.mutationAuditStore?.append({
+          source: "proxy",
+          ticket: issueId ?? "",
+          changeType: "state",
+          oldValue: migrateResult.from,
+          newValue: migrateTarget,
+          actorId: agentId,
+          opName: "migrate-state",
+          intent: "steward break-glass forward migration (INF-1268)",
+        });
+
+        // Audit comment naming the steward, mirroring the rewind path's receipt.
+        const migrateCommentIssueId = migrateResult.internalId ?? issueId;
+        if (migrateCommentIssueId) {
+          const commentBody =
+            `[Steward migrate-state by ${agentId}] state:${migrateResult.from ?? "?"} -> state:${migrateTarget} — break-glass forward recovery (INF-1268). Carried through setStateAtomic: label + native state + delegate + connector ledger atomically, with re-dispatch to the target owner role${migrateResult.redispatched ? ` (${migrateResult.redispatched})` : ""}.`;
+          await fetch(LINEAR_API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: authorization },
+            body: JSON.stringify({
+              query: `mutation($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } } }`,
+              variables: { issueId: migrateCommentIssueId, body: commentBody },
+            }),
+          }).catch((err: unknown) => {
+            log.warn(`migrate-state audit comment failed for ${migrateCommentIssueId}: ${err instanceof Error ? err.message : String(err)}`);
+          });
+        }
+
+        res.status(200).json({ data: { migrateState: { success: true, from: migrateResult.from, to: migrateTarget, redispatched: migrateResult.redispatched ?? null } } });
         return;
       }
 
