@@ -281,7 +281,10 @@ describe("DelegatePingPongDetector", () => {
     test("starts suppressing dispatch when cycle threshold is reached", async () => {
       const config: Partial<DelegatePingPongConfig> = { maxBounces: 2, windowMs: 60000 };
       const tracker = new DelegateChainTracker(config);
-      const detector = new DelegatePingPongDetector(tracker, config);
+      // Non-exempt resolver: this test verifies the suppression path. Hanzo is
+      // the merge-gate owner and is exempt by default (INF-574), which would let
+      // the dispatch through — the exempt path has its own test below.
+      const detector = new DelegatePingPongDetector(tracker, config, undefined, async () => false);
 
       const now = Date.now();
       const ticketId = "GEN-263";
@@ -299,6 +302,28 @@ describe("DelegatePingPongDetector", () => {
       expect(r3.suppressDispatch).toBe(true);
       expect(r3.detection!.hasCycle).toBe(true);
       expect(r3.detection!.cyclingDelegates).toContain("user-hanzo");
+    });
+
+    test("merge-gate terminal target is exempt — cycle observed but dispatch NOT suppressed (INF-574)", async () => {
+      const config: Partial<DelegatePingPongConfig> = { maxBounces: 2, windowMs: 60000 };
+      const tracker = new DelegateChainTracker(config);
+      // Exempt resolver: the target fills the terminal merge-gate role, so a
+      // detected cycle must NOT suppress the dispatch (INF-573/INF-574).
+      const detector = new DelegatePingPongDetector(tracker, config, undefined, async () => true);
+
+      const now = Date.now();
+      const ticketId = "GEN-263";
+
+      await detector.checkAndHandle(ticketId, "user-hanzo", "Hanzo", now);
+      await detector.checkAndHandle(ticketId, "user-ai", "Ai", now + 1000);
+      const r3 = await detector.checkAndHandle(ticketId, "user-hanzo", "Hanzo", now + 2000);
+
+      // The cycle is still detected...
+      expect(r3.detection!.hasCycle).toBe(true);
+      expect(r3.detection!.cyclingDelegates).toContain("user-hanzo");
+      // ...but a terminal merge-gate target is exempt: dispatch allowed, no escalation.
+      expect(r3.suppressDispatch).toBe(false);
+      expect(r3.escalation).toBeNull();
     });
 
     test("single handoff between two delegates never trips cycle", async () => {
@@ -325,7 +350,9 @@ describe("DelegatePingPongDetector", () => {
       const config: Partial<DelegatePingPongConfig> = { maxBounces: 2, windowMs: 60000 };
       const eventStore = new OperationalEventStore(path.join(dir, "events.db"));
       const tracker = new DelegateChainTracker(config);
-      const detector = new DelegatePingPongDetector(tracker, config, eventStore);
+      // Non-exempt resolver — verify the cycle-detected operational event on the
+      // suppression path (Hanzo would otherwise be exempt, INF-574).
+      const detector = new DelegatePingPongDetector(tracker, config, eventStore, async () => false);
 
       const now = Date.now();
       const ticketId = "GEN-263";
@@ -376,7 +403,10 @@ describe("Integration: simulated ping-pong", () => {
     const dir = tempDir();
     const eventStore = new OperationalEventStore(path.join(dir, "events.db"));
     const tracker = new DelegateChainTracker(config);
-    const detector = new DelegatePingPongDetector(tracker, config, eventStore);
+    // Non-exempt resolver — this integration case verifies suppression fires on a
+    // real cycle. Hanzo is the merge-gate owner (exempt by default, INF-574); the
+    // exempt path is covered by its own test below.
+    const detector = new DelegatePingPongDetector(tracker, config, eventStore, async () => false);
 
     const now = Date.now();
     const ticketId = "GEN-263";
