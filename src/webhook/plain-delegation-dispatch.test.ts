@@ -251,7 +251,13 @@ describe("INF-334 plain delegation webhook dispatch", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  test("AC1/AC5: delegate set on a no-wf ticket dispatches a plain wake to that delegate", async () => {
+  // INF-1243: inverted from the original INF-334 "AC1/AC5" expectation. Plain
+  // delegation must still dispatch the wake (DOCS-20 shape), but must NEVER
+  // stamp wf:*/state:* labels — auto-enrollment on plain delegation is now a
+  // regression, not a feature. The prior assertion here
+  // (`expect(labelUpdates).toEqual([["label-wf-task", "label-state-doing"]])`)
+  // documented the exact behavior this ticket removes.
+  test("INF-1243 (was AC1/AC5): delegate set on a no-wf ticket dispatches a plain wake and stamps zero wf:*/state:* labels", async () => {
     const dispatched: Array<{ agentId: string; ticketId: string }> = [];
     const app = createTestApp((agentId, ticketId) => dispatched.push({ agentId, ticketId }));
 
@@ -267,8 +273,10 @@ describe("INF-334 plain delegation webhook dispatch", () => {
     expect(deliveries[0].message).not.toContain("This is a [");
     expect(deliveries[0].message).not.toContain("Your legal action(s)");
     expect(deliveries[0].message).not.toContain("state: **");
-    await waitFor(() => labelUpdates.length === 1);
-    expect(labelUpdates).toEqual([["label-wf-task", "label-state-doing"]]);
+    // Give the (would-be) fire-and-forget enrollment call a chance to land
+    // before asserting its absence — it is not awaited by the handler.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(labelUpdates).toEqual([]);
   });
 
   test("AC4: delegate clear is quiet, and re-delegation dispatches the new delegate", async () => {
