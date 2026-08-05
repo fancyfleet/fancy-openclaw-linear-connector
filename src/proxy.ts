@@ -38,6 +38,7 @@ import { buildTransitionAuditRecord, emitTransitionAuditRecord, verifyPostTransi
 import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import type { ObservationStore } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
+import { getAlertBus } from "./alerts/alert-bus.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import type { MutationAuditStore, MutationAuditInput, ChangeType } from "./store/mutation-audit-store.js";
 import { isTerminalState } from "./barrier.js";
@@ -313,46 +314,62 @@ type IssueContext = {
   teamId: string | null;
   stateType: string | null;
   labelNames: string[];
+  /**
+   * INF-1219: false when the `labels` sub-field was absent from a partial GraphQL
+   * response (a real upstream failure mode — the field errored and was dropped,
+   * not resolved to zero). Distinguishes "confirmed zero labels" from "could not
+   * confirm labels at all" so callers can fail closed on the latter.
+   */
+  labelsVerified: boolean;
 };
 
 async function fetchIssueContext(issueId: string, authToken: string): Promise<IssueContext | null> {
-  const res = await fetch(LINEAR_API_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: authToken },
-    body: JSON.stringify({
-      query: `query IssueContext($id: String!) {
-        issue(id: $id) {
-          id
-          team { id key name }
-          creator { id name }
-          state { id name type }
-          labels { nodes { id name } }
-          delegate { id name }
-        }
-      }`,
-      variables: { id: issueId },
-      operationName: "IssueContext",
-    }),
-  });
-  if (!res.ok) return null;
-  const data = (await res.json()) as {
-    data?: {
-      issue?: {
-        team?: { id?: string } | null;
-        state?: { type?: string } | null;
-        labels?: { nodes?: { name?: string }[] } | null;
-      } | null;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({
+        query: `query IssueContext($id: String!) {
+          issue(id: $id) {
+            id
+            team { id key name }
+            creator { id name }
+            state { id name type }
+            labels { nodes { id name } }
+            delegate { id name }
+          }
+        }`,
+        variables: { id: issueId },
+        operationName: "IssueContext",
+      }),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      data?: {
+        issue?: {
+          team?: { id?: string } | null;
+          state?: { type?: string } | null;
+          labels?: { nodes?: { name?: string }[] } | null;
+        } | null;
+      };
     };
-  };
-  const issue = data.data?.issue;
-  if (!issue) return null;
-  return {
-    teamId: issue.team?.id ?? null,
-    stateType: issue.state?.type ?? null,
-    labelNames: (issue.labels?.nodes ?? [])
-      .map((n) => n.name)
-      .filter((n): n is string => typeof n === "string"),
-  };
+    const issue = data.data?.issue;
+    if (!issue) return null;
+    return {
+      teamId: issue.team?.id ?? null,
+      stateType: issue.state?.type ?? null,
+      labelNames: (issue.labels?.nodes ?? [])
+        .map((n) => n.name)
+        .filter((n): n is string => typeof n === "string"),
+      labelsVerified: "labels" in issue && issue.labels !== undefined,
+    };
+  } catch (err) {
+    // INF-1219 AC1: a network failure fetching IssueContext must fail closed
+    // (return null, same as an unresolvable teamId already does) rather than
+    // leaving the caller's awaited promise rejected and the request hanging.
+    log.warn(`fetchIssueContext failed for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
 }
 
 async function fetchTeamStates(teamId: string, authToken: string): Promise<TeamState[]> {
@@ -464,6 +481,10 @@ async function maybeDemoteCrossFunctionalRequest(
   authToken: string,
   agentId: string,
 ): Promise<XfnDemotionNotification | null> {
+  // INF-1219 AC3: env-gated kill-switch, read per-call (this sits on the live
+  // per-request path, not a bootstrap-time sweep) so a toggle takes effect
+  // without a redeploy/restart.
+  if (process.env.QUIESCE_XFN_DEMOTE === "1") return null;
   if (!body || !isMutationRequest(body)) return null;
   try {
     if (await bodyHasCapability(agentId, "human:escalate")) return null;
@@ -493,6 +514,12 @@ async function maybeDemoteCrossFunctionalRequest(
     ? (typeof input.teamId === "string" ? input.teamId : null)
     : (issueId ? (issueCtx = await fetchIssueContext(issueId, authToken))?.teamId ?? null : null);
   if (!teamId) return null;
+
+  // INF-1219 AC1: a partial IssueContext fetch (labels field dropped, not
+  // confirmed empty) cannot be told apart from "verified not enrolled" — fail
+  // closed the same way a missing teamId already does, rather than falling
+  // through to "no wf:* label found -> demote" on unverifiable data.
+  if (issueCtx && !issueCtx.labelsVerified) return null;
 
   // INF-996 / INF-925-class hardening (Astrid directive, 2026-07-28): a ticket
   // already ENROLLED in a concrete workflow — carrying any `wf:*` label — is NOT an
@@ -553,6 +580,7 @@ async function emitXfnDemotionNotification(
   notification: XfnDemotionNotification | null,
   responseText: string | null,
   authToken: string,
+  operationalEventStore?: OperationalEventStore,
 ): Promise<void> {
   if (!notification) return;
   let issueId = notification.issueId;
@@ -565,6 +593,30 @@ async function emitXfnDemotionNotification(
     }
   }
   if (!issueId) return;
+
+  // INF-1219 AC2: every actual demotion emits an operational event and an
+  // alert-bus warning, in addition to the existing Linear comment below — a
+  // governed ticket being ejected from its workflow must surface in /health
+  // and page a human, not rely on a comment nobody is watching.
+  try {
+    operationalEventStore?.append({
+      outcome: "xfn-demoted",
+      agent: notification.requester,
+      key: issueId,
+      detail: { dimension: notification.dimension, steward: notification.steward },
+    });
+  } catch (err) {
+    log.warn(`xfn-demoted operational event failed for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  getAlertBus().notify({
+    severity: "warning",
+    source: "xfn-demote",
+    title: `Cross-functional request demoted: ${issueId}`,
+    ticket: issueId,
+    agent: notification.requester,
+    detail: { dimension: notification.dimension, steward: notification.steward },
+  });
+
   const body =
     `[Cross-functional request demoted] requester=${notification.requester}; source=${notification.dimension}; routed to Backlog for ${notification.steward} steward triage.`;
   await fetch(LINEAR_API_URL, {
@@ -2136,7 +2188,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
     }
   }
 
-  await emitXfnDemotionNotification(xfnDemotionNotification, responseText, authorization);
+  await emitXfnDemotionNotification(xfnDemotionNotification, responseText, authorization, deps?.operationalEventStore);
 
   res
     .status(upstreamRes.status)
