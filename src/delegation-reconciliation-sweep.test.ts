@@ -53,6 +53,7 @@ import { OperationalEventStore } from "./store/operational-event-store.js";
 import { resetCronRegistryForTest, getRegisteredCrons } from "./cron/registry.js";
 import { reloadAgents } from "./agents.js";
 import { resetPolicyCache } from "./escalation-gate.js";
+import { resetWorkflowCache } from "./workflow-gate.js";
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
 
@@ -273,6 +274,8 @@ function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
                 nodes: [
                   { id: "label-wf-task", name: "wf:task", isGroup: false, team: { id: TEAM_ID }, parent: null },
                   { id: "label-state-doing", name: "state:doing", isGroup: false, team: { id: TEAM_ID }, parent: null },
+                  { id: "label-wf-chore", name: "wf:chore", isGroup: false, team: { id: TEAM_ID }, parent: null },
+                  { id: "label-state-intake", name: "state:intake", isGroup: false, team: { id: TEAM_ID }, parent: null },
                   { id: WF_LABEL.id, name: WF_LABEL.name, isGroup: false, team: { id: TEAM_ID }, parent: null },
                   { id: STATE_IMPLEMENTATION_LABEL.id, name: STATE_IMPLEMENTATION_LABEL.name, isGroup: false, team: { id: TEAM_ID }, parent: null },
                 ],
@@ -293,6 +296,8 @@ function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
         const namesById = new Map<string, string>([
           ["label-wf-task", "wf:task"],
           ["label-state-doing", "state:doing"],
+          ["label-wf-chore", "wf:chore"],
+          ["label-state-intake", "state:intake"],
           [WF_LABEL.id, WF_LABEL.name],
           [STATE_IMPLEMENTATION_LABEL.id, STATE_IMPLEMENTATION_LABEL.name],
           [STATE_DONE_LABEL.id, STATE_DONE_LABEL.name],
@@ -576,8 +581,15 @@ describe("AC1: sweep detects stranded delegations and re-dispatches", () => {
 describe("INF-334 AC2: reconciliation redispatches missed plain delegations", () => {
   let policyDir: string;
   let prevPolicyPath: string | undefined;
+  let prevWorkflowDefsDir: string | undefined;
 
   beforeEach(() => {
+    prevWorkflowDefsDir = process.env.WORKFLOW_DEFS_DIR;
+    // INF-1237: autoEnrollPlainDelegation resolves its target workflow's
+    // entry state from the real workflow registry (chore, per
+    // enrollment-policy.ts' fallback default), not a hardcoded literal.
+    process.env.WORKFLOW_DEFS_DIR = path.resolve(process.cwd(), "src/registered-defs");
+    resetWorkflowCache();
     prevPolicyPath = process.env.CAPABILITY_POLICY_PATH;
     policyDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf334-policy-"));
     const policyFile = path.join(policyDir, "capability-policy.yaml");
@@ -592,10 +604,16 @@ describe("INF-334 AC2: reconciliation redispatches missed plain delegations", ()
         "roles:",
         "  - id: worker",
         "    requires: [linear:transition]",
+        "  - id: steward",
+        "    requires: [linear:transition]",
         "bodies:",
         "  - id: igor",
         "    container: worker",
-        "    fills_roles: [worker]",
+        // INF-1237: chore's entry state (intake) is owner_role steward, not
+        // worker — grant both roles so the plain-delegation enrollment gate
+        // (see workflow-gate.ts autoEnrollPlainDelegation) still promotes
+        // this fixture body into chore:intake.
+        "    fills_roles: [worker, steward]",
         "",
       ].join("\n"),
       "utf8",
@@ -609,6 +627,9 @@ describe("INF-334 AC2: reconciliation redispatches missed plain delegations", ()
     else process.env.CAPABILITY_POLICY_PATH = prevPolicyPath;
     resetPolicyCache();
     fs.rmSync(policyDir, { recursive: true, force: true });
+    if (prevWorkflowDefsDir === undefined) delete process.env.WORKFLOW_DEFS_DIR;
+    else process.env.WORKFLOW_DEFS_DIR = prevWorkflowDefsDir;
+    resetWorkflowCache();
   });
 
   it("redispatches a plain delegated ticket with no wf:* labels and no dispatch record", async () => {
@@ -646,8 +667,8 @@ describe("INF-334 AC2: reconciliation redispatches missed plain delegations", ()
     const events = eventStore.query({ key: "linear-DSN-334", limit: 20 });
     expect(events.some((e) =>
       e.outcome === "auto-enrolled" &&
-      (e.detail as { workflowId?: string; entryState?: string } | null)?.workflowId === "task" &&
-      (e.detail as { workflowId?: string; entryState?: string } | null)?.entryState === "doing",
+      (e.detail as { workflowId?: string; entryState?: string } | null)?.workflowId === "chore" &&
+      (e.detail as { workflowId?: string; entryState?: string } | null)?.entryState === "intake",
     )).toBe(true);
     eventStore.close();
   });
@@ -735,8 +756,8 @@ describe("INF-334 AC2: reconciliation redispatches missed plain delegations", ()
     const events = eventStore.query({ key: "linear-DSN-336", limit: 20 });
     expect(events.some((e) =>
       e.outcome === "auto-enrolled" &&
-      (e.detail as { workflowId?: string; entryState?: string } | null)?.workflowId === "task" &&
-      (e.detail as { workflowId?: string; entryState?: string } | null)?.entryState === "doing",
+      (e.detail as { workflowId?: string; entryState?: string } | null)?.workflowId === "chore" &&
+      (e.detail as { workflowId?: string; entryState?: string } | null)?.entryState === "intake",
     )).toBe(true);
     eventStore.close();
   });
@@ -2579,8 +2600,13 @@ describe("INF-589: governed heal wakes by resolved OpenClaw id, not Linear displ
   let prevEncKey: string | undefined;
   let prevEncKeyFile: string | undefined;
   let prevPolicyPath: string | undefined;
+  let prevWorkflowDefsDir: string | undefined;
 
   beforeEach(() => {
+    prevWorkflowDefsDir = process.env.WORKFLOW_DEFS_DIR;
+    // INF-1237: see the matching note in the INF-334 AC2 describe block above.
+    process.env.WORKFLOW_DEFS_DIR = path.resolve(process.cwd(), "src/registered-defs");
+    resetWorkflowCache();
     prevAgentsFile = process.env.AGENTS_FILE;
     prevEncKey = process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
     prevEncKeyFile = process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
@@ -2619,10 +2645,15 @@ describe("INF-589: governed heal wakes by resolved OpenClaw id, not Linear displ
         "roles:",
         "  - id: worker",
         "    requires: [linear:transition]",
+        "  - id: steward",
+        "    requires: [linear:transition]",
         "bodies:",
         "  - id: felix",
         "    container: worker",
-        "    fills_roles: [worker]",
+        // INF-1237: chore's entry state (intake) is owner_role steward, not
+        // worker — grant both roles so the plain-delegation enrollment gate
+        // still promotes this fixture body into chore:intake.
+        "    fills_roles: [worker, steward]",
         "",
       ].join("\n"),
       "utf8",
@@ -2645,6 +2676,9 @@ describe("INF-589: governed heal wakes by resolved OpenClaw id, not Linear displ
     resetPolicyCache();
     reloadAgents();
     fs.rmSync(agentsDir, { recursive: true, force: true });
+    if (prevWorkflowDefsDir === undefined) delete process.env.WORKFLOW_DEFS_DIR;
+    else process.env.WORKFLOW_DEFS_DIR = prevWorkflowDefsDir;
+    resetWorkflowCache();
   });
 
   it("wakes with the OpenClaw agent id (felix), never the Linear display name", async () => {
@@ -2724,7 +2758,7 @@ describe("INF-589: governed heal wakes by resolved OpenClaw id, not Linear displ
     expect(result.errors).toEqual([]);
     expect(result.healed).toBe(1);
     expect(labelUpdates).toEqual([
-      expect.arrayContaining(["label-wf-task", "label-state-doing"]),
+      expect.arrayContaining(["label-wf-chore", "label-state-intake"]),
     ]);
     expect(wakeDispatches).toEqual([
       { agentName: FELIX_OPENCLAW_ID, ticketIdentifier: "DSN-826" },

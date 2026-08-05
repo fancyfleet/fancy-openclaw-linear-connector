@@ -37,6 +37,7 @@ import { resetConfigHealth } from "./config-health.js";
 // ── Fixtures / identifiers ──────────────────────────────────────────────────
 
 const CANONICAL_DEV_IMPL = path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml");
+const CANONICAL_CHORE = path.resolve(process.cwd(), "src/__fixtures__/canonical-chore.yaml");
 
 const LIF_TEAM = "lif-team-uuid";
 const PARENT_TEAM = "parent-team-uuid";
@@ -54,8 +55,7 @@ const ISSUE_LABELS = [
 const TEAM_LABELS = [
   { id: "wf-devimpl-lbl", name: "wf:dev-impl", team: { id: LIF_TEAM } },
   { id: "state-intake-lbl", name: "state:intake", team: { id: LIF_TEAM } },
-  { id: "wf-task-lbl", name: "wf:task", team: { id: LIF_TEAM } },
-  { id: "state-doing-lbl", name: "state:doing", team: { id: LIF_TEAM } },
+  { id: "wf-chore-lbl", name: "wf:chore", team: { id: LIF_TEAM } },
 ];
 
 interface Captured {
@@ -125,6 +125,11 @@ beforeAll(() => {
     fs.readFileSync(CANONICAL_DEV_IMPL, "utf8"),
     "utf8",
   );
+  fs.writeFileSync(
+    path.join(registryDir, "chore.yaml"),
+    fs.readFileSync(CANONICAL_CHORE, "utf8"),
+    "utf8",
+  );
   savedDefsDir = process.env.WORKFLOW_DEFS_DIR;
   process.env.WORKFLOW_DEFS_DIR = registryDir;
 });
@@ -170,7 +175,8 @@ describe("INF-1085: enrollment writes drop inherited cross-team label IDs", () =
     const { fetch: mock, writes } = makeEnrollFetch();
     globalThis.fetch = mock;
 
-    // delegateAgentName=null skips the worker-body gate; workflow is hardcoded task:doing.
+    // delegateAgentName=null skips the owner-role gate; workflow resolves via
+    // enrollment-policy.ts (INF-1237), which falls back to chore:intake.
     const result = await autoEnrollPlainDelegation(ISSUE_UUID, "Bearer tok", undefined, undefined, null);
 
     expect(result.enrolled).toBe(true);
@@ -178,7 +184,7 @@ describe("INF-1085: enrollment writes drop inherited cross-team label IDs", () =
     const labelIds = writes[0].variables.labelIds as string[];
     expect(labelIds).not.toContain(INHERITED_XFN_LABEL_ID);
     expect(labelIds).toContain("lif-cr-lbl");
-    expect(labelIds).toContain("wf-task-lbl");
-    expect(labelIds).toContain("state-doing-lbl");
+    expect(labelIds).toContain("wf-chore-lbl");
+    expect(labelIds).toContain("state-intake-lbl");
   });
 });

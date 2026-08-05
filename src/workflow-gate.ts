@@ -39,6 +39,7 @@ import path from "node:path";
 import yaml from "js-yaml";
 import { componentLogger, createLogger, type Logger } from "./logger.js";
 import { defaultWorkflowDefPath } from "./instance-config.js";
+import { loadEnrollmentPolicy } from "./enrollment-policy.js";
 import { bodyHasCapability, resolveBodiesForRole, resolveBodiesWithCapability, isBodyKnown, isRoleDeclared, isSyntheticNoBodyRole, roleResolutionScopeForOwnerRole, type RoleResolutionScope } from "./escalation-gate.js";
 import { probeDeployOutcome } from "./deploy-probe.js";
 import { isTerminalIssueState } from "./linear-actionable.js";
@@ -8565,11 +8566,14 @@ export async function autoEnrollByTeam(
 }
 
 /**
- * INF-334: promote an already-delegated ad-hoc ticket into the task workflow.
+ * INF-334: promote an already-delegated ad-hoc ticket into its default workflow.
  *
  * Plain ticket delegation already chooses the worker via Linear's delegate
- * field. Enrolling at task:doing preserves that ownership while making the
- * ticket visible to governed capacity/rearm/rescue machinery.
+ * field. Enrolling at the configured default workflow's entry state (INF-1237:
+ * resolved via enrollment-policy.ts, same single source as workflow-bootstrap
+ * and fanout — never a hardcoded "task"/"doing" pairing) preserves that
+ * ownership while making the ticket visible to governed capacity/rearm/rescue
+ * machinery.
  */
 export async function autoEnrollPlainDelegation(
   issueId: string,
@@ -8579,26 +8583,54 @@ export async function autoEnrollPlainDelegation(
   delegateAgentName?: string | null,
   delegateSetTimestamp?: string | null,
 ): Promise<{ enrolled: boolean; entryState?: string; workflowId?: string }> {
-  const workflowId = "task";
-  const entryState = "doing";
+  const workflowId = loadEnrollmentPolicy().defaultEnrollmentWorkflow;
 
+  let def: WorkflowDef | undefined;
+  try {
+    const registry = await loadWorkflowRegistry();
+    def = registry.get(workflowId);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: autoEnrollPlainDelegation: registry load failed for ${issueId}: ${msg} — skipping`);
+    return { enrolled: false };
+  }
+
+  if (!def?.entry_state) {
+    log.warn(`workflow-gate: autoEnrollPlainDelegation: no entry_state in def for ${workflowId} on ${issueId} — skipping`);
+    return { enrolled: false };
+  }
+  const entryState = def.entry_state;
+  const entryStateDef = def.states.find((s) => s.id === entryState);
+
+  // INF-1237: the entry phase's owner_role drives the delegate gate (was
+  // hardcoded "worker" back when this always landed on task:doing, a worker
+  // phase). chore's entry state is intake, owner_role steward — a different
+  // phase entirely — so the legal-delegate role must be resolved per workflow,
+  // not assumed to be "worker".
   if (delegateAgentName) {
+    const ownerRole = entryStateDef?.owner_role;
+    if (!ownerRole) {
+      log.warn(
+        `workflow-gate: autoEnrollPlainDelegation: no owner_role for ${workflowId}:${entryState} on ${issueId} — skipping`,
+      );
+      return { enrolled: false };
+    }
     try {
-      const workerBodies = await resolveBodiesForRole("worker");
-      const isWorkerDelegate = workerBodies
+      const ownerRoleBodies = await resolveBodiesForRole(ownerRole, roleResolutionScopeForOwnerRole(ownerRole, def));
+      const isOwnerRoleDelegate = ownerRoleBodies
         .map((body) => body.toLowerCase())
         .includes(delegateAgentName.toLowerCase());
-      if (!isWorkerDelegate) {
+      if (!isOwnerRoleDelegate) {
         log.info(
           `workflow-gate: autoEnrollPlainDelegation: skipping ${issueId} because ` +
-            `delegate '${delegateAgentName}' is not a worker body for task:doing`,
+            `delegate '${delegateAgentName}' is not a '${ownerRole}' body for ${workflowId}:${entryState}`,
         );
         return { enrolled: false };
       }
     } catch (err) {
       log.warn(
-        `workflow-gate: autoEnrollPlainDelegation: worker role resolution failed for ${issueId} — ` +
-          `skipping task:doing promotion: ${err instanceof Error ? err.message : String(err)}`,
+        `workflow-gate: autoEnrollPlainDelegation: '${ownerRole}' role resolution failed for ${issueId} — ` +
+          `skipping ${workflowId}:${entryState} promotion: ${err instanceof Error ? err.message : String(err)}`,
       );
       return { enrolled: false };
     }

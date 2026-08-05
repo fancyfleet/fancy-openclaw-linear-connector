@@ -6,6 +6,7 @@ import path from "node:path";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, test } from "@jest/globals";
 import { reloadAgents } from "../agents.js";
+import { resetWorkflowCache } from "../workflow-gate.js";
 import { createWebhookRouter } from "./index.js";
 
 const SECRET = "inf-334-plain-delegation-secret";
@@ -140,13 +141,18 @@ describe("INF-334 plain delegation webhook dispatch", () => {
         "roles:",
         "  - id: worker",
         "    requires: [linear:transition]",
+        "  - id: steward",
+        "    requires: [linear:transition]",
         "bodies:",
         "  - id: igor",
         "    container: worker",
-        "    fills_roles: [worker]",
+        // INF-1237: chore's entry state (intake) is owner_role steward, not
+        // worker — grant both roles so the plain-delegation enrollment gate
+        // still promotes this fixture body into chore:intake.
+        "    fills_roles: [worker, steward]",
         "  - id: sage",
         "    container: worker",
-        "    fills_roles: [worker]",
+        "    fills_roles: [worker, steward]",
         "",
       ].join("\n"),
       "utf8",
@@ -158,8 +164,13 @@ describe("INF-334 plain delegation webhook dispatch", () => {
       LINEAR_WEBHOOK_SECRET: SECRET,
       LINEAR_API_KEY: "linear-test-token",
       REQUIRE_GATEWAY_DELIVERY: "false",
+      // INF-1237: autoEnrollPlainDelegation resolves its target workflow's
+      // entry state from the real workflow registry (chore, per
+      // enrollment-policy.ts' fallback default), not a hardcoded literal.
+      WORKFLOW_DEFS_DIR: path.resolve(process.cwd(), "src/registered-defs"),
     };
     reloadAgents();
+    resetWorkflowCache();
     globalThis.fetch = async (url, init) => {
       if (String(url) !== HOOKS_URL) {
         if (String(url) !== "https://api.linear.app/graphql") {
@@ -191,6 +202,8 @@ describe("INF-334 plain delegation webhook dispatch", () => {
                   nodes: [
                     { id: "label-wf-task", name: "wf:task", team: { id: "team-dsn" } },
                     { id: "label-state-doing", name: "state:doing", team: { id: "team-dsn" } },
+                    { id: "label-wf-chore", name: "wf:chore", team: { id: "team-dsn" } },
+                    { id: "label-state-intake", name: "state:intake", team: { id: "team-dsn" } },
                   ],
                 },
               },
@@ -248,6 +261,7 @@ describe("INF-334 plain delegation webhook dispatch", () => {
     globalThis.fetch = originalFetch;
     process.env = originalEnv;
     reloadAgents();
+    resetWorkflowCache();
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -268,7 +282,7 @@ describe("INF-334 plain delegation webhook dispatch", () => {
     expect(deliveries[0].message).not.toContain("Your legal action(s)");
     expect(deliveries[0].message).not.toContain("state: **");
     await waitFor(() => labelUpdates.length === 1);
-    expect(labelUpdates).toEqual([["label-wf-task", "label-state-doing"]]);
+    expect(labelUpdates).toEqual([["label-wf-chore", "label-state-intake"]]);
   });
 
   test("AC4: delegate clear is quiet, and re-delegation dispatches the new delegate", async () => {
