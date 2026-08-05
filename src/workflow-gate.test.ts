@@ -6101,7 +6101,7 @@ states:
         requires_human_signoff_above_stakes: true
         requires_capability: sprint:signoff
       - command: request-rework
-        to: intake
+        to: validating
         generic: revision
 
   - id: done
@@ -6793,9 +6793,14 @@ describe("AI-1493: transition-walk canary", () => {
     fs.writeFileSync(workflowFile, badYaml, "utf8");
     resetWorkflowCache();
 
+    // INF-1228: validateTransitionTargets now catches this at load time
+    // (loadWorkflowDef -> loadWorkflowRegistry rejects the def before the walk
+    // ever runs), so the violation surfaces as a load failure rather than the
+    // walkDef-time "undefined state" issue this canary predates. Either path
+    // must name the dangling target.
     const result = await runTransitionWalk();
     expect(result.passed).toBe(false);
-    expect(result.violations.some(v => v.issue.includes("undefined state"))).toBe(true);
+    expect(result.violations.some(v => v.issue.includes("nonexistent"))).toBe(true);
   });
 });
 

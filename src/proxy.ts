@@ -1987,36 +1987,31 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           transitionResult.code !== "ad-hoc" &&
           transitionResult.code !== "no-issue-id";
 
-        // INF-1147: a governed dev-impl forward transition that does NOT fully apply
-        // must decline loudly. Two cases:
-        //   1. generic:continue (`submit`/`continue-workflow`) whose atomic write
-        //      FAILED (status: "failed").
-        //   2. The `capture_ac` accept forward BLOCKED by the AC-of-record gate
-        //      (status: "blocked", code: "ac-of-record-missing") — a repairable
-        //      decline (T2).
-        // In both cases the forwarded placeholder mutation may have returned
-        // `data.issueUpdate.success: true`, but the transition tuple did NOT land —
-        // returning that success payload beside a non-applied `_workflowTransition`
-        // is the false-success the AC forbids. Replace the body with an explicit
-        // GraphQL error envelope (no `data`), carrying the decline reason. The
-        // delegate is now written only by the atomic write (see the strip above), so
-        // no split-brain delegate/state was written; do NOT emit the misleading
-        // "no state was changed" phrasing.
-        const loudGenericFail =
-          genericContinueForward && transitionResult?.status === "failed";
-        const loudAcceptGate =
-          acCaptureAcceptForward &&
-          transitionResult?.status === "blocked" &&
-          transitionResult?.code === "ac-of-record-missing";
+        // INF-1147/INF-1228: a governed dev-impl forward transition (generic:continue
+        // OR the capture_ac accept forward) that does NOT fully apply must decline
+        // loudly — regardless of WHY it didn't apply. That covers both an atomic-write
+        // FAILURE (status: "failed") and a gate BLOCK (status: "blocked", any code —
+        // not just "ac-of-record-missing"; INF-1228 generalized this from the single
+        // code the original fix covered). In every case the forwarded placeholder
+        // mutation may have returned `data.issueUpdate.success: true`, but the
+        // transition tuple did NOT land — returning that success payload beside a
+        // non-applied `_workflowTransition` is the false-success the AC forbids.
+        // Replace the body with an explicit GraphQL error envelope (no `data`),
+        // carrying the decline reason. The delegate is now written only by the atomic
+        // write (see the strip above), so no split-brain delegate/state was written;
+        // do NOT emit the misleading "no state was changed" phrasing.
+        const nonAppliedForward =
+          (genericContinueForward || acCaptureAcceptForward) &&
+          (transitionResult?.status === "failed" || transitionResult?.status === "blocked");
         if (
           attachTransition &&
           transitionResult &&
-          (loudGenericFail || loudAcceptGate)
+          nonAppliedForward
         ) {
           const detail = transitionResult.detail
             ? `: ${transitionResult.detail}`
             : "";
-          const message = loudAcceptGate
+          const message = acCaptureAcceptForward
             ? `Governed transition ${transitionResult.from ?? "?"} → ${transitionResult.to ?? "?"} ` +
               `was declined${detail} The delegate and state:* label were not advanced.`
             : `Governed transition ${transitionResult.from ?? "?"} → ${transitionResult.to ?? "?"} ` +
