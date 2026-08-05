@@ -668,6 +668,32 @@ function stripNativeStateField(body: GraphQLRequestBody | null): boolean {
 export const _stripNativeStateFieldForTests = stripNativeStateField;
 
 /**
+ * INF-1248: decide whether the proxy should strip the CLI's forwarded native
+ * `stateId` from an intent-bearing issueUpdate before forwarding.
+ *
+ * The strip (INF-835) exists so `applyStateTransition` (B2) is the SOLE native-state
+ * writer for governed workflow tickets, closing the partial-apply window. But B2
+ * no-ops on ad-hoc / label-less tickets (`applyStateTransition` returns
+ * `code:"ad-hoc"` — there is no workflow def to resolve a destination). On those
+ * tickets the proxy is therefore NOT a state writer, so stripping the CLI's resolved
+ * terminal `stateId` silently drops the state write: `complete`/`cancel`/`park`
+ * report Done/Canceled and clear the delegate + post the comment, yet leave the
+ * ticket in a live (started/unstarted) state — the "Done-that-isn't" strand.
+ * This mirrors `stripNullDelegateAssigneeFields`, which already exempts
+ * complete/park's delegate clear for exactly this ad-hoc case.
+ *
+ * @param forwardTicketWorkflowId workflow id (governed ticket) → strip;
+ *   `null` (confirmed ad-hoc, no wf:* label) → DO NOT strip, the CLI stateId is the
+ *   sole writer; `undefined` (pre-forward label fetch failed → unknown) → strip,
+ *   fail-safe so a governed transition can never partial-apply on an unknown.
+ */
+export function shouldStripForwardedNativeState(
+  forwardTicketWorkflowId: string | null | undefined,
+): boolean {
+  return forwardTicketWorkflowId !== null;
+}
+
+/**
  * AI-1857: Strip null delegateId/assigneeId from an intent-bearing issueUpdate input.
  * The proxy owns delegate management; CLIs must not directly null these fields.
  *
@@ -1504,6 +1530,12 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // kill, on the accept path.
       let acCaptureAcceptForward = false;
 
+      // INF-1248: workflow-ness of the forward target, captured from the same
+      // pre-forward label fetch below. undefined = unknown (fetch failed);
+      // null = confirmed ad-hoc (no wf:* label); string = workflow id. Gates the
+      // native-state-strip so the CLI's resolved terminal stateId is preserved on
+      // ad-hoc tickets, where B2 (applyStateTransition) no-ops and is not a writer.
+      let forwardTicketWorkflowId: string | null | undefined;
       // AI-1498: snapshot the pre-forward workflow state for applyStateTransition.
       // Fail-open: on any fetch error leave it undefined and let applyStateTransition
       // fall back to the ticket's current state:* label (legacy behavior).
@@ -1513,6 +1545,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           // AI-2094: def-aware most-advanced resolution — see the auth-snapshot
           // capture above. A stale state:* label must not become the source override.
           const srcWfId = getWorkflowId(preLabels);
+          forwardTicketWorkflowId = srcWfId ?? null; // INF-1248: null iff confirmed ad-hoc
           const srcDef = srcWfId ? await loadWorkflowDefById(srcWfId) : null;
           sourceStateOverride = getCurrentState(preLabels, srcDef ?? undefined) ?? undefined;
         } catch (err) {
@@ -1547,10 +1580,25 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         // tuple as the state:* label and delegate. Strip the CLI's forwarded
         // native stateId and let applyStateTransition write the resolved
         // destination atomically after delegate resolution succeeds.
+        //
+        // INF-1248: but ONLY for governed workflow tickets. B2 no-ops on ad-hoc /
+        // label-less tickets, so there the proxy is not a state writer — stripping
+        // the CLI's resolved terminal stateId silently drops the state write (the
+        // "Done-that-isn't" strand on complete/cancel/park). See
+        // shouldStripForwardedNativeState for the tri-state rationale.
         if (isIssueUpdateMutation(body)) {
-          const strippedNativeState = stripNativeStateField(body);
-          if (strippedNativeState) {
-            log.info(`native-state-strip agent=${agentId} intent=${effectiveIntent}${ticketCtx}: stripped stateId — applyStateTransition is sole native-state writer`);
+          if (shouldStripForwardedNativeState(forwardTicketWorkflowId)) {
+            const strippedNativeState = stripNativeStateField(body);
+            if (strippedNativeState) {
+              log.info(`native-state-strip agent=${agentId} intent=${effectiveIntent}${ticketCtx}: stripped stateId — applyStateTransition is sole native-state writer`);
+            }
+          } else {
+            // Confirmed ad-hoc: preserve the CLI's terminal stateId — it is the
+            // sole writer here since applyStateTransition (B2) no-ops on ad-hoc.
+            const input = issueUpdateInput(body);
+            if (input && "stateId" in input) {
+              log.info(`native-state-passthrough agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ad-hoc ticket — CLI stateId preserved (B2 no-ops on ad-hoc; INF-1248)`);
+            }
           }
         }
 
