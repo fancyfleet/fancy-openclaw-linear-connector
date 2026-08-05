@@ -259,6 +259,30 @@ describe("fireEscalation", () => {
       if (savedKey) process.env.LINEAR_API_KEY = savedKey;
     }
   });
+
+  test("sends a RAW (non-Bearer) Authorization header so API-key service credentials work (INF-1212)", async () => {
+    // A Linear API key (lin_api_...) is rejected when Bearer-prefixed. This path
+    // consumes the dedicated service credential, which may be an API key, so the
+    // Authorization header must be raw — matching the reconciliation sweeps.
+    const captured: string[] = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async (_url: string, opts?: { headers?: Record<string, string> }) => {
+      const h = opts?.headers ?? {};
+      captured.push(h.authorization ?? h.Authorization ?? "");
+      // Minimal response so resolveIssueId returns null and fireEscalation exits
+      // early — we only need to observe the header on the first call.
+      return { ok: true, json: async () => ({ data: { issues: { nodes: [] } } }) } as unknown as Response;
+    }) as typeof fetch;
+
+    try {
+      await fireEscalation("GEN-263", ["user-x"], 2, "lin_api_examplekey1234567890");
+      expect(captured.length).toBeGreaterThanOrEqual(1);
+      expect(captured[0]).toBe("lin_api_examplekey1234567890");
+      expect(captured[0].startsWith("Bearer ")).toBe(false);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
 });
 
 // ── Tests: DelegatePingPongDetector (high-level) ─────────────────────────────

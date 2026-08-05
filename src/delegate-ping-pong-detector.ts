@@ -296,7 +296,13 @@ export async function fireEscalation(
     };
   }
 
-  const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
+  // INF-1212: use the RAW Authorization header (matches every reconciliation
+  // sweep, e.g. native-state-reconciler / bootstrap-reconciliation-sweep). The
+  // dedicated service credential can be a Linear API key, which Linear REJECTS
+  // when Bearer-prefixed (400); OAuth tokens authenticate raw as well, so raw is
+  // the universally-compatible form. (Was `Bearer ${token}`, which broke
+  // API-key service credentials on this escalation path.)
+  const authHeader = token.replace(/^Bearer\s+/i, "");
   const issueId = await resolveIssueId(ticketId, authHeader);
   if (!issueId) {
     log.error(`ping-pong escalation: could not resolve issue ID for ${ticketId}`);
