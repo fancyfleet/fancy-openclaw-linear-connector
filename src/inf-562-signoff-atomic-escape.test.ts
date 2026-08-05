@@ -272,7 +272,7 @@ describe("INF-562 governed sign-off and terminal escape regressions", () => {
     });
 
     expect(result.status).toBe("failed");
-    expect(result.code).toBe("transition-write-unverified");
+    expect(result.code).toBe("post-write-diverge");
     expect(getAppliedState("INF-562")).toBeNull();
     expect(getSnapshot()).toEqual({
       state: "review",
