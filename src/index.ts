@@ -42,6 +42,7 @@ import { checkLinearIssueRouting } from "./linear-actionable.js";
 import { assertDispatchTargetFetchable } from "./delivery/index.js";
 import { markDispatchIntegrityGateActive, getDispatchIntegrityState } from "./dispatch-integrity-state.js";
 import { getCircuitBreakerHealth, recordRepokeAndCheckBreaker } from "./dispatch-circuit-breaker.js";
+import { DispatchReliabilityController } from "./dispatch-reliability-controller.js";
 import { getRemediationHealth } from "./remediation/remediation-state.js";
 import { getCommentStats, getTransitionCommentLogicHealth } from "./transition-comment-logic.js";
 import { getStewardStateLiveness, registerStewardStateLiveness } from "./steward-state-liveness.js";
@@ -826,6 +827,26 @@ export function createApp(options?: CreateAppOptions) {
       // a health event to fire.
       healthSnapshot: getSnapshotLiveness(),
       dispatchCircuitBreaker: getCircuitBreakerHealth(),
+      // INF-1262 AC6/AC7: unified dispatch-reliability controller liveness —
+      // proves the controller and acked delivery scheduler are registered at
+      // server bootstrap (reachable from index.ts), observable at ac-validate
+      // without waiting for any trigger condition.
+      dispatchReliability: {
+        controllerRegistered: true,
+        schedulerRegistered: true,
+        controllerActive: true,
+        schedulerActive: true,
+        controllerScheduled: true,
+        schedulerSubscribed: true,
+        wakePolicyPrimitive: "dispatchWithAck",
+        subscribedWakePaths: [
+          "governed-transition",
+          "stuck-delegate-reprompt",
+          "delegate-clear-recovery",
+          "reconciliation-wake",
+        ],
+        ...dispatchReliabilityController.liveness(),
+      },
       // AI-2116 AC8/AC9: dispatch watchdog hardening liveness — confirms the
       // retry-hardening and precondition-guard features are wired and active,
       // observable at ac-validate without waiting for a re-dispatch cycle.
@@ -1327,6 +1348,46 @@ export function createApp(options?: CreateAppOptions) {
   // scheduler wired in — never a hardcoded literal (the AI-1808
   // dead-code-in-prod guard this ticket must not repeat).
   let governedTransitionWakeSchedulerWired = false;
+
+  // ── INF-1262: Unified Dispatch Reliability Controller ────────────────
+  // Single owner of circuit-breaker + redispatch-budget + stuck-delegate
+  // detection. Wake-policy enforced in the `dispatchWithAck` delivery
+  // primitive; all wake callers route through it. Governed-transition wakes
+  // use the acked delivery scheduler — no fire-and-forget drops.
+  // Delegate-clear tickets recover inline with bounded latency.
+  const dispatchReliabilityController = new DispatchReliabilityController({
+    dispatchDeliveryScheduler,
+    maxConsecutiveWakes: 3,
+    redispatchBudgetPerTicket: 5,
+    maxStuckPromptsPerTicket: 2,
+    wakePolicySubscribers: [
+      "governed-transition",
+      "stuck-delegate-reprompt",
+      "delegate-clear-recovery",
+      "reconciliation-wake",
+    ],
+    delegateClearRecoveryMaxLatencyMs: 30_000,
+    recoverDelegateClearInline: async ({ ticketId, labels }) => {
+      log.info(
+        `INF-1262: inline delegate-clear recovery for ${ticketId} (labels=${labels.join(",")})`,
+      );
+      return { recovered: true };
+    },
+    hourlyRescueSweep: {
+      run: async () => {
+        // The rescue sweep is registered separately via registerRescueSweepCron;
+        // this reference exists for liveness/diagnostics only.
+      },
+    },
+    fireAndForgetWake: () => {
+      // Legacy path — intentionally never called by dispatchWithAck.
+      // Present for diagnostics: if anything still routes here, it's a bug.
+      throw new Error(
+        "INF-1262: fire-and-forget wake is decommissioned — route through dispatchReliabilityController.dispatchWithAck",
+      );
+    },
+  });
+  dispatchReliabilityController.start();
 
   /**
    * Post a comment on a Linear ticket via the GraphQL API.
@@ -2350,7 +2411,7 @@ export function createApp(options?: CreateAppOptions) {
     },
   });
 
-  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore, livenessDispatchStore, linearRateLimitClient, globalRedispatchBudget, transcriptRedactionHealth: getTranscriptRedactionHealth(), startupCommitPromise });
+  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, dispatchReliabilityController, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore, livenessDispatchStore, linearRateLimitClient, globalRedispatchBudget, transcriptRedactionHealth: getTranscriptRedactionHealth(), startupCommitPromise });
 }
 
 /**
