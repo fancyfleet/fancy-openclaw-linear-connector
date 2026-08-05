@@ -30,7 +30,7 @@ import { resolveServiceCredential } from "../service-credential.js";
 import { checkAgentLiveness, type LivenessConfig } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
 import { checkRoleGuardAndBlock, type LinearUserIdResolver } from "../routing-guard.js";
-import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, autoEnrollPlainDelegation, markAutoEnrollRegistered, markCommitmentActivityObserverRegistered, applyStateTransition, type WorkflowInstanceContext } from "../workflow-gate.js";
+import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, markAutoEnrollRegistered, markCommitmentActivityObserverRegistered, applyStateTransition, type WorkflowInstanceContext } from "../workflow-gate.js";
 import { checkLabelSyncForTicket, emitLabelSyncWarning } from "../transition-audit.js";
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets, type NoActivityDetector } from "../bag/index.js";
@@ -897,43 +897,12 @@ export function createWebhookRouter(
             });
           }
 
-          // INF-334: plain delegated tickets are still real work. If a ticket
-          // gains a delegate without already being governed, enroll it into the
-          // task worker phase so capacity rearm/rescue paths can see it.
-          const updatedFrom = (event as { updatedFrom?: Record<string, unknown> }).updatedFrom;
-          const delegateChanged =
-            event.action === "update" &&
-            updatedFrom !== undefined &&
-            ("delegateId" in updatedFrom || "delegate" in updatedFrom);
-          const delegate = enrollData?.delegate as { id?: string; name?: string } | null | undefined;
-          const delegateId = delegate?.id;
-          if (delegateChanged && delegateId) {
-            const mappedAgentName = buildAgentMap()[delegateId];
-            const delegateAgentName = mappedAgentName ? getOpenclawAgentName(mappedAgentName) : null;
-            autoEnrollPlainDelegation(enrollIssueId, enrollToken, (info) => {
-              appendOperationalEvent(operationalEventStore, {
-                outcome: "auto-enrolled",
-                type: event.type,
-                key: enrollIdentifier,
-                sessionKey: normalizeSessionKey(enrollIdentifier),
-                detail: {
-                  workflowId: info.workflowId,
-                  entryState: info.entryState,
-                  mode: "plain-delegation",
-                  delegate: info.delegateAgentName ?? null,
-                },
-              });
-            }, enrolledTicketsStore, delegateAgentName).then((result) => {
-              if (result.enrolled) {
-                log.info(
-                  `Plain delegation auto-enrolled: stamped wf:${result.workflowId ?? "task"} + ` +
-                  `state:${result.entryState ?? "doing"} on ${enrollIssueId}`,
-                );
-              }
-            }).catch((err) => {
-              log.warn(`autoEnrollPlainDelegation failed for ${enrollIssueId}: ${err instanceof Error ? err.message : String(err)}`);
-            });
-          }
+          // INF-1243: plain delegated tickets dispatch via the normal webhook
+          // pipeline (router.ts) without ever being enrolled into a workflow.
+          // Workflows are opt-in via an explicit wf:* label — there is no
+          // substitute default for plain delegation. (Reverts the enrollment
+          // side-effect added in INF-334 / PR #431; the dispatch fix it also
+          // introduced is untouched.)
 
           // ── AI-2554: On-webhook label-sync audit ──────────────────────────
           // Lightweight single-ticket check on Issue webhooks: compare proxy-store

@@ -611,9 +611,16 @@ describe("INF-334 AC2: reconciliation redispatches missed plain delegations", ()
     fs.rmSync(policyDir, { recursive: true, force: true });
   });
 
-  it("redispatches a plain delegated ticket with no wf:* labels and no dispatch record", async () => {
+  // INF-1243: inverted from the original INF-334 expectation. The sweep must
+  // still redispatch the wake for a plain (no wf:*) delegated ticket, but must
+  // NEVER auto-enroll it into a workflow — that auto-enrollment via
+  // autoEnrollPlainDelegation is the regression this ticket removes. The
+  // prior assertion here (`expect(... "auto-enrolled" ...).toBe(true)`)
+  // documented the exact behavior being reversed.
+  it("INF-1243 (was 'redispatches...and enrolls'): redispatches a plain delegated ticket with no wf:* labels and does NOT auto-enroll it", async () => {
     const eventStore = makeEventStore();
     const wakeDispatches: Array<{ agentName: string; ticketIdentifier: string }> = [];
+    const labelUpdates: string[][] = [];
     const { bus } = makeTestAlertBus();
 
     globalThis.fetch = makeReconciliationFetch({
@@ -628,6 +635,7 @@ describe("INF-334 AC2: reconciliation redispatches missed plain delegations", ()
           teamId: TEAM_ID,
         },
       ],
+      labelUpdates,
     });
 
     const result = await runDelegationReconciliationSweep({
@@ -644,17 +652,15 @@ describe("INF-334 AC2: reconciliation redispatches missed plain delegations", ()
       { agentName: DELEGATE_AGENT_NAME, ticketIdentifier: "DSN-334" },
     ]);
     const events = eventStore.query({ key: "linear-DSN-334", limit: 20 });
-    expect(events.some((e) =>
-      e.outcome === "auto-enrolled" &&
-      (e.detail as { workflowId?: string; entryState?: string } | null)?.workflowId === "task" &&
-      (e.detail as { workflowId?: string; entryState?: string } | null)?.entryState === "doing",
-    )).toBe(true);
+    expect(events.some((e) => e.outcome === "auto-enrolled")).toBe(false);
+    expect(labelUpdates).toEqual([]);
     eventStore.close();
   });
 
-  it("redispatches a plain delegated ticket when the only prior dispatch after delegation failed", async () => {
+  it("redispatches a plain delegated ticket when the only prior dispatch after delegation failed, and does NOT auto-enroll it (INF-1243)", async () => {
     const eventStore = makeEventStore();
     const wakeDispatches: Array<{ agentName: string; ticketIdentifier: string }> = [];
+    const labelUpdates: string[][] = [];
     const { bus } = makeTestAlertBus();
 
     eventStore.append({
@@ -676,6 +682,7 @@ describe("INF-334 AC2: reconciliation redispatches missed plain delegations", ()
           teamId: TEAM_ID,
         },
       ],
+      labelUpdates,
     });
 
     const result = await runDelegationReconciliationSweep({
@@ -691,12 +698,19 @@ describe("INF-334 AC2: reconciliation redispatches missed plain delegations", ()
     expect(wakeDispatches).toEqual([
       { agentName: DELEGATE_AGENT_NAME, ticketIdentifier: "DSN-335" },
     ]);
+    // INF-1243: plain delegation must never be auto-enrolled into a workflow.
+    expect(labelUpdates).toEqual([]);
     eventStore.close();
   });
 
-  it("enrolls a plain delegated ticket even when a prior successful dispatch suppresses re-wake", async () => {
+  // INF-1243: was "enrolls a plain delegated ticket even when a prior
+  // successful dispatch suppresses re-wake" — inverted. Idempotency-suppressed
+  // re-wake behavior is unchanged, but the ticket must not be auto-enrolled
+  // into a workflow regardless of dispatch-suppression state.
+  it("INF-1243 (was 'enrolls...'): does NOT auto-enroll a plain delegated ticket even when a prior successful dispatch suppresses re-wake", async () => {
     const eventStore = makeEventStore();
     const wakeDispatches: Array<{ agentName: string; ticketIdentifier: string }> = [];
+    const labelUpdates: string[][] = [];
     const { bus } = makeTestAlertBus();
 
     eventStore.append({
@@ -718,6 +732,7 @@ describe("INF-334 AC2: reconciliation redispatches missed plain delegations", ()
           teamId: TEAM_ID,
         },
       ],
+      labelUpdates,
     });
 
     const result = await runDelegationReconciliationSweep({
@@ -733,11 +748,8 @@ describe("INF-334 AC2: reconciliation redispatches missed plain delegations", ()
     expect(result.skippedIdempotent).toBeGreaterThanOrEqual(1);
     expect(wakeDispatches).toEqual([]);
     const events = eventStore.query({ key: "linear-DSN-336", limit: 20 });
-    expect(events.some((e) =>
-      e.outcome === "auto-enrolled" &&
-      (e.detail as { workflowId?: string; entryState?: string } | null)?.workflowId === "task" &&
-      (e.detail as { workflowId?: string; entryState?: string } | null)?.entryState === "doing",
-    )).toBe(true);
+    expect(events.some((e) => e.outcome === "auto-enrolled")).toBe(false);
+    expect(labelUpdates).toEqual([]);
     eventStore.close();
   });
 });
@@ -2691,7 +2703,11 @@ describe("INF-589: governed heal wakes by resolved OpenClaw id, not Linear displ
     eventStore.close();
   });
 
-  it("auto-enrolls plain worker delegations using the resolved OpenClaw id, not the display name", async () => {
+  // INF-1243: inverted from the original INF-589 expectation. The sweep must
+  // still wake the resolved OpenClaw id (not the Linear display name) for a
+  // plain worker delegation, but must NOT auto-enroll it into wf:task/state:doing
+  // — that stamping is the regression this ticket removes.
+  it("INF-1243 (was 'auto-enrolls...'): wakes a plain worker delegation by the resolved OpenClaw id without auto-enrolling it", async () => {
     const eventStore = makeEventStore();
     const wakeDispatches: Array<{ agentName: string; ticketIdentifier: string }> = [];
     const labelUpdates: string[][] = [];
@@ -2723,16 +2739,13 @@ describe("INF-589: governed heal wakes by resolved OpenClaw id, not Linear displ
 
     expect(result.errors).toEqual([]);
     expect(result.healed).toBe(1);
-    expect(labelUpdates).toEqual([
-      expect.arrayContaining(["label-wf-task", "label-state-doing"]),
-    ]);
+    expect(labelUpdates).toEqual([]);
     expect(wakeDispatches).toEqual([
       { agentName: FELIX_OPENCLAW_ID, ticketIdentifier: "DSN-826" },
     ]);
 
     const events = eventStore.query({ key: "linear-DSN-826", limit: 50 });
-    const autoEnroll = events.find((e) => e.outcome === "auto-enrolled");
-    expect(autoEnroll?.agent).toBe(FELIX_OPENCLAW_ID);
+    expect(events.some((e) => e.outcome === "auto-enrolled")).toBe(false);
 
     eventStore.close();
   });
