@@ -32,11 +32,10 @@ describe("AI-1775: bootstrap reconciliation cron is wired in index.ts", () => {
     ).toBe(true);
   });
 
-  it("calls registerBootstrapReconciliationCron with an authToken resolved from the agent token store", () => {
+  it("calls registerBootstrapReconciliationCron with an authToken resolved from the dedicated service credential", () => {
     expect(INDEX_TS.includes("registerBootstrapReconciliationCron(")).toBe(true);
-    expect(INDEX_TS.includes('getAccessToken("ai")')).toBe(true);
-    expect(INDEX_TS.includes("LINEAR_OAUTH_TOKEN")).toBe(true);
-    expect(INDEX_TS.includes("LINEAR_API_KEY")).toBe(true);
+    expect(INDEX_TS.includes("resolveServiceCredential")).toBe(true);
+    expect(INDEX_TS.includes('getAccessToken("ai")')).toBe(false);
   });
 
   it("passes a wakeFn that uses buildWorkflowAwareDeliveryMessage + deliverMessageToAgent", () => {

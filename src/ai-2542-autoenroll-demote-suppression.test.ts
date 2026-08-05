@@ -418,6 +418,10 @@ beforeEach(() => {
   process.env.CAPABILITY_POLICY_PATH = path.join(dir, "capability-policy.yaml");
   process.env.WORKFLOW_DEF_PATH = path.join(dir, "dev-impl.yaml");
   process.env.ADMIN_SECRET = "admin-secret";
+  // INF-1212: enroll/barrier/bootstrap hooks now resolve auth via the
+  // dedicated service credential, not getAccessToken("ai") — provide one so
+  // the auto-enroll path under test can still authenticate.
+  process.env.LINEAR_SERVICE_CREDENTIAL = "tok-ai";
   delete process.env.LINEAR_WEBHOOK_SECRET;
   delete process.env.LINEAR_WEBHOOK_SECRETS;
   fs.writeFileSync(process.env.CAPABILITY_POLICY_PATH, POLICY_YAML, "utf8");
@@ -442,6 +446,7 @@ beforeEach(() => {
 afterEach(() => {
   jest.useRealTimers();
   globalThis.fetch = originalFetch;
+  delete process.env.LINEAR_SERVICE_CREDENTIAL;
   consoleErrorSpy.mockRestore();
   appState.bag.close();
   appState.sessionTracker.close();

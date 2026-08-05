@@ -98,6 +98,7 @@ import { LINEAR_PROXY_PROTOCOL_VERSION, proxyCompatibilityPayload } from "./prox
 import { getAccessToken, getAgent, getLinearUserIdForAgent, getAllTokenStatuses, isPolledForLinear } from "./agents.js";
 import { loadUniversalCanon, getCanonLiveness } from "./policy/universal-canon.js";
 import { loadRoster, getRoutingFunctionaryLiveness } from "./department-roster.js";
+import { resolveServiceCredential, getDedicatedCredentialLiveness } from "./service-credential.js";
 import { createGuidanceRouter, getDocsLiveness } from "./docs/guidance-router.js";
 import { createHealthSnapshotRouter, getSnapshotLiveness, registerSnapshot } from "./health/snapshot.js";
 import { TtlCache, buildFullCacheLiveness, markCacheFlushRouteMounted, registerTtlInvalidationCron } from "./cache/ttl-cache.js";
@@ -434,7 +435,7 @@ export function createApp(options?: CreateAppOptions) {
         return;
       }
       const agentCfg = getAgent(agentName);
-      const authToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+      const authToken = resolveServiceCredential();
       const deliveryConfig: DeliveryConfig = {
         nodeBin: process.execPath,
         hooksUrl: agentCfg?.hooksUrl ?? process.env.OPENCLAW_HOOKS_URL,
@@ -732,6 +733,9 @@ export function createApp(options?: CreateAppOptions) {
       // and a computed state (healthy/stale/expired/failing). Powers the
       // console token panel (AI-1955 AC3) and operator triage without log access.
       tokens: getAllTokenStatuses(),
+      // INF-1212: dedicated reconciliation/sweep service credential liveness,
+      // independent of any individual agent's OAuth token (see tokens above).
+      serviceCredential: getDedicatedCredentialLiveness(),
       // INF-322 AC4: health snapshot endpoint liveness — confirms the route
       // is wired at bootstrap, observable at ac-validate without waiting for
       // a health event to fire.
@@ -2118,8 +2122,9 @@ export function createApp(options?: CreateAppOptions) {
   // and ~20h token-refresh rotations can't strand a value captured at boot (the
   // captured-const 401 that blinded fleet-wide reconciliation). Mirrors the
   // already-correct resolveCronAuthToken/resolveValidationAuthToken siblings.
-  const resolveMigrationAuthToken = () =>
-    getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  // INF-1212: resolves via the dedicated service credential, not any
+  // individual agent's OAuth token.
+  const resolveMigrationAuthToken = () => resolveServiceCredential();
   const migrationWakeFn = async (agentName: string, ticketIdentifier: string) => {
     const sessionKey = normalizeSessionKey(ticketIdentifier);
     // AI-2313: guard against re-dispatch when a session is already live for this (agent, ticket).
@@ -2189,8 +2194,7 @@ export function createApp(options?: CreateAppOptions) {
   // and armed by createApp() alone. The confirmed-dead signal is the
   // first-action watchdog's terminal `unreachable` ladder — the frozen contract
   // fires the corrective write on confirmed-dead ONLY, never live-but-slow.
-  const reconcilerAuthToken =
-    getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  const reconcilerAuthToken = resolveServiceCredential();
   registerNativeStateReconcilerCron(
     createLinearReconcilerDataPlane({ authToken: reconcilerAuthToken }),
   );
@@ -2334,8 +2338,9 @@ if (isEntryPoint) {
   // and ~20h token-refresh rotations can't strand a value captured at boot. This
   // is the captured-const that 401'd every 5-min delegation-reconciliation cycle
   // and every build-message title/label fetch, blinding fleet-wide reconciliation.
-  const resolveReconciliationAuthToken = () =>
-    getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  // INF-1212: resolves via the dedicated service credential, not any
+  // individual agent's OAuth token.
+  const resolveReconciliationAuthToken = () => resolveServiceCredential();
   const reconciliationWakeFn = async (
     agentName: string,
     ticketIdentifier: string,
@@ -2653,8 +2658,9 @@ if (isEntryPoint) {
   const slaWorkflowDefPath = process.env.WORKFLOW_DEFS_DIR ?? process.env.WORKFLOW_DEF_PATH ?? defaultWorkflowDefPath;
   const slaDataDir = process.env.DATA_DIR ?? resolveStatePath("data");
   const slaBreachStorePath = process.env.SLA_BREACH_STORE_PATH ?? path.join(slaDataDir, "sla-breaches.db");
-  const resolveCronAuthToken = () =>
-    getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  // INF-1212: resolves via the dedicated service credential, not any
+  // individual agent's OAuth token.
+  const resolveCronAuthToken = () => resolveServiceCredential();
   const slaAuthToken = resolveCronAuthToken();
   const slaCadenceMs = process.env.SLA_SWEEP_CADENCE_MS ? parseInt(process.env.SLA_SWEEP_CADENCE_MS, 10) : undefined;
 
@@ -2704,8 +2710,9 @@ if (isEntryPoint) {
   // ones; a token captured here by value is dead minutes after registration.
   // This was the actual root cause of the validation-watchdog auth failures
   // (every tick since INF-105 shipped), misdiagnosed as repo drift.
-  const resolveValidationAuthToken = () =>
-    getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  // INF-1212: resolves via the dedicated service credential, not any
+  // individual agent's OAuth token.
+  const resolveValidationAuthToken = () => resolveServiceCredential();
   const validationAuthToken = resolveValidationAuthToken();
   const validationDataDir = process.env.DATA_DIR ?? resolveStatePath("data");
   const validationNudgeStorePath = process.env.VALIDATION_NUDGE_STORE_PATH ?? path.join(validationDataDir, "validation-nudges.db");
@@ -2766,8 +2773,9 @@ if (isEntryPoint) {
   // INF-683: lazy per-use getter — resolved per audit pass so the boot/~20h token
   // refresh can't strand a value captured at boot. The eager resolve here is a
   // registration gate only (skip when no token is available at boot).
-  const resolveLabelSyncAuthToken = () =>
-    getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  // INF-1212: resolves via the dedicated service credential, not any
+  // individual agent's OAuth token.
+  const resolveLabelSyncAuthToken = () => resolveServiceCredential();
   const labelSyncAuthToken = resolveLabelSyncAuthToken();
   if (labelSyncAuthToken) {
     registerLabelSyncAuditCron({

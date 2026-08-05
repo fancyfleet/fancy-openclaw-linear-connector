@@ -12,7 +12,7 @@
 
 import { createLogger, componentLogger } from "../logger.js";
 import { execFileSync } from "node:child_process";
-import { getAccessToken } from "../agents.js";
+import { resolveServiceCredential } from "../service-credential.js";
 import { formatIntervalMs, registerCron } from "./registry.js";
 import {
   DoneTicketDetector,
@@ -42,8 +42,8 @@ export interface DoneDetectorCronOptions {
   /** Poll interval in ms. Default: 1 hour or process.env.DONE_DETECTOR_POLL_INTERVAL_MS */
   pollIntervalMs?: number;
   /**
-   * Token for Linear API calls. Default: getAccessToken("ai") or
-   * process.env.LINEAR_OAUTH_TOKEN or process.env.LINEAR_API_KEY.
+   * Token for Linear API calls. Default: the dedicated service credential
+   * (resolveServiceCredential(), INF-1212).
    */
   linearToken?: string;
   /**
@@ -56,7 +56,7 @@ export interface DoneDetectorCronOptions {
 // ── Real Linear API implementation ───────────────────────────────────────────
 
 function resolveToken(token?: string): string | undefined {
-  return token ?? getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+  return token ?? (resolveServiceCredential() || undefined);
 }
 
 /** Create a real LinearApi implementation backed by fetch to api.linear.app. */

@@ -45,8 +45,9 @@ describe("AI-1807: delegation reconciliation sweep is wired in index.ts", () => 
     expect(INDEX_TS.includes("registerDelegationReconciliationCron(")).toBe(true);
   });
 
-  it("resolves the auth token via the agent token store (same as every other server-side Linear call)", () => {
-    expect(INDEX_TS.includes('getAccessToken("ai")')).toBe(true);
+  it("resolves the auth token via the dedicated service credential, not the ai agent token", () => {
+    expect(INDEX_TS.includes("resolveServiceCredential")).toBe(true);
+    expect(INDEX_TS.includes('getAccessToken("ai")')).toBe(false);
   });
 
   it("passes an operationalEventStore to the sweep (needed for dispatch-record idempotency checks)", () => {

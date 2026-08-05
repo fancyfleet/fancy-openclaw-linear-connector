@@ -28,10 +28,9 @@ describe("INF-105: validation watchdog cron is wired in index.ts", () => {
     expect(INDEX_TS.includes("registerValidationWatchdogCron(")).toBe(true);
   });
 
-  it("resolves the auth token via the agent token store", () => {
-    expect(INDEX_TS.includes('getAccessToken("ai")')).toBe(true);
-    expect(INDEX_TS.includes("LINEAR_OAUTH_TOKEN")).toBe(true);
-    expect(INDEX_TS.includes("LINEAR_API_KEY")).toBe(true);
+  it("resolves the auth token via the dedicated service credential, not the ai agent token", () => {
+    expect(INDEX_TS.includes("resolveServiceCredential")).toBe(true);
+    expect(INDEX_TS.includes('getAccessToken("ai")')).toBe(false);
   });
 
   it("wires a persisted nudge store (not an in-memory path)", () => {

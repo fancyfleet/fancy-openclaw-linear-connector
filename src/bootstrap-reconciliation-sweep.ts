@@ -1099,9 +1099,9 @@ export async function runBootstrapReconciliationSweep(
 /**
  * Register the reconciliation sweep as a recurring interval timer.
  *
- * The caller MUST supply the Linear auth token — typically resolved in
- * `index.ts` via `getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ??
- * process.env.LINEAR_API_KEY`, matching every other server-side Linear call.
+ * The caller MUST supply the Linear auth token — resolved in `index.ts` via
+ * the dedicated service credential (`resolveServiceCredential()`, INF-1212),
+ * decoupled from any individual agent's OAuth token.
  *
  * **Wake wiring (AC1):** the caller MUST supply a `wakeFn` that delivers a
  * workflow-aware wake to the healed delegate — identical to the post-bootstrap

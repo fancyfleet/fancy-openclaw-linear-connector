@@ -11,7 +11,7 @@
  */
 
 import { createLogger, componentLogger } from "../logger.js";
-import { getAccessToken } from "../agents.js";
+import { resolveServiceCredential } from "../service-credential.js";
 import { formatIntervalMs, registerCron, markCronRun } from "./registry.js";
 import {
   LeakedCredentialSweep,
@@ -33,7 +33,7 @@ export interface LeakedCredSweepCronOptions {
 }
 
 function resolveToken(token?: string): string | undefined {
-  return token ?? getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+  return token ?? (resolveServiceCredential() || undefined);
 }
 
 /** Open-state type priority when reopening (first available wins). */

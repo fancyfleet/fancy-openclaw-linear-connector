@@ -36,10 +36,9 @@ describe("AI-1773: SLA sweep cron is wired in index.ts", () => {
     expect(INDEX_TS.includes("registerSlaSweepCron(")).toBe(true);
   });
 
-  it("resolves the auth token via the agent token store (same as every other server-side Linear call)", () => {
-    expect(INDEX_TS.includes('getAccessToken("ai")')).toBe(true);
-    expect(INDEX_TS.includes("LINEAR_OAUTH_TOKEN")).toBe(true);
-    expect(INDEX_TS.includes("LINEAR_API_KEY")).toBe(true);
+  it("resolves the auth token via the dedicated service credential, not the ai agent token", () => {
+    expect(INDEX_TS.includes("resolveServiceCredential")).toBe(true);
+    expect(INDEX_TS.includes('getAccessToken("ai")')).toBe(false);
   });
 
   it("wires notify to the alert-bus funnel (AC1: warning alert via notify())", () => {

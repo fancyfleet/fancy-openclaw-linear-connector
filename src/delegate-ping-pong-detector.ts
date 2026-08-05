@@ -30,7 +30,8 @@
 import { createLogger, componentLogger } from "./logger.js";
 import { writeDelegate } from "./delegate-write.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
-import { getAccessToken, getLinearUserIdForAgent } from "./agents.js";
+import { getLinearUserIdForAgent } from "./agents.js";
+import { resolveServiceCredential } from "./service-credential.js";
 import { resolveAgentIdentifiersForRole } from "./escalation-gate.js";
 
 const log = componentLogger(createLogger(), "delegate-ping-pong-detector");
@@ -282,11 +283,7 @@ export async function fireEscalation(
   bounceCount: number,
   authToken?: string,
 ): Promise<EscalationResult> {
-  const token =
-    authToken ??
-    getAccessToken("ai") ??
-    process.env.LINEAR_OAUTH_TOKEN ??
-    process.env.LINEAR_API_KEY;
+  const token = authToken ?? (resolveServiceCredential() || undefined);
 
   if (!token) {
     log.error(`ping-pong escalation: no auth token for ${ticketId}`);

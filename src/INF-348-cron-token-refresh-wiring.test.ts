@@ -19,11 +19,9 @@ const INDEX_TS = fs.readFileSync(
 );
 
 describe("INF-348: cron auth token refresh wiring", () => {
-  it("defines a resolver that reads the live ai token store with env fallback", () => {
-    expect(INDEX_TS).toContain("const resolveCronAuthToken = () =>");
-    expect(INDEX_TS).toContain('getAccessToken("ai")');
-    expect(INDEX_TS).toContain("LINEAR_OAUTH_TOKEN");
-    expect(INDEX_TS).toContain("LINEAR_API_KEY");
+  it("defines a resolver that reads the dedicated service credential, not the ai agent token", () => {
+    expect(INDEX_TS).toContain("const resolveCronAuthToken = () => resolveServiceCredential()");
+    expect(INDEX_TS.includes('getAccessToken("ai")')).toBe(false);
   });
 
   it("passes the live resolver into sla-sweep instead of a captured token value", () => {

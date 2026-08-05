@@ -26,6 +26,7 @@ import {
 import type { RouteResult } from "../types.js";
 import { normalizeSessionKey } from "../session-key.js";
 import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgents } from "../agents.js";
+import { resolveServiceCredential } from "../service-credential.js";
 import { checkAgentLiveness, type LivenessConfig } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
 import { checkRoleGuardAndBlock, type LinearUserIdResolver } from "../routing-guard.js";
@@ -193,7 +194,7 @@ export async function findUnblockWakeRoutesForTerminalIssue(event: LinearEvent):
   const blockerLookup = blockerId ?? blockerIdentifier;
   if (!blockerLookup || !isDoneOrCanceledState(blocker.state)) return [];
 
-  const token = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+  const token = resolveServiceCredential() || undefined;
   if (!token) return [];
 
   const response = await fetch("https://api.linear.app/graphql", {
@@ -474,7 +475,7 @@ async function autoAcceptCommitmentOnActivity(
   const claimKey = issueIdentifierFromEvent(event) ?? issueId;
   if (commitmentAutoAcceptClaims.has(claimKey)) return;
   commitmentAutoAcceptClaims.add(claimKey);
-  const token = getAccessToken(bodyId) ?? getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+  const token = getAccessToken(bodyId) ?? (resolveServiceCredential() || undefined);
   if (!token) {
     commitmentAutoAcceptClaims.delete(claimKey);
     return;
@@ -724,7 +725,7 @@ export function createWebhookRouter(
           // When a child reaches a terminal state, check if all siblings are
           // terminal and auto-advance the parent managing → review.
           // Fail-open: barrier errors are logged and never block the terminal prune.
-          const barrierToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+          const barrierToken = resolveServiceCredential() || undefined;
           if (barrierToken) {
             onChildTerminal(identifier, barrierToken).then((result) => {
               if (result?.transitioned) {
@@ -768,7 +769,7 @@ export function createWebhookRouter(
       // AI-1584: Enrollment gap repair — heal wf:* tickets that lack state:* label.
       // Fires on every Issue event (create or update). Fail-open: never blocks routing.
       if (event.type === "Issue") {
-        const enrollToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+        const enrollToken = resolveServiceCredential() || undefined;
         const enrollData = event.data as Record<string, unknown> | null;
         const enrollIssueId = enrollData?.id as string | undefined;
         if (enrollToken && enrollIssueId) {
@@ -902,7 +903,7 @@ export function createWebhookRouter(
       // Fires before the delegate-based router so a wf:* label-add with no
       // delegate can bootstrap the ticket into its entry state and set the
       // first-owner delegate — which then fires the normal dispatch path.
-      const bootstrapToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? (() => {
+      const bootstrapToken = resolveServiceCredential() || (() => {
         // Fallback: use any agent's OAuth token (needed when there's no
         // generic service token in the env — e.g. ILL Tokyo deployment).
         const agents = getAgents();
