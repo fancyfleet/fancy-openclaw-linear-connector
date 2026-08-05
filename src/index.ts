@@ -1320,7 +1320,7 @@ export function createApp(options?: CreateAppOptions) {
       if (!token) continue;
       const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
       try {
-        const issueRes = await fetch("https://api.linear.app/graphql", {
+        const issueRes = await fetch(LINEAR_API_URL, {
           method: "POST",
           headers: { "content-type": "application/json", authorization: authHeader },
           body: JSON.stringify({
@@ -1337,7 +1337,7 @@ export function createApp(options?: CreateAppOptions) {
           lastError = `issue lookup failed via ${source}: ${issueBody.errors?.[0]?.message ?? `no issue for '${identifier}'`}`;
           continue;
         }
-        const commentRes = await fetch("https://api.linear.app/graphql", {
+        const commentRes = await fetch(LINEAR_API_URL, {
           method: "POST",
           headers: { "content-type": "application/json", authorization: authHeader },
           body: JSON.stringify({
@@ -1411,7 +1411,7 @@ export function createApp(options?: CreateAppOptions) {
       if (!token) continue;
       const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
       try {
-        const res = await fetch("https://api.linear.app/graphql", {
+        const res = await fetch(LINEAR_API_URL, {
           method: "POST",
           headers: { "content-type": "application/json", authorization: authHeader },
           body: JSON.stringify({
@@ -1442,7 +1442,7 @@ export function createApp(options?: CreateAppOptions) {
       if (!token) continue;
       const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
       try {
-        const res = await fetch("https://api.linear.app/graphql", {
+        const res = await fetch(LINEAR_API_URL, {
           method: "POST",
           headers: { "content-type": "application/json", authorization: authHeader },
           body: JSON.stringify({
@@ -1480,7 +1480,7 @@ export function createApp(options?: CreateAppOptions) {
       if (!token) continue;
       const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
       try {
-        const res = await fetch("https://api.linear.app/graphql", {
+        const res = await fetch(LINEAR_API_URL, {
           method: "POST",
           headers: { "content-type": "application/json", authorization: authHeader },
           body: JSON.stringify({

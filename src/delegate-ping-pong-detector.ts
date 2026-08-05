@@ -33,12 +33,12 @@ import type { OperationalEventStore } from "./store/operational-event-store.js";
 import { getLinearUserIdForAgent } from "./agents.js";
 import { resolveServiceCredential } from "./service-credential.js";
 import { resolveAgentIdentifiersForRole } from "./escalation-gate.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 
 const log = createModuleLogger("delegate-ping-pong-detector", "info");
 
 const DEFAULT_MAX_BOUNCES = 3;
 const DEFAULT_WINDOW_MS = 30 * 60 * 1000; // 30 minutes
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 // INF-574: roles whose members are terminal, non-oscillation dispatch targets.
 // A dispatch TO the merge-gate owner (Hanzo, role `deployment`) is the legitimate

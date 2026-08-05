@@ -20,10 +20,9 @@ import yaml from "js-yaml";
 import { createModuleLogger } from "./logging.js";
 import { recordSuccess, recordFailure } from "./config-health.js";
 import { defaultCapabilityPolicyPath } from "./instance-config.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 
 const log = createModuleLogger("escalation-gate");
-
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 /** Resolve the policy path dynamically (reads env each call so test beforeAll works). */
 function policyPath(): string {

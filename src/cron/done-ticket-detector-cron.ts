@@ -26,9 +26,9 @@ import {
   type DeployVerdictApi,
   type CodePresence,
 } from "../bag/deploy-verdict.js";
+import { LINEAR_API_URL } from "../linear-helpers.js";
 
 const log = createModuleLogger("done-ticket-detector-cron");
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 // ── Options ──────────────────────────────────────────────────────────────────
 

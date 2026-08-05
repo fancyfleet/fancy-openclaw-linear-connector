@@ -26,10 +26,10 @@ import {
   recordDetectorSkip,
   recordDetectorFail,
 } from "../done-ticket-detector-state.js";
+import { LINEAR_API_URL } from "../linear-helpers.js";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 const HALLMARK_LABEL_PREFIX = "hallmark:";
 
 const log = createModuleLogger("done-ticket-detector");

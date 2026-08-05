@@ -29,9 +29,9 @@ import {
   SEC_LEAKED_CREDENTIAL_LABEL,
   anyCommentConfirmsRotation,
 } from "./leaked-credential-artifact.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 
 const log = createModuleLogger("leaked-credential-gate");
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 /**
  * Semantic verbs that resolve/close a ticket. The `stateId` type check below is

@@ -33,10 +33,9 @@ import {
 import { resolveBodiesForRole, resolveBodiesWithCapability, roleResolutionScopeForOwnerRole } from "./escalation-gate.js";
 import { getBinding } from "./implementer-store.js";
 import { notify } from "./alerts/alert-bus.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 
 const log = createModuleLogger("routing-guard", "info");
-
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 export interface RoleGuardResult {
   /** True when the dispatch has been blocked. */

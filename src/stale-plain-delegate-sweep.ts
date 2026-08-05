@@ -31,10 +31,9 @@ import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
 import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
 import { getRateLimitClient } from "./linear-rate-limit-client.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 
 const log = createModuleLogger("stale-plain-delegate");
-
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 const DEFAULT_STALE_TIMEOUT_MS = 4 * 60 * 60 * 1000;
 const DEFAULT_POLL_MS = 15 * 60 * 1000;

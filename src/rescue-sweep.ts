@@ -25,10 +25,9 @@ import { defaultCapabilityPolicyPath } from "./instance-config.js";
 import { getLinearUserIdForAgent } from "./agents.js";
 import { boundSeatFor } from "./implementer-store.js";
 import type { OperationalEventInput } from "./store/operational-event-store.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 
 const log = createModuleLogger("rescue-sweep");
-
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 /**
  * INF-719: page size for the paginated wf:* enumeration. Unpaginated issues()

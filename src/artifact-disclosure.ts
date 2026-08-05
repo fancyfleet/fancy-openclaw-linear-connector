@@ -1,8 +1,8 @@
 import { parseArtifactMarkers, parseCodeArtifact, sameArtifact, formatCodeArtifact, type CodeArtifact } from "./artifact.js";
 import { createModuleLogger } from "./logging.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 
 const log = createModuleLogger("artifact-disclosure");
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 interface DisclosureComment {
   body: string;

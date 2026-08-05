@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { getAgent, upsertAgent, AgentConfig } from "./agents.js";
 import { createModuleLogger } from "./logging.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 
 const log = createModuleLogger("oauth-callback", "info");
 
@@ -95,7 +96,7 @@ export async function handleOAuthCallback(req: Request, res: Response): Promise<
   let linearUserId: string;
   let linearUserName: string;
   try {
-    const viewerRes = await fetch("https://api.linear.app/graphql", {
+    const viewerRes = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${access_token}`,

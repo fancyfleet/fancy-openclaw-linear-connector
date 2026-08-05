@@ -11,6 +11,7 @@
 
 import type { LinearEvent } from "./webhook/schema.js";
 import { createModuleLogger } from "./logging.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 
 const log = createModuleLogger("canonical-identifier", "info");
 
@@ -87,7 +88,7 @@ export async function resolveCanonicalIdentifier(
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 5_000);
 
-      const res = await fetch("https://api.linear.app/graphql", {
+      const res = await fetch(LINEAR_API_URL, {
         method: "POST",
         headers: {
           "content-type": "application/json",

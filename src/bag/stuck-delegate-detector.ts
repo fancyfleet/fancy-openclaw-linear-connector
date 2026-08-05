@@ -44,6 +44,7 @@ import { normalizeSessionKey } from "../session-key.js";
 import { deliverMessageToAgent, type DeliveryConfig } from "../delivery/index.js";
 import type { DispatchAckTracker } from "./dispatch-ack-tracker.js";
 import { isBlockedByOpenIssue, isHumanLinearUser, type LinearIssueRelation, type LinearUserReference } from "../linear-actionable.js";
+import { LINEAR_API_URL } from "../linear-helpers.js";
 
 const log = createModuleLogger("stuck-delegate-detector", "info");
 
@@ -672,7 +673,7 @@ export async function defaultFetchStuckCandidates(
           body: string;
           user: { id: string; name: string } | null;
         }>;
-            };
+      };
             history: {
               nodes: Array<{
                 __typename: string;
@@ -701,7 +702,7 @@ export async function defaultFetchStuckCandidates(
     let cursor: string | null = null;
     let hasNextPage = true;
     while (hasNextPage) {
-      const res = await fetchImpl("https://api.linear.app/graphql", {
+      const res = await fetchImpl(LINEAR_API_URL, {
         method: "POST",
         headers: { "content-type": "application/json", authorization: authHeader },
         body: JSON.stringify({ query, variables: { delegateId: agent.linearUserId, after: cursor } }),

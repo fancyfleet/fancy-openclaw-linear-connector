@@ -29,10 +29,9 @@ import { createModuleLogger } from "./logging.js";
 import { isHealthy as isConfigHealthy, getStatus as getConfigStatus, onAlert, type ConfigHealthStatus } from "./config-health.js";
 import { loadWorkflowDef, loadWorkflowRegistry, type WorkflowDef } from "./workflow-gate.js";
 import { notify } from "./alerts/alert-bus.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 
 const log = createModuleLogger("canary");
-
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 

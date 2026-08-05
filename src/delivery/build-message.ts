@@ -33,6 +33,7 @@ import { createModuleLogger } from "../logging.js";
 import { defaultGuidanceDir } from "../instance-config.js";
 import { loadUniversalCanon, formatCanonBlock } from "../policy/universal-canon.js";
 import { remediateAgentToken } from "../agents.js";
+import { LINEAR_API_URL } from "../linear-helpers.js";
 
 const log = createModuleLogger("build-message");
 
@@ -226,7 +227,7 @@ export async function buildWorkflowAwareDeliveryMessage(
   let title = "";
   let instanceContext: WorkflowInstanceContext | undefined;
   try {
-    const res = await fetch("https://api.linear.app/graphql", {
+    const res = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: authToken },
       body: JSON.stringify({ query, variables: { id: identifier } }),
@@ -320,7 +321,7 @@ async function fetchLastComment(
     }
   `;
   try {
-    const res = await fetch("https://api.linear.app/graphql", {
+    const res = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: authToken },
       body: JSON.stringify({ query, variables: { identifier } }),
@@ -451,7 +452,6 @@ export async function tryBuildWorkflowMessage(
     loadStepGuidance(def.id, currentState),
     stateNode.deliverLastComment ? fetchLastComment(identifier, authToken) : Promise.resolve(null),
   ]);
-
 
   const guidanceBlock: string[] = guidance
     ? ["", "---", "**Step guidance (accumulated lessons for this state):**", "", guidance.trim(), "---"]

@@ -2,6 +2,7 @@ import { buildAgentMap, getAccessToken, getAgent } from "./agents.js";
 import { createModuleLogger } from "./logging.js";
 import { normalizeSessionKey } from "./session-key.js";
 import type { LinearEvent } from "./webhook/schema.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 
 const log = createModuleLogger("linear-actionable", "info");
 
@@ -241,7 +242,7 @@ export async function checkLinearIssueRouting(
   const agent = getAgent(agentId);
   const identifier = issueIdentifierFromSessionKey(ticketId);
   try {
-    const response = await fetch("https://api.linear.app/graphql", {
+    const response = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -404,7 +405,7 @@ export async function isLinearIssueActionable(ticketId: string, agentId: string)
 
   const identifier = issueIdentifierFromSessionKey(ticketId);
   try {
-    const response = await fetch("https://api.linear.app/graphql", {
+    const response = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: {
         "content-type": "application/json",

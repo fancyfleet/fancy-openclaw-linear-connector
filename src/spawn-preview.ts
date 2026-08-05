@@ -22,10 +22,9 @@
  */
 
 import { createModuleLogger } from "./logging.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 
 const log = createModuleLogger("spawn-preview");
-
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
