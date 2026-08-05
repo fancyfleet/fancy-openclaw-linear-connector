@@ -20,7 +20,7 @@
  * for a single ticket or a time window (AC5).
  */
 
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import {
   fetchIssueContext,
   applyBootstrapToIssue,
@@ -36,10 +36,7 @@ import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import { type DispatchIdempotencyStore } from "./store/dispatch-idempotency-store.js";
 
-const log = componentLogger(
-  createLogger(process.env.LOG_LEVEL ?? "info"),
-  "delegation-reconciliation",
-);
+const log = createModuleLogger("delegation-reconciliation");
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 

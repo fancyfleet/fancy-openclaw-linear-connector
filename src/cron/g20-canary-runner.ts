@@ -8,12 +8,12 @@
  * Scheduled:    registerG20CanaryCron() during connector startup
  */
 
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import { runG20Canary, type G20CanaryConfig, type G20CanaryResult } from "./g20-canary-job.js";
 import { notify } from "../alerts/alert-bus.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "g20-canary");
+const log = createModuleLogger("g20-canary");
 
 const DEFAULT_INTERVAL_MS = parseIntervalMs(process.env.G20_CANARY_INTERVAL ?? "15m");
 

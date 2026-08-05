@@ -31,7 +31,7 @@
  *   NO_ACTIVITY_DEFERRED_STALE_MS   — how long a deferred entry may sit before rescue (default: 90 min)
  */
 
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import type { AgentConfig } from "../agents.js";
 import type { DispatchAckTracker } from "./dispatch-ack-tracker.js";
 import type { SessionTracker } from "./session-tracker.js";
@@ -44,7 +44,7 @@ import { isLinearIssueActionable } from "../linear-actionable.js";
 import { tryNormalizeSessionKey } from "../session-key.js";
 import { notify } from "../alerts/alert-bus.js";
 
-const log = componentLogger(createLogger(), "no-activity-detector");
+const log = createModuleLogger("no-activity-detector");
 
 const DEFAULT_WARN_MS = 2 * 60 * 1000;          // 2 minutes
 const DEFAULT_FAIL_MS = 5 * 60 * 1000;           // 5 minutes

@@ -13,9 +13,9 @@ import { getCachedRoster, resolveRoute } from "./department-roster.js";
 import type { LinearEvent } from "./webhook/schema.js";
 import type { RouteResult } from "./types.js";
 import { normalizeSessionKey } from "./session-key.js";
-import { createLogger, componentLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 
-const log = componentLogger(createLogger(), "router");
+const log = createModuleLogger("router");
 
 /**
  * Discriminated union returned by extractAgentTarget.

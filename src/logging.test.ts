@@ -14,6 +14,7 @@
  * sites being migrated). The implementer may relocate the export as long as
  * `createModuleLogger` remains importable from `./logging.js`.
  */
+import { jest } from "@jest/globals";
 import { componentLogger, createLogger } from "./logger.js";
 import { createModuleLogger } from "./logging.js";
 

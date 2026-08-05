@@ -26,12 +26,12 @@ import { isBarrierState, resolveBarrierTarget } from "../barrier.js";
 
 import fs from "node:fs/promises";
 import yaml from "js-yaml";
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
 import { type WorkflowDef } from "../workflow-gate.js";
 import { findOrCreateLabel } from "../linear-helpers.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "anti-entropy");
+const log = createModuleLogger("anti-entropy");
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 

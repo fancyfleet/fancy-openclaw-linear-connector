@@ -1,4 +1,4 @@
-import { componentLogger, createLogger, type Logger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 
 /**
  * Push transport chain for the alert bus (docs/alert-bus.md).
@@ -21,7 +21,7 @@ import { componentLogger, createLogger, type Logger } from "../logger.js";
 
 const PUSH_TIMEOUT_MS = 10_000;
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "alert-push");
+const log = createModuleLogger("alert-push");
 
 async function postJson(url: string, token: string | undefined, body: unknown): Promise<Response> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };

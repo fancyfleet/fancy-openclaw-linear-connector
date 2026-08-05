@@ -27,14 +27,14 @@
  *                                   (default: 30 min)
  */
 
-import { createLogger, componentLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { writeDelegate } from "./delegate-write.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import { getLinearUserIdForAgent } from "./agents.js";
 import { resolveServiceCredential } from "./service-credential.js";
 import { resolveAgentIdentifiersForRole } from "./escalation-gate.js";
 
-const log = componentLogger(createLogger(), "delegate-ping-pong-detector");
+const log = createModuleLogger("delegate-ping-pong-detector");
 
 const DEFAULT_MAX_BOUNCES = 3;
 const DEFAULT_WINDOW_MS = 30 * 60 * 1000; // 30 minutes

@@ -17,10 +17,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { instanceConfigRoot } from "./instance-config.js";
-import { createLogger, componentLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import yaml from "js-yaml";
 
-const log = componentLogger(createLogger(), "webhook-routes");
+const log = createModuleLogger("webhook-routes");
 
 // ---------------------------------------------------------------------------
 // Types

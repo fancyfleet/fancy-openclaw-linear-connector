@@ -18,11 +18,11 @@
 
 import Database from "better-sqlite3";
 import path from "path";
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import { normalizeSessionKey } from "../session-key.js";
 import { emitStreamTopic } from "../admin-stream.js";
 
-const log = componentLogger(createLogger(), "dispatch-ack-tracker");
+const log = createModuleLogger("dispatch-ack-tracker");
 
 export type AckStatus = "pending" | "acknowledged" | "unconfirmed" | "escalated" | "deferred";
 

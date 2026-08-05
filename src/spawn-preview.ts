@@ -21,9 +21,9 @@
  *   3. The preview shows the proposed child list before any child ticket exists.
  */
 
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "spawn-preview");
+const log = createModuleLogger("spawn-preview");
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 

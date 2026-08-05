@@ -36,10 +36,10 @@ import {
   type GeneratedProposalSink,
 } from "../proposal/generated-proposal-adapter.js";
 import { defaultGuidanceDir, instanceConfigRoot } from "../instance-config.js";
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import { registerCron, markCronRun, formatIntervalMs } from "./registry.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "p4-metrics-distillation");
+const log = createModuleLogger("p4-metrics-distillation");
 
 const DEFAULT_THRESHOLD = parseInt(process.env.P4_DISTILL_THRESHOLD ?? "3", 10);
 const MAX_PROPOSALS_PER_RUN = parseInt(process.env.MAX_PROPOSALS_PER_RUN ?? "10", 10);

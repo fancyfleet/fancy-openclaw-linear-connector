@@ -25,9 +25,9 @@
  */
 
 import fs from "node:fs/promises";
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "implementer-store");
+const log = createModuleLogger("implementer-store");
 
 /** The role key for the original single-body record (back-compat). */
 export const IMPLEMENTER_ROLE = "implementer";

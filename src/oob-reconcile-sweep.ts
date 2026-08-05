@@ -23,13 +23,13 @@
  *     are excluded by the query (both carry correlated=1).
  */
 
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import type { MutationAuditStore, MutationAuditRecord, ChangeType } from "./store/mutation-audit-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import { getAlertBus } from "./alerts/alert-bus.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "oob-reconcile");
+const log = createModuleLogger("oob-reconcile");
 
 /** Default grace window before a webhook mutation is eligible for reconcile.
  *  The proxy op may arrive slightly after the webhook; this prevents premature

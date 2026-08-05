@@ -10,9 +10,9 @@
  */
 
 import type { LinearEvent } from "./webhook/schema.js";
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 
-const log = componentLogger(createLogger(), "canonical-identifier");
+const log = createModuleLogger("canonical-identifier");
 
 const RESOLVE_QUERY = `query ResolveIdentifier($id: String!) {
   issue(id: $id) {

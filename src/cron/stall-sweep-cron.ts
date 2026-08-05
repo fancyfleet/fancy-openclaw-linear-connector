@@ -16,11 +16,11 @@
 
 import type { LivenessRecord, StallClassifierConfig } from "../stall-detection.js";
 import { getStalledTickets } from "../stall-detection.js";
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import { registerCron, markCronRun, formatIntervalMs } from "./registry.js";
 import { recordStallDetectionActive } from "../stall-detection-state.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "stall-sweep-cron");
+const log = createModuleLogger("stall-sweep-cron");
 
 /** Parse a duration string like "5m", "30s", "3600s" or raw milliseconds. */
 function parseIntervalMs(value: string): number {

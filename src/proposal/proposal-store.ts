@@ -21,14 +21,14 @@
 import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
-import { componentLogger, createLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import {
   computeIdempotencyKey as _computeIdempotencyKey,
   type GeneratedProposal,
   type ProposalTarget,
 } from "./proposal-generator.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proposal-store");
+const log = createModuleLogger("proposal-store");
 
 /** The six lifecycle statuses a stored proposal may hold (AC3.3). */
 export const PROPOSAL_STATUSES = [

@@ -6,7 +6,7 @@ import { handleProxyRequest } from "./proxy.js";
 import { handleProxyUploadRequest } from "./proxy-upload.js";
 import { startTokenRefresh, forceRefreshAll } from "./token-refresh.js";
 import { getAgents, watchAgentsFile, getEncryptionKeyValidation } from "./agents.js";
-import { createLogger, componentLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { handleOAuthCallback } from "./oauth-callback.js";
 import { EventStore } from "./store/event-store.js";
 import { NudgeStore } from "./store/nudge-store.js";
@@ -112,7 +112,7 @@ import crypto from "crypto";
 import path from "path";
 import { resolveStatePath } from "./state-dir.js";
 
-const log = componentLogger(createLogger(), "server");
+const log = createModuleLogger("server");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3100;
 const DEPLOYMENT_NAME = process.env.DEPLOYMENT_NAME ?? "fancymatt";
 const DEFAULT_CRITICAL_STALE_CRON_MS = 24 * 60 * 60 * 1000;

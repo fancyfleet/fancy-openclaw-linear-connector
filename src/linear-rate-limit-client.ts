@@ -27,12 +27,9 @@
  */
 
 import type { AlertBus } from "./alerts/alert-bus.js";
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 
-const log = componentLogger(
-  createLogger(process.env.LOG_LEVEL ?? "info"),
-  "linear-rate-limit",
-);
+const log = createModuleLogger("linear-rate-limit");
 
 /**
  * Consumers whose Linear query path routes through the rate-limit-aware client

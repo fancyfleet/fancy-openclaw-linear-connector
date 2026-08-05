@@ -20,13 +20,13 @@
 import fs from "node:fs";
 import { writeDelegate } from "./delegate-write.js";
 import yaml from "js-yaml";
-import { createLogger, componentLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { defaultCapabilityPolicyPath } from "./instance-config.js";
 import { getLinearUserIdForAgent } from "./agents.js";
 import { boundSeatFor } from "./implementer-store.js";
 import type { OperationalEventInput } from "./store/operational-event-store.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "rescue-sweep");
+const log = createModuleLogger("rescue-sweep");
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 

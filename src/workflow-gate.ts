@@ -37,7 +37,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import yaml from "js-yaml";
-import { componentLogger, createLogger, type Logger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
+import type { Logger } from "./logger.js";
 import { defaultWorkflowDefPath } from "./instance-config.js";
 import { bodyHasCapability, resolveBodiesForRole, resolveBodiesWithCapability, isBodyKnown, isRoleDeclared, isSyntheticNoBodyRole, roleResolutionScopeForOwnerRole, type RoleResolutionScope } from "./escalation-gate.js";
 import { probeDeployOutcome } from "./deploy-probe.js";
@@ -86,14 +87,14 @@ import { checkDefAgainstFixture } from "./fixture-drift-core.js";
  * Design: design.md §4.2, §4.4, §4.6, §11, §13, §16.1, §16.2, and H-6.
  */
 
-let log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-gate");
+let log = createModuleLogger("workflow-gate");
 
 /**
  * AI-2544: Test hook to inject a spy logger for verifying error-payload logging.
  * Call with no args or undefined to reset to the real logger.
  */
 export function _setLogForTests(testLogger?: Logger): void {
-  log = testLogger ?? componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-gate");
+  log = testLogger ?? createModuleLogger("workflow-gate");
 }
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";

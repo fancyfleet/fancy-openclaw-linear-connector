@@ -1,7 +1,7 @@
 import { spawn } from "child_process";
 import path from "node:path";
 import type { RouteResult } from "../types.js";
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import { buildDeliveryMessage } from "./build-message.js";
 import { getAccessToken, getOpenclawAgentName } from "../agents.js";
 import { getActiveCanonVersion } from "../policy/universal-canon.js";
@@ -19,7 +19,7 @@ import {
 } from "../store/session-spawn-idempotency-store.js";
 import { probeBoundSessionTerminal } from "../bag/stale-session-forensics.js";
 
-const log = componentLogger(createLogger(), "delivery");
+const log = createModuleLogger("delivery");
 
 export interface DeliveryConfig {
   nodeBin: string;

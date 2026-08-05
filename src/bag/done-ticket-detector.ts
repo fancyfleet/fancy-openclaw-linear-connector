@@ -7,11 +7,11 @@
  * never from the ticket's identifier/title/`Done` label. See ./deploy-verdict.ts.
  */
 
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import { markCronRun } from "../cron/registry.js";
 import type { DeployVerdict, DeployVerdictApi } from "./deploy-verdict.js";
 
-const log = componentLogger(createLogger(), "done-ticket-detector");
+const log = createModuleLogger("done-ticket-detector");
 
 // ── Types ──────────────────────────────────────────────────────────────────
 

@@ -1,11 +1,11 @@
 import { makeFreshSessionKey, normalizeSessionKey } from "../session-key.js";
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import { sendWakeUpSignal, MENTION_TICKET_TEMPLATE, type WakeUpConfig } from "./wake-up.js";
 import { PendingWorkBag } from "./pending-work-bag.js";
 import { SessionTracker } from "./session-tracker.js";
 import { isLinearIssueActionable, isLinearIssueStillRoutedToAgent, checkLinearIssueRouting, type RoutingReason } from "../linear-actionable.js";
 
-const log = componentLogger(createLogger(), "resignal");
+const log = createModuleLogger("resignal");
 
 export interface DispatchResult {
   ticketId: string;

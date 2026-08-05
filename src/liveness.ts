@@ -12,9 +12,9 @@
  *           that it can actually run a model. Document this delta in the source.
  */
 
-import { createLogger, componentLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 
-const log = componentLogger(createLogger(), "liveness");
+const log = createModuleLogger("liveness");
 
 export type LivenessResult =
   | { available: true }

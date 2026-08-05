@@ -10,10 +10,10 @@
  *  - Fails open when HEALTH_CHECK_URL is missing or for non-connector repos (AC5).
  */
 
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { notify } from "./alerts/alert-bus.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "deploy-probe");
+const log = createModuleLogger("deploy-probe");
 
 export interface DeployProbeResult {
   success: boolean;

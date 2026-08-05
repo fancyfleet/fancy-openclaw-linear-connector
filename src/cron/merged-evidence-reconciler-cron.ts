@@ -8,10 +8,10 @@
  * Pattern mirrors src/cron/rescue-sweep-cron.ts.
  */
 
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "merged-evidence-reconciler-cron");
+const log = createModuleLogger("merged-evidence-reconciler-cron");
 
 const CRON_NAME = "merged-evidence-reconciler";
 

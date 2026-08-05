@@ -26,11 +26,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { instanceConfigRoot } from "./instance-config.js";
 import { notify } from "./alerts/alert-bus.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "known-humans");
+const log = createModuleLogger("known-humans");
 
 export function knownHumansPath(): string {
   return (

@@ -19,14 +19,14 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import yaml from "js-yaml";
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { notify } from "./alerts/alert-bus.js";
 import { defaultWorkflowDefPath } from "./instance-config.js";
 import { checkDefAgainstFixture, fixturePathFor } from "./fixture-drift-core.js";
 
 export { checkDefAgainstFixture, fixturePathFor } from "./fixture-drift-core.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "fixture-drift");
+const log = createModuleLogger("fixture-drift");
 
 // ── Types ──────────────────────────────────────────────────────────────────
 

@@ -11,9 +11,9 @@
  * Module log tag: "linear-helpers".
  */
 
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "linear-helpers");
+const log = createModuleLogger("linear-helpers");
 
 export const LINEAR_API_URL = "https://api.linear.app/graphql";
 

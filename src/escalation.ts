@@ -10,12 +10,12 @@
  * the outbound "agent unreachable" notification path.
  */
 
-import { createLogger, componentLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { writeDelegate } from "./delegate-write.js";
 import { getAccessToken, getAgent, getLinearUserIdForAgent } from "./agents.js";
 import { notify } from "./alerts/alert-bus.js";
 
-const log = componentLogger(createLogger(), "escalation");
+const log = createModuleLogger("escalation");
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 

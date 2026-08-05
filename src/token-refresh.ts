@@ -20,9 +20,9 @@
 import { getAgents, getTokenStatus, updateTokens, recordTokenFailure, isAgentLocal, validateEncryptionKeyMatch } from "./agents.js";
 import type { AgentConfig } from "./agents.js";
 import { notify } from "./alerts/alert-bus.js";
-import { createLogger, componentLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 
-const log = componentLogger(createLogger(), "token-refresh");
+const log = createModuleLogger("token-refresh");
 
 // ── Constants ──────────────────────────────────────────────────────────────
 

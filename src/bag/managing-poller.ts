@@ -20,7 +20,7 @@
  * next poller tick) because `lastDispatchedAt` is null until the first dispatch.
  */
 
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import { getAccessToken, getAgents, isAgentLocal, isPolledForLinear, type AgentConfig } from "../agents.js";
 import type { OperationalEventStore } from "../store/operational-event-store.js";
 import type { ManagingStateStore } from "../store/managing-state-store.js";
@@ -29,7 +29,7 @@ import { sendManagingWakeSignal, type ManagingWakeTicket } from "./managing-wake
 import { surfaceStalledChildren, evaluateBarrier, attemptBarrierTransition, isManagedBarrierFromLabels } from "../barrier.js";
 import { notify } from "../alerts/alert-bus.js";
 
-const log = componentLogger(createLogger(), "managing-poller");
+const log = createModuleLogger("managing-poller");
 
 // Singleton guard (AI-2624 AC5): prevents a second ManagingPoller from being
 // instantiated while one is already active. If two pollers run independently,

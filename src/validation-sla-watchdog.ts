@@ -21,13 +21,13 @@
 import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
-import { createLogger, componentLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 
-const log = componentLogger(createLogger(), "validation-watchdog");
+const log = createModuleLogger("validation-watchdog");
 
 // ── Defaults ──────────────────────────────────────────────────────────────────
 

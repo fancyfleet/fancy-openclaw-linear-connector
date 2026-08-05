@@ -23,9 +23,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { instanceConfigRoot } from "../instance-config.js";
-import { componentLogger, createLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "universal-canon");
+const log = createModuleLogger("universal-canon");
 
 /** Result of a successful canon load. */
 export interface CanonLoadResult {

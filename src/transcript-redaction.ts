@@ -17,11 +17,11 @@ import type { Stats } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import { registerCron, markCronRun, formatIntervalMs } from "./cron/registry.js";
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 
 const execFileAsync = promisify(execFile);
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "transcript-redaction");
+const log = createModuleLogger("transcript-redaction");
 
 /** Registry key for the cron registry. */
 const CRON_NAME = "transcript-redaction";

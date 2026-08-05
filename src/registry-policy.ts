@@ -26,9 +26,9 @@ import { getAgents, onAgentsReloaded, type AgentConfig } from "./agents.js";
 import { getPolicyBodies, type PolicyBody, type CapabilityPolicy } from "./escalation-gate.js";
 import { defaultCapabilityPolicyPath } from "./instance-config.js";
 import { notify } from "./alerts/alert-bus.js";
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "registry-policy");
+const log = createModuleLogger("registry-policy");
 
 export interface RegistryPolicyStatus {
   /** ISO timestamp of the last completed check, or null if never run. */

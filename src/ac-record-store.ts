@@ -19,10 +19,10 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { resolveBodiesForRole } from "./escalation-gate.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "ac-record-store");
+const log = createModuleLogger("ac-record-store");
 
 /** Linear GraphQL API endpoint (used by recaptureAc to fetch description / post comments). */
 const LINEAR_API_URL = "https://api.linear.app/graphql";

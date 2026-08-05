@@ -35,7 +35,7 @@ import { checkLabelSyncForTicket, emitLabelSyncWarning } from "../transition-aud
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets, type NoActivityDetector } from "../bag/index.js";
 import { type WakeUpConfig } from "../bag/wake-up.js";
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import { checkLinearIssueRouting, isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
 import { onChildTerminal } from "../barrier.js";
 import { maybeBootstrapWorkflow } from "../workflow-bootstrap.js";
@@ -47,7 +47,7 @@ import type { DispatchRecordStore } from "../liveness-channel/dispatch-record-st
 import type { GatewayDispatchAck } from "../liveness-channel/gateway-ack-types.js";
 import { extractRejectedWebhookDiagnostic, WebhookSecretDriftTracker } from "./drift.js";
 
-const log = componentLogger(createLogger(), "webhook");
+const log = createModuleLogger("webhook");
 
 /**
  * INF-1214: minimal structural interface for the acknowledged-delivery front

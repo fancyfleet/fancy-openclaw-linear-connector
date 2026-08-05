@@ -19,7 +19,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { createLogger, componentLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
 import {
   recordDetectorRun,
@@ -32,7 +32,7 @@ import {
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 const HALLMARK_LABEL_PREFIX = "hallmark:";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "done-ticket-detector");
+const log = createModuleLogger("done-ticket-detector");
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
