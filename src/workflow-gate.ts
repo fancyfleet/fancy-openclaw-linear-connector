@@ -608,6 +608,13 @@ async function loadDefFromFile(file: string): Promise<WorkflowDef> {
   if (commitmentGateErrors.length > 0) {
     throw new Error(commitmentGateErrors.join("; "));
   }
+  // INF-1218: routine-verb invariant — every state must expose an unambiguous
+  // forward/revision edge, or the engine cannot translate continue-workflow /
+  // request-revision. Fail closed on load rather than at dispatch time.
+  const routineEdgeErrors = validateRoutineEdges(def);
+  if (routineEdgeErrors.length > 0) {
+    throw new Error(routineEdgeErrors.join("; "));
+  }
   const warnings = validateNativeStateMappings(def);
   for (const w of warnings) {
     log.error(`workflow-gate: native_state validation FAILURE (${def.id}): ${w}`);
@@ -3271,6 +3278,139 @@ export function resolveStakesLevel(labels: string[], stakesConfig: StakesLevel):
   return stakesConfig.levels[stakesLabel];
 }
 
+// ── INF-1218: engine-level routine-verb resolver ───────────────────────────
+//
+// `continue-workflow` / `request-revision` resolve to the UNIQUE forward /
+// revision edge from the current state, so a workflow YAML no longer has to
+// teach agents literal verbs (submit/approve/tests-ready/validated/reject) nor
+// tag every edge `generic:`. Special/internal edges are excluded from routine
+// resolution and keep their literal command names: escape (break_glass),
+// handoff, demote/park, force-deploy, reseat-merge, designated sign-off, and
+// self-loops. `generic:` tags remain honored as an explicit override.
+
+/** Commands that are always special hatches, never routine forward/back verbs. */
+const SPECIAL_ROUTINE_COMMANDS = new Set([
+  "handoff",
+  "demote",
+  "park",
+  "force-deploy",
+  "reseat-merge",
+]);
+
+type RoutineClass = "forward" | "revision" | "special";
+
+function isSpecialTransition(
+  def: WorkflowDef,
+  stateId: string,
+  t: WorkflowTransition,
+): boolean {
+  if (def.break_glass?.command && t.command === def.break_glass.command) return true;
+  if (SPECIAL_ROUTINE_COMMANDS.has(t.command)) return true;
+  if (t.designated_approver) return true; // opt-in sign-off authority, not a spine verb
+  if (typeof t.to === "string" && t.to.startsWith("__")) return true; // __ad_hoc__ / park sentinels
+  if (t.to === stateId) return true; // self-loop (re-seat same state, handoff-style)
+  return false;
+}
+
+/**
+ * Forward topological rank per state (entry_state = 0), following only
+ * non-special, non-`generic:revision` edges. Used to infer a revision (send-back)
+ * edge that carries no explicit tag: an edge landing on an earlier-or-equal rank
+ * is backward. Cycles/unreachable states get no rank and never cause a forward
+ * edge to be mis-read as backward (we only classify as revision on positive
+ * evidence that `to` ranks <= `from`).
+ */
+function buildStateRank(def: WorkflowDef): Map<string, number> {
+  const adj = new Map<string, string[]>();
+  for (const s of def.states ?? []) {
+    const outs: string[] = [];
+    for (const t of s.transitions ?? []) {
+      if (isSpecialTransition(def, s.id, t)) continue;
+      if (t.generic === "revision") continue;
+      outs.push(t.to);
+    }
+    adj.set(s.id, outs);
+  }
+  const rank = new Map<string, number>();
+  const start = def.entry_state;
+  if (!start) return rank;
+  const queue: Array<[string, number]> = [[start, 0]];
+  while (queue.length) {
+    const next = queue.shift();
+    if (!next) break;
+    const [id, r] = next;
+    const cur = rank.get(id);
+    if (cur !== undefined && cur <= r) continue;
+    rank.set(id, r);
+    for (const nxt of adj.get(id) ?? []) queue.push([nxt, r + 1]);
+  }
+  return rank;
+}
+
+function classifyRoutineTransition(
+  def: WorkflowDef,
+  stateId: string,
+  t: WorkflowTransition,
+  rank: Map<string, number>,
+): RoutineClass {
+  if (isSpecialTransition(def, stateId, t)) return "special";
+  if (t.generic === "revision") return "revision";
+  if (t.generic === "continue") return "forward";
+  const from = rank.get(stateId);
+  const to = rank.get(t.to);
+  if (from !== undefined && to !== undefined && to <= from) return "revision";
+  return "forward";
+}
+
+/**
+ * Resolve the unique routine edge of the requested kind from a state.
+ * Returns the command, `null` when the state has no such edge (legal — e.g. a
+ * terminal state has no forward edge), or an `error` when 2+ edges match
+ * (ambiguous — the engine refuses to guess). Fails closed at both transition
+ * time and registry load (validateRoutineEdges).
+ */
+function resolveRoutineEdge(
+  def: WorkflowDef,
+  node: WorkflowState,
+  kind: "forward" | "revision",
+  rank?: Map<string, number>,
+): { command: string } | { error: string } | null {
+  const r = rank ?? buildStateRank(def);
+  const matches = (node.transitions ?? []).filter(
+    (t) => classifyRoutineTransition(def, node.id, t, r) === kind,
+  );
+  if (matches.length === 0) return null;
+  if (matches.length > 1) {
+    return {
+      error:
+        `state '${node.id}' exposes ${matches.length} ${kind} edges ` +
+        `(${matches.map((m) => m.command).join(", ")}) — the routine verb is ` +
+        `ambiguous; exactly one ${kind} edge is required (tag one 'generic' or ` +
+        `mark the others special).`,
+    };
+  }
+  return { command: matches[0].command };
+}
+
+/**
+ * Registry-load invariant (INF-1218): every state must expose an unambiguous
+ * routine forward/revision verb. Returns a list of config errors (empty = ok);
+ * loadWorkflowRegistry throws on any, so an ambiguous def fails closed on load.
+ */
+function validateRoutineEdges(def: WorkflowDef): string[] {
+  const errors: string[] = [];
+  const rank = buildStateRank(def);
+  for (const state of def.states ?? []) {
+    for (const kind of ["forward", "revision"] as const) {
+      const res = resolveRoutineEdge(def, state, kind, rank);
+      if (res && "error" in res) {
+        errors.push(`workflow '${def.id}': ${res.error}`);
+      }
+    }
+  }
+  return errors;
+}
+
 // ── Public enforcement API ─────────────────────────────────────────────────
 
 /**
@@ -3373,31 +3513,25 @@ export async function resolveMetaIntent(
     return { error: `[Proxy] '${intent}' blocked: current state '${currentState}' not found in workflow definition.` };
   }
 
-  const genericRole: 'continue' | 'revision' = intent === 'continue-workflow' ? 'continue' : 'revision';
-  let transition = intent === 'begin-workflow'
-    ? undefined
-    : stateNode.transitions?.find((t) => t.generic === genericRole);
-
-  // INF-443: begin-workflow has no dedicated `generic` tag in existing defs — it
-  // is only ever legal at entry_state, where the conventional forward command is
-  // named `accept` (dev-impl.yaml and every registered def use this name for the
-  // steward's entry-state transition). Fall back to that literal command name
-  // when resolving begin-workflow, rather than requiring defs to be re-tagged.
-  if (!transition && intent === 'begin-workflow' && currentState === def.entry_state) {
-    transition = stateNode.transitions?.find((t) => t.command === 'accept');
-  }
-
-  if (!transition) {
+  // INF-1218: resolve to the UNIQUE routine edge via the engine. Honors explicit
+  // `generic:` tags but no longer requires them — `continue-workflow`/
+  // `begin-workflow` take the forward edge, `request-revision` the send-back.
+  const kind: 'forward' | 'revision' =
+    intent === 'request-revision' ? 'revision' : 'forward';
+  const routine = resolveRoutineEdge(def, stateNode, kind);
+  if (routine === null) {
     const available = stateNode.transitions?.map((t) => t.command).join(', ') ?? 'none';
-    const role = intent === 'begin-workflow' ? 'begin' : genericRole;
     return {
       error:
-        `[Proxy] '${intent}' has no ${role} transition in state '${currentState}' ` +
+        `[Proxy] '${intent}' has no ${kind} transition in state '${currentState}' ` +
         `(wf:${workflowId}). Available named commands: ${available}.`,
     };
   }
+  if ('error' in routine) {
+    return { error: `[Proxy] '${intent}' blocked: ${routine.error}` };
+  }
 
-  return { resolved: transition.command };
+  return { resolved: routine.command };
 }
 
 /**
@@ -3406,10 +3540,39 @@ export async function resolveMetaIntent(
  * names (e.g. task.yaml's `request`) do not exist as CLI commands, so
  * rejection hints must never render them bare (pilot finding, 2026-07-03).
  */
-export function cliVerbFor(t: { command: string; generic?: string }): string {
+export function cliVerbFor(
+  t: WorkflowTransition,
+  def?: WorkflowDef,
+  stateId?: string,
+): string {
+  // INF-1218: with def+state context, classify engine-side so agents only ever
+  // see the two routine verbs (+ the literal names of special hatches). Literal
+  // forward/revision verbs (submit/approve/tests-ready/validated/reject) are
+  // hidden. Without context, fall back to the explicit `generic:` tag.
+  if (def && stateId) {
+    const cls = classifyRoutineTransition(def, stateId, t, buildStateRank(def));
+    if (cls === "forward") return "continue-workflow";
+    if (cls === "revision") return "request-revision";
+    return t.command; // special hatch keeps its literal name (escape/handoff/…)
+  }
   if (t.generic === "continue") return "continue-workflow";
   if (t.generic === "revision") return "request-revision";
   return t.command;
+}
+
+/**
+ * INF-1218: build the deduped, agent-facing legal-move list for a state — the
+ * routine verbs (continue-workflow / request-revision), the special hatches by
+ * their literal names, and the break-glass command. Literal spine verbs are
+ * collapsed into the routine verbs, so agents never see submit/approve/etc.
+ */
+export function legalMovesFor(
+  def: WorkflowDef,
+  node: WorkflowState | undefined,
+  breakGlass: string,
+): string {
+  const verbs = (node?.transitions ?? []).map((t) => cliVerbFor(t, def, node!.id));
+  return [...new Set([...verbs, breakGlass])].join(", ");
 }
 
 /**
@@ -3678,7 +3841,7 @@ export async function checkWorkflowRules(
     );
     if (!isHumanSignoffPath) {
       log.warn(`workflow-gate: unknown caller '${bodyId}' on wf:${workflowId} ticket ${issueId} — blocking`);
-      const legalMoves = [...(preNode?.transitions?.map((t) => cliVerbFor(t)) ?? []), breakGlassCommand].join(", ");
+      const legalMoves = legalMovesFor(def, preNode, breakGlassCommand);
       return (
         `[Proxy] Unknown caller '${bodyId}' blocked on workflow ticket. ` +
         `Ensure this agent is registered in the capability policy. ` +
@@ -3724,7 +3887,7 @@ export async function checkWorkflowRules(
     log.warn(`workflow-gate: escape blocked agent=${bodyId} ticket=${issueId} (not delegate or steward)`);
     const escapeCurrentState = getCurrentState(labels);
     const escapeNode = escapeCurrentState ? def.states.find((s) => s.id === escapeCurrentState) : undefined;
-    const escapeLegalMoves = [...(escapeNode?.transitions?.map((t) => cliVerbFor(t)) ?? []), breakGlassCommand].join(", ");
+    const escapeLegalMoves = legalMovesFor(def, escapeNode, breakGlassCommand);
     return (
       `[Proxy] 'escape' blocked: '${bodyId}' is not the current delegate or the workflow steward. ` +
       `Only the assigned delegate or a workflow steward may use break-glass on a governed ticket. ` +
@@ -3836,7 +3999,7 @@ export async function checkWorkflowRules(
     log.warn(`workflow-gate: unknown-caller block agent=${bodyId} intent=${intent} ticket=${issueId}`);
     const wcState = getCurrentState(labels);
     const wcNode = wcState ? def.states.find((s) => s.id === wcState) : undefined;
-    const legalMoves = [...(wcNode?.transitions?.map((t) => cliVerbFor(t)) ?? []), breakGlassCommand].join(", ");
+    const legalMoves = legalMovesFor(def, wcNode, breakGlassCommand);
     return (
       `[Proxy] '${intent}' blocked: caller '${bodyId}' cannot be verified and the ticket has a known delegate. ` +
       `Register the agent in agents.json with a linearUserId to proceed. ` +
@@ -3881,7 +4044,7 @@ export async function checkWorkflowRules(
         log.warn(`workflow-gate: delegate-only block agent=${bodyId} intent=${intent} ticket=${issueId}`);
         const wdState = getCurrentState(labels);
         const wdNode = wdState ? def.states.find((s) => s.id === wdState) : undefined;
-        const legalMoves = [...(wdNode?.transitions?.map((t) => cliVerbFor(t)) ?? []), breakGlassCommand].join(", ");
+        const legalMoves = legalMovesFor(def, wdNode, breakGlassCommand);
         return (
           `[Proxy] '${intent}' blocked: ${bodyId} is not the current delegate for ${issueId}. ` +
           `Only the ticket delegate may mutate its state. ` +
