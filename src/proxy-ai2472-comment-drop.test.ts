@@ -65,7 +65,12 @@ roles:
 bodies:
   - id: astrid
     container: steward
-    fills_roles: [steward]
+    # INF-1217: also fills 'dev' so AC1 below — a two-mutation sequence that
+    # must share one agent identity for the AI-2472 sticky-intent snapshot
+    # key (agentId:issueId:intent:commandId) to recognize the second mutation
+    # as a continuation — can submit from implementation as the same caller
+    # it uses everywhere else in this file, without a role-membership block.
+    fills_roles: [steward, dev]
   - id: igor
     container: dev
     fills_roles: [dev]

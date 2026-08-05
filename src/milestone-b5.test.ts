@@ -778,17 +778,22 @@ describe("Integration: full state machine walk — all states visited", () => {
   it("walks the happy path: intake → auditing → spawning → managing → review → done", async () => {
     const { checkWorkflowRules } = await import("./workflow-gate.js");
 
+    // INF-1217: intake's owner_role is 'steward' (filled by astrid in this
+    // fixture) — igor fills no role at all, so 'accept' must run as astrid.
+    // The other states' owner_roles ('ux-researcher', 'engine') have zero
+    // bodies configured in this fixture's policy, so the owner_role gate
+    // fails open for them and igor (as the live delegate) still passes.
     const stateSequence = [
-      { state: "intake", command: "accept" },
-      { state: "auditing", command: "complete-audit" },
-      { state: "spawning", command: "spawn" },
-      { state: "managing", command: "complete" },
-      { state: "review", command: "approve" },
+      { state: "intake", command: "accept", caller: "astrid", callerLinearUserId: "user-astrid" },
+      { state: "auditing", command: "complete-audit", caller: "igor", callerLinearUserId: "user-igor" },
+      { state: "spawning", command: "spawn", caller: "igor", callerLinearUserId: "user-igor" },
+      { state: "managing", command: "complete", caller: "igor", callerLinearUserId: "user-igor" },
+      { state: "review", command: "approve", caller: "igor", callerLinearUserId: "user-igor" },
     ];
 
-    for (const { state, command } of stateSequence) {
-      setupFetchForState(state, "user-igor");
-      const rejection = await checkWorkflowRules(command, "AI-1000", "Bearer tok", "igor", null, "user-igor");
+    for (const { state, command, caller, callerLinearUserId } of stateSequence) {
+      setupFetchForState(state, callerLinearUserId);
+      const rejection = await checkWorkflowRules(command, "AI-1000", "Bearer tok", caller, null, callerLinearUserId);
       expect(rejection).toBeNull();
     }
   });
@@ -821,11 +826,18 @@ describe("Integration: full state machine walk — all states visited", () => {
       { state: "review", legalCommands: ["approve", "request-rework"], illegalCommands: ["accept", "complete-audit", "spawn", "complete"] },
     ];
 
+    // INF-1217: intake's owner_role ('steward') is filled by astrid, not
+    // igor — legal-command checks against intake must run as astrid.
+    // Illegal-command checks are unaffected (rejected before the owner_role
+    // gate is ever reached, on the "not a legal command" branch).
     for (const { state, legalCommands, illegalCommands } of crossStateChecks) {
+      const legalCaller = state === "intake" ? "astrid" : "igor";
+      const legalCallerLinearUserId = state === "intake" ? "user-astrid" : "user-igor";
+
       // All legal commands should pass
       for (const cmd of legalCommands) {
-        setupFetchForState(state, "user-igor");
-        const rejection = await checkWorkflowRules(cmd, "AI-1000", "Bearer tok", "igor", null, "user-igor");
+        setupFetchForState(state, legalCallerLinearUserId);
+        const rejection = await checkWorkflowRules(cmd, "AI-1000", "Bearer tok", legalCaller, null, legalCallerLinearUserId);
         expect(rejection).toBeNull();
       }
 

@@ -4154,6 +4154,62 @@ export async function checkWorkflowRules(
     }
   }
 
+  // INF-1217: owner_role membership gate — independent of delegate identity.
+  // The delegate-identity gate above (~3833-3891) only fires when a delegate is
+  // set; when unset, ANY known caller previously fell through with no role check
+  // at all (the exact gap that let INF-1212 through — a code-review-role caller
+  // ran 'accept' directly on an un-delegated intake ticket). A caller must fill
+  // the CURRENT state's owner_role to fire a transition on it, whether or not a
+  // delegate is set, and even when the caller happens to BE the delegate
+  // (delegate identity is not a substitute for role membership).
+  //
+  // Placed after the capability/force-deploy gates above (not before) so their
+  // more specific, already-established messaging (INF-197/INF-629 designated-
+  // approver signoff-wake text, force-deploy's workflow:force-deploy message,
+  // plain requires_capability text) still fires first when a caller fails
+  // those checks — this gate only catches the residual case: a caller who
+  // passed (or wasn't subject to) any capability check but still doesn't fill
+  // the role.
+  //
+  // Composes with, does not replace, the existing opt-in exceptions:
+  //   - designated_approver / force-deploy: these transitions nominate their
+  //     own dedicated capability-based authority (requires_capability +
+  //     designated_approver, or workflow:force-deploy respectively) as the
+  //     FULL authorization for that specific verb — exempt them here entirely
+  //     rather than layering a second, generic role requirement on top.
+  //   - workflow:break-glass: the recovery steward may act on states owned by
+  //     the break-glass role itself (def.break_glass.owner_role) — the
+  //     recovery mechanism for stuck/un-delegated tickets, not a blanket
+  //     bypass of every role on every state (an unrelated owner_role, e.g.
+  //     'dev', stays gated to its own role members).
+  // Unknown callers are exempt here, same as the capability gate above — the
+  // human sign-off path (requires_human_signoff_above_stakes) governs them.
+  if (isCallerKnown && intent !== 'force-deploy') {
+    const ownerRole = stateNode.owner_role;
+    if (ownerRole && match.designated_approver !== true) {
+      const roleBodies = await resolveBodiesForOwnerRole(ownerRole, def);
+      // Misconfigured/unpopulated role (zero bodies) fails open, same convention
+      // as the first-delegate role check above (~line 5054) — a policy gap must
+      // not lock every caller out of a state no one is configured to own.
+      if (roleBodies.length > 0 && !roleBodies.includes(bodyId)) {
+        let authorized = false;
+        if (ownerRole === def.break_glass?.owner_role) {
+          authorized = await bodyHasCapability(bodyId, "workflow:break-glass");
+        }
+        if (!authorized) {
+          log.warn(`workflow-gate: owner-role block agent=${bodyId} intent=${intent} ticket=${issueId} state=${currentState} owner_role=${ownerRole}`);
+          const roleLegalMoves = [...transitions.map((t) => cliVerbFor(t)), breakGlassCommand].join(", ");
+          return (
+            `[Proxy] '${intent}' blocked: caller '${bodyId}' does not fill the '${ownerRole}' role required to act on ` +
+            `${issueId} in state '${currentState}'. Only members of the '${ownerRole}' role (or an applicable exception — ` +
+            `designated_approver, workflow:break-glass) may fire this transition. Legal moves: ${roleLegalMoves}.`
+          );
+        }
+        log.info(`workflow-gate: owner-role exception bypass agent=${bodyId} intent=${intent} ticket=${issueId} owner_role=${ownerRole} (workflow:break-glass)`);
+      }
+    }
+  }
+
   // AI-1731 / INF-443: Comment requirement gate.
   // Transitions marked requires_comment: true must be accompanied by a non-empty
   // comment body (posted via commentCreate in the same request). This ensures

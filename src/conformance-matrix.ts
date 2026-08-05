@@ -54,7 +54,7 @@ export interface ConformanceCell {
     delegateLinearUserId?: string | null;
   };
   expected: 'allow' | 'block';
-  blockReason?: 'wrong-state' | 'cap-missing' | 'wrong-delegate' | 'human-signoff' | 'unknown-caller';
+  blockReason?: 'wrong-state' | 'cap-missing' | 'wrong-delegate' | 'human-signoff' | 'unknown-caller' | 'wrong-owner-role';
   legalCommands: string[];
   requiredCapability?: string;
 }
@@ -254,6 +254,25 @@ function resolveExpected(
         blockReason: 'cap-missing',
         requiredCapability: match.requires_capability,
       };
+    }
+  }
+
+  // 5.5. INF-1217: owner_role membership gate — independent of delegate
+  // identity. A caller must fill the state's owner_role (or an applicable
+  // exception — designated_approver, workflow:break-glass scoped to states
+  // owned by the break-glass role itself) to fire a transition on it.
+  // force-deploy has its own dedicated workflow:force-deploy capability gate
+  // and is exempt here; a misconfigured/unpopulated role (zero bodies) fails
+  // open, mirroring checkWorkflowRules.
+  if (command !== 'force-deploy' && !match.designated_approver && stateNode.owner_role) {
+    const roleBodies = bodiesForRole(policy, stateNode.owner_role);
+    if (roleBodies.length > 0 && !roleBodies.includes(spec.bodyId)) {
+      const isBreakGlassEligible =
+        stateNode.owner_role === def.break_glass?.owner_role &&
+        bodyHasCap(policy, spec.bodyId, 'workflow:break-glass');
+      if (!isBreakGlassEligible) {
+        return { expected: 'block', blockReason: 'wrong-owner-role' };
+      }
     }
   }
 

@@ -97,7 +97,11 @@ bodies:
     fills_roles: [dev]
   - id: astrid
     container: steward
-    fills_roles: [steward]
+    # INF-1217: also fills 'worker' so the route not-self test below can
+    # exercise the not-self constraint with a caller who is both the intake
+    # owner (steward) and a legal 'working'-role assignment target — otherwise
+    # the earlier legal-target check would fire first, never reaching not-self.
+    fills_roles: [steward, worker]
   - id: reviewer
     container: code-review
     fills_roles: [code-review]
@@ -705,15 +709,20 @@ describe("checkWorkflowRules — implementation state", () => {
 
   it("blocks 'route' when the caller targets itself (not-self constraint)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
-    const result = await checkWorkflowRules("route", "issue-uuid", "Bearer tok", "worker1", "worker1");
+    // INF-1217: 'route' lives on intake (owner_role: steward), so the caller
+    // must fill 'steward' to fire it at all — astrid, who (per the fixture
+    // above) also fills 'worker', so she's a legal assignment target and this
+    // exercises the not-self constraint specifically, not the role gate.
+    const result = await checkWorkflowRules("route", "issue-uuid", "Bearer tok", "astrid", "astrid");
     expect(result).not.toBeNull();
     expect(result).toContain("Self-assignment blocked");
-    expect(result).toContain("worker1");
+    expect(result).toContain("astrid");
   });
 
   it("allows 'route' to a different legal worker (not-self constraint)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
-    expect(await checkWorkflowRules("route", "issue-uuid", "Bearer tok", "worker1", "worker2")).toBeNull();
+    // INF-1217: caller must fill intake's owner_role (steward) — astrid.
+    expect(await checkWorkflowRules("route", "issue-uuid", "Bearer tok", "astrid", "worker2")).toBeNull();
   });
 
   it("rejects submit with wrong target (not a code-review body)", async () => {
@@ -749,12 +758,14 @@ describe("checkWorkflowRules — code-review state", () => {
 
   it("allows 'approve' in code-review", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
-    expect(await checkWorkflowRules("approve", "issue-uuid", "Bearer tok", "charles")).toBeNull();
+    // INF-1217: caller must fill code-review's owner_role ('code-review') —
+    // 'reviewer', not 'charles' (who fills 'dev').
+    expect(await checkWorkflowRules("approve", "issue-uuid", "Bearer tok", "reviewer")).toBeNull();
   });
 
   it("allows 'request-changes' in code-review", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
-    expect(await checkWorkflowRules("request-changes", "issue-uuid", "Bearer tok", "charles")).toBeNull();
+    expect(await checkWorkflowRules("request-changes", "issue-uuid", "Bearer tok", "reviewer")).toBeNull();
   });
 
   it("blocks 'deploy' in code-review", async () => {
@@ -937,7 +948,8 @@ describe("checkWorkflowRules — canonical vault schema (src/__fixtures__/canoni
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"]);
     // 'reject' requires no capability — should pass through
     // AI-1731: reject now has requires_comment — pass hasComment=true to test legality, not the comment gate
-    const result = await checkWorkflowRules("reject", "issue-uuid", "Bearer tok", "astrid", null, undefined, null, false, false, true);
+    // INF-1217: caller must fill merge's owner_role ('deployment') — hanzo, not astrid (steward).
+    const result = await checkWorkflowRules("reject", "issue-uuid", "Bearer tok", "hanzo", null, undefined, null, false, false, true);
     expect(result).toBeNull();
   });
 
@@ -6172,8 +6184,10 @@ describe("AI-2358: stakes-threshold designated-approver bypass", () => {
 
   it("AC5: transition with no requires_capability still blocks (original behavior preserved)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:sprint-with-stakes", "state:validating", "stakes:high"]);
-    const result = await checkWorkflowRules("request-rework", "AI2358-AC5", "Bearer tok", "charles");
-    // request-rework does NOT have requires_human_signoff_above_stakes — should pass
+    // INF-1217: caller must fill validating's owner_role ('sprint-owner') — ai,
+    // not charles (who fills 'dev'). request-rework does NOT have
+    // requires_human_signoff_above_stakes — should pass for a role-filling caller.
+    const result = await checkWorkflowRules("request-rework", "AI2358-AC5", "Bearer tok", "ai");
     expect(result).toBeNull();
   });
 
