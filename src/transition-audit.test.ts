@@ -6,6 +6,7 @@
  *   - emitTransitionAuditRecord logs at correct severity
  */
 
+import path from "node:path";
 import { describe, it, expect, jest, beforeEach, afterEach } from "@jest/globals";
 
 // Import the module under test after mocks are set up
@@ -13,7 +14,10 @@ import {
   buildTransitionAuditRecord,
   emitTransitionAuditRecord,
   emitLabelSyncWarning,
+  checkLabelNativeStateSyncForTicket,
+  emitLabelNativeSyncWarning,
 } from "./transition-audit.js";
+import { resetWorkflowCache } from "./workflow-gate.js";
 
 describe("buildTransitionAuditRecord", () => {
   it("produces a complete record with all fields", () => {
@@ -169,5 +173,115 @@ describe("emitLabelSyncWarning", () => {
     };
 
     expect(() => emitLabelSyncWarning(divergence)).not.toThrow();
+  });
+});
+
+/**
+ * INF-1242 AC3 — label-vs-native divergence detection.
+ *
+ * INF-1197's actual observed failure was "labels read `state:intake` while
+ * native Linear state is `Doing`" — the `state:*` LABEL diverged from the
+ * native Linear STATUS FIELD. This is distinct from checkLabelSyncForTicket
+ * above (which compares the connector's own applied-state-store record
+ * against the label — never touches the native status field at all).
+ *
+ * checkLabelNativeStateSyncForTicket compares a ticket's current `state:*`
+ * label (resolved through the workflow def's `native_state` semantic
+ * mapping + SEMANTIC_STATE_MAP candidate names) against the actual native
+ * Linear workflow state name.
+ */
+describe("checkLabelNativeStateSyncForTicket", () => {
+  const REGISTERED_DEFS_DIR = path.resolve(process.cwd(), "src/registered-defs");
+  const savedEnv: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    savedEnv.WORKFLOW_DEFS_DIR = process.env.WORKFLOW_DEFS_DIR;
+    savedEnv.WORKFLOW_DEF_DIR = process.env.WORKFLOW_DEF_DIR;
+    savedEnv.WORKFLOW_DEF_PATH = process.env.WORKFLOW_DEF_PATH;
+    process.env.WORKFLOW_DEFS_DIR = REGISTERED_DEFS_DIR;
+    delete process.env.WORKFLOW_DEF_PATH;
+    resetWorkflowCache();
+  });
+
+  afterEach(() => {
+    if (savedEnv.WORKFLOW_DEFS_DIR === undefined) delete process.env.WORKFLOW_DEFS_DIR;
+    else process.env.WORKFLOW_DEFS_DIR = savedEnv.WORKFLOW_DEFS_DIR;
+    if (savedEnv.WORKFLOW_DEF_DIR === undefined) delete process.env.WORKFLOW_DEF_DIR;
+    else process.env.WORKFLOW_DEF_DIR = savedEnv.WORKFLOW_DEF_DIR;
+    if (savedEnv.WORKFLOW_DEF_PATH === undefined) delete process.env.WORKFLOW_DEF_PATH;
+    else process.env.WORKFLOW_DEF_PATH = savedEnv.WORKFLOW_DEF_PATH;
+    resetWorkflowCache();
+    jest.restoreAllMocks();
+  });
+
+  function mockIssueState(stateLabelName: string | null, nativeStateName: string | null): void {
+    jest.spyOn(globalThis, "fetch").mockImplementation((async (_url: unknown, init?: RequestInit) => {
+      const body = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as { query?: string };
+      if ((body.query ?? "").includes("IssueStateLabel")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                labels: { nodes: stateLabelName ? [{ name: stateLabelName }] : [] },
+                state: nativeStateName ? { name: nativeStateName } : null,
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ data: {} }), { status: 200 });
+    }) as typeof globalThis.fetch);
+  }
+
+  // dev-impl v20's `intake` state declares native_state: todo, whose
+  // SEMANTIC_STATE_MAP candidates are ["Todo", "To Do", "To Develop"].
+
+  it("returns a label-native-desync divergence when the label's expected native state doesn't match Linear's actual native state (the INF-1197 shape)", async () => {
+    mockIssueState("state:intake", "Doing");
+
+    const divergence = await checkLabelNativeStateSyncForTicket("INF-1197", "dev-impl", "Bearer tok");
+
+    expect(divergence).not.toBeNull();
+    expect(divergence).toMatchObject({
+      kind: "label-native-desync",
+      ticketId: "INF-1197",
+      workflowId: "dev-impl",
+      stateLabel: "state:intake",
+      expectedNativeState: "todo",
+      actualNativeStateName: "Doing",
+    });
+  });
+
+  it("returns null when the native state name matches one of the semantic candidates (case/space-insensitive)", async () => {
+    mockIssueState("state:intake", "To Do");
+
+    const divergence = await checkLabelNativeStateSyncForTicket("INF-9001", "dev-impl", "Bearer tok");
+
+    expect(divergence).toBeNull();
+  });
+
+  it("returns null when the state label has no matching workflow state in the def", async () => {
+    mockIssueState("state:not-a-real-state", "Doing");
+
+    const divergence = await checkLabelNativeStateSyncForTicket("INF-9002", "dev-impl", "Bearer tok");
+
+    expect(divergence).toBeNull();
+  });
+});
+
+describe("emitLabelNativeSyncWarning", () => {
+  it("accepts a label-native-desync divergence descriptor and logs without throwing", () => {
+    const divergence = {
+      kind: "label-native-desync" as const,
+      ticketId: "INF-1197",
+      workflowId: "dev-impl",
+      stateLabel: "state:intake",
+      expectedNativeState: "todo",
+      expectedNativeStateCandidates: ["Todo", "To Do", "To Develop"],
+      actualNativeStateName: "Doing",
+    };
+
+    expect(() => emitLabelNativeSyncWarning(divergence)).not.toThrow();
   });
 });

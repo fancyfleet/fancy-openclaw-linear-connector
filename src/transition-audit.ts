@@ -9,6 +9,7 @@
 
 import { componentLogger, createLogger } from "./logger.js";
 import { getAppliedState } from "./store/applied-state-store.js";
+import { loadWorkflowRegistry, SEMANTIC_STATE_MAP } from "./workflow-gate.js";
 import type { TransitionApplyResult } from "./workflow-gate.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "transition-audit");
@@ -162,8 +163,13 @@ export async function verifyPostTransition(
 
 /**
  * Label-sync divergence descriptor: proxy-state vs Linear live state.
+ *
+ * `kind` is optional (rather than required) so existing untyped divergence
+ * literals built before INF-1242 (e.g. in tests) remain valid — concrete
+ * divergences returned by checkLabelSyncForTicket always set it.
  */
 export interface LabelSyncDivergence {
+  kind?: "proxy-vs-label";
   ticketId: string;
   proxyState: string | null;
   linearState: string | null;
@@ -171,6 +177,31 @@ export interface LabelSyncDivergence {
   /** Approximate seconds since proxy state was recorded. */
   ageSec: number;
 }
+
+/**
+ * INF-1242 AC3 — label-vs-native divergence descriptor: the `state:*` LABEL
+ * vs the actual native Linear workflow STATUS FIELD, resolved through the
+ * workflow def's `native_state` semantic mapping. This is the pairing that
+ * actually wedged INF-1197 ("labels read `state:intake` while native Linear
+ * state is `Doing`") — distinct from LabelSyncDivergence above, which never
+ * touches the native status field.
+ */
+export interface LabelNativeStateDivergence {
+  kind: "label-native-desync";
+  ticketId: string;
+  workflowId: string;
+  /** The ticket's current state:* label (e.g. "state:intake"), or null if none found. */
+  stateLabel: string | null;
+  /** The semantic native_state the current state label declares (e.g. "todo"), or null if unresolvable. */
+  expectedNativeState: string | null;
+  /** Candidate native Linear state display names for expectedNativeState, per SEMANTIC_STATE_MAP. */
+  expectedNativeStateCandidates: string[];
+  /** The actual native Linear workflow state name read back from the ticket. */
+  actualNativeStateName: string | null;
+}
+
+/** Either flavor of label-sync divergence this module can detect. */
+export type LabelSyncAuditDivergence = LabelSyncDivergence | LabelNativeStateDivergence;
 
 /**
  * Run a label-sync audit for a single ticket: compare the proxy-store
@@ -204,6 +235,7 @@ export async function checkLabelSyncForTicket(
   if (proxyState === linearState) return null; // Match — no divergence.
 
   return {
+    kind: "proxy-vs-label",
     ticketId,
     proxyState,
     linearState,
@@ -223,18 +255,113 @@ export function emitLabelSyncWarning(divergence: LabelSyncDivergence): void {
 }
 
 /**
- * Fetch the state:* label name from Linear for a given issue.
- * Returns the full label name (e.g. "state:doing") or null if not found.
+ * INF-1242 AC3 — compare a ticket's `state:*` label against its native
+ * Linear workflow status, using the workflow's `native_state` semantic
+ * mapping (SEMANTIC_STATE_MAP, same source of truth resolveNativeStateId
+ * uses). Detects exactly the INF-1197 shape: labels read `state:intake`
+ * while native Linear state is `Doing`.
+ *
+ * Returns null (nothing to report) when:
+ *   - the ticket has no state:* label,
+ *   - the workflow id has no loadable def,
+ *   - the state label doesn't correspond to any state in that def,
+ *   - that state declares no (or an unrecognized) native_state semantic, or
+ *   - the actual native state name matches one of the semantic candidates.
+ *
+ * Returns a LabelNativeStateDivergence when the actual native state name
+ * matches none of the semantic candidates for the label's expected state.
  */
-async function fetchStateLabel(
+export async function checkLabelNativeStateSyncForTicket(
+  ticketId: string,
+  workflowId: string,
+  authToken: string,
+): Promise<LabelNativeStateDivergence | null> {
+  let stateLabel: string | null;
+  let actualNativeStateName: string | null;
+  try {
+    const info = await fetchIssueStateInfo(ticketId, authToken);
+    stateLabel = info.stateLabel;
+    actualNativeStateName = info.nativeStateName;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`[transition-audit] label-native-state check failed for ${ticketId}: ${msg}`);
+    return null;
+  }
+
+  if (!stateLabel || !stateLabel.startsWith("state:")) return null;
+  const stateId = stateLabel.slice("state:".length);
+
+  let registry;
+  try {
+    registry = await loadWorkflowRegistry();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`[transition-audit] label-native-state check: registry load failed for ${ticketId}: ${msg}`);
+    return null;
+  }
+  const def = registry.get(workflowId);
+  if (!def) return null; // No loadable def for this workflow — nothing to validate against.
+
+  const stateNode = def.states.find((s) => s.id === stateId);
+  if (!stateNode) return null; // Label doesn't correspond to a known state in this def.
+
+  const expectedNativeState = stateNode.native_state ?? null;
+  if (!expectedNativeState) return null; // No semantic native_state declared — nothing to compare.
+
+  const candidates = SEMANTIC_STATE_MAP[expectedNativeState.toLowerCase()];
+  if (!candidates) return null; // Unrecognized semantic name — nothing to compare.
+
+  // Same normalization as workflow-gate.ts's resolveNativeStateId.
+  const normalize = (s: string) => s.toLowerCase().replace(/\s+/g, "");
+  const matches =
+    actualNativeStateName !== null &&
+    candidates.some((candidate) => normalize(candidate) === normalize(actualNativeStateName!));
+  if (matches) return null; // Native state matches the label's expectation — no divergence.
+
+  return {
+    kind: "label-native-desync",
+    ticketId,
+    workflowId,
+    stateLabel,
+    expectedNativeState,
+    expectedNativeStateCandidates: candidates,
+    actualNativeStateName,
+  };
+}
+
+/**
+ * Emit a warning log entry for a label-vs-native-state divergence. Mirrors
+ * emitLabelSyncWarning's structured-JSON-log-line pattern.
+ */
+export function emitLabelNativeSyncWarning(divergence: LabelNativeStateDivergence): void {
+  log.warn(
+    `[TRANSITION-AUDIT] LABEL-NATIVE-STATE DIVERGENCE ${JSON.stringify(divergence)}`,
+  );
+}
+
+interface IssueStateInfo {
+  stateLabel: string | null;
+  nativeStateName: string | null;
+}
+
+/**
+ * Fetch both the state:* label and the native Linear workflow state name for
+ * a given issue in a single query. Shared by fetchStateLabel (proxy-vs-label
+ * audit) and checkLabelNativeStateSyncForTicket (INF-1242 label-vs-native
+ * audit) so both checks cost exactly one round trip's worth of state reads.
+ */
+async function fetchIssueStateInfo(
   issueId: string,
   authToken: string,
-): Promise<string | null> {
+): Promise<IssueStateInfo> {
   const query = `
     query IssueStateLabel($id: String!) {
       issue(id: $id) {
         labels {
           nodes { name }
+        }
+        state {
+          name
         }
       }
     }
@@ -244,13 +371,37 @@ async function fetchStateLabel(
     headers: { "Content-Type": "application/json", Authorization: authToken },
     body: JSON.stringify({ query, variables: { id: issueId } }),
   });
-  type Resp = { data?: { issue?: { labels?: { nodes?: Array<{ name: string }> } } | null } | null };
+  type Resp = {
+    data?: {
+      issue?: {
+        labels?: { nodes?: Array<{ name: string }> };
+        state?: { name?: string } | null;
+      } | null;
+    } | null;
+  };
   const data = (await res.json()) as Resp;
   const labels = data.data?.issue?.labels?.nodes ?? [];
+  let stateLabel: string | null = null;
   for (const l of labels) {
-    if (l.name.startsWith("state:")) return l.name;
+    if (l.name.startsWith("state:")) {
+      stateLabel = l.name;
+      break;
+    }
   }
-  return null;
+  const nativeStateName = data.data?.issue?.state?.name ?? null;
+  return { stateLabel, nativeStateName };
+}
+
+/**
+ * Fetch the state:* label name from Linear for a given issue.
+ * Returns the full label name (e.g. "state:doing") or null if not found.
+ */
+async function fetchStateLabel(
+  issueId: string,
+  authToken: string,
+): Promise<string | null> {
+  const info = await fetchIssueStateInfo(issueId, authToken);
+  return info.stateLabel;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────

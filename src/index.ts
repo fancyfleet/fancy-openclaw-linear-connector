@@ -550,6 +550,32 @@ export function createApp(options?: CreateAppOptions) {
       ...(cron.required === true ? { required: true } : {}),
     })));
 
+    // INF-1242 AC3: label-sync divergences (state:* label vs proxy-store, and
+    // state:* label vs native Linear workflow status) are first-class
+    // operational events; project the recent ones into /health.warnings, same
+    // pattern as dispatch-undeliverable above, so a silent divergence is
+    // visible without log access.
+    const labelSyncDivergences = operationalEventStore.query({
+      outcome: "label-sync-divergence",
+      limit: 100,
+    });
+    warnings.push(...labelSyncDivergences.map((e) => {
+      const detail = (e.detail ?? {}) as Record<string, unknown>;
+      return {
+        kind: "label-sync-divergence",
+        ticket: (detail.ticket as string | undefined) ?? e.key ?? null,
+        divergenceKind: (detail.divergenceKind as string | undefined) ?? null,
+        proxyState: (detail.proxyState as string | undefined) ?? null,
+        linearState: (detail.linearState as string | undefined) ?? null,
+        linearStateLabel: (detail.linearStateLabel as string | undefined) ?? null,
+        workflowId: (detail.workflowId as string | undefined) ?? null,
+        stateLabel: (detail.stateLabel as string | undefined) ?? null,
+        expectedNativeState: (detail.expectedNativeState as string | undefined) ?? null,
+        actualNativeStateName: (detail.actualNativeStateName as string | undefined) ?? null,
+        occurredAt: e.occurredAt,
+      };
+    }));
+
     res.status(healthy ? 200 : 503).json({
       status: healthy ? "ok" : "degraded",
       // AI-2008: operational warnings surfaced at /health (dispatch-undeliverable
@@ -2840,6 +2866,8 @@ if (isEntryPoint) {
     registerLabelSyncAuditCron({
       authToken: resolveLabelSyncAuthToken,
       enrolledTicketsStore,
+      // INF-1242 AC3: divergences also surface at /health, not just in logs.
+      operationalEventStore,
     });
     log.info("AI-2554: label-sync audit cron registered (interval=15m)");
   } else {
