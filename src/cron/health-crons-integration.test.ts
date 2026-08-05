@@ -17,6 +17,11 @@
  *    guidance requires.
  *
  * Requires a fresh `npm run build` — CI builds before jest (see ci.yml).
+ *
+ * INF-1263 AC7 contract introduced here: every /health.crons[] entry exposes
+ * lastOutcome ("success" | "fail" | null), lastError (string | null), and
+ * failureStreak (number), so ac-validate can see both schedule liveness and
+ * most-recent run outcome immediately after boot.
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
@@ -39,6 +44,7 @@ const EXPECTED_CRONS = [
   "first-action-watchdog",
   "g20-canary",
   "label-sync-audit", // AI-2554: periodic proxy-store vs Linear label divergence check
+  "leaked-credential-sweep", // INF-1263/INF-529: credential sweep must be armed from production bootstrap when enabled
   "matrix-approval-gate", // INF-192: Matrix approval gate bootstrap registrar
   "merged-evidence-reconciler",
   "native-state-reconciler", // INF-993: native-state reconciler write-back cron
@@ -116,6 +122,11 @@ describe("AI-1810: production entry point registers all crons in /health", () =>
         // makes no network calls until its first 5m tick — the test is long
         // gone by then.
         LINEAR_OAUTH_TOKEN: "test-linear-oauth-token",
+        // INF-1263 AC6: the leaked-credential sweep is intentionally
+        // env-gated. Enable it with a dummy token so the production entry
+        // point proves the known-dark sweep is registered/armed at bootstrap.
+        LEAKED_CRED_SWEEP_ENABLED: "1",
+        LEAKED_CRED_SWEEP_POLL_INTERVAL_MS: String(24 * 60 * 60 * 1000),
         // The Done-ticket detector only registers when a repo path is
         // configured; point it at the isolated temp cwd for deterministic
         // bootstrap coverage without touching the real shared clone.
@@ -162,13 +173,21 @@ describe("AI-1810: production entry point registers all crons in /health", () =>
         );
       }
 
-      const crons = body.crons as Array<{ name: string; schedule: string; registeredAt: string }>;
+      const crons = body.crons as Array<{
+        name: string;
+        schedule: string;
+        registeredAt: string;
+        lastOutcome?: "success" | "fail" | null;
+        lastError?: string | null;
+        failureStreak?: number;
+      }>;
       expect(Array.isArray(crons)).toBe(true);
 
       // AC2: the two historical dead-code incidents are present by name.
       const names = crons.map((c) => c.name).sort();
       expect(names).toContain("sla-sweep");
       expect(names).toContain("bootstrap-reconciliation-sweep");
+      expect(names).toContain("leaked-credential-sweep");
 
       // AC1/AC4: exact-set match against the wired bootstrap.
       expect(names).toEqual(EXPECTED_CRONS);
@@ -196,6 +215,13 @@ describe("AI-1810: production entry point registers all crons in /health", () =>
         expect(typeof cron.schedule).toBe("string");
         expect(cron.schedule.length).toBeGreaterThan(0);
         expect(Number.isNaN(Date.parse(cron.registeredAt))).toBe(false);
+        // INF-1263 AC7: outcome visibility is present at /health without
+        // waiting for any cron trigger condition.
+        expect(cron).toHaveProperty("lastOutcome");
+        expect(["success", "fail", null]).toContain(cron.lastOutcome);
+        expect(cron).toHaveProperty("lastError");
+        expect(cron.lastError === null || typeof cron.lastError === "string").toBe(true);
+        expect(typeof cron.failureStreak).toBe("number");
       }
     },
     60_000,
