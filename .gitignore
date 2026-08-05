@@ -22,3 +22,11 @@ dist.pre-deploy-*/
 # Never track these; a stray git add -A here re-commits worktrees as gitlinks.
 .worktrees/
 scripts/__pycache__/
+-e 
+# Runtime SQLite DBs
+dispatch-acks.db
+dispatch-acks.db-shm
+dispatch-acks.db-wal
+liveness-dispatches.db
+liveness-dispatches.db-shm
+liveness-dispatches.db-wal
