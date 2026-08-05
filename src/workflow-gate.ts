@@ -3278,49 +3278,69 @@ export function resolveStakesLevel(labels: string[], stakesConfig: StakesLevel):
   return stakesConfig.levels[stakesLabel];
 }
 
-// ── INF-1218: engine-level routine-verb resolver ───────────────────────────
+// --- INF-1218: engine-level routine-verb resolver (three-bucket model) ---
 //
-// `continue-workflow` / `request-revision` resolve to the UNIQUE forward /
-// revision edge from the current state, so a workflow YAML no longer has to
-// teach agents literal verbs (submit/approve/tests-ready/validated/reject) nor
-// tag every edge `generic:`. Special/internal edges are excluded from routine
-// resolution and keep their literal command names: escape (break_glass),
-// handoff, demote/park, force-deploy, reseat-merge, designated sign-off, and
-// self-loops. `generic:` tags remain honored as an explicit override.
+// Every transition classifies into exactly one bucket (workflow-state design
+// principle 3c, Astrid ruling 2026-08-04):
+//   ROUTINE   -> continue-workflow (the single forward edge of a LINEAR state) +
+//               request-revision (send-back; universal, never a branch).
+//   BRANCH    -> named outcome verbs, KEPT explicit -- only when a state has 2+
+//               distinct forward destinations that each advance to a *different
+//               non-terminal* state (a genuine routing decision).
+//   SPECIAL   -> escape/handoff/force-deploy/reseat-merge/park-hold/waive +
+//               terminal hatches (edges to an abort-terminal state).
+// So submit/approve/tests-ready/validated/merge-continue/deploy-continue all
+// collapse to continue-workflow; pass/pass-with-followups collapse (same
+// forward destination); cancel/abandon/retire are terminal hatches. `generic:`
+// tags remain an explicit override but are no longer required on the spine.
 
 /** Commands that are always special hatches, never routine forward/back verbs. */
 const SPECIAL_ROUTINE_COMMANDS = new Set([
-  "handoff",
-  "demote",
-  "park",
-  "force-deploy",
-  "reseat-merge",
+  "handoff", "force-deploy", "reseat-merge",
+  "wait", "waive", "park", "hold",
+  "demote", "retire", "cancel", "abandon",
+  "start-cycle", // begin-workflow entry meta-intent, not a mid-flow continue
 ]);
+/** Native states that mark a state terminal (no routine forward needed). */
+const TERMINAL_NATIVE_STATES = new Set(["done", "invalid", "cancelled", "canceled", "rejected"]);
+/** Terminal states that are ABORTS -- an edge landing here is a terminal hatch,
+ *  not the routine forward completion (which lands on a `done` native state). */
+const ABORT_NATIVE_STATES = new Set(["invalid", "cancelled", "canceled", "rejected"]);
 
 type RoutineClass = "forward" | "revision" | "special";
 
-function isSpecialTransition(
-  def: WorkflowDef,
-  stateId: string,
-  t: WorkflowTransition,
-): boolean {
+function stateNodeById(def: WorkflowDef, id: string): WorkflowState | undefined {
+  return def.states?.find((s) => s.id === id);
+}
+export function isTerminalStateId(def: WorkflowDef, id: string): boolean {
+  const s = stateNodeById(def, id);
+  if (!s) return false;
+  if (s.kind === "terminal") return true;
+  return typeof s.native_state === "string" && TERMINAL_NATIVE_STATES.has(s.native_state);
+}
+function isAbortDestination(def: WorkflowDef, id: string): boolean {
+  const s = stateNodeById(def, id);
+  return !!s && typeof s.native_state === "string" && ABORT_NATIVE_STATES.has(s.native_state);
+}
+
+function isSpecialTransition(def: WorkflowDef, stateId: string, t: WorkflowTransition): boolean {
   if (def.break_glass?.command && t.command === def.break_glass.command) return true;
   if (SPECIAL_ROUTINE_COMMANDS.has(t.command)) return true;
   if (t.designated_approver) return true; // opt-in sign-off authority, not a spine verb
-  if (typeof t.to === "string" && t.to.startsWith("__")) return true; // __ad_hoc__ / park sentinels
-  if (t.to === stateId) return true; // self-loop (re-seat same state, handoff-style)
+  if (typeof t.to === "string" && t.to.startsWith("__")) return true; // __ad_hoc__/park sentinels
+  if (t.to === stateId) return true; // self-loop (handoff-style re-seat)
+  if (isAbortDestination(def, t.to)) return true; // terminal hatch (cancel/abandon -> cancelled/invalid)
   return false;
 }
 
 /**
- * Forward topological rank per state (entry_state = 0), following only
- * non-special, non-`generic:revision` edges. Used to infer a revision (send-back)
- * edge that carries no explicit tag: an edge landing on an earlier-or-equal rank
- * is backward. Cycles/unreachable states get no rank and never cause a forward
- * edge to be mis-read as backward (we only classify as revision on positive
- * evidence that `to` ranks <= `from`).
+ * Forward topological rank per state (entry_state = 0), over non-special,
+ * non-`generic:revision` edges. Used to infer an untagged send-back edge as a
+ * revision when it lands STRICTLY earlier than its source. Rework loops that
+ * only appear "later" are not caught here -- those keep needing a `generic:
+ * revision` tag, and the load validator surfaces them.
  */
-function buildStateRank(def: WorkflowDef): Map<string, number> {
+export function buildStateRank(def: WorkflowDef): Map<string, number> {
   const adj = new Map<string, string[]>();
   for (const s of def.states ?? []) {
     const outs: string[] = [];
@@ -3347,65 +3367,104 @@ function buildStateRank(def: WorkflowDef): Map<string, number> {
   return rank;
 }
 
-function classifyRoutineTransition(
-  def: WorkflowDef,
-  stateId: string,
-  t: WorkflowTransition,
-  rank: Map<string, number>,
+export function classifyRoutineTransition(
+  def: WorkflowDef, stateId: string, t: WorkflowTransition, rank: Map<string, number>,
 ): RoutineClass {
   if (isSpecialTransition(def, stateId, t)) return "special";
   if (t.generic === "revision") return "revision";
   if (t.generic === "continue") return "forward";
   const from = rank.get(stateId);
   const to = rank.get(t.to);
-  if (from !== undefined && to !== undefined && to <= from) return "revision";
+  if (from !== undefined && to !== undefined && to < from) return "revision";
   return "forward";
 }
 
-/**
- * Resolve the unique routine edge of the requested kind from a state.
- * Returns the command, `null` when the state has no such edge (legal — e.g. a
- * terminal state has no forward edge), or an `error` when 2+ edges match
- * (ambiguous — the engine refuses to guess). Fails closed at both transition
- * time and registry load (validateRoutineEdges).
- */
-function resolveRoutineEdge(
-  def: WorkflowDef,
-  node: WorkflowState,
-  kind: "forward" | "revision",
-  rank?: Map<string, number>,
-): { command: string } | { error: string } | null {
-  const r = rank ?? buildStateRank(def);
-  const matches = (node.transitions ?? []).filter(
-    (t) => classifyRoutineTransition(def, node.id, t, r) === kind,
+/** State shape for the routine invariant: 'terminal' (no forward), 'linear'
+ *  (exactly one routine forward advance), or 'branch' (2+ distinct non-terminal
+ *  forward destinations -- named outcome verbs kept explicit). */
+type StateRoutineShape =
+  | { shape: "terminal" }
+  | { shape: "linear"; forwardCommand: string }
+  | { shape: "branch"; forwardCommands: string[] }
+  | { shape: "ambiguous"; detail: string };
+
+export function analyzeStateRoutine(def: WorkflowDef, node: WorkflowState, rank: Map<string, number>): StateRoutineShape {
+  const forwards = (node.transitions ?? []).filter(
+    (t) => classifyRoutineTransition(def, node.id, t, rank) === "forward",
   );
-  if (matches.length === 0) return null;
-  if (matches.length > 1) {
-    return {
-      error:
-        `state '${node.id}' exposes ${matches.length} ${kind} edges ` +
-        `(${matches.map((m) => m.command).join(", ")}) — the routine verb is ` +
-        `ambiguous; exactly one ${kind} edge is required (tag one 'generic' or ` +
-        `mark the others special).`,
-    };
+  if (forwards.length === 0) return { shape: "terminal" };
+  const nonTerminalDests = new Set(
+    forwards.filter((t) => !isTerminalStateId(def, t.to)).map((t) => t.to),
+  );
+  if (nonTerminalDests.size >= 2) {
+    return { shape: "branch", forwardCommands: forwards.map((t) => t.command) };
   }
-  return { command: matches[0].command };
+  // Linear: all forwards advance to a single destination (a live next state or a
+  // done-terminal completion). Pick the routine continue: prefer a generic:
+  // continue tag, else the one with no extra payload requirement (pass over
+  // pass-with-followups), else fail closed as ambiguous.
+  const tagged = forwards.find((t) => t.generic === "continue");
+  if (tagged) return { shape: "linear", forwardCommand: tagged.command };
+  if (forwards.length === 1) return { shape: "linear", forwardCommand: forwards[0].command };
+  const hasPayload = (t: WorkflowTransition) =>
+    !!(t.requires_comment || t.requires_artifact || t.feedback?.required || t.requires_demonstration_walk);
+  const plain = forwards.filter((t) => !hasPayload(t));
+  if (plain.length === 1) return { shape: "linear", forwardCommand: plain[0].command };
+  return {
+    shape: "ambiguous",
+    detail:
+      `state '${node.id}' has ${forwards.length} forward edges to the same destination ` +
+      `(${forwards.map((t) => t.command).join(", ")}) with no unambiguous routine continue ` +
+      `-- tag one 'generic: continue'.`,
+  };
 }
 
 /**
- * Registry-load invariant (INF-1218): every state must expose an unambiguous
- * routine forward/revision verb. Returns a list of config errors (empty = ok);
- * loadWorkflowRegistry throws on any, so an ambiguous def fails closed on load.
+ * Resolve the routine edge for continue-workflow ('forward') / request-revision
+ * ('revision'). Returns the command, `null` when the state legitimately has no
+ * such edge (terminal / branch-forward), or an `error` when a non-branch state
+ * is ambiguous. Branch states resolve their named forward verb, not a collapsed
+ * continue-workflow -- so the CLI still hands the decision to the agent.
+ */
+export function resolveRoutineEdge(
+  def: WorkflowDef, node: WorkflowState, kind: "forward" | "revision", rank?: Map<string, number>,
+): { command: string } | { error: string } | null {
+  const r = rank ?? buildStateRank(def);
+  if (kind === "revision") {
+    const revs = (node.transitions ?? []).filter(
+      (t) => classifyRoutineTransition(def, node.id, t, r) === "revision",
+    );
+    if (revs.length === 0) return null;
+    if (revs.length > 1) {
+      return { error: `state '${node.id}' has ${revs.length} revision edges (${revs.map((m) => m.command).join(", ")}) -- send-back must be unique.` };
+    }
+    return { command: revs[0].command };
+  }
+  const shape = analyzeStateRoutine(def, node, r);
+  if (shape.shape === "linear") return { command: shape.forwardCommand };
+  if (shape.shape === "ambiguous") return { error: shape.detail };
+  return null;
+}
+
+/**
+ * Registry-load invariant (INF-1218 3c): every non-terminal state must be
+ * classifiable as linear or branch. Fail closed ONLY when a non-branch state has
+ * an ambiguous/missing routine forward edge, or 2+ revision edges. Genuine
+ * branches are allowed.
  */
 function validateRoutineEdges(def: WorkflowDef): string[] {
   const errors: string[] = [];
   const rank = buildStateRank(def);
   for (const state of def.states ?? []) {
-    for (const kind of ["forward", "revision"] as const) {
-      const res = resolveRoutineEdge(def, state, kind, rank);
-      if (res && "error" in res) {
-        errors.push(`workflow '${def.id}': ${res.error}`);
-      }
+    const shape = analyzeStateRoutine(def, state, rank);
+    if (shape.shape === "ambiguous") {
+      errors.push(`workflow '${def.id}': ${shape.detail}`);
+    }
+    const revs = (state.transitions ?? []).filter(
+      (t) => classifyRoutineTransition(def, state.id, t, rank) === "revision",
+    );
+    if (revs.length > 1) {
+      errors.push(`workflow '${def.id}': state '${state.id}' has ${revs.length} revision edges (${revs.map((m) => m.command).join(", ")}) -- send-back must be unique.`);
     }
   }
   return errors;
