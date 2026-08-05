@@ -70,10 +70,12 @@ states:
     transitions:
       - command: pass
         to: done
+        generic: continue
       - command: pass-with-followups
         to: done
       - command: fail
         to: fail
+        generic: revision
 
   - id: fail
     owner_role: visual-reviewer
@@ -82,6 +84,7 @@ states:
     transitions:
       - command: retry-capture
         to: capture
+        generic: revision
       - command: resolve
         to: done
       - command: escalate

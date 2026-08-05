@@ -3298,7 +3298,7 @@ export function resolveStakesLevel(labels: string[], stakesConfig: StakesLevel):
 const SPECIAL_ROUTINE_COMMANDS = new Set([
   "handoff", "force-deploy", "reseat-merge",
   "wait", "waive", "park", "hold",
-  "demote", "retire", "cancel", "abandon",
+  "demote", "retire", "cancel", "abandon", "escalate",
   "start-cycle", // begin-workflow entry meta-intent, not a mid-flow continue
 ]);
 /** Native states that mark a state terminal (no routine forward needed). */
@@ -3389,8 +3389,13 @@ type StateRoutineShape =
   | { shape: "ambiguous"; detail: string };
 
 export function analyzeStateRoutine(def: WorkflowDef, node: WorkflowState, rank: Map<string, number>): StateRoutineShape {
+  // Edges to an undefined destination are malformed — a different validator
+  // (transition-walk canary) reports them; they must not preempt the routine
+  // check or trip a spurious ambiguity here.
   const forwards = (node.transitions ?? []).filter(
-    (t) => classifyRoutineTransition(def, node.id, t, rank) === "forward",
+    (t) =>
+      classifyRoutineTransition(def, node.id, t, rank) === "forward" &&
+      stateNodeById(def, t.to) !== undefined,
   );
   if (forwards.length === 0) return { shape: "terminal" };
   const nonTerminalDests = new Set(
@@ -3454,6 +3459,16 @@ export function resolveRoutineEdge(
  */
 function validateRoutineEdges(def: WorkflowDef): string[] {
   const errors: string[] = [];
+  // Only enforce the routine invariant on a WELL-FORMED def. A transition to an
+  // undefined destination makes the def malformed (the transition-walk canary
+  // reports it) and can distort topological ranks into a spurious ambiguity, so
+  // defer entirely rather than exclude the def and mask the real error.
+  const ids = new Set((def.states ?? []).map((s) => s.id));
+  for (const s of def.states ?? []) {
+    for (const t of s.transitions ?? []) {
+      if (typeof t.to === "string" && !t.to.startsWith("__") && !ids.has(t.to)) return errors;
+    }
+  }
   const rank = buildStateRank(def);
   for (const state of def.states ?? []) {
     const shape = analyzeStateRoutine(def, state, rank);

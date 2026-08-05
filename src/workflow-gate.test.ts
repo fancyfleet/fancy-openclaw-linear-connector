@@ -6099,6 +6099,7 @@ states:
         requires_capability: sprint:signoff
       - command: request-rework
         to: intake
+        generic: revision
 
   - id: done
     kind: terminal
