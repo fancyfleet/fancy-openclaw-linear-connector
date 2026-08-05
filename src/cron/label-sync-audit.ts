@@ -10,15 +10,64 @@
 
 import { componentLogger, createLogger } from "../logger.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
-import { checkLabelSyncForTicket, emitLabelSyncWarning, type LabelSyncDivergence } from "../transition-audit.js";
+import {
+  checkLabelSyncForTicket,
+  checkLabelNativeStateSyncForTicket,
+  emitLabelSyncWarning,
+  emitLabelNativeSyncWarning,
+  type LabelSyncAuditDivergence,
+} from "../transition-audit.js";
 import type { EnrolledTicketsStore } from "../store/enrolled-tickets-store.js";
+import type { OperationalEventStore } from "../store/operational-event-store.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "label-sync-audit");
 
 export interface LabelSyncAuditOptions {
   authToken: string | (() => string);
   enrolledTicketsStore?: EnrolledTicketsStore;
+  /**
+   * INF-1242 AC3: when provided, every divergence found (either the
+   * proxy-vs-label kind or the new label-vs-native kind) is also appended as
+   * a `label-sync-divergence` operational event, so it surfaces at /health
+   * (see index.ts's /health handler) — not just in logs.
+   */
+  operationalEventStore?: OperationalEventStore;
   intervalMs?: number;
+}
+
+/**
+ * INF-1242 AC3: append a `label-sync-divergence` operational event for a
+ * detected divergence, alongside the existing log-line emit. Detail carries
+ * both flavors' fields (unset ones are simply absent from the object) so
+ * downstream consumers (like /health) can project either kind uniformly.
+ */
+function recordDivergenceEvent(
+  store: OperationalEventStore | undefined,
+  divergence: LabelSyncAuditDivergence,
+): void {
+  if (!store) return;
+  const divergenceKind = divergence.kind ?? "proxy-vs-label";
+  store.append({
+    outcome: "label-sync-divergence",
+    key: divergence.ticketId,
+    sessionKey: divergence.ticketId,
+    detail: {
+      ticket: divergence.ticketId,
+      divergenceKind,
+      ...(divergenceKind === "proxy-vs-label"
+        ? {
+            proxyState: (divergence as { proxyState: string | null }).proxyState,
+            linearState: (divergence as { linearState: string | null }).linearState,
+            linearStateLabel: (divergence as { linearStateLabel: string | null }).linearStateLabel,
+          }
+        : {
+            workflowId: (divergence as { workflowId: string }).workflowId,
+            stateLabel: (divergence as { stateLabel: string | null }).stateLabel,
+            expectedNativeState: (divergence as { expectedNativeState: string | null }).expectedNativeState,
+            actualNativeStateName: (divergence as { actualNativeStateName: string | null }).actualNativeStateName,
+          }),
+    },
+  });
 }
 
 export interface LabelSyncAuditResult {
@@ -74,6 +123,21 @@ export async function runLabelSyncAuditPass(
         const ageSec = Math.round((Date.now() - enteredMs) / 1000);
         divergence.ageSec = ageSec;
         emitLabelSyncWarning(divergence);
+        recordDivergenceEvent(opts.operationalEventStore, divergence);
+      }
+
+      // INF-1242 AC3: `state:*` label vs native Linear workflow status —
+      // distinct pairing from the proxy-vs-label check above. Reuses
+      // ticket.workflow, already available on the enrolled-tickets mirror row.
+      const nativeDivergence = await checkLabelNativeStateSyncForTicket(
+        ticket.ticket_id,
+        ticket.workflow,
+        authToken,
+      );
+      if (nativeDivergence) {
+        result.divergencesFound++;
+        emitLabelNativeSyncWarning(nativeDivergence);
+        recordDivergenceEvent(opts.operationalEventStore, nativeDivergence);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
