@@ -1616,7 +1616,8 @@ describe("checkRawMutationInterception — Layer 2 (AI-1387)", () => {
     expect(result).toContain("Direct status");
     expect(result).toContain("blocked on this workflow ticket");
     expect(result).toContain("implementation");
-    expect(result).toContain("submit");
+    // INF-1218: implementation's forward edge (submit→code-review) collapses to continue-workflow
+    expect(result).toContain("continue-workflow");
   });
 
   it("blocks a raw assigneeId mutation on a workflow ticket", async () => {
@@ -1723,8 +1724,9 @@ describe("checkRawMutationInterception — Layer 2 (AI-1387)", () => {
 
     const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
     expect(result).not.toBeNull();
-    // Should include the submit command (the legal move from implementation)
-    expect(result).toContain("linear submit");
+    // INF-1218: the legal move from implementation surfaces as continue-workflow
+    // (the literal submit verb is hidden), still routing → code-review.
+    expect(result).toContain("linear continue-workflow");
     // Should include the escape/break-glass command
     expect(result).toContain("escape");
     // Should show the transition arrow
@@ -3270,7 +3272,8 @@ describe("checkRawMutationInterception — AI-1658: addedLabelIds/removedLabelId
     const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
     expect(result).not.toBeNull();
     expect(result).toContain("implementation");
-    expect(result).toContain("submit");
+    // INF-1218: forward edge collapses to continue-workflow
+    expect(result).toContain("continue-workflow");
     expect(result).toContain("escape");
   });
 
