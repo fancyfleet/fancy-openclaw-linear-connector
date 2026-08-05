@@ -166,8 +166,17 @@ describe("MutationAuditStore", () => {
   });
 
   test("persist and reopen", () => {
-    store.append(webhookInput);
-    store.append(proxyInput);
+    // Durability test — must be decoupled from the age-prune window. The other
+    // fixtures use fixed 2026-07-05 timestamps for time-window assertions on a
+    // single instance (prune only runs at construction, on the still-empty db).
+    // This test constructs a SECOND store AFTER the rows exist, so its
+    // constructor's prune() runs against them: fixed-date fixtures older than
+    // MUTATION_AUDIT_MAX_AGE_DAYS (30) get deleted, and the test silently rots
+    // ~30 days after those dates (INF-1229 fleet-wide CI red). Use recent
+    // timestamps so persistence is what's under test, not the prune policy.
+    const now = new Date().toISOString();
+    store.append({ ...webhookInput, recordedAt: now });
+    store.append({ ...proxyInput, recordedAt: now });
     store.close();
 
     const reopened = new MutationAuditStore(dbPath);
