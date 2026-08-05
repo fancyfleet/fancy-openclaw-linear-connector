@@ -28,7 +28,7 @@ import {
   type WorkflowDef,
 } from "./workflow-bootstrap.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
-import { registerCron, formatIntervalMs } from "./cron/registry.js";
+import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "bootstrap-reconciliation");
 
@@ -322,11 +322,14 @@ export function registerBootstrapReconciliationCron(
       authToken: opts.authToken,
       alertBus: opts.alertBus,
       wakeFn: opts.wakeFn,
-    }).catch((err) => {
-      log.error(
-        `bootstrap-reconciliation: unexpected sweep failure: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    });
+    })
+      .then(() => markCronRun("bootstrap-reconciliation-sweep", { outcome: "success" }))
+      .catch((err) => {
+        log.error(
+          `bootstrap-reconciliation: unexpected sweep failure: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        markCronRun("bootstrap-reconciliation-sweep", { outcome: "failure" });
+      });
   }, intervalMs);
 
   timer.unref();

@@ -190,9 +190,10 @@ export function registerDistillationCron(
   registerCron(DISTILLATION_CRON_NAME, `every ${formatIntervalMs(intervalMs)}`);
   const timer = setInterval(() => {
     runDistillation(observationStore, proposalStore, ctx)
-      .then(() => markCronRun(DISTILLATION_CRON_NAME))
+      .then(() => markCronRun(DISTILLATION_CRON_NAME, { outcome: "success" }))
       .catch((err) => {
         log.error(`[P4-C3] Scheduled distillation failed: ${err instanceof Error ? err.message : String(err)}`);
+        markCronRun(DISTILLATION_CRON_NAME, { outcome: "failure" });
       });
   }, intervalMs);
   timer.unref();

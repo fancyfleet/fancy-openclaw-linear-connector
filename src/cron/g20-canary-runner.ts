@@ -11,7 +11,7 @@
 import { createLogger, componentLogger } from "../logger.js";
 import { runG20Canary, type G20CanaryConfig, type G20CanaryResult } from "./g20-canary-job.js";
 import { notify } from "../alerts/alert-bus.js";
-import { registerCron, formatIntervalMs } from "./registry.js";
+import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "g20-canary");
 
@@ -90,9 +90,12 @@ export function registerG20CanaryCron(): void {
   // must not appear in /health as if it were live (AI-1810).
   registerCron("g20-canary", `every ${formatIntervalMs(intervalMs)}`);
   const timer = setInterval(() => {
-    runG20Canary(config).catch((err) => {
-      log.error(`[G-20 CANARY] Scheduled run threw: ${err instanceof Error ? err.message : String(err)}`);
-    });
+    runG20Canary(config)
+      .then(() => markCronRun("g20-canary", { outcome: "success" }))
+      .catch((err) => {
+        log.error(`[G-20 CANARY] Scheduled run threw: ${err instanceof Error ? err.message : String(err)}`);
+        markCronRun("g20-canary", { outcome: "failure" });
+      });
   }, intervalMs);
   timer.unref();
   log.info(`[G-20 CANARY] Scheduled every ${intervalMs}ms against ticket ${canaryTicketId} (G20_CANARY_INTERVAL=${process.env.G20_CANARY_INTERVAL ?? "15m"})`);

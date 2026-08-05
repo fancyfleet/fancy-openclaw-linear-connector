@@ -21,6 +21,9 @@
  * instead of per-feature grep archaeology in index.ts.
  */
 
+/** Outcome of a driver's most recent run. */
+export type CronRunOutcome = "success" | "failure";
+
 export interface CronRegistryEntry {
   /** Stable driver name, kebab-case (e.g. "sla-sweep"). */
   name: string;
@@ -34,6 +37,16 @@ export interface CronRegistryEntry {
    * proves the job actually fires (AI-2037 / AC2.4).
    */
   lastRunAt: string | null;
+  /**
+   * Outcome of the driver's most recent run, or null if it has not run yet
+   * in this process (INF-1213).
+   */
+  lastRunOutcome: CronRunOutcome | null;
+}
+
+export interface MarkCronRunOptions {
+  outcome?: CronRunOutcome;
+  now?: Date;
 }
 
 const entries = new Map<string, CronRegistryEntry>();
@@ -60,6 +73,7 @@ export function registerCron(name: string, schedule: string): void {
     registeredAt: new Date().toISOString(),
     // A hot-reload re-registers the driver but does not un-run it.
     lastRunAt: entries.get(name)?.lastRunAt ?? null,
+    lastRunOutcome: entries.get(name)?.lastRunOutcome ?? null,
   });
 }
 
@@ -69,10 +83,12 @@ export function registerCron(name: string, schedule: string): void {
  * this call has not run, and its stale lastRunAt is the signal.
  * No-op for an unregistered name: liveness cannot precede scheduling.
  */
-export function markCronRun(name: string, now = new Date()): void {
+export function markCronRun(name: string, opts?: MarkCronRunOptions): void {
   const entry = entries.get(name);
   if (!entry) return;
+  const now = opts?.now ?? new Date();
   entry.lastRunAt = now.toISOString();
+  entry.lastRunOutcome = opts?.outcome ?? null;
 }
 
 /** All drivers registered in this process, sorted by name. */

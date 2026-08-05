@@ -6,6 +6,10 @@
  * outcomes (skip, fail, success) produce a non-null lastRunAt with context.
  */
 
+import { markCronRun } from "./cron/registry.js";
+
+const RESCUE_SWEEP_CRON_NAME = "rescue-sweep";
+
 export type RescueSweepOutcome = "success" | "skip" | "fail";
 
 export interface RescueSweepRunState {
@@ -50,6 +54,7 @@ export function recordRescueSweepRun(result: {
     lastSkipReason: null,
     lastError: null,
   };
+  markCronRun(RESCUE_SWEEP_CRON_NAME, { outcome: "success" });
 }
 
 /** Record a skipped run (e.g. no auth token available). */
@@ -61,6 +66,7 @@ export function recordRescueSweepSkip(reason: string): void {
     lastSkipReason: reason,
     lastError: null,
   };
+  markCronRun(RESCUE_SWEEP_CRON_NAME, { outcome: "failure" });
 }
 
 /** Record a failed run (thrown error caught by cron wrapper). */
@@ -72,6 +78,7 @@ export function recordRescueSweepFail(error: string): void {
     lastSkipReason: null,
     lastError: error,
   };
+  markCronRun(RESCUE_SWEEP_CRON_NAME, { outcome: "failure" });
 }
 
 export function getRescueSweepState(): RescueSweepRunState {
