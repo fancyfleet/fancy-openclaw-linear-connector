@@ -8468,6 +8468,11 @@ export interface AutoEnrollLiveness {
   suppressedDemotedCount: number;
   lastEnrolledAt: string | null;
   lastSuppressedAt: string | null;
+  plainDelegationActiveLane?: {
+    subscribed: boolean;
+    deprecatedTaskFallback: false;
+    classifiesTo: Array<"wf:chore" | "wf:dev-impl">;
+  };
 }
 
 let autoEnrollLiveness: AutoEnrollLiveness = {
@@ -8478,9 +8483,17 @@ let autoEnrollLiveness: AutoEnrollLiveness = {
   lastSuppressedAt: null,
 };
 
-/** AI-2542: Mark auto-enroll live only where the webhook path is actually wired. */
+/** AI-2542/INF-1197: Mark auto-enroll live only where the webhook path is actually wired. */
 export function markAutoEnrollRegistered(): void {
-  autoEnrollLiveness = { ...autoEnrollLiveness, active: true };
+  autoEnrollLiveness = {
+    ...autoEnrollLiveness,
+    active: true,
+    plainDelegationActiveLane: {
+      subscribed: true,
+      deprecatedTaskFallback: false,
+      classifiesTo: ["wf:chore", "wf:dev-impl"],
+    },
+  };
 }
 
 /** AI-2542: Liveness snapshot for /health.autoEnroll. */

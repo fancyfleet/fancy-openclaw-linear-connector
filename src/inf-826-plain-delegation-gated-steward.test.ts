@@ -2,6 +2,7 @@
  * INF-826 — plain delegation must not force steward-held task work into doing.
  */
 
+import path from "node:path";
 import { jest, describe, it, expect, beforeEach, afterEach } from "@jest/globals";
 
 const mockResolveBodiesForRole = jest.fn<(role: string) => Promise<string[]>>();
@@ -17,7 +18,7 @@ jest.unstable_mockModule("./escalation-gate.js", () => ({
   isSyntheticNoBodyRole: jest.fn(),
 }));
 
-const { autoEnrollPlainDelegation } = await import("./workflow-gate.js");
+const { autoEnrollPlainDelegation, resetWorkflowCache } = await import("./workflow-gate.js");
 
 type FetchCall = { query: string; variables: Record<string, unknown> };
 
@@ -57,6 +58,8 @@ function makePlainDelegationFetch(calls: FetchCall[]): typeof globalThis.fetch {
               nodes: [
                 { id: "label-wf-task", name: "wf:task", isGroup: false, team: { id: "team-dsn" }, parent: null },
                 { id: "label-state-doing", name: "state:doing", isGroup: false, team: { id: "team-dsn" }, parent: null },
+                { id: "label-wf-chore", name: "wf:chore", isGroup: false, team: { id: "team-dsn" }, parent: null },
+                { id: "label-state-intake", name: "state:intake", isGroup: false, team: { id: "team-dsn" }, parent: null },
               ],
             },
           },
@@ -74,13 +77,23 @@ function makePlainDelegationFetch(calls: FetchCall[]): typeof globalThis.fetch {
 
 describe("INF-826: plain delegation task enrollment role guard", () => {
   const originalFetch = globalThis.fetch;
+  let prevWorkflowDefPath: string | undefined;
 
   beforeEach(() => {
     jest.clearAllMocks();
+    prevWorkflowDefPath = process.env.WORKFLOW_DEF_PATH;
+    // INF-1197: DSN-15's fixture has no title/description, so classification resolves
+    // to "chore" and autoEnrollPlainDelegation performs a real loadWorkflowRegistry()
+    // read; point it at the canonical chore def instead of the host's default path.
+    process.env.WORKFLOW_DEF_PATH = path.join(process.cwd(), "src", "registered-defs", "chore.yaml");
+    resetWorkflowCache();
   });
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    if (prevWorkflowDefPath === undefined) delete process.env.WORKFLOW_DEF_PATH;
+    else process.env.WORKFLOW_DEF_PATH = prevWorkflowDefPath;
+    resetWorkflowCache();
   });
 
   it("does not stamp wf:task/state:doing when a delegated plain ticket is held by the steward", async () => {
@@ -94,18 +107,18 @@ describe("INF-826: plain delegation task enrollment role guard", () => {
     expect(calls).toEqual([]);
   });
 
-  it("still promotes a plain delegated ticket into task:doing when the delegate is a worker", async () => {
+  it("still promotes a plain delegated ticket into chore:intake when the delegate is a worker", async () => {
     const calls: FetchCall[] = [];
     globalThis.fetch = makePlainDelegationFetch(calls);
     mockResolveBodiesForRole.mockResolvedValue(["felix"]);
 
     const result = await autoEnrollPlainDelegation("DSN-15", "Bearer token", undefined, undefined, "felix");
 
-    expect(result).toEqual({ enrolled: true, entryState: "doing", workflowId: "task" });
+    expect(result).toEqual({ enrolled: true, entryState: "intake", workflowId: "chore" });
     const mutation = calls.find((call) => call.query.includes("issueUpdate"));
     expect(mutation?.variables).toMatchObject({
       issueId: "issue-dsn-14",
-      labelIds: expect.arrayContaining(["label-wf-task", "label-state-doing"]),
+      labelIds: expect.arrayContaining(["label-wf-chore", "label-state-intake"]),
     });
   });
 });
