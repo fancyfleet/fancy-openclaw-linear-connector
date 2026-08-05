@@ -27,6 +27,7 @@
 
 import { componentLogger, createLogger } from "./logger.js";
 import { findLabel, findOrCreateLabel } from "./linear-helpers.js";
+import { loadEnrollmentPolicy } from "./enrollment-policy.js";
 import { generateSpawnPreview, checkCaps, formatPreviewComment, formatCapRefusalComment, parseSpawnCaps, type SpawnPreview, type CapCheckResult, type SpawnCaps, type FindingInput } from "./spawn-preview.js";
 import type { FanoutConfig, SpawnIfConfig, WorkflowDef } from "./workflow-gate.js";
 import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
@@ -1085,20 +1086,31 @@ export function validateFanoutSpec(
   // set must reference a registered workflow id. Fail-closed: one unregistered
   // entry refuses the entire transition (no partial spawn).
   if (registeredWorkflows) {
+    // INF-1164/INF-1196: deprecated workflow ids and the default they redirect
+    // to are config-driven — the same source workflow-bootstrap.ts reads —
+    // so fanout and direct enrollment cannot drift the way INF-1164's
+    // hardcoded fix did (one patched, one forgotten).
+    const enrollmentPolicy = loadEnrollmentPolicy();
     for (const f of findings) {
-      // INF-1164: wf:task is deprecated and no longer accepts new enrollment.
-      // Reject any fan-out entry targeting it before the registration check
-      // (the def stays registered so in-flight tickets finish — grandfather).
-      // This catches both the parsed per-entry child_workflow marker AND a
-      // trailing `[wf:task ...]` marker that lands in the finding's raw text.
-      const parsedTaskChild =
-        f.child_workflow === "wf:task" || f.child_workflow === "task";
-      const textRequestsTask = /\[\s*wf:\s*task\b/.test(`${f.title}\n${f.description ?? ""}`);
-      if (parsedTaskChild || textRequestsTask) {
+      // Reject any fan-out entry targeting a deprecated child workflow before
+      // the registration check (the def stays registered so in-flight tickets
+      // finish — grandfather). This catches both the parsed per-entry
+      // child_workflow marker AND a trailing `[wf:<id> ...]` marker that lands
+      // in the finding's raw text.
+      const parsedDeprecatedId = f.child_workflow
+        ? enrollmentPolicy.deprecatedWorkflowIds.find(
+            (id) => f.child_workflow === `wf:${id}` || f.child_workflow === id,
+          )
+        : undefined;
+      const textDeprecatedId = enrollmentPolicy.deprecatedWorkflowIds.find((id) =>
+        `${f.title}\n${f.description ?? ""}`.match(new RegExp(`\\[\\s*wf:\\s*${id}\\b`)),
+      );
+      const deprecatedId = parsedDeprecatedId ?? textDeprecatedId;
+      if (deprecatedId) {
         return {
           ok: false,
-          reason: `fan-out spec entry "${f.title}" targets deprecated child workflow 'wf:task' (INF-1164). ` +
-            `wf:task no longer accepts new enrollment — use 'wf:dev-impl' for code implementation or 'wf:chore' for non-code/operational work.`,
+          reason: `fan-out spec entry "${f.title}" targets deprecated child workflow 'wf:${deprecatedId}' (INF-1164/INF-1196). ` +
+            `wf:${deprecatedId} no longer accepts new enrollment — use 'wf:dev-impl' for code implementation or 'wf:${enrollmentPolicy.defaultEnrollmentWorkflow}' for non-code/operational work.`,
         };
       }
       if (f.child_workflow) {
@@ -1122,13 +1134,14 @@ export function validateFanoutSpec(
     const hasMarkerLessFindings = findings.some((f) => !f.child_workflow);
     if (hasMarkerLessFindings && config.child_workflow) {
       const defId = config.child_workflow.startsWith("wf:") ? config.child_workflow.slice(3) : config.child_workflow;
-      // INF-1164: defensive — no live config still defaults to wf:task after the
-      // dept-engine/dev-sprint repoint, but reject it consistently if one does.
-      if (defId === "task") {
+      // INF-1164/INF-1196: defensive — no live config still defaults to a
+      // deprecated workflow after the dept-engine/dev-sprint repoint, but
+      // reject it consistently if one does.
+      if (enrollmentPolicy.deprecatedWorkflowIds.includes(defId)) {
         return {
           ok: false,
-          reason: `fan-out config default child_workflow 'wf:task' is deprecated (INF-1164) and no longer accepts new enrollment. ` +
-            `Use 'wf:dev-impl' for code implementation or 'wf:chore' for non-code/operational work.`,
+          reason: `fan-out config default child_workflow 'wf:${defId}' is deprecated (INF-1164/INF-1196) and no longer accepts new enrollment. ` +
+            `Use 'wf:dev-impl' for code implementation or 'wf:${enrollmentPolicy.defaultEnrollmentWorkflow}' for non-code/operational work.`,
         };
       }
       if (!registeredWorkflows.has(config.child_workflow) && !registeredWorkflows.has(defId)) {
