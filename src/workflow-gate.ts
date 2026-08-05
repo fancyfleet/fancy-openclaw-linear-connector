@@ -3286,10 +3286,52 @@ export function hasPassedDemonstrationWalkEvidence(description: string | null | 
 }
 
 /**
+ * Prefix marking an AC-capture warning comment. Used both for idempotency
+ * (this file) and by the webhook layer to recognize the comment as a
+ * connector-authored notice rather than commitment-evidence activity (INF-1239).
+ */
+export const AC_CAPTURE_WARNING_PREFIX = "[AC Capture Warning]";
+
+/**
+ * INF-1239: check whether an AC-capture warning has already been posted on
+ * this ticket, so repeated accept attempts (e.g. re-triggered by the warning
+ * comment's own webhook, or by repeated issue-update activity) don't restate
+ * it. Fail-closed on query failure — a missed warning is low severity, but an
+ * unbounded comment storm can brick a ticket at Linear's 2000-comment cap
+ * (observed live on INF-1204), so an inability to check must suppress, not post.
+ */
+async function hasExistingAcCaptureWarning(internalIssueId: string, authToken: string): Promise<boolean> {
+  const query = `
+    query AcCaptureWarningExisting($id: String!) {
+      issue(id: $id) { comments(first: 50) { nodes { body } } }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: internalIssueId } }),
+    });
+    type CommentsResp = { data?: { issue?: { comments?: { nodes?: Array<{ body?: string | null }> } } } };
+    const data = (await res.json()) as CommentsResp;
+    const nodes = data.data?.issue?.comments?.nodes ?? [];
+    return nodes.some((c) => typeof c.body === "string" && c.body.startsWith(AC_CAPTURE_WARNING_PREFIX));
+  } catch (err) {
+    log.warn(`workflow-gate: H-7: existing-warning check failed — suppressing to avoid a duplicate storm: ${err instanceof Error ? err.message : String(err)}`);
+    return true;
+  }
+}
+
+/**
  * AI-1776 AC2: Post a fail-visible warning comment when a capture_ac: true
  * transition captures nothing (null extraction or description fetch failure).
  * Signal, not gate — the transition still completes. The comment tells the
  * steward the AC of record was not captured and why, so they can react.
+ *
+ * INF-1239: idempotent — posts at most once per ticket. Without this, every
+ * re-run of the accept-time capture gate (including runs the warning comment
+ * itself indirectly re-triggers) reposted an identical comment, producing a
+ * 250-comment storm that hit Linear's 2000-comment cap and bricked the ticket.
  */
 async function postAcCaptureWarningComment(
   internalIssueId: string,
@@ -3297,13 +3339,17 @@ async function postAcCaptureWarningComment(
   authToken: string,
   cause: string,
 ): Promise<void> {
+  if (await hasExistingAcCaptureWarning(internalIssueId, authToken)) {
+    log.info(`workflow-gate: H-7: AC capture warning already posted for ${issueIdentifier} — suppressing duplicate`);
+    return;
+  }
   const mutation = `
     mutation($issueId: String!, $body: String!) {
       commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
     }
   `;
   const body =
-    `[AC Capture Warning] The AC of record was **not captured** at accept time: ${cause}. ` +
+    `${AC_CAPTURE_WARNING_PREFIX} The AC of record was **not captured** at accept time: ${cause}. ` +
     `The transition proceeded, but there is no verbatim AC snapshot for this ticket. ` +
     `Use the recapture verb to create the AC record from the current description once an Acceptance Criteria section is present.`;
   try {
