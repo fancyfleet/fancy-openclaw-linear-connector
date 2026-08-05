@@ -1,15 +1,25 @@
 /**
  * INF-1197 — active-lane wf:task freeze.
  *
- * AC map:
- *   AC1/AC4: newly-created active-lane tickets without an explicit workflow
- *            never auto-enroll into wf:task (INF-1191 leak regression).
- *   AC2: To Do active-lane classification chooses wf:dev-impl for code work,
- *        wf:chore for operational/non-code work, or loudly declines when the
- *        connector cannot classify.
+ * SUPERSEDED by INF-1243 (2026-08-05, Matt-confirmed): AC2 below originally
+ * asserted that To Do active-lane classification *chose* wf:dev-impl for
+ * code work or wf:chore for operational work instead of the deprecated
+ * wf:task default. INF-1243 tightened the requirement further — plain
+ * delegation must enroll into NO workflow at all, not even a correctly
+ * classified one. `classifyPlainDelegationActiveLane` (the classifier this
+ * suite exercised) is deleted; `autoEnrollPlainDelegation` is now an inert
+ * no-op. These tests are inverted accordingly — same input fixtures, but
+ * now asserting zero enrollment across every description shape.
+ *
+ * AC map (as inverted for INF-1243):
+ *   AC1/AC4: active-lane tickets without an explicit workflow never
+ *            auto-enroll into any wf: or state: label (INF-1191 leak
+ *            regression stays fixed by construction — nothing enrolls).
+ *   AC2: To Do active-lane classification (code-signal, chore-signal,
+ *        empty, and ambiguous description text) all decline enrollment.
  *   AC3: Backlog tickets remain clean inventory and are not auto-enrolled.
- *   AC5: the runtime build stamp must include the fix commit, so deployment
- *        verification cannot stop at the source branch.
+ *   AC5: the runtime build stamp must include the INF-1197 fix commit, so
+ *        deployment verification cannot stop at the source branch.
  */
 
 import fs from "node:fs";
@@ -216,8 +226,8 @@ afterEach(() => {
   _setLogForTests();
 });
 
-describe("INF-1197 AC1/AC2/AC4: active To Do without explicit workflow never leaks into wf:task", () => {
-  it("INF-1191 regression: delegated To Do code work auto-enrolls as wf:dev-impl, not wf:task", async () => {
+describe("INF-1243 AC2/AC5: plain delegation never auto-enrolls, for any description shape", () => {
+  it("code-signal description does not auto-enroll", async () => {
     const { writes } = installEnrollFetch({
       title: "Fix connector active lane freeze",
       description: "engineering-domain: backend\nUpdate src/workflow-gate.ts and ship the connector fix.",
@@ -226,14 +236,11 @@ describe("INF-1197 AC1/AC2/AC4: active To Do without explicit workflow never lea
 
     const result = await autoEnrollPlainDelegation(ISSUE_UUID, "Bearer test", undefined, undefined, "igor");
 
-    expect(result).toEqual({ enrolled: true, entryState: "intake", workflowId: "dev-impl" });
-    expect(writes).toHaveLength(1);
-    expect(writtenLabelIds(writes)).toEqual(expect.arrayContaining([LABEL_IDS.wfDevImpl, LABEL_IDS.stateIntake]));
-    expect(writtenLabelIds(writes)).not.toContain(LABEL_IDS.wfTask);
-    expect(writtenLabelIds(writes)).not.toContain(LABEL_IDS.stateDoing);
+    expect(result).toEqual({ enrolled: false });
+    expect(writes).toHaveLength(0);
   });
 
-  it("AC2: delegated To Do operational work auto-enrolls as wf:chore, not wf:task", async () => {
+  it("chore-signal description does not auto-enroll", async () => {
     const { writes } = installEnrollFetch({
       title: "Archive stale operational notes",
       description: "Clean up obsolete runbook notes after the sprint handoff. No code changes.",
@@ -242,14 +249,24 @@ describe("INF-1197 AC1/AC2/AC4: active To Do without explicit workflow never lea
 
     const result = await autoEnrollPlainDelegation(ISSUE_UUID, "Bearer test", undefined, undefined, "igor");
 
-    expect(result).toEqual({ enrolled: true, entryState: "intake", workflowId: "chore" });
-    expect(writes).toHaveLength(1);
-    expect(writtenLabelIds(writes)).toEqual(expect.arrayContaining([LABEL_IDS.wfChore, LABEL_IDS.stateIntake]));
-    expect(writtenLabelIds(writes)).not.toContain(LABEL_IDS.wfTask);
-    expect(writtenLabelIds(writes)).not.toContain(LABEL_IDS.stateDoing);
+    expect(result).toEqual({ enrolled: false });
+    expect(writes).toHaveLength(0);
   });
 
-  it("AC2: ambiguous delegated To Do work declines loudly instead of defaulting to wf:task", async () => {
+  it("empty title and description does not auto-enroll", async () => {
+    const { writes } = installEnrollFetch({
+      title: "",
+      description: "",
+      nativeState: { id: "state-todo", name: "To Do", type: "unstarted" },
+    });
+
+    const result = await autoEnrollPlainDelegation(ISSUE_UUID, "Bearer test", undefined, undefined, "igor");
+
+    expect(result).toEqual({ enrolled: false });
+    expect(writes).toHaveLength(0);
+  });
+
+  it("ambiguous description (no code or chore signal) does not auto-enroll", async () => {
     const spy = spyLogger();
     _setLogForTests(spy);
     const { writes } = installEnrollFetch({
@@ -262,7 +279,6 @@ describe("INF-1197 AC1/AC2/AC4: active To Do without explicit workflow never lea
 
     expect(result).toEqual({ enrolled: false });
     expect(writes).toHaveLength(0);
-    expect(spy.warns.join("\n")).toMatch(/classif|cannot determine|ambiguous|wf:chore|wf:dev-impl/i);
   });
 });
 
