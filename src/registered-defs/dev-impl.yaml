@@ -70,9 +70,15 @@
 #   removed and migrated to `implementation`. `reject` is now the single backward
 #   verb from write-tests/review/release gates, replacing request-changes and
 #   ac-fail.
+#
+# v21 (2026-08-05, INF-1260): governed forward-recovery edge. `resume-review`
+#   from `intake` allows a ticket with completed work (PR open, tests green) that
+#   was bounced back to intake to resume at code-review without re-running TDD.
+#   Escape preserves spine position (AC3) — no longer resets to intake. Commitment
+#   gate ignores hold/decline comments (AC6). Anti-entropy flags label-loss (AC4).
 
 id: dev-impl
-version: 20
+version: 21
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
 
@@ -134,6 +140,15 @@ states:
         to: intake
         assign:
           mode: required
+      # INF-1260 AC5: governed forward-recovery edge for tickets that already
+      # have completed work (PR open, tests green) but were bounced back to intake.
+      # Resumes at code-review without re-running write-tests/implementation.
+      - command: resume-review
+        to: code-review
+        requires_comment: true
+        assign:
+          mode: required
+          constraint: not-implementer
 
   - id: write-tests
     owner_role: test-author     # TestDrivenDevelopmentAgent; dev container (§16.2)

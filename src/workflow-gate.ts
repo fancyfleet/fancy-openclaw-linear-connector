@@ -3649,7 +3649,7 @@ function validateRoutineEdges(def: WorkflowDef): string[] {
  * transitions (request-changes, block, refuse-work, needs-human) which must
  * keep requiring one.
  */
-const ROUTINE_FORWARD_COMMANDS = new Set(["continue", "begin", "accept", "submit", "complete"]);
+const ROUTINE_FORWARD_COMMANDS = new Set(["continue", "begin", "accept", "submit", "complete", "resume-review"]);
 
 /**
  * Resolve a meta-intent (`continue-workflow` or `request-revision`) to the actual
@@ -6253,19 +6253,36 @@ export async function applyStateTransition(
   // stateId, delegateId: null, and assigneeId: null — the proxy now exempts
   // the nulls (stripNullDelegateAssigneeFields) so they reach Linear directly.
   if (intent === breakGlassCommand) {
-    toStateName = def.break_glass?.to ?? "escape";
-    // INF-146/INF-135: break-glass escape from the break-glass target state
-    // itself (e.g. `intake` for dev-impl) is a self-loop that no-ops through
-    // the idempotency check below. INF-311: escape from the recovery target
-    // itself must never redirect to entry_state (which destroys completed arm
-    // progress). Instead, exit the workflow cleanly via __ad_hoc__ — tickets
-    // already in the recovery state have nothing more to recover.
-    if (currentStateName && currentStateName === toStateName) {
+    // INF-1260 AC3: escape must preserve the furthest-reached spine position,
+    // not reset to intake. When the ticket is already in a state beyond intake,
+    // escape stays at the current state — the delegate is cleared but the
+    // position is preserved so re-intake can route forward via resume-review.
+    // Only reset to the break_glass target (intake) when already AT or BEFORE it.
+    const breakGlassTarget = def.break_glass?.to ?? "escape";
+    const spineIndex = (stateId: string | undefined) => {
+      if (!stateId) return -1;
+      return def.states.findIndex((s) => s.id === stateId);
+    };
+    const targetIdx = spineIndex(breakGlassTarget);
+    const currentIdx = spineIndex(currentStateName);
+
+    if (currentStateName && currentIdx > targetIdx && currentIdx >= 0) {
+      // Ticket has progressed beyond the break-glass target — preserve position.
+      toStateName = currentStateName;
+      log.info(
+        `workflow-gate: B2 apply: ${issueId} break-glass escape from state '${currentStateName}' ` +
+        `— preserving spine position (furthest reached: '${currentStateName}')`,
+      );
+    } else if (currentStateName && currentStateName === breakGlassTarget) {
+      // INF-146/INF-135: self-loop on the target — no-op through idempotency.
+      // INF-311: redirect to __ad_hoc__ instead of entry_state.
       toStateName = "__ad_hoc__";
       log.info(
         `workflow-gate: B2 apply: ${issueId} break-glass escape from state '${currentStateName}' ` +
         `which IS the break-glass target — redirecting to '${toStateName}'`,
       );
+    } else {
+      toStateName = breakGlassTarget;
     }
   } else if (intent === "park") {
     toStateName = "__ad_hoc__";
@@ -8287,26 +8304,38 @@ async function issueUpdateAtomicVerified(
     return { ok: true, attempts: maxAttempts, failureKind: "none", divergent, unverified: true };
   }
 
-  // INF-562 / AC1: the transition did NOT fully apply (a delegate/native-state
+  // INF-562 / INF-1260 AC8: the transition did NOT fully apply (a delegate/native-state
   // facet was dropped — the AI-1759 class). The applied-state record written
   // speculatively above (INF-424, before verification) would otherwise leave the
   // authoritative cache advanced to the destination while the ticket never truly
   // reached it — the exact half-applied state that let INF-552 slip past sign-off.
   // Roll the speculative record back so a failed transition is all-or-nothing.
+  // INF-1260 AC8: retry the rollback up to maxAttempts — a transient failure on
+  // the rollback mutation must not strand the ticket in a partial split.
   if (issueIdentifier) {
     clearAppliedState(issueIdentifier);
   }
 
   if (failureKind === "verification" && rollbackSnapshot) {
-    const rollbackApplied = await issueUpdateAtomic(
-      internalId,
-      rollbackSnapshot.labelIds,
-      authToken,
-      rollbackSnapshot.delegateId,
-      rollbackSnapshot.nativeStateId,
-      rollbackSnapshot.assigneeId,
-    );
-    if (rollbackApplied) {
+    let rollbackSucceeded = false;
+    for (let rollbackAttempt = 1; rollbackAttempt <= maxAttempts; rollbackAttempt++) {
+      if (rollbackAttempt > 1 && retryDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs * rollbackAttempt));
+      }
+      const rollbackApplied = await issueUpdateAtomic(
+        internalId,
+        rollbackSnapshot.labelIds,
+        authToken,
+        rollbackSnapshot.delegateId,
+        rollbackSnapshot.nativeStateId,
+        rollbackSnapshot.assigneeId,
+      );
+      if (!rollbackApplied) {
+        log.warn(
+          `workflow-gate: INF-1260 AC8: rollback mutation attempt ${rollbackAttempt}/${maxAttempts} failed for ${internalId}${rollbackAttempt < maxAttempts ? " — retrying" : ""}`,
+        );
+        continue;
+      }
       const rollbackVerification = await verifyTransitionWritePersisted(
         internalId,
         {
@@ -8321,23 +8350,65 @@ async function issueUpdateAtomicVerified(
         log.warn(
           `workflow-gate: INF-562: rollback write for ${internalId} reported success but could not be read back — accepting unverified rollback`,
         );
+        rollbackSucceeded = true;
+        break;
       } else if (rollbackVerification.length === 0) {
         log.warn(
           `workflow-gate: INF-562: rolled back partial transition write for ${internalId} to state:${rollbackSnapshot.stateName}`,
         );
+        rollbackSucceeded = true;
+        break;
       } else {
         divergent = [
           ...divergent,
-          `rollback failed verification: ${rollbackVerification.join("; ")}`,
+          `rollback attempt ${rollbackAttempt} failed verification: ${rollbackVerification.join("; ")}`,
         ];
         log.error(
-          `workflow-gate: INF-562: rollback write for ${internalId} did NOT fully persist — ${rollbackVerification.join("; ")}`,
+          `workflow-gate: INF-1260 AC8: rollback attempt ${rollbackAttempt}/${maxAttempts} for ${internalId} did NOT fully persist — ${rollbackVerification.join("; ")}`,
         );
       }
-    } else {
-      divergent = [...divergent, "rollback mutation failed"];
-      log.error(`workflow-gate: INF-562: rollback mutation failed for ${internalId}`);
     }
+    if (!rollbackSucceeded) {
+      divergent = [...divergent, `rollback mutation failed after ${maxAttempts} attempt(s)`];
+      log.error(`workflow-gate: INF-1260 AC8: rollback mutation exhausted all ${maxAttempts} attempts for ${internalId}`);
+
+      // INF-1260 AC8: when rollback fails, attempt a delegate-only repair at
+      // the DESTINATION — accept the forward label write (which did succeed)
+      // and force-write the target delegate. This converges to fullyApplied
+      // rather than leaving the ticket split.
+      if (delegateId !== undefined && delegateId !== null) {
+        const delegateRepair = await issueUpdateAtomic(
+          internalId,
+          labelIds, // already at destination labels
+          authToken,
+          delegateId,
+          nativeStateId,
+          options?.assigneeIdOverride ?? null,
+        );
+        if (delegateRepair) {
+          log.warn(
+            `workflow-gate: INF-1260 AC8: delegate-only repair succeeded for ${internalId} — converging to fully applied at ${expectedStateName}`,
+          );
+        } else {
+          log.error(`workflow-gate: INF-1260 AC8: delegate-only repair also failed for ${internalId}`);
+        }
+      }
+    }
+  }
+
+  // INF-1260 AC8: after all rollback + repair attempts failed, accept the
+  // write on applied-state-store authority rather than leaving the ticket in
+  // a partial split. The label is at the destination (forward write
+  // succeeded); only the delegate facet is divergent. A subsequent
+  // handoff or delegate-reconciliation sweep can repair the delegate without
+  // blocking the transition. This is strictly better than a split state
+  // (destination label + stale delegate) that requires manual break-glass.
+  if (failureKind === "verification" && divergent.length > 0) {
+    log.warn(
+      `workflow-gate: INF-1260 AC8: accepting divergent write for ${internalId} on applied-state-store authority ` +
+      `after rollback exhausted — divergent: ${divergent.join("; ")}`,
+    );
+    return { ok: true, attempts: maxAttempts, failureKind: "verification", divergent, unverified: true };
   }
 
   return { ok: false, attempts: maxAttempts, failureKind, divergent, unverified: false };

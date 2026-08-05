@@ -3,7 +3,7 @@
 # The canonical fixture is a mirror of the registered-def (INF-723 single-source rule).
 
 id: dev-impl
-version: 20
+version: 21
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
 
@@ -65,6 +65,15 @@ states:
         to: intake
         assign:
           mode: required
+      # INF-1260 AC5: governed forward-recovery edge for tickets that already
+      # have completed work (PR open, tests green) but were bounced back to intake.
+      # Resumes at code-review without re-running write-tests/implementation.
+      - command: resume-review
+        to: code-review
+        requires_comment: true
+        assign:
+          mode: required
+          constraint: not-implementer
 
   - id: write-tests
     owner_role: test-author     # TestDrivenDevelopmentAgent; dev container (§16.2)

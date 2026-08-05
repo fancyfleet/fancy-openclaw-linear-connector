@@ -28,6 +28,15 @@ const TERMINAL_INTS = new Set([
 ]);
 
 /**
+ * INF-1260 AC1+AC2: governed forward-write intents that must also be
+ * checked for a zombie/stale dispatch lease before applying. `submit` and
+ * `continue-workflow` are the primary dev-impl forward-progress verbs and
+ * were previously excluded from any lease check at all — a stale lease left
+ * behind by a crashed/orphaned session let them fail-open unconditionally.
+ */
+const ZOMBIE_LEASE_GATED_INTS = new Set([...TERMINAL_INTS, "submit", "continue-workflow"]);
+
+/**
  * Resolve a UUID issue ID to its human-readable identifier (e.g. "AI-2565").
  * Returns null on failure.
  */
@@ -152,9 +161,33 @@ export async function checkStaleSnapshotForTerminal(
   callerLinearUserId: string | null,
   leaseStore?: DispatchLeaseStore,
 ): Promise<string | null> {
-  // Only applies to terminal/routing intents
-  if (!TERMINAL_INTS.has(effectiveIntent)) return null;
+  // Only applies to terminal/routing + governed forward-write intents
+  if (!ZOMBIE_LEASE_GATED_INTS.has(effectiveIntent)) return null;
   if (!leaseStore) return null; // no lease store = pass-through
+
+  // AC1+AC2: zombie/stale dispatch lease check. This runs first and does NOT
+  // depend on a successful network fetch — a lease record's expiry is known
+  // locally, so a crashed/orphaned session's stale lease is detected and
+  // refused loudly even if the Linear API is unreachable (fail-closed,
+  // never fail-open). `get()` returns the lease record even if expired;
+  // `isActive()` returns null once it has expired — the gap between the two
+  // is exactly the "zombie lease" case this closes.
+  const rawLease = leaseStore.get(agentId, issueId);
+  if (rawLease && !leaseStore.isActive(agentId, issueId)) {
+    log.warn(
+      `zombie-lease-block agent=${agentId} intent=${effectiveIntent} ticket=${issueId}: ` +
+      `lease expired at ${rawLease.expires_at} (dispatched ${rawLease.dispatched_at}) — refusing`,
+    );
+    return (
+      `[Proxy] '${effectiveIntent}' refused: your dispatch lease for this ticket expired at ` +
+      `${rawLease.expires_at}. This looks like a stale/orphaned session. ` +
+      `Re-dispatch or re-run \`linear observe-issue ${issueId}\` to pick up a fresh lease before retrying.`
+    );
+  }
+
+  // The remaining comment-diff CAS check only applies to the original
+  // terminal/delegate-routing intents.
+  if (!TERMINAL_INTS.has(effectiveIntent)) return null;
 
   // Fetch the issue's current updatedAt and identifier
   const current = await fetchIssueUpdatedAt(issueId, authorization);

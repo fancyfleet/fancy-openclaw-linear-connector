@@ -129,7 +129,7 @@ describe("INF-1260 AC5 (intake forward-recovery): a governed edge must exist fro
     expect(result).toBeNull();
   });
 
-  it("AC7(intake forward-recovery): the plain 'accept' path (full TDD re-run) remains the ONLY legal forward edge today (documents the gap)", async () => {
+  it("AC7(intake forward-recovery): 'accept' remains a legal forward edge from intake (full TDD re-run)", async () => {
     globalThis.fetch = makeIntakeContextFetch("astrid-linear-uid");
 
     const acceptResult = await checkWorkflowRules(
@@ -142,6 +142,7 @@ describe("INF-1260 AC5 (intake forward-recovery): a governed edge must exist fro
     );
     expect(acceptResult).toBeNull();
 
+    // After INF-1260 AC5: resume-review is now legal too, so the gap is closed.
     const resumeResult = await checkWorkflowRules(
       "resume-review",
       "INF-1260-RECOVER",
@@ -150,8 +151,6 @@ describe("INF-1260 AC5 (intake forward-recovery): a governed edge must exist fro
       null,
       "astrid-linear-uid",
     );
-    // Today 'resume-review' is illegal while 'accept' is the only legal
-    // forward path — the exact AC5 gap (no shortcut back to code-review).
-    expect(resumeResult).not.toBeNull();
+    expect(resumeResult).toBeNull();
   });
 });
