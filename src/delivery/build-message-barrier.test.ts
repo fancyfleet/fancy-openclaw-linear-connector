@@ -27,6 +27,15 @@ break_glass:
   to: evaluating
 
 states:
+  - id: evaluating
+    owner_role: steward
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: proceed
+        to: scoping
+        generic: continue
+
   - id: scoping
     owner_role: steward
     kind: normal

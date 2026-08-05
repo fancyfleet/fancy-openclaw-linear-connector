@@ -139,7 +139,13 @@ export async function verifyPostTransition(
       );
       return null;
     }
-    const match = actualState === expectedState;
+    // Strip the "state:" prefix for comparison. fetchStateLabel returns the
+    // FULL label (e.g. "state:write-tests") while expectedState is the bare
+    // state id (e.g. "write-tests") — comparing the raw values always misses.
+    const bareActualState = actualState.startsWith("state:")
+      ? actualState.slice("state:".length)
+      : actualState;
+    const match = bareActualState === expectedState;
     if (!match) {
       log.warn(
         `[transition-audit] post-transition LABEL MISMATCH for ${issueId}: ` +

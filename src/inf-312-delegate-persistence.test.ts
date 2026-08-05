@@ -134,7 +134,7 @@ states:
     native_state: doing
     transitions:
       - command: continue
-        to: review
+        to: code-review
         assign:
           default: code-review
       - command: refuse-work

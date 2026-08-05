@@ -784,6 +784,12 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
         if (driftErrors.length > 0) {
           throw new Error(driftErrors.join("; "));
         }
+        // INF-1228: refuse to activate a def whose dispatch guidance could name
+        // a workflow state that doesn't exist.
+        const danglingTargetErrors = validateTransitionTargets(def);
+        if (danglingTargetErrors.length > 0) {
+          throw new Error(danglingTargetErrors.join("; "));
+        }
         registry.set(def.id, def);
       } catch (err) {
         // AC2: one bad def fails that def only — exclude it, keep the rest.
@@ -818,6 +824,12 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
       const driftErrors = validateGateAnchorDefs(def);
       if (driftErrors.length > 0) {
         throw new Error(driftErrors.join("; "));
+      }
+      // INF-1228: refuse to activate a def whose dispatch guidance could name
+      // a workflow state that doesn't exist.
+      const danglingTargetErrors = validateTransitionTargets(def);
+      if (danglingTargetErrors.length > 0) {
+        throw new Error(danglingTargetErrors.join("; "));
       }
       registry.set(def.id, def);
       recordSuccess("workflow-def");
@@ -1223,6 +1235,49 @@ export function validateGateAnchorDefs(def: WorkflowDef): string[] {
       `on this state. If the rename is intentional, update the drift guard and gate ` +
       `predicates together.`,
     );
+  }
+
+  return errors;
+}
+
+/**
+ * INF-1228: Validate that every transition target names a real state.
+ *
+ * Dispatch guidance (legal-actions listings, delivery messages) is built
+ * directly from `transition.to` — if a `to` names a state that isn't in the
+ * def's `states` list, guidance can point an agent at a state that doesn't
+ * exist (the `accept (→ doing)` defect: a `doing` state was removed from
+ * dev-impl but a stray transition still targeted it). This is a load-time
+ * invariant, not an incidental fact of how legal-actions happens to be
+ * rendered today.
+ *
+ * `to` values prefixed `__` (e.g. `__ad_hoc__`, `__terminal_hold__`) are
+ * sentinel exits meaning "leaves the workflow entirely" and are not real
+ * states — skipped.
+ *
+ * Called at registry load time; a non-empty return excludes the def from the
+ * registry (same fail-closed pattern as validateGateAnchorDefs).
+ */
+export function validateTransitionTargets(def: WorkflowDef): string[] {
+  const errors: string[] = [];
+  const stateIds = new Set(def.states.map((s) => s.id));
+
+  for (const state of def.states) {
+    for (const transition of state.transitions ?? []) {
+      // Legacy/minimal defs may carry transitions with no `to` (e.g. a bare
+      // `target:` edge) — treat those as non-special rather than crash on
+      // undefined.startsWith (same guard as isSpecialTransition, INF-25
+      // synthetic defs exercise this shape).
+      if (typeof transition.to !== "string") continue;
+      if (transition.to.startsWith("__")) continue;
+      if (!stateIds.has(transition.to)) {
+        errors.push(
+          `[INF-1228 dangling-target guard] ${def.id} v${def.version}: state '${state.id}' ` +
+          `transition '${transition.command}' targets '${transition.to}', which is not a ` +
+          `defined state in this def.`,
+        );
+      }
+    }
   }
 
   return errors;
