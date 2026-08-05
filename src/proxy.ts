@@ -1987,10 +1987,10 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           transitionResult.code !== "ad-hoc" &&
           transitionResult.code !== "no-issue-id";
 
-        // INF-1147: a governed dev-impl forward transition that does NOT fully apply
-        // must decline loudly. Two cases:
-        //   1. generic:continue (`submit`/`continue-workflow`) whose atomic write
-        //      FAILED (status: "failed").
+        // INF-1147/INF-1222: a governed transition that does NOT fully apply must
+        // decline loudly. Two cases:
+        //   1. Any governed transition (`submit`/`continue-workflow`/peers) whose
+        //      atomic write FAILED (status: "failed").
         //   2. The `capture_ac` accept forward BLOCKED by the AC-of-record gate
         //      (status: "blocked", code: "ac-of-record-missing") — a repairable
         //      decline (T2).
@@ -2002,8 +2002,32 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         // delegate is now written only by the atomic write (see the strip above), so
         // no split-brain delegate/state was written; do NOT emit the misleading
         // "no state was changed" phrasing.
+        // Require a resolved `to` (destination) state: this scopes the loud
+        // decline to actual atomic-write-stage failures (atomic-mutation-failed,
+        // transition-write-unverified, delegate-unresolved, native-state-*,
+        // label-resolve-failed, target-unresolved, fanout-create-failed — every
+        // workflow-gate.ts "failed" code that reaches the write attempt sets
+        // both `from` and `to`). It excludes pre-identification failures
+        // (context-fetch-failed, no-state-label, registry-load-failed,
+        // transition-exception) that can't "name the current workflow state"
+        // per AC1 anyway, and "no-transition" — raised when a stale trailing
+        // chunk of an already-applied multi-step command (AI-1860) is
+        // re-evaluated after its own transition already landed; that's an
+        // intentional no-op, not a declined governed transition.
+        //
+        // Also require the forwarded mutation itself to be an issueUpdate:
+        // a commentCreate-carried governed verb (e.g. ac-fail) has its own
+        // payload — the delivered comment — worth preserving in the response
+        // even when the paired transition write fails/is unverified;
+        // overwriting the body with a bare errors envelope would silently
+        // drop that comment confirmation, the exact regression AI-1809/
+        // AI-2472 exist to prevent. issueUpdate mutations carry no such
+        // payload, so replacing the body is safe.
         const loudGenericFail =
-          genericContinueForward && transitionResult?.status === "failed";
+          attachTransition &&
+          transitionResult?.status === "failed" &&
+          transitionResult?.to != null &&
+          isIssueUpdateMutation(body);
         const loudAcceptGate =
           acCaptureAcceptForward &&
           transitionResult?.status === "blocked" &&
