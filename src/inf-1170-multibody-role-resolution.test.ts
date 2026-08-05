@@ -277,7 +277,9 @@ describe("INF-1170 — multi-body requester role resolution", () => {
     globalThis.fetch = originalFetch;
   });
 
-  it("AC1: escape never fail-closes on requester role ambiguity; invoking body lands in recoverable intake", async () => {
+  it("AC1: escape preserves position when beyond break-glass target (INF-1260 AC3)", async () => {
+    // INF-1260 AC3: escape from merge/sign-off (beyond break-glass target intake)
+    // preserves spine position — noop rather than demoting to intake.
     for (const sourceState of ["merge", "sign-off"]) {
       captured = { comments: [], writes: [] };
       globalThis.fetch = makeFetch({
@@ -290,13 +292,26 @@ describe("INF-1170 — multi-body requester role resolution", () => {
         sourceStateOverride: sourceState,
       });
 
-      expect(result).toMatchObject({ status: "applied", from: sourceState, to: "intake" });
-      const write = captured.writes.find((call) => call.query.includes("ApplyAtomicTransition"));
-      expect(write).toBeDefined();
-      expect(write!.variables.labelIds).toEqual(expect.arrayContaining(["state-intake-label"]));
-      expect(write!.variables.delegateId).toBe("user-ai");
+      // Position preserved — noop, stays at current state.
+      expect(result).toMatchObject({ status: "noop", from: sourceState, to: sourceState });
+      // No label write should occur (noop).
+      expect(captured.writes.find((call) => call.query.includes("ApplyAtomicTransition"))).toBeUndefined();
       expect(captured.comments).toEqual([]);
     }
+  });
+
+  it("AC1b: escape from intake (at break-glass target) still works", async () => {
+    captured = { comments: [], writes: [] };
+    globalThis.fetch = makeFetch({
+      labelNames: ["wf:task", "state:intake"],
+      instanceRequesterUserId: "user-ai",
+    });
+    const result = await applyStateTransition("escape", TICKET_IDENTIFIER, "Bearer tok", {
+      bodyId: "ai",
+      sourceStateOverride: "intake",
+    });
+    // At the break-glass target itself → self-loop → __ad_hoc__
+    expect(result).toMatchObject({ status: "applied", from: "intake", to: "__ad_hoc__" });
   });
 
   it("AC2 + INF-1150: merge -> sign-off pins the instance-bound requester when requester is astrid or ai", async () => {

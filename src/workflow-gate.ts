@@ -6259,7 +6259,7 @@ export async function applyStateTransition(
     // position is preserved so re-intake can route forward via resume-review.
     // Only reset to the break_glass target (intake) when already AT or BEFORE it.
     const breakGlassTarget = def.break_glass?.to ?? "escape";
-    const spineIndex = (stateId: string | undefined) => {
+    const spineIndex = (stateId: string | null | undefined) => {
       if (!stateId) return -1;
       return def.states.findIndex((s) => s.id === stateId);
     };
@@ -8396,21 +8396,12 @@ async function issueUpdateAtomicVerified(
     }
   }
 
-  // INF-1260 AC8: after all rollback + repair attempts failed, accept the
-  // write on applied-state-store authority rather than leaving the ticket in
-  // a partial split. The label is at the destination (forward write
-  // succeeded); only the delegate facet is divergent. A subsequent
-  // handoff or delegate-reconciliation sweep can repair the delegate without
-  // blocking the transition. This is strictly better than a split state
-  // (destination label + stale delegate) that requires manual break-glass.
-  if (failureKind === "verification" && divergent.length > 0) {
-    log.warn(
-      `workflow-gate: INF-1260 AC8: accepting divergent write for ${internalId} on applied-state-store authority ` +
-      `after rollback exhausted — divergent: ${divergent.join("; ")}`,
-    );
-    return { ok: true, attempts: maxAttempts, failureKind: "verification", divergent, unverified: true };
-  }
-
+  // INF-1260 AC8: the delegate-repair attempt above tried to converge the
+  // ticket to fully-applied when rollback failed. Whether it succeeded or
+  // not, the caller must still see `ok: false` so that its own verification
+  // / loud-failure / operational-event path runs correctly. Returning
+  // `ok: true` here would bypass the caller's transition-write-unverified
+  // detection (AI-1762 / INF-724), masking a genuine consistency failure.
   return { ok: false, attempts: maxAttempts, failureKind, divergent, unverified: false };
 }
 
