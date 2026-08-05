@@ -18,7 +18,7 @@ import type { ObservationStore, ReasonCode, MetricSummary } from "./store/observ
 import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forensics.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
 import { fetchIssueWorkflowSnapshot, parkIssueToBacklog, setStateAtomic, loadWorkflowRegistry, resetWorkflowCache, reloadWorkflowDefs } from "./workflow-gate.js";
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { runFixtureDriftCheck } from "./fixture-drift-detector.js";
 import { instanceConfigRoot } from "./instance-config.js";
 import { retryApply } from "./proposal/apply-pipeline.js";
@@ -47,7 +47,7 @@ import {
 import { mountStreamRoute } from "./admin-stream.js";
 import { listWebhooks, addWebhook, removeWebhook } from "./webhook/registry.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "admin");
+const log = createModuleLogger("admin");
 
 interface AdminDeps {
   agentQueue: AgentQueue;

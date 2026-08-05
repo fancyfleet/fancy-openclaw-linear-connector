@@ -44,11 +44,11 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { componentLogger, createLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 
 const execFileAsync = promisify(execFile);
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "apply-pipeline");
+const log = createModuleLogger("apply-pipeline");
 
 const sha256hex = (s: string): string => createHash("sha256").update(s, "utf8").digest("hex");
 
