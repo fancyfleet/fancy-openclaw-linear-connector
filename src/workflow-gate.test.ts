@@ -672,7 +672,7 @@ describe("checkWorkflowRules — intake state", () => {
     expect(result).toContain("[Proxy]");
     expect(result).toContain("submit");
     expect(result).toContain("intake");
-    expect(result).toContain("accept");
+    expect(result).toContain("continue-workflow");
   });
 
   it("blocks 'deploy' in intake", async () => {
@@ -747,7 +747,7 @@ describe("checkWorkflowRules — implementation state", () => {
     expect(result).not.toBeNull();
     expect(result).toContain("approve");
     expect(result).toContain("implementation");
-    expect(result).toContain("submit");
+    expect(result).toContain("continue-workflow");
   });
 });
 
@@ -780,8 +780,8 @@ describe("checkWorkflowRules — code-review state", () => {
     const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles");
     expect(result).not.toBeNull();
     expect(result).toContain("code-review");
-    expect(result).toContain("approve");
-    expect(result).toContain("request-changes");
+    expect(result).toContain("continue-workflow");
+    expect(result).toContain("request-revision");
   });
 });
 
@@ -890,7 +890,7 @@ describe("checkWorkflowRules — error message format", () => {
   it("names the legal moves in the rejection for an illegal command", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
     const result = await checkWorkflowRules("approve", "issue-uuid", "Bearer tok", "charles");
-    expect(result).toContain("submit");
+    expect(result).toContain("continue-workflow");
     expect(result).toContain("escape");
   });
 });
@@ -959,7 +959,7 @@ describe("checkWorkflowRules — canonical vault schema (src/__fixtures__/canoni
     expect(result).not.toBeNull();
     expect(result).toContain("[Proxy]");
     expect(result).toContain("continue");
-    expect(result).toContain("reject");
+    expect(result).toContain("request-revision");
     expect(result).toContain("escape");
   });
 
@@ -3794,7 +3794,7 @@ describe("checkWorkflowRules — canonical ux-audit schema (src/__fixtures__/can
     globalThis.fetch = makeLabelFetch(["wf:ux-audit", "state:intake"]);
     const blocked = await checkWorkflowRules("complete-audit", "issue-uuid", "Bearer tok", "astrid");
     expect(blocked).not.toBeNull();
-    expect(blocked).toContain("accept");
+    expect(blocked).toContain("continue-workflow");
     expect(blocked).toContain("demote");
     expect(blocked).toContain("escape");
   });
@@ -3807,7 +3807,7 @@ describe("checkWorkflowRules — canonical ux-audit schema (src/__fixtures__/can
     globalThis.fetch = makeLabelFetch(["wf:ux-audit", "state:auditing"]);
     const blocked = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "maya");
     expect(blocked).not.toBeNull();
-    expect(blocked).toContain("complete-audit");
+    expect(blocked).toContain("continue-workflow");
   });
 
   it("spawning state allows spawn only", async () => {
@@ -3829,7 +3829,7 @@ describe("checkWorkflowRules — canonical ux-audit schema (src/__fixtures__/can
     globalThis.fetch = makeLabelFetch(["wf:ux-audit", "state:managing"]);
     const blocked = await checkWorkflowRules("spawn", "issue-uuid", "Bearer tok", "maya");
     expect(blocked).not.toBeNull();
-    expect(blocked).toContain("complete");
+    expect(blocked).toContain("continue-workflow");
   });
 
   it("review state allows approve and request-rework", async () => {
@@ -3843,8 +3843,8 @@ describe("checkWorkflowRules — canonical ux-audit schema (src/__fixtures__/can
     globalThis.fetch = makeLabelFetch(["wf:ux-audit", "state:review"]);
     const blocked = await checkWorkflowRules("complete", "issue-uuid", "Bearer tok", "maya");
     expect(blocked).not.toBeNull();
-    expect(blocked).toContain("approve");
-    expect(blocked).toContain("request-rework");
+    expect(blocked).toContain("continue-workflow");
+    expect(blocked).toContain("request-revision");
   });
 
   // §16.0 invariant: all transition targets resolve to valid states
@@ -4628,7 +4628,7 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
     globalThis.fetch = makeLabelFetch(["wf:sprint", "state:intake"]);
     const blocked = await checkWorkflowRules("spawn", "issue-uuid", "Bearer tok", "astrid");
     expect(blocked).not.toBeNull();
-    expect(blocked).toContain("accept");
+    expect(blocked).toContain("continue-workflow");
     expect(blocked).toContain("demote");
     expect(blocked).toContain("escape");
   });
@@ -4641,7 +4641,7 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
     globalThis.fetch = makeLabelFetch(["wf:sprint", "state:ux-shaping"]);
     const blocked = await checkWorkflowRules("accept", "issue-uuid", "Bearer tok", "maya");
     expect(blocked).not.toBeNull();
-    expect(blocked).toContain("submit");
+    expect(blocked).toContain("continue-workflow");
   });
 
   it("spawning state allows spawn only", async () => {
@@ -4663,7 +4663,7 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
     globalThis.fetch = makeLabelFetch(["wf:sprint", "state:managing"]);
     const blocked = await checkWorkflowRules("spawn", "issue-uuid", "Bearer tok", "soren");
     expect(blocked).not.toBeNull();
-    expect(blocked).toContain("complete");
+    expect(blocked).toContain("continue-workflow");
   });
 
   it("validating state allows approve and request-rework", async () => {
@@ -4677,8 +4677,8 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
     globalThis.fetch = makeLabelFetch(["wf:sprint", "state:validating"]);
     const blocked = await checkWorkflowRules("complete", "issue-uuid", "Bearer tok", "soren");
     expect(blocked).not.toBeNull();
-    expect(blocked).toContain("approve");
-    expect(blocked).toContain("request-rework");
+    expect(blocked).toContain("continue-workflow");
+    expect(blocked).toContain("request-revision");
   });
 
   // §16.0 invariant: all transition targets reference valid states
@@ -5340,7 +5340,7 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
       expect(result).toContain("[Proxy]");
       expect(result).toContain("spawn");
       expect(result).toContain("intake");
-      expect(result).toContain("accept");
+      expect(result).toContain("continue-workflow");
       expect(result).toContain("demote");
       expect(result).toContain("escape");
     });
@@ -5515,10 +5515,10 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
       const result = await checkWorkflowRules("complete", "SPRINT-1", "Bearer tok", "soren");
       expect(result).not.toBeNull();
       expect(result).toContain("[Proxy]");
-      expect(result).toContain("complete");
+      expect(result).toContain("continue-workflow");
       expect(result).toContain("validating");
-      expect(result).toContain("approve");
-      expect(result).toContain("request-rework");
+      expect(result).toContain("continue-workflow");
+      expect(result).toContain("request-revision");
     });
 
     it("validating → approve blocked when no artifact bound (§5.6 gate)", async () => {
@@ -5787,7 +5787,7 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
       globalThis.fetch = makeLabelFetch(["wf:sprint", "state:managing"]);
       const block3 = await checkWorkflowRules("approve", "SPRINT-SHORTCUT", "Bearer tok", "soren");
       expect(block3).not.toBeNull();
-      expect(block3).toContain("complete"); // should suggest 'complete', not 'approve'
+      expect(block3).toContain("continue-workflow"); // routine forward, not literal 'approve'
     });
   });
 });
