@@ -327,7 +327,10 @@ export async function runStalePlainDelegateSweep(
 
       if (postLinearComment) {
         const body = `🔴 **Stale delegate escalation** — ${ticketId} delegated to ${agentName} in "${ticket.state.name}" with no progress for >${Math.round(staleTimeoutMs / 3_600_000)}h after ${attemptCount} re-dispatch(s). Labeled \`stale-delegate\`. Manual intervention required.`;
-        await postLinearComment(agentName, ticketId, body).catch(() => {});
+        await postLinearComment(agentName, ticketId, body).catch((err) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.error(`stale-plain-delegate: failed to post escalation comment for ${ticketId} (${agentName}): ${msg}`);
+        });
       }
 
       operationalEventStore.append({
@@ -362,7 +365,10 @@ export async function runStalePlainDelegateSweep(
 
       if (postLinearComment) {
         const body = `⚠️ **Stale delegate detected** — ${ticketId} delegated to ${agentName} in "${ticket.state.name}" with no progress for >${Math.round(staleTimeoutMs / 3_600_000)}h. Re-dispatching (attempt ${attemptCount + 1}/${DEFAULT_MAX_REDISPATCH}).`;
-        await postLinearComment(agentName, ticketId, body).catch(() => {});
+        await postLinearComment(agentName, ticketId, body).catch((err) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.error(`stale-plain-delegate: failed to post re-dispatch comment for ${ticketId} (${agentName}): ${msg}`);
+        });
       }
 
       alertBus.notify({
