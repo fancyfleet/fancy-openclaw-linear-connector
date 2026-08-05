@@ -1,9 +1,9 @@
 import { execFile } from "node:child_process";
-import { componentLogger, createLogger } from "./logger.js";
+import { createModuleLogger } from "./logging.js";
 import { notify } from "./alerts/alert-bus.js";
 import { registerCron, markCronRun, formatIntervalMs } from "./cron/registry.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "deploy-drift");
+const log = createModuleLogger("deploy-drift");
 
 export interface DeployDriftCheckOptions {
   getLiveCommit: () => Promise<string>;
