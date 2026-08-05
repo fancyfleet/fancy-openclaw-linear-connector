@@ -43,6 +43,8 @@ import { registerStallSweepCron } from "./cron/stall-sweep-cron.js";
 import { getStallDetectionState, DEFAULT_STALL_CONFIG } from "./stall-detection-state.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
 import { registerDoneDetectorCron } from "./cron/done-ticket-detector-cron.js";
+import { registerDeployDriftCron } from "./deploy-drift.js";
+import { getDeployDriftState, resolveMainCommit } from "./deploy-drift.js";
 import { registerBootstrapReconciliationCron } from "./bootstrap-reconciliation-sweep.js";
 import { registerDelegationReconciliationCron, runDelegationReconciliationSweep } from "./delegation-reconciliation-sweep.js";
 import { registerStalePlainDelegateCron } from "./stale-plain-delegate-sweep.js";
@@ -417,6 +419,9 @@ export function createApp(options?: CreateAppOptions) {
       // AI-2468 AC2: done-ticket detector liveness — scheduled + last-run
       // visibility, observable at ac-validate without waiting for a cron tick.
       doneTicketDetector: getDetectorState(),
+      // INF-1264 AC1/AC4: live↔main deploy-drift liveness — scheduled + last-check
+      // state, observable at ac-validate without waiting for the real cadence.
+      deployDrift: getDeployDriftState(),
       // AI-1848 (Pillar 2 D1): universal policy canon liveness — confirms
       // the canon file loaded and its version, observable at ac-validate
       // without waiting for a dispatch trigger.
@@ -2121,6 +2126,14 @@ if (isEntryPoint) {
     lookbackDays: parseInt(process.env.DONE_DETECTOR_LOOKBACK_DAYS ?? "14", 10),
     graceHours: parseInt(process.env.DONE_DETECTOR_GRACE_HOURS ?? "4", 10),
     pollIntervalMs: parseInt(process.env.DONE_DETECTOR_POLL_INTERVAL_MS ?? String(60 * 60 * 1000), 10),
+  });
+
+  // INF-1264: live↔main deploy-drift detector — surfaces merged-but-not-live
+  // drift loudly instead of silently (AI-1808 bootstrap-wiring requirement).
+  registerDeployDriftCron({
+    getLiveCommit: async () => getStartupCommit(),
+    getMainCommit: () => resolveMainCommit(),
+    cadenceMs: parseInt(process.env.DEPLOY_DRIFT_INTERVAL_MS ?? String(15 * 60 * 1000), 10),
   });
 
   // INF-122: periodic anti-entropy reconciliation (G-7/G-17).
