@@ -1172,6 +1172,77 @@ describe("proxy enforcement — B2 state-label transition application", () => {
     expect(res.body.errors).toBeUndefined();
     expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(true);
   });
+
+  // INF-1249: the native-state strip must be gated on the ticket being governed.
+  // On an ad-hoc ticket (no workflow labels) applyStateTransition no-ops with code
+  // "ad-hoc" and never re-writes the native state, so stripping the CLI's stateId
+  // silently drops the close while the delegate clear still lands (split-brain that
+  // left demoted INF-1204 stuck in "Thinking" after `complete` reported state:Done).
+  const forwardedAgentMutation = (
+    calls: Array<{ query: string; variables: unknown }>,
+  ) =>
+    calls.find(
+      (c) =>
+        c.query.includes("issueUpdate") &&
+        !c.query.includes("ApplyAtomicTransition") &&
+        (c.variables as { input?: unknown })?.input !== undefined,
+    );
+
+  it("INF-1249: does NOT strip stateId on `complete` for an ad-hoc ticket (no workflow) — state write must survive", async () => {
+    const { fetch: mock, calls } = makeB2Fetch({
+      b1LabelResponse: NON_WORKFLOW_LABEL_RESPONSE,
+    });
+    globalThis.fetch = mock;
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "complete")
+      .send({
+        query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+        variables: { id: "issue-uuid", input: { stateId: "state-done-uuid", delegateId: null, assigneeId: null } },
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+    // No atomic writer runs for an ad-hoc ticket, so the forwarded CLI stateId is
+    // the ONLY thing that can move the native state — it must not be stripped.
+    expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(false);
+    const forwarded = forwardedAgentMutation(calls);
+    expect(forwarded).toBeDefined();
+    const input = (forwarded!.variables as { input: { stateId?: string; delegateId?: unknown } }).input;
+    expect(input.stateId).toBe("state-done-uuid");
+    // delegate clear still forwarded (complete is exempt from the null-delegate strip)
+    expect(input.delegateId).toBeNull();
+  });
+
+  it("INF-1249: still strips stateId on a governed forward — atomic writer remains sole native-state writer", async () => {
+    const { fetch: mock, calls } = makeB2Fetch({
+      b1LabelResponse: DEV_IMPL_IMPLEMENTATION_RESPONSE,
+    });
+    globalThis.fetch = mock;
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "submit")
+      .send({
+        query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+        variables: { id: "issue-uuid", input: { stateId: "state-done-uuid" } },
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+    // Governed: atomic writer fires AND the forwarded native stateId is stripped.
+    expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(true);
+    const forwarded = forwardedAgentMutation(calls);
+    if (forwarded) {
+      const input = (forwarded.variables as { input: { stateId?: string } }).input;
+      expect(input.stateId).toBeUndefined();
+    }
+  });
 });
 
 // ── AI-1612: proxy is the sole writer of the state:* label ───────────────

@@ -1491,11 +1491,17 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // Fail-open: on any fetch error leave it undefined and let applyStateTransition
       // fall back to the ticket's current state:* label (legacy behavior).
       if (issueId) {
+        // INF-1249: tri-state governance flag for the native-state strip below.
+        //   true  = ticket is in a workflow (applyStateTransition is the writer)
+        //   false = POSITIVELY-confirmed ad-hoc (no workflow labels)
+        //   null  = unknown (label fetch failed) — treat as governed, fail-closed
+        let sourceIsGoverned: boolean | null = null;
         try {
           const preLabels = await fetchWorkflowLabels(issueId, authorization);
           // AI-2094: def-aware most-advanced resolution — see the auth-snapshot
           // capture above. A stale state:* label must not become the source override.
           const srcWfId = getWorkflowId(preLabels);
+          sourceIsGoverned = srcWfId !== null;
           const srcDef = srcWfId ? await loadWorkflowDefById(srcWfId) : null;
           sourceStateOverride = getCurrentState(preLabels, srcDef ?? undefined) ?? undefined;
         } catch (err) {
@@ -1530,11 +1536,24 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         // tuple as the state:* label and delegate. Strip the CLI's forwarded
         // native stateId and let applyStateTransition write the resolved
         // destination atomically after delegate resolution succeeds.
-        if (isIssueUpdateMutation(body)) {
+        //
+        // INF-1249: BUT only for GOVERNED tickets. applyStateTransition writes the
+        // native state only when a workflow drives it; on an ad-hoc / label-stripped
+        // ticket it returns code "ad-hoc" and writes nothing. Stripping the CLI's
+        // stateId there silently drops the state write while the delegate clear (which
+        // `complete`/`park`/`needs-human` legitimately forward) still lands — the exact
+        // split-brain that left demoted INF-1204 stuck in "Thinking" after `complete`
+        // reported state:Done. Skip the strip only for a POSITIVELY-confirmed ad-hoc
+        // ticket (sourceIsGoverned === false); when governance is unknown (label fetch
+        // failed, null) keep stripping so the INF-835 partial-apply race stays closed
+        // for governed traffic.
+        if (isIssueUpdateMutation(body) && sourceIsGoverned !== false) {
           const strippedNativeState = stripNativeStateField(body);
           if (strippedNativeState) {
             log.info(`native-state-strip agent=${agentId} intent=${effectiveIntent}${ticketCtx}: stripped stateId — applyStateTransition is sole native-state writer`);
           }
+        } else if (isIssueUpdateMutation(body) && sourceIsGoverned === false) {
+          log.info(`native-state-passthrough agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ad-hoc ticket has no workflow writer — forwarding CLI stateId to Linear (INF-1249)`);
         }
 
         // INF-274: Guard raw-path delegate=null on plain (non-workflow) tickets.
