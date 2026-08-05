@@ -44,8 +44,11 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import { componentLogger, createLogger } from "../logger.js";
 
 const execFileAsync = promisify(execFile);
+
+const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "apply-pipeline");
 
 const sha256hex = (s: string): string => createHash("sha256").update(s, "utf8").digest("hex");
 
@@ -151,7 +154,10 @@ async function atomicWrite(absPath: string, content: string): Promise<void> {
   try {
     await fs.rename(tmp, absPath);
   } catch (err) {
-    await fs.rm(tmp, { force: true }).catch(() => {});
+    await fs.rm(tmp, { force: true }).catch((rmErr) => {
+      const msg = rmErr instanceof Error ? rmErr.message : String(rmErr);
+      log.error(`atomicWrite: failed to clean up temp file ${tmp} after rename failure: ${msg}`);
+    });
     throw err;
   }
 }
@@ -170,7 +176,10 @@ const _applyLocks = new Map<string, Promise<unknown>>();
 
 async function withKeyLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
   while (_applyLocks.has(key)) {
-    await _applyLocks.get(key)!.catch(() => {});
+    await _applyLocks.get(key)!.catch((err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.error(`withKeyLock: unexpected rejection while waiting on lock for key ${key}: ${msg}`);
+    });
   }
   let release!: () => void;
   const held = new Promise<void>((resolve) => (release = resolve));

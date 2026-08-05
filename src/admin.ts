@@ -18,6 +18,7 @@ import type { ObservationStore, ReasonCode, MetricSummary } from "./store/observ
 import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forensics.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
 import { fetchIssueWorkflowSnapshot, parkIssueToBacklog, setStateAtomic, loadWorkflowRegistry, resetWorkflowCache, reloadWorkflowDefs } from "./workflow-gate.js";
+import { componentLogger, createLogger } from "./logger.js";
 import { runFixtureDriftCheck } from "./fixture-drift-detector.js";
 import { instanceConfigRoot } from "./instance-config.js";
 import { retryApply } from "./proposal/apply-pipeline.js";
@@ -45,6 +46,8 @@ import {
 } from "./admin-session.js";
 import { mountStreamRoute } from "./admin-stream.js";
 import { listWebhooks, addWebhook, removeWebhook } from "./webhook/registry.js";
+
+const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "admin");
 
 interface AdminDeps {
   agentQueue: AgentQueue;
@@ -1418,7 +1421,10 @@ export function createAdminRouter(deps: AdminDeps): Router {
         query: `mutation($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } } }`,
         variables: { issueId: auditIssueId, body: auditCommentBody },
       }),
-    }).catch(() => {});
+    }).catch((err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.error(`set-state: failed to post audit comment for ${ticketId}: ${msg}`);
+    });
 
     res.status(200).json(result);
   });
@@ -1487,7 +1493,10 @@ export function createAdminRouter(deps: AdminDeps): Router {
           query: `mutation($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } } }`,
           variables: { issueId: ticketId, body: auditCommentBody },
         }),
-      }).catch(() => {});
+      }).catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.error(`recapture-ac: failed to post audit comment for ${ticketId}: ${msg}`);
+      });
 
       res.status(200).json({ ok: true, ticketId, callerBodyId, force });
     } catch (err) {
