@@ -167,22 +167,17 @@ describe("INF-1085: enrollment writes drop inherited cross-team label IDs", () =
     expect(labelIds).toContain("state-intake-lbl");
   });
 
-  it("autoEnrollPlainDelegation omits the inherited parent-team xfn label from the enrollment write", async () => {
+  // INF-1243 (2026-08-05): autoEnrollPlainDelegation is now a permanent
+  // no-op — it never reaches a governed write, so the inherited-label
+  // sanitization this file guards is moot for this specific site (the
+  // autoEnrollByTeam coverage above remains the live regression guard).
+  it("autoEnrollPlainDelegation performs zero writes, so the inherited xfn label can never leak here", async () => {
     const { fetch: mock, writes } = makeEnrollFetch();
     globalThis.fetch = mock;
 
-    // delegateAgentName=null skips the worker-body gate; INF-1197 freezes new
-    // active-lane auto-enrollment away from deprecated wf:task.
     const result = await autoEnrollPlainDelegation(ISSUE_UUID, "Bearer tok", undefined, undefined, null);
 
-    expect(result.enrolled).toBe(true);
-    expect(writes).toHaveLength(1);
-    const labelIds = writes[0].variables.labelIds as string[];
-    expect(labelIds).not.toContain(INHERITED_XFN_LABEL_ID);
-    expect(labelIds).toContain("lif-cr-lbl");
-    expect(labelIds).toContain("wf-chore-lbl");
-    expect(labelIds).toContain("state-intake-lbl");
-    expect(labelIds).not.toContain("wf-task-lbl");
-    expect(labelIds).not.toContain("state-doing-lbl");
+    expect(result).toEqual({ enrolled: false });
+    expect(writes).toHaveLength(0);
   });
 });

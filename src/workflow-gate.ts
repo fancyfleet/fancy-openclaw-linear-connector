@@ -8573,51 +8573,6 @@ export interface PlainDelegationEnrollInfo {
   delegateAgentName?: string | null;
 }
 
-const PLAIN_DELEGATION_PR_URL_RE = /https?:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/i;
-const PLAIN_DELEGATION_PR_HASH_RE = /\bPR\s*#?\d+\b/i;
-const PLAIN_DELEGATION_PULL_REQUEST_RE = /\bpull request\b/i;
-const PLAIN_DELEGATION_DIFF_RE = /(?:^|\n)\s*diff --git\s+/;
-const PLAIN_DELEGATION_SOURCE_PATH_RE =
-  /\b[\w.-]+\/[\w./-]*\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|rb|php|c|cc|cpp|h|hpp|cs|sh|sql|ya?ml|json|toml)\b/i;
-const PLAIN_DELEGATION_ENG_DOMAIN_MARKER_RE = /\bengineering-domain\s*:/i;
-const PLAIN_DELEGATION_BRANCH_NAME_RE = /\b(?:feature|fix|bugfix|hotfix|chore|refactor)\/[A-Za-z0-9._-]+/;
-const PLAIN_DELEGATION_CHORE_SIGNAL_RE =
-  /\b(?:operational|operations|runbook|archive|cleanup|clean up|notes?|handoff|schedule|triage|inventory|document|docs?|no code changes?)\b/i;
-
-function classifyPlainDelegationActiveLane(issue: {
-  title?: string | null;
-  description?: string | null;
-  nativeStateName?: string | null;
-  nativeStateType?: string | null;
-}): "dev-impl" | "chore" | "ambiguous" | "inactive" {
-  const stateName = issue.nativeStateName?.trim().toLowerCase();
-  const stateType = issue.nativeStateType?.trim().toLowerCase();
-  if (stateType === "backlog" || stateName === "backlog") return "inactive";
-
-  const hasNativeStateMetadata = Boolean(stateName || stateType);
-  const isActiveTodo = !hasNativeStateMetadata || stateType === "unstarted" || stateName === "to do" || stateName === "todo";
-  if (!isActiveTodo) return "inactive";
-
-  if (issue.title === undefined && issue.description === undefined) {
-    return "chore";
-  }
-
-  const text = `${issue.title ?? ""}\n${issue.description ?? ""}`;
-  if (
-    PLAIN_DELEGATION_PR_URL_RE.test(text) ||
-    PLAIN_DELEGATION_PR_HASH_RE.test(text) ||
-    PLAIN_DELEGATION_PULL_REQUEST_RE.test(text) ||
-    PLAIN_DELEGATION_DIFF_RE.test(text) ||
-    PLAIN_DELEGATION_SOURCE_PATH_RE.test(text) ||
-    PLAIN_DELEGATION_ENG_DOMAIN_MARKER_RE.test(text) ||
-    PLAIN_DELEGATION_BRANCH_NAME_RE.test(text)
-  ) {
-    return "dev-impl";
-  }
-
-  return PLAIN_DELEGATION_CHORE_SIGNAL_RE.test(text) ? "chore" : "ambiguous";
-}
-
 const DEFAULT_TEAM_ENROLL_CONFIG: TeamEnrollConfig = {
   "AI": "dev-impl",
 };
@@ -8738,153 +8693,28 @@ export async function autoEnrollByTeam(
 }
 
 /**
- * INF-334: promote an already-delegated ad-hoc ticket into a governed workflow.
+ * INF-334 introduced active-lane auto-enrollment for plain delegations.
  *
- * INF-1197: new active-lane plain delegation must never mint deprecated
- * `wf:task`; classify To Do into dev-impl/chore and leave Backlog untouched.
+ * INF-1243 (2026-08-05 Matt-confirmed revision): workflows are opt-in only —
+ * plain, ad-hoc delegation must NEVER auto-enroll a `wf:*`/`state:*` label,
+ * under any input (including code-signal or chore-signal description text
+ * that the former `classifyPlainDelegationActiveLane` used to route into
+ * `wf:dev-impl`/`wf:chore`). That classifier is deleted. This function is
+ * kept as an inert no-op — rather than removed outright — so any call site
+ * that is ever wired to it again (accidentally or otherwise) fails safe
+ * into "did nothing" instead of resurrecting silent enrollment. Plain
+ * delegations still dispatch via the unrelated delegate→agent webhook path
+ * (INF-334's router.ts fix, out of scope here).
  */
 export async function autoEnrollPlainDelegation(
-  issueId: string,
-  authToken: string,
-  onEnroll?: (info: PlainDelegationEnrollInfo) => void,
-  enrolledTicketsStore?: EnrolledTicketsStore,
-  delegateAgentName?: string | null,
-  delegateSetTimestamp?: string | null,
+  _issueId: string,
+  _authToken: string,
+  _onEnroll?: (info: PlainDelegationEnrollInfo) => void,
+  _enrolledTicketsStore?: EnrolledTicketsStore,
+  _delegateAgentName?: string | null,
+  _delegateSetTimestamp?: string | null,
 ): Promise<{ enrolled: boolean; entryState?: string; workflowId?: string }> {
-  if (delegateAgentName) {
-    try {
-      const workerBodies = await resolveBodiesForRole("worker");
-      const isWorkerDelegate = workerBodies
-        .map((body) => body.toLowerCase())
-        .includes(delegateAgentName.toLowerCase());
-      if (!isWorkerDelegate) {
-        log.info(
-          `workflow-gate: autoEnrollPlainDelegation: skipping ${issueId} because ` +
-            `delegate '${delegateAgentName}' is not a worker body for active-lane enrollment`,
-        );
-        return { enrolled: false };
-      }
-    } catch (err) {
-      log.warn(
-        `workflow-gate: autoEnrollPlainDelegation: worker role resolution failed for ${issueId} — ` +
-          `skipping active-lane enrollment: ${err instanceof Error ? err.message : String(err)}`,
-      );
-      return { enrolled: false };
-    }
-  }
-
-  const issue = await fetchIssueWithLabels(issueId, authToken);
-  if (!issue) {
-    log.warn(`workflow-gate: autoEnrollPlainDelegation: failed to fetch labels for ${issueId} — skipping`);
-    return { enrolled: false };
-  }
-
-  const labelNames = issue.labels.map((l) => l.name);
-  const existingWorkflowId = getWorkflowId(labelNames);
-  if (existingWorkflowId) {
-    return { enrolled: false };
-  }
-
-  const classification = classifyPlainDelegationActiveLane(issue);
-  if (classification === "inactive") {
-    log.info(
-      `workflow-gate: autoEnrollPlainDelegation: skipping ${issue.identifier} because ` +
-        `native Linear state '${issue.nativeStateName ?? issue.nativeStateType ?? issue.nativeStateId ?? "unknown"}' is not active To Do`,
-    );
-    return { enrolled: false };
-  }
-  if (classification === "ambiguous") {
-    log.warn(
-      `workflow-gate: autoEnrollPlainDelegation: cannot determine active-lane workflow for ${issue.identifier}; ` +
-        `refusing deprecated wf:task fallback. Add an explicit workflow or enough signal to choose wf:chore or wf:dev-impl.`,
-    );
-    return { enrolled: false };
-  }
-
-  const workflowId = classification;
-  let def: WorkflowDef | undefined;
-  try {
-    const registry = await loadWorkflowRegistry();
-    def = registry.get(workflowId);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    log.warn(`workflow-gate: autoEnrollPlainDelegation: registry load failed for ${issueId}: ${msg} — skipping`);
-    return { enrolled: false };
-  }
-
-  if (!def?.entry_state && workflowId === "chore") {
-    log.warn(
-      `workflow-gate: autoEnrollPlainDelegation: workflow def for chore is missing on ${issueId}; ` +
-        `using freeze-policy intake fallback`,
-    );
-  } else if (!def?.entry_state) {
-    log.warn(`workflow-gate: autoEnrollPlainDelegation: no entry_state in def for ${workflowId} on ${issueId} — skipping`);
-    return { enrolled: false };
-  }
-  const entryState = def?.entry_state ?? "intake";
-
-  // INF-334: A re-delegation timestamp can bypass a stale demoted tombstone.
-  if (enrolledTicketsStore?.wasDemoted(issue.identifier, delegateSetTimestamp ?? undefined)) {
-    autoEnrollLiveness = {
-      ...autoEnrollLiveness,
-      suppressedDemotedCount: autoEnrollLiveness.suppressedDemotedCount + 1,
-      lastSuppressedAt: new Date().toISOString(),
-    };
-    log.info(`workflow-gate: autoEnrollPlainDelegation: skipping ${issue.identifier} because last enrolled-ticket event is demoted`);
-    return { enrolled: false };
-  }
-
-  const wfLabelName = `wf:${workflowId}`;
-  const stateLabelName = `state:${entryState}`;
-
-  const wfLabelId = await findOrCreateLabel(issue.teamId, wfLabelName, authToken);
-  if (!wfLabelId) {
-    log.warn(`workflow-gate: autoEnrollPlainDelegation: could not resolve label '${wfLabelName}' for ${issueId} — skipping`);
-    return { enrolled: false };
-  }
-
-  const stateLabelId = await findOrCreateLabel(issue.teamId, stateLabelName, authToken);
-  if (!stateLabelId) {
-    log.warn(`workflow-gate: autoEnrollPlainDelegation: could not resolve label '${stateLabelName}' for ${issueId} — skipping`);
-    return { enrolled: false };
-  }
-
-  // INF-1085: sanitize inherited cross-team labels before the governed write.
-  const existingIds = issueTeamLabelIds(issue.labels, issue.teamId);
-  const newLabelIds = [...new Set([...existingIds, wfLabelId, stateLabelId])];
-  const success = await issueUpdateLabels(issue.internalId, newLabelIds, authToken);
-  if (!success) {
-    log.warn(`workflow-gate: autoEnrollPlainDelegation: label update failed for ${issueId} — skipping`);
-    return { enrolled: false };
-  }
-
-  enrolledTicketsStore?.enroll({
-    ticketId: issue.identifier,
-    workflow: workflowId,
-    state: entryState,
-    delegate: delegateAgentName ?? null,
-  });
-
-  autoEnrollLiveness = {
-    ...autoEnrollLiveness,
-    enrolledCount: autoEnrollLiveness.enrolledCount + 1,
-    lastEnrolledAt: new Date().toISOString(),
-  };
-
-  try {
-    onEnroll?.({
-      issueId,
-      internalId: issue.internalId,
-      workflowId,
-      entryState,
-      delegateAgentName: delegateAgentName ?? null,
-    });
-  } catch (err) {
-    log.warn(`workflow-gate: autoEnrollPlainDelegation: onEnroll audit hook threw for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
-  }
-
-  log.info(`workflow-gate: autoEnrollPlainDelegation: stamped '${wfLabelName}' + '${stateLabelName}' on ${issueId}`);
-  return { enrolled: true, entryState, workflowId };
+  return { enrolled: false };
 }
 
 // ── AI-1546 / G-6: Steward/human-only atomic set-state ─────────────────────

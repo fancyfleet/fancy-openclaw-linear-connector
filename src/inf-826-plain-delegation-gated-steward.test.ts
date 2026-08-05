@@ -1,5 +1,10 @@
 /**
  * INF-826 — plain delegation must not force steward-held task work into doing.
+ *
+ * INF-1243 (2026-08-05, Matt-confirmed): autoEnrollPlainDelegation is now a
+ * permanent no-op — plain delegation never auto-enrolls a workflow for any
+ * delegate, worker or steward. The second test below used to assert the
+ * opposite (worker delegate ⇒ promoted into wf:chore); it is inverted here.
  */
 
 import path from "node:path";
@@ -82,9 +87,9 @@ describe("INF-826: plain delegation task enrollment role guard", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     prevWorkflowDefPath = process.env.WORKFLOW_DEF_PATH;
-    // INF-1197: DSN-15's fixture has no title/description, so classification resolves
-    // to "chore" and autoEnrollPlainDelegation performs a real loadWorkflowRegistry()
-    // read; point it at the canonical chore def instead of the host's default path.
+    // Harmless leftover from pre-INF-1243 setup — autoEnrollPlainDelegation
+    // no longer reads the workflow registry at all, so this path is unused,
+    // but left set for minimal diff against the original fixture setup.
     process.env.WORKFLOW_DEF_PATH = path.join(process.cwd(), "src", "registered-defs", "chore.yaml");
     resetWorkflowCache();
   });
@@ -107,18 +112,14 @@ describe("INF-826: plain delegation task enrollment role guard", () => {
     expect(calls).toEqual([]);
   });
 
-  it("still promotes a plain delegated ticket into chore:intake when the delegate is a worker", async () => {
+  it("does not promote a plain delegated ticket into any workflow, even when the delegate is a worker", async () => {
     const calls: FetchCall[] = [];
     globalThis.fetch = makePlainDelegationFetch(calls);
     mockResolveBodiesForRole.mockResolvedValue(["felix"]);
 
     const result = await autoEnrollPlainDelegation("DSN-15", "Bearer token", undefined, undefined, "felix");
 
-    expect(result).toEqual({ enrolled: true, entryState: "intake", workflowId: "chore" });
-    const mutation = calls.find((call) => call.query.includes("issueUpdate"));
-    expect(mutation?.variables).toMatchObject({
-      issueId: "issue-dsn-14",
-      labelIds: expect.arrayContaining(["label-wf-chore", "label-state-intake"]),
-    });
+    expect(result).toEqual({ enrolled: false });
+    expect(calls.find((call) => call.query.includes("issueUpdate"))).toBeUndefined();
   });
 });
