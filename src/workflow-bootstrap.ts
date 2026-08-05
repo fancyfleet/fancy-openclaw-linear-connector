@@ -18,6 +18,7 @@ import { componentLogger, createLogger } from "./logger.js";
 import { loadWorkflowRegistry, type WorkflowDef } from "./workflow-gate.js";
 import { resolveBodiesForRole, roleResolutionScopeForOwnerRole } from "./escalation-gate.js";
 import { findOrCreateLabel, postComment } from "./linear-helpers.js";
+import { loadEnrollmentPolicy } from "./enrollment-policy.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import type { LinearEvent, LinearIssueCreatedEvent, LinearIssueUpdatedEvent } from "./webhook/schema.js";
 import { getAgents, getAccessToken } from "./agents.js";
@@ -82,14 +83,6 @@ const TASK_WORKFLOW_ID = "task";
  * deploy built in — rather than admitting a code fix to a Design-only track.
  */
 const DEV_IMPL_WORKFLOW_ID = "dev-impl";
-
-/**
- * INF-1164: `wf:chore` is the replacement for the deprecated `wf:task`. Any new
- * enrollment still resolving to `task` (that was not redirected to dev-impl for
- * code signals) is routed here — the `task` def stays registered so in-flight
- * tickets finish (grandfather); only new bootstrap enrollment is blocked.
- */
-const CHORE_WORKFLOW_ID = "chore";
 
 /**
  * INF-594 / INF-1023: signals that a ticket's text describes a code change. The
@@ -486,17 +479,21 @@ export async function applyBootstrapToIssue(
     workflowId = DEV_IMPL_WORKFLOW_ID;
   }
 
-  // INF-1164: wf:task is deprecated. Any NEW enrollment still resolving to
-  // `task` (that was not already redirected to dev-impl for code signals above)
-  // is redirected to `chore`. The `task` def stays registered so in-flight
-  // tickets finish (grandfather); only new bootstrap enrollment is blocked here.
-  if (workflowId === TASK_WORKFLOW_ID) {
+  // INF-1164/INF-1196: any NEW enrollment still resolving to a deprecated
+  // workflow id (that was not already redirected to dev-impl for code signals
+  // above) is redirected to the configured default — both read from the same
+  // enrollment-policy config, not a hardcoded pairing, so changing the default
+  // is a config edit, never a code change + build + deploy. The deprecated
+  // def(s) stay registered so in-flight tickets finish (grandfather); only new
+  // bootstrap enrollment is blocked here.
+  const enrollmentPolicy = loadEnrollmentPolicy();
+  if (enrollmentPolicy.deprecatedWorkflowIds.includes(workflowId)) {
     log.info(
-      `workflow-bootstrap: INF-1164 — ${issue.identifier ?? issue.id} requested deprecated wf:task; ` +
-        `redirecting new enrollment to wf:chore`,
+      `workflow-bootstrap: INF-1164/INF-1196 — ${issue.identifier ?? issue.id} requested deprecated wf:${workflowId}; ` +
+        `redirecting new enrollment to wf:${enrollmentPolicy.defaultEnrollmentWorkflow}`,
     );
     if (redirectedFromLabelId === undefined) redirectedFromLabelId = wfLabelNode.id;
-    workflowId = CHORE_WORKFLOW_ID;
+    workflowId = enrollmentPolicy.defaultEnrollmentWorkflow;
   }
 
   let registry: Map<string, WorkflowDef>;

@@ -36,6 +36,15 @@ export function defaultDeployPolicyPath(): string {
   return path.join(instanceConfigRoot(), "config", "deploy-policy.yaml");
 }
 
+/**
+ * INF-1196: single config source for default-enrollment/deprecation policy,
+ * shared by workflow-bootstrap (direct enrollment) and fanout (spawn) so the
+ * two paths cannot drift the way INF-1164's hardcoded fix did.
+ */
+export function defaultEnrollmentPolicyPath(): string {
+  return path.join(instanceConfigRoot(), "config", "enrollment-policy.yaml");
+}
+
 export function defaultGuidanceDir(): string {
   // Guidance files live alongside their workflow YAML definitions:
   // {configRoot}/workflows/{workflowId}/{state}.md
