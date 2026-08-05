@@ -389,3 +389,42 @@ describe("AC2: migrate-state is capability-gated to workflow:break-glass", () =>
     expect(res.body.errors[0].message).toMatch(/target|not a (valid|live|known) state|no-such-state/i);
   });
 });
+
+describe("INF-1268: migrate-state routes through the atomic write path", () => {
+  it("records the migrated state in the applied-state store (no desync)", async () => {
+    const { getAppliedState } = await import("./store/applied-state-store.js");
+    globalThis.fetch = makeFetch(DEFUNCT_TICKET_RESPONSE);
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer tok-astrid")
+      .set("X-Openclaw-Agent", "astrid")
+      .set("X-Openclaw-Linear-Intent", "migrate-state")
+      .set("X-Openclaw-Migrate-Target", "ac-validate")
+      .send(MIGRATE_MUTATION);
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+    // The atomic write path returns a structured migrateState result.
+    expect(res.body.data?.migrateState?.to).toBe("ac-validate");
+    // The authoritative applied-state store must reflect the migration target so the
+    // next governed command reads the new state (not the stale pre-migration label).
+    expect(getAppliedState("INF-1857")).toBe("ac-validate");
+  });
+
+  it("AC5: accepts the target via the generic X-Openclaw-Linear-Target header (CLI transition verb)", async () => {
+    globalThis.fetch = makeFetch(DEFUNCT_TICKET_RESPONSE);
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer tok-astrid")
+      .set("X-Openclaw-Agent", "astrid")
+      .set("X-Openclaw-Linear-Intent", "migrate-state")
+      // No X-Openclaw-Migrate-Target — the CLI's generic transition verb sends the
+      // target in X-Openclaw-Linear-Target instead.
+      .set("X-Openclaw-Linear-Target", "ac-validate")
+      .send(MIGRATE_MUTATION);
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+    expect(res.body.data?.migrateState?.to).toBe("ac-validate");
+  });
+});

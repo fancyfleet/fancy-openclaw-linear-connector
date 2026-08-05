@@ -1148,7 +1148,14 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // not fall through to the normal transition-legality path (migrate-state is not
       // a def transition, and the ticket's current state is by definition defunct).
       if (effectiveIntent === "migrate-state") {
-        const migrateTarget = (req.headers["x-openclaw-migrate-target"] as string | undefined) ?? null;
+        // INF-1268 AC5: the CLI's generic `transition <id> migrate-state --target <state>`
+        // verb carries the target in X-Openclaw-Linear-Target (the shared target header),
+        // not the migrate-specific X-Openclaw-Migrate-Target. Accept either so the steward
+        // can run the sanctioned verb from the CLI without hand-crafted curl. The
+        // migrate-specific header wins when both are present (explicit > generic).
+        const migrateTarget =
+          ((req.headers["x-openclaw-migrate-target"] as string | undefined) ?? null) ??
+          ((req.headers["x-openclaw-linear-target"] as string | undefined) ?? null);
 
         // Capability gate — mirror the break-glass identity gate: name the caller
         // and the capability so the denial is unambiguous (AC5).

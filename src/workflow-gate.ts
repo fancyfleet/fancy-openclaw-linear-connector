@@ -9002,7 +9002,12 @@ export async function setStateAtomic(
     resolvedDelegateId,
     resolvedNativeStateId,
     targetState,
-    undefined,
+    // INF-1268: pass the human identifier so the applied-state store is keyed the
+    // same way applyStateTransition keys it (issue.identifier). Without this the
+    // set-state / migrate-state path skipped the INF-424 recordAppliedState write,
+    // leaving the authoritative store desynced from the migrated label — the root
+    // of the submit-boundary no-op.
+    issue.identifier ?? ticketIdentifier,
     undefined,
     {
       assigneeIdOverride: options?.assigneeIdOverride,
