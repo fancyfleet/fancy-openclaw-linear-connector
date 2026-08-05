@@ -95,7 +95,7 @@ import { boundSeatFor } from "./implementer-store.js";
 import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
 import { onAlert as onConfigHealthAlert } from "./config-health.js";
 import { getRegistryPolicyStatus, startRegistryPolicyCheck } from "./registry-policy.js";
-import { resolveStartupCommit } from "./startup-commit.js";
+import { resolveStartupCommit, type StartupCommitResult } from "./startup-commit.js";
 import { LINEAR_PROXY_PROTOCOL_VERSION, proxyCompatibilityPayload } from "./proxy-compatibility.js";
 import { getAccessToken, getAgent, getLinearUserIdForAgent, getAllTokenStatuses, isPolledForLinear } from "./agents.js";
 import { loadUniversalCanon, getCanonLiveness } from "./policy/universal-canon.js";
@@ -313,6 +313,10 @@ export interface CreateAppOptions {
    * live hooks URL. Also used as isTicketActionable bypass when provided.
    */
   sendWakeUp?: (agentId: string, ticketIds: string[]) => Promise<void>;
+  /** Test hook: override startup commit resolution for deploy-drift bootstrap wiring. */
+  resolveStartupCommit?: () => Promise<StartupCommitResult>;
+  /** Test hook: override main commit resolution for deploy-drift bootstrap wiring. */
+  resolveMainCommit?: () => Promise<string>;
   /** Override DeadLetterQueueStore database path (for testing). */
   deadLetterQueueDbPath?: string;
 }
@@ -329,6 +333,36 @@ function bindReturnedCloseMethods<T extends Record<string, unknown>>(created: T)
   return created;
 }
 
+function createStartupCommitPromise(resolveCommit: () => Promise<StartupCommitResult>): Promise<StartupCommitResult> {
+  setStartupCommit("unknown");
+  const promise = resolveCommit();
+  promise.then(
+    ({ commit }) => setStartupCommit(commit),
+    () => {},
+  );
+  return promise;
+}
+
+function registerBootstrapDeployDriftCron(options?: {
+  startupCommitPromise?: Promise<StartupCommitResult>;
+  resolveStartupCommit?: () => Promise<StartupCommitResult>;
+  resolveMainCommit?: () => Promise<string>;
+}): Promise<StartupCommitResult> {
+  const startupCommitPromise =
+    options?.startupCommitPromise ??
+    createStartupCommitPromise(options?.resolveStartupCommit ?? (() => resolveStartupCommit()));
+
+  // INF-1264: live↔main deploy-drift detector — surfaces merged-but-not-live
+  // drift loudly instead of silently (AI-1808 bootstrap-wiring requirement).
+  registerDeployDriftCron({
+    getLiveCommit: async () => (await startupCommitPromise).commit,
+    getMainCommit: options?.resolveMainCommit ?? (() => resolveMainCommit()),
+    cadenceMs: parseInt(process.env.DEPLOY_DRIFT_INTERVAL_MS ?? String(15 * 60 * 1000), 10),
+  });
+
+  return startupCommitPromise;
+}
+
 export function createApp(options?: CreateAppOptions) {
   // Reset module-level singleton so per-test AC_RECORDS_PATH is picked up.
   clearAcRecordStore();
@@ -340,6 +374,13 @@ export function createApp(options?: CreateAppOptions) {
     demoteGuardActive: false,
     dispatchPath: "unmounted",
   };
+  const startupCommitPromise =
+    options?.resolveStartupCommit || options?.resolveMainCommit
+      ? registerBootstrapDeployDriftCron({
+          resolveStartupCommit: options?.resolveStartupCommit,
+          resolveMainCommit: options?.resolveMainCommit,
+        })
+      : undefined;
 
   // Create stores early — needed before route registration.
   const observationStore = new ObservationStore(options?.observationsDbPath);
@@ -2263,7 +2304,7 @@ export function createApp(options?: CreateAppOptions) {
     createLinearReconcilerDataPlane({ authToken: reconcilerAuthToken }),
   );
 
-  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore, livenessDispatchStore, linearRateLimitClient, globalRedispatchBudget, transcriptRedactionHealth: getTranscriptRedactionHealth() });
+  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore, livenessDispatchStore, linearRateLimitClient, globalRedispatchBudget, transcriptRedactionHealth: getTranscriptRedactionHealth(), startupCommitPromise });
 }
 
 /**
@@ -2883,13 +2924,7 @@ if (isEntryPoint) {
   // artifact. Disabled unless LEAKED_CRED_SWEEP_ENABLED=1; the proxy gate is always on.
   registerLeakedCredentialSweepCron();
 
-  // INF-1264: live↔main deploy-drift detector — surfaces merged-but-not-live
-  // drift loudly instead of silently (AI-1808 bootstrap-wiring requirement).
-  registerDeployDriftCron({
-    getLiveCommit: async () => getStartupCommit(),
-    getMainCommit: () => resolveMainCommit(),
-    cadenceMs: parseInt(process.env.DEPLOY_DRIFT_INTERVAL_MS ?? String(15 * 60 * 1000), 10),
-  });
+  const startupCommitPromise = registerBootstrapDeployDriftCron();
 
   // INF-122: periodic anti-entropy reconciliation (G-7/G-17).
   // AC1 — native state desync heal; AC2 — missed barrier webhook auto-advance.
@@ -2976,7 +3011,7 @@ if (isEntryPoint) {
     // verification, and crash-loop indicator (repeat bursts fold + count).
     // AI-1841: prefer the dist/DEPLOY_COMMIT stamp over git HEAD — the shared
     // working tree may be on a feature branch and its HEAD is not what runs.
-    resolveStartupCommit().then(({ commit, source }) => {
+    startupCommitPromise.then(({ commit, source }) => {
       setStartupCommit(commit);
       notify({
         severity: "warning",
