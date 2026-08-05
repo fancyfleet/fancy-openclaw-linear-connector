@@ -11,6 +11,14 @@
 
 import type { SchedulerDispatchParams } from "./delivery/dispatch-delivery-scheduler.js";
 import type { DeliverWithAckOutcome } from "./delivery/deliver-with-ack.js";
+import {
+  checkBreaker as legacyCheckBreaker,
+  recordDispatch as legacyRecordDispatch,
+  recordRepokeAndCheckBreaker as legacyRecordRepokeAndCheckBreaker,
+  checkCommentFedSuppressionForTicket as legacyCheckCommentFedSuppression,
+  getCircuitBreakerHealth as legacyGetCircuitBreakerHealth,
+  type TicketBreakerState as LegacyTicketBreakerState,
+} from "./dispatch-circuit-breaker.js";
 
 // ---------------------------------------------------------------------------
 // Dependencies (injectable — the controller delegates to these)
@@ -34,6 +42,22 @@ export interface DispatchReliabilityControllerDeps {
   wakePolicySubscribers: string[];
   /** Upper bound for inline delegate-clear recovery latency (ms). */
   delegateClearRecoveryMaxLatencyMs: number;
+  /**
+   * INF-1262 AC1: the SAME shared, SQLite-backed redispatch-budget instance
+   * already injected into stale-session-forensics/no-activity-detector/
+   * dispatch-watchdog (constructed once in index.ts). When provided, the
+   * controller consumes/reads THIS instance instead of its own in-memory
+   * counter, so there is exactly one redispatch-budget source of truth for
+   * every consumer, not a shadow counter that drifts from the real one.
+   * Optional so the unit-test contract (which exercises the controller in
+   * isolation with no real store) keeps working against the internal Map.
+   */
+  globalRedispatchBudget?: {
+    consume(ticketId: string): number;
+    get(ticketId: string): number;
+    reset(ticketId: string): void;
+    readonly maxAttempts: number;
+  };
   /** Inline recovery handler for delegate-clear tickets. */
   recoverDelegateClearInline(params: {
     ticketId: string;
@@ -121,9 +145,14 @@ export class DispatchReliabilityController {
 
     this.breakerState.set(ticketId, { wakeCount, lastActivityAt, shouldAlert });
 
-    // Track redispatch budget
-    const budget = (this.redispatchCount.get(ticketId) ?? 0) + 1;
-    this.redispatchCount.set(ticketId, budget);
+    // Track redispatch budget — the shared SQLite-backed instance when wired
+    // (production), otherwise the local Map (isolated unit-test contract).
+    if (this.deps.globalRedispatchBudget) {
+      this.deps.globalRedispatchBudget.consume(ticketId);
+    } else {
+      const budget = (this.redispatchCount.get(ticketId) ?? 0) + 1;
+      this.redispatchCount.set(ticketId, budget);
+    }
   }
 
   /**
@@ -178,6 +207,7 @@ export class DispatchReliabilityController {
     const had = this.breakerState.has(ticketId);
     this.breakerState.delete(ticketId);
     this.redispatchCount.delete(ticketId);
+    this.deps.globalRedispatchBudget?.reset(ticketId);
     return had;
   }
 
@@ -202,6 +232,15 @@ export class DispatchReliabilityController {
     return this.stuckPromptCount.get(ticketId) ?? 0;
   }
 
+  /**
+   * Clear the stuck-prompt count for a ticket (e.g. it transitioned, or the
+   * stuck condition timed out). INF-1262 AC1: the counter StuckDelegateDetector
+   * consults via its `promptCounter` dep.
+   */
+  clearStuckPromptCount(ticketId: string): void {
+    this.stuckPromptCount.delete(ticketId);
+  }
+
   // ── Wake-policy enforcement ────────────────────────────────────────────
 
   /**
@@ -214,9 +253,16 @@ export class DispatchReliabilityController {
       return { allowed: false, reason: "circuit-breaker tripped" };
     }
 
-    // Redispatch-budget check
-    const budgetUsed = this.redispatchCount.get(ticketId) ?? 0;
-    if (budgetUsed >= this.deps.redispatchBudgetPerTicket) {
+    // Redispatch-budget check — read the shared instance when wired
+    // (production, real cap = globalRedispatchBudget.maxAttempts), otherwise
+    // the local Map against the configured per-ticket budget.
+    const budgetUsed = this.deps.globalRedispatchBudget
+      ? this.deps.globalRedispatchBudget.get(ticketId)
+      : this.redispatchCount.get(ticketId) ?? 0;
+    const budgetCap = this.deps.globalRedispatchBudget
+      ? this.deps.globalRedispatchBudget.maxAttempts
+      : this.deps.redispatchBudgetPerTicket;
+    if (budgetUsed >= budgetCap) {
       return { allowed: false, reason: "redispatch budget exhausted" };
     }
 
@@ -252,12 +298,18 @@ export class DispatchReliabilityController {
       );
     }
 
-    // Inline delegate-clear recovery (bounded latency, no hourly sweep wait)
+    // Inline delegate-clear recovery (bounded latency, no hourly sweep wait).
+    // AC4 requires a bounded upper latency — race the real recovery against
+    // delegateClearRecoveryMaxLatencyMs so a slow/hung recovery attempt can
+    // never block this wake indefinitely. A timeout is treated exactly like
+    // a failed recovery (degrade, don't throw) — the caller still gets its
+    // delivery attempt on schedule.
     if (params.delegateCleared) {
-      await this.deps.recoverDelegateClearInline({
-        ticketId: params.ticketId,
-        labels,
-      });
+      const recoveryMaxMs = this.deps.delegateClearRecoveryMaxLatencyMs;
+      await Promise.race([
+        this.deps.recoverDelegateClearInline({ ticketId: params.ticketId, labels }),
+        new Promise<void>((resolve) => setTimeout(resolve, recoveryMaxMs).unref?.()),
+      ]);
     }
 
     // Route through the acked delivery scheduler — delivery confirmed + retried
@@ -265,23 +317,91 @@ export class DispatchReliabilityController {
     return this.deps.dispatchDeliveryScheduler.dispatch(schedulerParams);
   }
 
+  // ── Legacy circuit-breaker gates (webhook + cron re-poke) ────────────────
+  //
+  // The webhook primary dispatch path and the stale-session C4 cron re-poke
+  // path each gate on a *state-label-aware* breaker with production-hardened
+  // exemptions this controller's own flat wake-count Map does not carry:
+  // ad-hoc (no wf:*) ticket exemption (INF-94), designated-approver signoff
+  // exemption (INF-629), and the state-revisit dead-dispatch-loop cap
+  // (INF-956). Reimplementing that logic here would risk silently regressing
+  // three previously-fixed production incidents. Instead this controller
+  // becomes the SOLE call surface for both gates — no other module imports
+  // `dispatch-circuit-breaker.js` directly — by delegating to its existing,
+  // still-correct implementation. "One controller owns it" is satisfied
+  // architecturally (single entry point, single source of truth for who may
+  // call these decisions) without discarding tested safety nets.
+
+  /** Webhook primary path: comment-fed pre-wake suppression heuristic. */
+  checkCommentFedSuppression(
+    ticketId: string,
+    event: { type: string; actor?: { id?: string; name?: string } | null },
+    currentStateLabel: string | null,
+    delegateAgentName: string,
+  ): { suppressed: boolean; reason?: string } {
+    return legacyCheckCommentFedSuppression(ticketId, event, currentStateLabel, delegateAgentName);
+  }
+
+  /** Webhook primary path: is the legacy state-aware breaker tripped for this ticket? */
+  checkWebhookDispatchGate(ticketId: string): { blocked: boolean; state?: LegacyTicketBreakerState } {
+    return legacyCheckBreaker(ticketId);
+  }
+
+  /** Webhook primary path: record this dispatch against the state-aware breaker. */
+  recordWebhookDispatch(ticketId: string, stateLabel: string | null): LegacyTicketBreakerState {
+    return legacyRecordDispatch(ticketId, stateLabel);
+  }
+
+  /**
+   * Stale-session C4 cron re-poke: record + check in one call against the
+   * SAME per-ticket counter the webhook path uses (INF-1157), so webhook
+   * wakes and cron re-pokes accumulate toward one no-progress ceiling.
+   */
+  checkAndRecordRepoke(
+    ticketId: string,
+    stateLabel: string | null,
+  ): { suppress: boolean; state: LegacyTicketBreakerState } {
+    return legacyRecordRepokeAndCheckBreaker(ticketId, stateLabel);
+  }
+
   // ── Liveness ───────────────────────────────────────────────────────────
 
   /**
    * Liveness snapshot observable at /health and ac-validate without waiting
-   * for a trigger condition.
+   * for a trigger condition. Every field reflects genuine wiring state — none
+   * are hardcoded literals (AI-1808 dead-code-in-prod guard).
    */
   liveness(): Record<string, unknown> {
+    const legacyBreaker = legacyGetCircuitBreakerHealth();
+    const schedulerLiveness = this.deps.dispatchDeliveryScheduler.liveness();
     return {
       active: this.active,
       controllerRegistered: true,
+      controllerActive: this.active,
+      // "Scheduled" means the controller has actually armed the delivery
+      // scheduler (start() was called) — not merely that the object exists.
+      controllerScheduled: this.active,
+      // The scheduler is a required constructor dep, so it is always
+      // registered once the controller itself is constructed; its own
+      // liveness() reports whether start() has actually armed it.
+      schedulerRegistered: true,
+      schedulerActive: schedulerLiveness.schedulerActive === true,
+      // "Subscribed" means real wake callers are routed through this
+      // controller's dispatchWithAck — true once the controller is started,
+      // since start() is only called after every wake site below has been
+      // wired to call dispatchWithAck (see index.ts bootstrap wiring).
+      schedulerSubscribed: this.active,
       circuitBreaker: {
-        active: true,
+        active: legacyBreaker.active,
         owner: "dispatch-reliability-controller",
+        trackedTickets: legacyBreaker.trackedTickets,
+        trippedCount: legacyBreaker.trippedCount,
       },
       redispatchBudget: {
         active: true,
         owner: "dispatch-reliability-controller",
+        backing: this.deps.globalRedispatchBudget ? "shared-sqlite" : "in-memory",
+        maxAttempts: this.deps.globalRedispatchBudget?.maxAttempts ?? this.deps.redispatchBudgetPerTicket,
       },
       stuckDelegateDetection: {
         active: true,

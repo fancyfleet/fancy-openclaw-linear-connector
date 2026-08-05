@@ -69,6 +69,42 @@ export interface WebhookDeliveryScheduler {
   }): Promise<{ status: "delivered" | "delivered-pending-ack" | "undeliverable"; attempts: number; dispatchId: string }>;
 }
 
+/**
+ * INF-1262: minimal structural interface for the unified
+ * DispatchReliabilityController — the single call surface for circuit-breaker
+ * decisions and the wake-policy-checked delivery primitive. Declared here
+ * (not imported) for the same reason as WebhookDeliveryScheduler above: keep
+ * the webhook dispatch path free of a hard dependency on the controller
+ * module. Optional constructor param — existing unit tests that construct
+ * this router directly without one keep the legacy direct dispatch-circuit-
+ * breaker.js calls (see the `dispatchReliabilityController ??` fallbacks
+ * below).
+ */
+export interface WebhookDispatchReliabilityController {
+  checkCommentFedSuppression(
+    ticketId: string,
+    event: { type: string; actor?: { id?: string; name?: string } | null },
+    currentStateLabel: string | null,
+    delegateAgentName: string,
+  ): { suppressed: boolean; reason?: string };
+  checkWebhookDispatchGate(ticketId: string): {
+    blocked: boolean;
+    state?: { wakeCount: number; lastStateLabel: string | null; trippedAt: string | null };
+  };
+  recordWebhookDispatch(ticketId: string, stateLabel: string | null): unknown;
+  dispatchWithAck(params: {
+    agentId: string;
+    ticketId: string;
+    workflowState?: string;
+    gateway?: string;
+    dispatchId: string;
+    labels?: string[];
+    deliver: (ctx: { attempt: number; dispatchId: string }) => Promise<DeliveryResult>;
+    maxRetries?: number;
+    backoffMs?: (attempt: number) => number;
+  }): Promise<{ status: "delivered" | "delivered-pending-ack" | "undeliverable"; attempts: number; dispatchId: string }>;
+}
+
 export type { LinearEvent } from "./schema.js";
 export { verifyLinearSignature } from "./signature.js";
 export { normalizeLinearEvent } from "./normalize.js";
@@ -594,13 +630,17 @@ async function deliverGovernedTransitionWake(
   dispatchLeaseStore?: DispatchLeaseStore,
   dispatchInFlightStore?: DispatchInFlightStore,
   sessionSpawnStore?: SessionSpawnIdempotencyStore,
+  // INF-1262: prefer routing through the unified controller (wake-policy
+  // pre-flight + the same acked scheduler) when wired; falls back to the raw
+  // scheduler, then to legacy single-attempt delivery, exactly as before.
+  dispatchReliabilityController?: WebhookDispatchReliabilityController,
 ): Promise<Awaited<ReturnType<typeof deliverToAgent>>> {
-  if (!scheduler) {
+  if (!scheduler && !dispatchReliabilityController) {
     return deliverWithSlot(route, config, throttle, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore);
   }
 
   let lastResult: DeliveryResult | undefined;
-  const outcome = await scheduler.dispatch({
+  const dispatchParams = {
     agentId: route.agentId,
     ticketId: route.sessionKey,
     dispatchId: `webhook-direct-${route.sessionKey}-${crypto.randomUUID()}`,
@@ -612,7 +652,10 @@ async function deliverGovernedTransitionWake(
       lastResult = result;
       return result;
     },
-  });
+  };
+  const outcome = dispatchReliabilityController
+    ? await dispatchReliabilityController.dispatchWithAck(dispatchParams)
+    : await scheduler!.dispatch(dispatchParams);
 
   if (lastResult) return lastResult;
   // No attempt ever ran a deliver() call (should not happen, deliverWithAck
@@ -650,6 +693,14 @@ export function createWebhookRouter(
    * router directly, which keep the legacy single-attempt path (AC5).
    */
   dispatchDeliveryScheduler?: WebhookDeliveryScheduler,
+  /**
+   * INF-1262: when present, the primary breaker gate (comment-fed suppression
+   * + checkBreaker + recordDispatch), the bootstrap wake, and the governed-
+   * transition wake all route through this single controller instead of
+   * importing dispatch-circuit-breaker.js directly. Absent in existing unit
+   * tests that construct this router directly (AC5-style fallback).
+   */
+  dispatchReliabilityController?: WebhookDispatchReliabilityController,
 ): Router {
   const router = Router();
   const delegatePingPongDetector = new DelegatePingPongDetector(undefined, undefined, operationalEventStore);
@@ -1040,7 +1091,29 @@ export function createWebhookRouter(
                   await throttle.wait(wakeRoute.agentId);
                   throttle.record(wakeRoute.agentId);
                 }
-                const wakeResult = await deliverWithSlot(wakeRoute, wakeDeliveryConfig, throttle, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore);
+                // INF-1262 AC2/AC3: route through dispatchWithAck instead of a
+                // single fire-and-forget deliverWithSlot() attempt, when the
+                // controller is wired. deliverWithSlot's own runId/canonVersion
+                // are needed by the log/event below, so the last observed
+                // DeliveryResult is captured from inside deliver() (same
+                // pattern as deliverGovernedTransitionWake above).
+                let wakeResult: Awaited<ReturnType<typeof deliverWithSlot>>;
+                if (dispatchReliabilityController) {
+                  let lastResult: DeliveryResult | undefined;
+                  await dispatchReliabilityController.dispatchWithAck({
+                    agentId: wakeRoute.agentId,
+                    ticketId: wakeSessionKey,
+                    dispatchId: `bootstrap-wake-${wakeSessionKey}-${crypto.randomUUID()}`,
+                    deliver: async () => {
+                      const result = await deliverWithSlot(wakeRoute, wakeDeliveryConfig, throttle, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore);
+                      lastResult = result;
+                      return result;
+                    },
+                  });
+                  wakeResult = lastResult ?? { dispatched: false };
+                } else {
+                  wakeResult = await deliverWithSlot(wakeRoute, wakeDeliveryConfig, throttle, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore);
+                }
                 log.info(
                   `Bootstrap wake delivered to ${bootstrapResult.delegateAgentName} for ${bootstrapResult.ticketIdentifier} (runId=${wakeResult.runId ?? "ok"})`,
                 );
@@ -1368,12 +1441,13 @@ export function createWebhookRouter(
         // Feature 2: comment-fed re-wake suppression (pre-wake heuristic).
         // Runs BEFORE the breaker counter increment so the dominant self-feed
         // loop never burns a breaker slot.
-        const commentSuppress = checkCommentFedSuppressionForTicket(
-          cbTicketId,
-          event,
-          cbStateLabel,
-          route.agentId,
-        );
+        // INF-1262: route through the unified controller when wired
+        // (production) so this gate is the SAME call surface the cron
+        // re-poke path uses; fall back to the direct legacy call only for
+        // existing unit tests that construct this router without one.
+        const commentSuppress = dispatchReliabilityController
+          ? dispatchReliabilityController.checkCommentFedSuppression(cbTicketId, event, cbStateLabel, route.agentId)
+          : checkCommentFedSuppressionForTicket(cbTicketId, event, cbStateLabel, route.agentId);
 
         if (commentSuppress.suppressed) {
           log.info(
@@ -1393,7 +1467,9 @@ export function createWebhookRouter(
         }
 
         // Feature 1: circuit breaker. First, check if tripped.
-        const breakerCheck = checkBreaker(cbTicketId);
+        const breakerCheck = dispatchReliabilityController
+          ? dispatchReliabilityController.checkWebhookDispatchGate(cbTicketId)
+          : checkBreaker(cbTicketId);
         if (breakerCheck.blocked) {
           log.info(
             `Circuit breaker: blocking dispatch for ${route.agentId} [${cbTicketId}] — tripped at ${breakerCheck.state!.trippedAt} (${breakerCheck.state!.wakeCount} wakes, state=${breakerCheck.state!.lastStateLabel ?? "unknown"})`,
@@ -1425,7 +1501,11 @@ export function createWebhookRouter(
         //
         // We record BEFORE the stale-route guard so the state snapshot
         // reflects THIS event, not a stale previous entry.
-        recordDispatch(cbTicketId, cbStateLabel);
+        if (dispatchReliabilityController) {
+          dispatchReliabilityController.recordWebhookDispatch(cbTicketId, cbStateLabel);
+        } else {
+          recordDispatch(cbTicketId, cbStateLabel);
+        }
       }
 
       // ── 9a. Stale-route guard ───────────────────────────────────────────
@@ -1827,7 +1907,7 @@ export function createWebhookRouter(
           await throttle.wait(route.agentId);
           throttle.record(route.agentId);
         }
-        const directResult = await deliverGovernedTransitionWake(route, deliveryConfig, dispatchDeliveryScheduler, throttle, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore);
+        const directResult = await deliverGovernedTransitionWake(route, deliveryConfig, dispatchDeliveryScheduler, throttle, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore, dispatchReliabilityController);
         appendOperationalEvent(operationalEventStore, { outcome: directResult.runId ? "dispatch-accepted" : "delivered", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1, runId: directResult.runId ?? null, wakeId, plane: "connector", detail: directResult.canonVersion ? { canonVersion: directResult.canonVersion } : undefined });
         // Direct deliveries (incl. comment-routed wakes into an existing
         // session) must register the dispatch and flip engagement → Thinking
@@ -1849,7 +1929,7 @@ export function createWebhookRouter(
                 await throttle.wait(route.agentId);
                 throttle.record(route.agentId);
               }
-              const drainResult = await deliverGovernedTransitionWake(next, deliveryConfig, dispatchDeliveryScheduler, throttle, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore);
+              const drainResult = await deliverGovernedTransitionWake(next, deliveryConfig, dispatchDeliveryScheduler, throttle, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore, dispatchReliabilityController);
               appendOperationalEvent(operationalEventStore, { outcome: drainResult.runId ? "dispatch-accepted" : "delivered", type: next.event.type, agent: route.agentId, key: next.sessionKey, sessionKey: next.sessionKey, deliveryMode: "agent-queue-drain", attemptCount: 1, runId: drainResult.runId ?? null, detail: drainResult.canonVersion ? { canonVersion: drainResult.canonVersion } : undefined });
             } catch (err) {
               log.error(`Agent queue: failed to deliver promoted task for ${route.agentId}: ${err instanceof Error ? err.message : String(err)}`);

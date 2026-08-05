@@ -91,6 +91,14 @@ export interface StuckDelegateDeps {
   fetchStuckCandidates?: (agent: AgentConfig) => Promise<StuckCandidate[]>;
   /** Overridable for testing — loads workflow def. */
   loadDef?: () => Promise<WorkflowDef>;
+  /**
+   * INF-1262 AC1: when provided, re-prompt counting delegates to this
+   * (e.g. the unified DispatchReliabilityController's recordStuckPrompt/
+   * getStuckPromptCount) instead of this detector's own private
+   * PromptCounter — so there is one stuck-prompt counter, not two competing
+   * ones. Defaults to a fresh PromptCounter for backward compatibility.
+   */
+  promptCounter?: { increment(ticketId: string): number; get(ticketId: string): number; clear(ticketId: string): void };
 }
 
 // ── Data types ───────────────────────────────────────────────────────────────
@@ -267,10 +275,10 @@ export function buildRePrompt(
 export class StuckDelegateDetector {
   private timer?: ReturnType<typeof setInterval>;
   private config: StuckDelegateConfig;
-  private deps: Required<Omit<StuckDelegateDeps, "ackTracker">>;
+  private deps: Required<Omit<StuckDelegateDeps, "ackTracker" | "promptCounter">>;
   /** Persisted ack tracker — optional, stored separately since it has no default fallback. */
   private ackTracker: DispatchAckTracker | undefined;
-  private promptCounter: PromptCounter;
+  private promptCounter: { increment(ticketId: string): number; get(ticketId: string): number; clear(ticketId: string): void };
   /** Tracks when sessions ended per (agent, sessionKey) for idle-grace calculation. */
   private sessionEndedAt: Map<string, number> = new Map();
 
@@ -293,7 +301,7 @@ export class StuckDelegateDetector {
       fetchStuckCandidates: deps.fetchStuckCandidates ?? defaultFetchStuckCandidates,
       loadDef: deps.loadDef ?? loadWorkflowDef,
     };
-    this.promptCounter = new PromptCounter();
+    this.promptCounter = deps.promptCounter ?? new PromptCounter();
   }
 
   start(): void {
