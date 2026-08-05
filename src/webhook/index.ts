@@ -30,7 +30,7 @@ import { resolveServiceCredential } from "../service-credential.js";
 import { checkAgentLiveness, type LivenessConfig } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
 import { checkRoleGuardAndBlock, type LinearUserIdResolver } from "../routing-guard.js";
-import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, markAutoEnrollRegistered, markCommitmentActivityObserverRegistered, applyStateTransition, type WorkflowInstanceContext } from "../workflow-gate.js";
+import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, autoEnrollPlainDelegation, markAutoEnrollRegistered, markCommitmentActivityObserverRegistered, applyStateTransition, AC_CAPTURE_WARNING_PREFIX as AC_CAPTURE_WARNING_COMMENT_PREFIX, type WorkflowInstanceContext } from "../workflow-gate.js";
 import { checkLabelSyncForTicket, emitLabelSyncWarning } from "../transition-audit.js";
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets, type NoActivityDetector } from "../bag/index.js";
@@ -472,7 +472,7 @@ function acknowledgeAgentAuthoredActivity(
 
 const commitmentAutoAcceptClaims = new Set<string>();
 
-async function autoAcceptCommitmentOnActivity(
+export async function autoAcceptCommitmentOnActivity(
   event: LinearEvent,
   operationalEventStore?: OperationalEventStore,
 ): Promise<void> {
@@ -483,6 +483,21 @@ async function autoAcceptCommitmentOnActivity(
   if (!agentName) return;
   const bodyId = getOpenclawAgentName(agentName);
   const data = (event as { data?: Record<string, unknown> }).data;
+
+  // INF-1239: a connector-authored notice comment (e.g. the AC-capture warning
+  // itself) must never count as commitment-evidence activity. Without this
+  // guard, the warning comment's own Comment webhook re-enters this function,
+  // which re-attempts accept, which (while still gated) posts another warning
+  // — a self-sustaining loop observed live as 250 duplicate comments in 3.5
+  // minutes on INF-1204, hitting Linear's 2000-comment cap and bricking it.
+  // Same defect class as the AI-2044 body-mention guard in router.ts.
+  if (event.type === "Comment") {
+    const commentBody = data?.body as string | undefined;
+    if (typeof commentBody === "string" && commentBody.startsWith(AC_CAPTURE_WARNING_COMMENT_PREFIX)) {
+      log.info("Skipping commitment auto-accept: activity is the connector's own AC-capture warning comment");
+      return;
+    }
+  }
   const issue = data?.issue as Record<string, unknown> | undefined;
   const sessionIssue = ((data?.agentSession as Record<string, unknown> | undefined)?.issue ?? {}) as Record<string, unknown>;
   const issueId =

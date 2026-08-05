@@ -8298,6 +8298,8 @@ describe("AI-1776: H-7 fail-visible — warning comment on null AC capture", () 
   function makeAc2Fetch(opts: {
     description?: string;
     descriptionFetchFails?: boolean;
+    existingComments?: string[];
+    existingCommentsCheckFails?: boolean;
   }): { fetch: typeof globalThis.fetch; calls: Array<{ query: string; variables: Record<string, unknown> }> } {
     const calls: Array<{ query: string; variables: Record<string, unknown> }> = [];
 
@@ -8306,6 +8308,16 @@ describe("AI-1776: H-7 fail-visible — warning comment on null AC capture", () 
       const parsed = JSON.parse(bodyText) as { query?: string; variables?: Record<string, unknown> };
       calls.push({ query: parsed.query ?? "", variables: parsed.variables ?? {} });
       const q = parsed.query ?? "";
+
+      if (q.includes("AcCaptureWarningExisting")) {
+        if (opts.existingCommentsCheckFails) throw new Error("simulated existing-comment check failure");
+        return new Response(
+          JSON.stringify({
+            data: { issue: { comments: { nodes: (opts.existingComments ?? []).map((body) => ({ body })) } } },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
 
       if (q.includes("IssueWithLabels")) {
         return new Response(
@@ -8512,6 +8524,88 @@ describe("AI-1776: H-7 fail-visible — warning comment on null AC capture", () 
 
     const record = await getAcRecord("AI-1776");
     expect(record).toBeNull();
+  });
+
+  // ── INF-1239: AC-capture warning comment storm — dedup guard ────────────
+  //
+  // Root cause (observed live on INF-1204): postAcCaptureWarningComment had no
+  // idempotency guard, so every re-run of accept-time AC capture on a ticket
+  // with no AC header reposted an identical warning. Combined with the
+  // self-triggering commitment-auto-accept path (webhook/index.ts), this
+  // produced 250 duplicate comments in 3.5 minutes and hit Linear's
+  // 2000-comment cap, bricking the ticket.
+
+  it("INF-1239 AC1: does not repost the warning when one already exists on the ticket", async () => {
+    const { fetch: mock, calls } = makeAc2Fetch({
+      description: "## Problem\nNo AC section.",
+      existingComments: ["[AC Capture Warning] The AC of record was not captured previously."],
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("accept", "AI-1776", "Bearer tok");
+
+    const commentCalls = calls.filter((c) => c.query.includes("commentCreate"));
+    expect(commentCalls).toHaveLength(0);
+  });
+
+  it("INF-1239 AC1/AC3: a loop of N repeated blocked accepts posts at most one warning comment", async () => {
+    const { fetch: mock, calls } = makeAc2Fetch({
+      description: "## Problem\nNo AC section, still no AC section after N attempts.",
+    });
+    globalThis.fetch = mock;
+
+    // Simulate the self-triggering loop: each accept call reads the comments
+    // that exist at call time (fed back from prior commentCreate calls),
+    // exactly as the live connector does via the Linear API.
+    const postedBodies: string[] = [];
+    const loopFetch: typeof globalThis.fetch = async (url, init) => {
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(bodyText) as { query?: string; variables?: Record<string, unknown> };
+      if (parsed.query?.includes("AcCaptureWarningExisting")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { comments: { nodes: postedBodies.map((body) => ({ body })) } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      const res = await mock(url, init);
+      if (parsed.query?.includes("commentCreate")) {
+        postedBodies.push((parsed.variables?.body as string | undefined) ?? "");
+      }
+      return res;
+    };
+    globalThis.fetch = loopFetch;
+
+    for (let i = 0; i < 10; i++) {
+      await applyStateTransition("accept", "AI-1776", "Bearer tok");
+    }
+
+    expect(postedBodies).toHaveLength(1);
+  });
+
+  it("INF-1239: fails closed (suppresses posting) when the existing-warning check itself fails", async () => {
+    const { fetch: mock, calls } = makeAc2Fetch({
+      description: "## Problem\nNo AC section.",
+      existingCommentsCheckFails: true,
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("accept", "AI-1776", "Bearer tok");
+
+    const commentCalls = calls.filter((c) => c.query.includes("commentCreate"));
+    expect(commentCalls).toHaveLength(0);
+  });
+
+  it("INF-1239 non-regression: still posts the warning on a genuinely first attempt", async () => {
+    const { fetch: mock, calls } = makeAc2Fetch({
+      description: "## Problem\nNo AC section.",
+      existingComments: [],
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("accept", "AI-1776", "Bearer tok");
+
+    const commentCalls = calls.filter((c) => c.query.includes("commentCreate"));
+    expect(commentCalls).toHaveLength(1);
   });
 });
 
