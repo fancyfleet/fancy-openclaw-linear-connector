@@ -1,25 +1,25 @@
-export interface StewardStateRedispatchEvidence {
+export interface StewardStateLivenessEvidence {
   kind: "startup" | "registry" | "health";
   component: "steward-state-redispatch";
   message: string;
   at: string;
 }
 
-export interface StewardStateRedispatchLiveness {
+export interface StewardStateLiveness {
   registered: boolean;
   active: boolean;
-  evidence: StewardStateRedispatchEvidence[];
+  evidence: StewardStateLivenessEvidence[];
 }
 
 let registeredAt: string | null = null;
 
-export function registerStewardStateRedispatch(): void {
+export function registerStewardStateLiveness(): void {
   registeredAt = new Date().toISOString();
   console.info("[steward-state-redispatch] registered at server bootstrap");
 }
 
-export function getStewardStateRedispatchLiveness(): StewardStateRedispatchLiveness {
-  const evidence: StewardStateRedispatchEvidence[] = [];
+export function getStewardStateLiveness(): StewardStateLiveness {
+  const evidence: StewardStateLivenessEvidence[] = [];
   if (registeredAt) {
     evidence.push({
       kind: "startup",
