@@ -55,6 +55,8 @@ import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
 import { registerDoneDetectorCron } from "./cron/done-ticket-detector-cron.js";
 import { registerLeakedCredentialSweepCron } from "./cron/leaked-credential-sweep-cron.js";
 import { registerMergedEvidenceReconcilerCron } from "./cron/merged-evidence-reconciler-cron.js";
+import { registerDeployDriftCron } from "./deploy-drift.js";
+import { getDeployDriftState, resolveMainCommit } from "./deploy-drift.js";
 import { registerBootstrapReconciliationCron } from "./bootstrap-reconciliation-sweep.js";
 import { registerDelegationReconciliationCron, runDelegationReconciliationSweep } from "./delegation-reconciliation-sweep.js";
 import { registerStalePlainDelegateCron } from "./stale-plain-delegate-sweep.js";
@@ -626,6 +628,9 @@ export function createApp(options?: CreateAppOptions) {
       // proving the write-back branch is armed at bootstrap and observable at
       // ac-validate without waiting for a confirmed-dead trigger.
       nativeStateReconciler: getNativeStateReconcilerLiveness(),
+      // INF-1264 AC1/AC4: live↔main deploy-drift liveness — scheduled + last-check
+      // state, observable at ac-validate without waiting for the real cadence.
+      deployDrift: getDeployDriftState(),
       // AI-1848 (Pillar 2 D1): universal policy canon liveness — confirms
       // the canon file loaded and its version, observable at ac-validate
       // without waiting for a dispatch trigger.
@@ -2877,6 +2882,14 @@ if (isEntryPoint) {
   // tickets a human closed in the UI (bypassing the proxy gate) without a rotation
   // artifact. Disabled unless LEAKED_CRED_SWEEP_ENABLED=1; the proxy gate is always on.
   registerLeakedCredentialSweepCron();
+
+  // INF-1264: live↔main deploy-drift detector — surfaces merged-but-not-live
+  // drift loudly instead of silently (AI-1808 bootstrap-wiring requirement).
+  registerDeployDriftCron({
+    getLiveCommit: async () => getStartupCommit(),
+    getMainCommit: () => resolveMainCommit(),
+    cadenceMs: parseInt(process.env.DEPLOY_DRIFT_INTERVAL_MS ?? String(15 * 60 * 1000), 10),
+  });
 
   // INF-122: periodic anti-entropy reconciliation (G-7/G-17).
   // AC1 — native state desync heal; AC2 — missed barrier webhook auto-advance.
