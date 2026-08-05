@@ -8300,6 +8300,13 @@ describe("AI-1776: H-7 fail-visible — warning comment on null AC capture", () 
     descriptionFetchFails?: boolean;
     existingComments?: string[];
     existingCommentsCheckFails?: boolean;
+    // INF-1265 AC3: simulate a ticket whose AcCaptureWarningExisting check
+    // must paginate — each entry is one page of comment bodies, returned in
+    // order as the client walks `after` cursors "page-0", "page-1", ...
+    existingCommentPages?: string[][];
+    // INF-1265 AC3: simulate a hard failure while fetching a specific page
+    // (0-based) of the paginated existing-warning scan.
+    failOnPageIndex?: number;
   }): { fetch: typeof globalThis.fetch; calls: Array<{ query: string; variables: Record<string, unknown> }> } {
     const calls: Array<{ query: string; variables: Record<string, unknown> }> = [];
 
@@ -8311,9 +8318,41 @@ describe("AI-1776: H-7 fail-visible — warning comment on null AC capture", () 
 
       if (q.includes("AcCaptureWarningExisting")) {
         if (opts.existingCommentsCheckFails) throw new Error("simulated existing-comment check failure");
+
+        if (opts.existingCommentPages) {
+          const afterCursor = parsed.variables?.after as string | undefined;
+          const pageIndex = afterCursor === undefined ? 0 : parseInt(afterCursor.replace("page-", ""), 10) + 1;
+          if (opts.failOnPageIndex !== undefined && pageIndex === opts.failOnPageIndex) {
+            throw new Error(`simulated existing-comment check failure at page ${pageIndex}`);
+          }
+          const pages = opts.existingCommentPages;
+          const page = pages[pageIndex] ?? [];
+          const hasNextPage = pageIndex < pages.length - 1;
+          return new Response(
+            JSON.stringify({
+              data: {
+                issue: {
+                  comments: {
+                    nodes: page.map((body) => ({ body })),
+                    pageInfo: { hasNextPage, endCursor: hasNextPage ? `page-${pageIndex}` : null },
+                  },
+                },
+              },
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+
         return new Response(
           JSON.stringify({
-            data: { issue: { comments: { nodes: (opts.existingComments ?? []).map((body) => ({ body })) } } },
+            data: {
+              issue: {
+                comments: {
+                  nodes: (opts.existingComments ?? []).map((body) => ({ body })),
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                },
+              },
+            },
           }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
@@ -8606,6 +8645,133 @@ describe("AI-1776: H-7 fail-visible — warning comment on null AC capture", () 
 
     const commentCalls = calls.filter((c) => c.query.includes("commentCreate"));
     expect(commentCalls).toHaveLength(1);
+  });
+
+  // ── INF-1265: AC-capture-warning cap remediation ──────────────────────
+  //
+  // AC1/AC2 (INF-1239) added an idempotency guard, but it only inspects the
+  // FIRST 50 comments (`comments(first: 50)`, no pagination). On any ticket
+  // that already had 50+ comments before the AC-capture warning was ever
+  // posted (a busy, long-lived, or already-storm-hit ticket — exactly
+  // INF-1265's "ticket already near/at the 2000-comment cap" scenario), the
+  // existing warning falls outside that window and the guard can never see
+  // it, so every subsequent governed accept reposts a duplicate — the storm
+  // AC1 promised to prevent, unbounded, forever, on precisely the tickets
+  // AC3 is about.
+  //
+  // These tests are written against the NOT-YET-IMPLEMENTED paginated scan:
+  // hasExistingAcCaptureWarning must walk pages via `after`/`pageInfo`, keep
+  // scanning until it finds the warning or exhausts a bound that covers the
+  // full 2000-comment cap (50/page × 40 pages), and — this is the actual
+  // AC3 "remediation" — fail CLOSED (suppress posting) if that bound is
+  // exhausted without a definitive answer, so a ticket already near/at cap
+  // can never be pushed further over it by this code path.
+
+  it("INF-1265 AC1/AC3: finds a prior warning buried past the first page and suppresses the duplicate", async () => {
+    const unrelatedPage = Array.from({ length: 50 }, (_, i) => `unrelated comment #${i}`);
+    const { fetch: mock, calls } = makeAc2Fetch({
+      description: "## Problem\nNo AC section.",
+      existingCommentPages: [unrelatedPage, ["[AC Capture Warning] already posted once, on page 2"]],
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("accept", "AI-1776", "Bearer tok");
+
+    const commentCalls = calls.filter((c) => c.query.includes("commentCreate"));
+    expect(commentCalls).toHaveLength(0);
+  });
+
+  it("INF-1265 AC1: a genuinely first attempt still posts after exhausting several unrelated pages", async () => {
+    const pages = [
+      Array.from({ length: 50 }, (_, i) => `unrelated comment page0 #${i}`),
+      Array.from({ length: 50 }, (_, i) => `unrelated comment page1 #${i}`),
+      Array.from({ length: 12 }, (_, i) => `unrelated comment page2 #${i}`),
+    ];
+    const { fetch: mock, calls } = makeAc2Fetch({
+      description: "## Problem\nNo AC section.",
+      existingCommentPages: pages,
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("accept", "AI-1776", "Bearer tok");
+
+    const checkCalls = calls.filter((c) => c.query.includes("AcCaptureWarningExisting"));
+    const commentCalls = calls.filter((c) => c.query.includes("commentCreate"));
+    expect(checkCalls).toHaveLength(pages.length);
+    expect(commentCalls).toHaveLength(1);
+  });
+
+  it("INF-1265 AC3: a ticket already near/at the 2000-comment cap fails closed instead of posting — scan is bounded, not unbounded", async () => {
+    // 45 pages of 50 unrelated comments each (2250 comments), every page
+    // reporting hasNextPage: true forever — this stands in for a ticket
+    // already at/near the 2000-comment cap where the existing warning (if
+    // any) can never be conclusively ruled in or out within a bounded scan.
+    const pages: string[][] = Array.from({ length: 45 }, (_, i) =>
+      Array.from({ length: 50 }, (_, j) => `unrelated comment page${i} #${j}`),
+    );
+    // Force every page to report hasNextPage: true (an unbounded/near-cap
+    // ticket), overriding makeAc2Fetch's "last page ends pagination" default.
+    const { fetch: baseMock, calls } = makeAc2Fetch({
+      description: "## Problem\nNo AC section.",
+      existingCommentPages: pages,
+    });
+    const unboundedMock: typeof globalThis.fetch = async (url, init) => {
+      const res = await baseMock(url, init);
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      if (!bodyText.includes("AcCaptureWarningExisting")) return res;
+      const json = (await res.json()) as { data?: { issue?: { comments?: { pageInfo?: { hasNextPage?: boolean }; nodes?: unknown[] } } } };
+      const comments = json.data?.issue?.comments;
+      if (comments?.nodes && comments.nodes.length > 0 && comments.pageInfo) {
+        comments.pageInfo.hasNextPage = true;
+      }
+      return new Response(JSON.stringify(json), { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+    globalThis.fetch = unboundedMock;
+
+    await applyStateTransition("accept", "AI-1776", "Bearer tok");
+
+    const checkCalls = calls.filter((c) => c.query.includes("AcCaptureWarningExisting"));
+    const commentCalls = calls.filter((c) => c.query.includes("commentCreate"));
+    // Bounded to at most 40 pages (50/page = 2000, the full cap window) —
+    // it must terminate rather than paginate forever.
+    expect(checkCalls.length).toBeLessThanOrEqual(40);
+    // And it must fail CLOSED: no comment is posted once the bound is
+    // exhausted without a definitive answer — the whole point of AC3.
+    expect(commentCalls).toHaveLength(0);
+  });
+
+  it("INF-1265 AC3: a hard failure mid-pagination fails closed (suppresses posting), not just a failure on page 0", async () => {
+    const pages = [
+      Array.from({ length: 50 }, (_, i) => `unrelated comment page0 #${i}`),
+      Array.from({ length: 50 }, (_, i) => `unrelated comment page1 #${i}`),
+    ];
+    const { fetch: mock, calls } = makeAc2Fetch({
+      description: "## Problem\nNo AC section.",
+      existingCommentPages: pages,
+      failOnPageIndex: 1,
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("accept", "AI-1776", "Bearer tok");
+
+    const commentCalls = calls.filter((c) => c.query.includes("commentCreate"));
+    expect(commentCalls).toHaveLength(0);
+  });
+
+  it("INF-1265 AC1/AC4 regression: repeated governed accepts on a near-cap ticket with a buried prior warning never produce a second one", async () => {
+    const unrelatedPage = Array.from({ length: 50 }, (_, i) => `unrelated comment #${i}`);
+    const { fetch: mock, calls } = makeAc2Fetch({
+      description: "## Problem\nNo AC section, still no AC section after N attempts.",
+      existingCommentPages: [unrelatedPage, ["[AC Capture Warning] already posted once, buried on page 2"]],
+    });
+    globalThis.fetch = mock;
+
+    for (let i = 0; i < 10; i++) {
+      await applyStateTransition("accept", "AI-1776", "Bearer tok");
+    }
+
+    const commentCalls = calls.filter((c) => c.query.includes("commentCreate"));
+    expect(commentCalls).toHaveLength(0);
   });
 });
 

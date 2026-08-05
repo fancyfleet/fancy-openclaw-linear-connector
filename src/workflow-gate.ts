@@ -3299,27 +3299,58 @@ export const AC_CAPTURE_WARNING_PREFIX = "[AC Capture Warning]";
  * it. Fail-closed on query failure — a missed warning is low severity, but an
  * unbounded comment storm can brick a ticket at Linear's 2000-comment cap
  * (observed live on INF-1204), so an inability to check must suppress, not post.
+ *
+ * INF-1265 AC3: paginates via `after`/`pageInfo` instead of only inspecting the
+ * first 50 comments. A ticket that already had 50+ comments before the warning
+ * was ever posted (exactly a ticket "already near/at the cap from a prior
+ * storm") would otherwise never see the buried warning and repost forever.
+ * Bounded to 40 pages (50/page = the full 2000-comment cap window); if that
+ * bound is exhausted without a definitive answer, fails CLOSED (suppresses
+ * posting) so a near/at-cap ticket can never be pushed further over the cap
+ * by this path.
  */
 async function hasExistingAcCaptureWarning(internalIssueId: string, authToken: string): Promise<boolean> {
+  const MAX_PAGES = 40;
   const query = `
-    query AcCaptureWarningExisting($id: String!) {
-      issue(id: $id) { comments(first: 50) { nodes { body } } }
+    query AcCaptureWarningExisting($id: String!, $after: String) {
+      issue(id: $id) { comments(first: 50, after: $after) { nodes { body } pageInfo { hasNextPage endCursor } } }
     }
   `;
-  try {
-    const res = await fetch(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({ query, variables: { id: internalIssueId } }),
-    });
-    type CommentsResp = { data?: { issue?: { comments?: { nodes?: Array<{ body?: string | null }> } } } };
-    const data = (await res.json()) as CommentsResp;
-    const nodes = data.data?.issue?.comments?.nodes ?? [];
-    return nodes.some((c) => typeof c.body === "string" && c.body.startsWith(AC_CAPTURE_WARNING_PREFIX));
-  } catch (err) {
-    log.warn(`workflow-gate: H-7: existing-warning check failed — suppressing to avoid a duplicate storm: ${err instanceof Error ? err.message : String(err)}`);
-    return true;
+  type CommentsResp = {
+    data?: {
+      issue?: {
+        comments?: {
+          nodes?: Array<{ body?: string | null }>;
+          pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+        };
+      };
+    };
+  };
+  let after: string | undefined;
+  for (let page = 0; page < MAX_PAGES; page++) {
+    try {
+      const res = await fetch(LINEAR_API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authToken },
+        body: JSON.stringify({ query, variables: { id: internalIssueId, after } }),
+      });
+      const data = (await res.json()) as CommentsResp;
+      const comments = data.data?.issue?.comments;
+      const nodes = comments?.nodes ?? [];
+      if (nodes.some((c) => typeof c.body === "string" && c.body.startsWith(AC_CAPTURE_WARNING_PREFIX))) {
+        return true;
+      }
+      if (!comments?.pageInfo?.hasNextPage) {
+        return false;
+      }
+      after = comments.pageInfo.endCursor ?? undefined;
+    } catch (err) {
+      log.warn(`workflow-gate: H-7: existing-warning check failed — suppressing to avoid a duplicate storm: ${err instanceof Error ? err.message : String(err)}`);
+      return true;
+    }
   }
+  log.warn(`workflow-gate: H-7: existing-warning scan exhausted ${MAX_PAGES} pages without a definitive answer — suppressing to avoid a duplicate storm`);
+  return true;
 }
 
 /**
