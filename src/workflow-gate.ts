@@ -3324,6 +3324,10 @@ function isAbortDestination(def: WorkflowDef, id: string): boolean {
 }
 
 function isSpecialTransition(def: WorkflowDef, stateId: string, t: WorkflowTransition): boolean {
+  // Legacy/minimal defs may carry transitions with no `command` (e.g. a bare
+  // `target:` edge) — treat those as non-special rather than crash on
+  // undefined.startsWith (INF-25 synthetic defs exercise this shape).
+  if (typeof t.command !== "string") return false;
   if (def.break_glass?.command && t.command === def.break_glass.command) return true;
   if (SPECIAL_ROUTINE_COMMANDS.has(t.command)) return true;
   if (t.command === "handoff" || t.command.startsWith("handoff-")) return true; // handoff + deprecated aliases (handoff-host-deploy)
