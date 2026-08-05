@@ -22,6 +22,7 @@ jest.unstable_mockModule("./escalation-gate.js", () => ({
   checkEnforcementRules: jest.fn(),
   bodyHasCapability: jest.fn(),
   getCapabilityPolicy: jest.fn(),
+  resolveBodiesForRole: jest.fn(),
 }));
 
 jest.unstable_mockModule("./proxy-cas-check.js", () => ({
