@@ -6258,6 +6258,12 @@ export async function applyStateTransition(
     // escape stays at the current state — the delegate is cleared but the
     // position is preserved so re-intake can route forward via resume-review.
     // Only reset to the break_glass target (intake) when already AT or BEFORE it.
+    //
+    // INF-792 AC3: position preservation is for mid-spine states only. A
+    // *terminal* state (done/invalid/cancelled/...) has no forward progress to
+    // preserve — "preserving" it means escape becomes a noop and the ticket
+    // stays stuck at done forever, killing the only governed reopen path for
+    // finished work. Terminal states always reopen to the break-glass target.
     const breakGlassTarget = def.break_glass?.to ?? "escape";
     const spineIndex = (stateId: string | null | undefined) => {
       if (!stateId) return -1;
@@ -6265,15 +6271,17 @@ export async function applyStateTransition(
     };
     const targetIdx = spineIndex(breakGlassTarget);
     const currentIdx = spineIndex(currentStateName);
+    const currentStateNode = currentStateName ? def.states.find((s) => s.id === currentStateName) : undefined;
+    const currentIsTerminal = currentStateNode?.kind === "terminal";
 
-    if (currentStateName && currentIdx > targetIdx && currentIdx >= 0) {
+    if (currentStateName && !currentIsTerminal && currentIdx > targetIdx && currentIdx >= 0) {
       // Ticket has progressed beyond the break-glass target — preserve position.
       toStateName = currentStateName;
       log.info(
         `workflow-gate: B2 apply: ${issueId} break-glass escape from state '${currentStateName}' ` +
         `— preserving spine position (furthest reached: '${currentStateName}')`,
       );
-    } else if (currentStateName && currentStateName === breakGlassTarget) {
+    } else if (currentStateName && !currentIsTerminal && currentStateName === breakGlassTarget) {
       // INF-146/INF-135: self-loop on the target — no-op through idempotency.
       // INF-311: redirect to __ad_hoc__ instead of entry_state.
       toStateName = "__ad_hoc__";
@@ -8310,69 +8318,34 @@ async function issueUpdateAtomicVerified(
   // authoritative cache advanced to the destination while the ticket never truly
   // reached it — the exact half-applied state that let INF-552 slip past sign-off.
   // Roll the speculative record back so a failed transition is all-or-nothing.
-  // INF-1260 AC8: retry the rollback up to maxAttempts — a transient failure on
-  // the rollback mutation must not strand the ticket in a partial split.
+  // AI-1762/INF-1222: the rollback stays a SINGLE, unretried mutation — the
+  // existing regression suites (ai-1762, inf-1222) lock this call count, and
+  // retrying it would just repeat a read the caller has no new information
+  // about. INF-1260 AC8 targets a narrower gap: if that one rollback call
+  // fails OUTRIGHT (a hard mutation failure, distinct from succeeding but
+  // failing verification), the speculative forward write already landed the
+  // destination label with no compensating action at all. Attempt a single
+  // delegate-only repair at the destination in that case only, so a second
+  // transient failure doesn't strand the ticket half-applied.
   if (issueIdentifier) {
     clearAppliedState(issueIdentifier);
   }
 
   if (failureKind === "verification" && rollbackSnapshot) {
-    let rollbackSucceeded = false;
-    for (let rollbackAttempt = 1; rollbackAttempt <= maxAttempts; rollbackAttempt++) {
-      if (rollbackAttempt > 1 && retryDelayMs > 0) {
-        await new Promise((resolve) => setTimeout(resolve, retryDelayMs * rollbackAttempt));
-      }
-      const rollbackApplied = await issueUpdateAtomic(
-        internalId,
-        rollbackSnapshot.labelIds,
-        authToken,
-        rollbackSnapshot.delegateId,
-        rollbackSnapshot.nativeStateId,
-        rollbackSnapshot.assigneeId,
-      );
-      if (!rollbackApplied) {
-        log.warn(
-          `workflow-gate: INF-1260 AC8: rollback mutation attempt ${rollbackAttempt}/${maxAttempts} failed for ${internalId}${rollbackAttempt < maxAttempts ? " — retrying" : ""}`,
-        );
-        continue;
-      }
-      const rollbackVerification = await verifyTransitionWritePersisted(
-        internalId,
-        {
-          stateName: rollbackSnapshot.stateName,
-          delegateId: rollbackSnapshot.delegateId,
-          assigneeId: rollbackSnapshot.assigneeId,
-          nativeStateId: rollbackSnapshot.nativeStateId,
-        },
-        authToken,
-      );
-      if (rollbackVerification === null) {
-        log.warn(
-          `workflow-gate: INF-562: rollback write for ${internalId} reported success but could not be read back — accepting unverified rollback`,
-        );
-        rollbackSucceeded = true;
-        break;
-      } else if (rollbackVerification.length === 0) {
-        log.warn(
-          `workflow-gate: INF-562: rolled back partial transition write for ${internalId} to state:${rollbackSnapshot.stateName}`,
-        );
-        rollbackSucceeded = true;
-        break;
-      } else {
-        divergent = [
-          ...divergent,
-          `rollback attempt ${rollbackAttempt} failed verification: ${rollbackVerification.join("; ")}`,
-        ];
-        log.error(
-          `workflow-gate: INF-1260 AC8: rollback attempt ${rollbackAttempt}/${maxAttempts} for ${internalId} did NOT fully persist — ${rollbackVerification.join("; ")}`,
-        );
-      }
-    }
-    if (!rollbackSucceeded) {
-      divergent = [...divergent, `rollback mutation failed after ${maxAttempts} attempt(s)`];
-      log.error(`workflow-gate: INF-1260 AC8: rollback mutation exhausted all ${maxAttempts} attempts for ${internalId}`);
+    const rollbackApplied = await issueUpdateAtomic(
+      internalId,
+      rollbackSnapshot.labelIds,
+      authToken,
+      rollbackSnapshot.delegateId,
+      rollbackSnapshot.nativeStateId,
+      rollbackSnapshot.assigneeId,
+    );
+    if (!rollbackApplied) {
+      divergent = [...divergent, "rollback mutation failed"];
+      log.error(`workflow-gate: INF-562: rollback mutation failed for ${internalId}`);
 
-      // INF-1260 AC8: when rollback fails, attempt a delegate-only repair at
+      // INF-1260 AC8: the rollback mutation call itself hard-failed (not
+      // merely a verification mismatch) — attempt a delegate-only repair at
       // the DESTINATION — accept the forward label write (which did succeed)
       // and force-write the target delegate. This converges to fullyApplied
       // rather than leaving the ticket split.
@@ -8392,6 +8365,31 @@ async function issueUpdateAtomicVerified(
         } else {
           log.error(`workflow-gate: INF-1260 AC8: delegate-only repair also failed for ${internalId}`);
         }
+      }
+    } else {
+      const rollbackVerification = await verifyTransitionWritePersisted(
+        internalId,
+        {
+          stateName: rollbackSnapshot.stateName,
+          delegateId: rollbackSnapshot.delegateId,
+          assigneeId: rollbackSnapshot.assigneeId,
+          nativeStateId: rollbackSnapshot.nativeStateId,
+        },
+        authToken,
+      );
+      if (rollbackVerification === null) {
+        log.warn(
+          `workflow-gate: INF-562: rollback write for ${internalId} reported success but could not be read back — accepting unverified rollback`,
+        );
+      } else if (rollbackVerification.length === 0) {
+        log.warn(
+          `workflow-gate: INF-562: rolled back partial transition write for ${internalId} to state:${rollbackSnapshot.stateName}`,
+        );
+      } else {
+        divergent = [...divergent, `rollback failed verification: ${rollbackVerification.join("; ")}`];
+        log.error(
+          `workflow-gate: INF-562: rollback write for ${internalId} did NOT fully persist — ${rollbackVerification.join("; ")}`,
+        );
       }
     }
   }

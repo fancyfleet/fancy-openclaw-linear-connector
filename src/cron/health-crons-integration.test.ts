@@ -35,6 +35,7 @@ const EXPECTED_CRONS = [
   "delegation-reconciliation-sweep",
   "deploy-drift", // INF-1264: live↔main drift detector
   "dispatch-delivery-scheduler", // AI-2008: acknowledged dispatch delivery + retry driver
+  "dispatch-lease-recovery", // INF-1260 AC9: zombie dispatch-lease recovery cron
   "done-ticket-detector", // AI-2576/INF-331: Done-ticket detector cron liveness
   "first-action-watchdog",
   "g20-canary",
