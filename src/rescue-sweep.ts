@@ -488,6 +488,21 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
   }
 
   for (const ticket of tickets) {
+    // INF-1287: a terminal ticket (state:done / state:escape / state:canceled)
+    // is closed and never needs rescuing — classifyTicket already returns
+    // "terminal" and ignores it. But that check lived AFTER the unknown-workflow
+    // guard below, so a *closed* ticket carrying a stale/legacy wf:* label the
+    // registry no longer knows (e.g. Done GEN-55/56 with bare `wf:sprint-arm`,
+    // whose live defs are sprint-arm-scope/ux/spike/design) was reported as an
+    // "unknown workflow" error, failing the whole sweep and eventually pinning
+    // /health. Skip terminal tickets first so a retired/closed ticket can never
+    // trip rescue-sweep, matching the anti-entropy label-loss guard.
+    const stateLabelId = ticket.labels.find((l) => l.startsWith("state:"))?.slice("state:".length);
+    if (stateLabelId === "done" || stateLabelId === "escape" || stateLabelId === "canceled") {
+      byClassification["terminal"] = (byClassification["terminal"] ?? 0) + 1;
+      continue;
+    }
+
     // Resolve workflow def from the wf:* label
     const wfLabel = ticket.labels.find((l) => l.startsWith("wf:"));
     const wfId = wfLabel?.slice("wf:".length);

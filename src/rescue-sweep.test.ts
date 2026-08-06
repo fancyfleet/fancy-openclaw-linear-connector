@@ -500,6 +500,48 @@ describe("AC6 — runRescueSweep: terminal tickets are ignored", () => {
     expect(delegateUpdateCalls).toHaveLength(0);
   });
 
+  it("INF-1287: a terminal (state:done) ticket carrying an UNREGISTERED wf:* label is skipped, not reported as an unknown-workflow error", async () => {
+    // Mirrors GEN-55/GEN-56: Done, with a stale bare `wf:sprint-arm` label whose
+    // live defs are sprint-arm-scope/ux/spike/design. Before the fix, the
+    // unknown-workflow guard ran before the terminal check and pushed an error
+    // that failed the whole sweep (→ eventually pinning /health). A closed
+    // ticket must be skipped regardless of whether its workflow is registered.
+    const { fetch: mock, delegateUpdateCalls } = makeLinearMock({
+      issues: [
+        { id: "uuid-gen56", identifier: "GEN-56", labels: ["wf:sprint-arm", "state:done"], delegateId: null },
+        { id: "uuid-gen55", identifier: "GEN-55", labels: ["wf:sprint-arm", "state:done"], delegateId: null },
+      ],
+    });
+    globalThis.fetch = mock;
+
+    const result = await runRescueSweep({
+      authToken: "Bearer test-token",
+      // Registry intentionally does NOT contain "sprint-arm" (only variants exist live).
+      workflowRegistry: new Map([["dev-impl", { ...TEST_WORKFLOW_DEF }]]),
+    });
+
+    expect(result.errors).toHaveLength(0);
+    expect(result.rescued).toBe(0);
+    expect(delegateUpdateCalls).toHaveLength(0);
+    expect(result.byClassification?.terminal).toBe(2);
+  });
+
+  it("INF-1287 regression: a NON-terminal ticket with an unregistered wf:* label is STILL reported as unknown-workflow", async () => {
+    const { fetch: mock } = makeLinearMock({
+      issues: [
+        { id: "uuid-active", identifier: "GEN-99", labels: ["wf:sprint-arm", "state:implementation"], delegateId: null },
+      ],
+    });
+    globalThis.fetch = mock;
+
+    const result = await runRescueSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: new Map([["dev-impl", { ...TEST_WORKFLOW_DEF }]]),
+    });
+
+    expect(result.errors.some((e) => e.includes("GEN-99") && e.includes("unknown workflow"))).toBe(true);
+  });
+
   it("terminal tickets are counted in byClassification.terminal, not rescued", async () => {
     const { fetch: mock } = makeLinearMock({
       issues: [
