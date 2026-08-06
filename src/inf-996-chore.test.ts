@@ -18,6 +18,7 @@ import { applyStateTransition, resetWorkflowCache } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { reloadAgents } from "./agents.js";
 import { getBinding, getBindings, recordBinding, clearImplementerStore } from "./implementer-store.js";
+import { _resetAppliedStateStore } from "./store/applied-state-store.js";
 
 const ISSUE = "internal-uuid-chore";
 const TOK = "Bearer test-token";
@@ -177,6 +178,10 @@ describe("INF-996 PR-D — wf:chore bound-seat behavior", () => {
     reloadAgents();
     process.env.IMPLEMENTER_STORE_PATH = path.join(tmpDir, `store-${Date.now()}-${Math.floor(process.hrtime()[1])}.json`);
     clearImplementerStore();
+    // Module-level applied-state store is keyed by ticket identifier ("CHO-1"
+    // here) and otherwise leaks across tests in this describe block, since
+    // every test shares that hardcoded identifier (same root cause as AI-2542).
+    _resetAppliedStateStore();
     originalFetch = globalThis.fetch;
   });
 

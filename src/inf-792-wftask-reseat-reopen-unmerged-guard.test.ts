@@ -182,11 +182,13 @@ function writeDefs(dir: string): string {
 function makeLinearFetch(opts: {
   workflow: "task" | "dev-impl";
   state: string;
+  identifier?: string;
   delegateId?: string | null;
   prCase?: PrCase;
   atomicWrites?: Array<Record<string, unknown>>;
 }): typeof globalThis.fetch {
   let delegateId = opts.delegateId === undefined ? LINEAR_AI_ID : opts.delegateId;
+  const identifier = opts.identifier ?? "INF-792";
   let currentState = opts.state;
   let nativeStateId = opts.state === "done" ? "native-done" : opts.state === "doing" ? "native-doing" : "native-todo";
   const prCase = opts.prCase ?? "none";
@@ -218,7 +220,7 @@ function makeLinearFetch(opts: {
       return json({
         data: {
           issue: {
-            identifier: "INF-792",
+            identifier,
             labels: { nodes: labels.map(({ name }) => ({ name })) },
             delegate: delegateId ? { id: delegateId } : null,
           },
@@ -231,7 +233,7 @@ function makeLinearFetch(opts: {
         data: {
           issue: {
             id: ISSUE_UUID,
-            identifier: "INF-792",
+            identifier,
             team: { id: "team-inf" },
             labels: { nodes: labels },
             delegate: delegateId ? { id: delegateId } : null,
@@ -404,6 +406,7 @@ describe("INF-792 wf:task re-seat/reopen/unmerged close guard", () => {
       globalThis.fetch = makeLinearFetch({
         workflow,
         state: "done",
+        identifier: `INF-792-${workflow}`,
         delegateId: LINEAR_AI_ID,
         atomicWrites: writes,
       });

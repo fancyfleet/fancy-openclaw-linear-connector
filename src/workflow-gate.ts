@@ -6264,29 +6264,47 @@ export async function applyStateTransition(
     // preserve — "preserving" it means escape becomes a noop and the ticket
     // stays stuck at done forever, killing the only governed reopen path for
     // finished work. Terminal states always reopen to the break-glass target.
+    // Resolve the escape source the same way the AI-2035 terminal-reentry guard
+    // above does: the applied-state store is lag-proof and authoritative, while
+    // currentStateName (sourceStateOverride ?? actualStateName) can still show a
+    // stale pre-terminal state inside Linear's read-after-write lag window. Without
+    // this, an escape issued in that window would treat the ticket as mid-spine
+    // (per the stale live read) and wrongly noop instead of reopening a terminal.
+    const escapeSource = getAppliedState(issue.identifier) ?? currentStateName;
     const breakGlassTarget = def.break_glass?.to ?? "escape";
     const spineIndex = (stateId: string | null | undefined) => {
       if (!stateId) return -1;
       return def.states.findIndex((s) => s.id === stateId);
     };
     const targetIdx = spineIndex(breakGlassTarget);
-    const currentIdx = spineIndex(currentStateName);
-    const currentStateNode = currentStateName ? def.states.find((s) => s.id === currentStateName) : undefined;
+    const currentIdx = spineIndex(escapeSource);
+    const currentStateNode = escapeSource ? def.states.find((s) => s.id === escapeSource) : undefined;
     const currentIsTerminal = currentStateNode?.kind === "terminal";
 
-    if (currentStateName && !currentIsTerminal && currentIdx > targetIdx && currentIdx >= 0) {
-      // Ticket has progressed beyond the break-glass target — preserve position.
-      toStateName = currentStateName;
+    if (breakGlassTarget === "__ad_hoc__") {
+      // The def declares a full-exit break-glass target (not a spine re-entry
+      // point like intake) — there is no spine position to preserve relative
+      // to it. spineIndex("__ad_hoc__") is always -1, which would otherwise
+      // make every real state look "beyond" the target and wrongly trigger
+      // position-preservation below. Always exit to __ad_hoc__.
+      toStateName = "__ad_hoc__";
       log.info(
-        `workflow-gate: B2 apply: ${issueId} break-glass escape from state '${currentStateName}' ` +
-        `— preserving spine position (furthest reached: '${currentStateName}')`,
+        `workflow-gate: B2 apply: ${issueId} break-glass escape from state '${escapeSource ?? "unknown"}' ` +
+        `— break-glass target is __ad_hoc__ (full exit), demoting`,
       );
-    } else if (currentStateName && !currentIsTerminal && currentStateName === breakGlassTarget) {
+    } else if (escapeSource && !currentIsTerminal && currentIdx > targetIdx && currentIdx >= 0) {
+      // Ticket has progressed beyond the break-glass target — preserve position.
+      toStateName = escapeSource;
+      log.info(
+        `workflow-gate: B2 apply: ${issueId} break-glass escape from state '${escapeSource}' ` +
+        `— preserving spine position (furthest reached: '${escapeSource}')`,
+      );
+    } else if (escapeSource && !currentIsTerminal && escapeSource === breakGlassTarget) {
       // INF-146/INF-135: self-loop on the target — no-op through idempotency.
       // INF-311: redirect to __ad_hoc__ instead of entry_state.
       toStateName = "__ad_hoc__";
       log.info(
-        `workflow-gate: B2 apply: ${issueId} break-glass escape from state '${currentStateName}' ` +
+        `workflow-gate: B2 apply: ${issueId} break-glass escape from state '${escapeSource}' ` +
         `which IS the break-glass target — redirecting to '${toStateName}'`,
       );
     } else {

@@ -12,9 +12,9 @@
  */
 
 import { registerCron, markCronRun, formatIntervalMs } from "./registry.js";
-import { componentLogger, createLogger } from "../logger.js";
+import { createModuleLogger } from "../logging.js";
 
-const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "lease-recovery");
+const log = createModuleLogger("lease-recovery");
 
 const DEFAULT_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 

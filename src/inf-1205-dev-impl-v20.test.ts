@@ -318,7 +318,10 @@ describe("INF-1205 AC1/AC4/AC5: dev-impl v20 registered def shape", () => {
     const registry = await loadWorkflowRegistry();
     const def = registry.get("dev-impl");
 
-    expect(def?.version).toBe(20);
+    // INF-1260 AC5 added a resume-review forward-recovery edge at intake,
+    // bumping the registered def to v21. The v20 state shape (still exactly
+    // these eight states, no INF-695 removed states) is unchanged.
+    expect(def?.version).toBe(21);
     expect(def?.states.map((s) => s.id)).toEqual(V20_STATES);
     expect(def?.states.map((s) => s.id)).toEqual(expect.not.arrayContaining(REMOVED_INF_695_STATES));
   });
@@ -364,7 +367,7 @@ describe("INF-1205 AC2: bootstrap liveness exposes live dev-impl v20 registry", 
 
       expect(res.body.workflowRegistry?.["dev-impl"]).toEqual({
         id: "dev-impl",
-        version: 20,
+        version: 21,
         states: V20_STATES,
       });
       expect(res.body.workflowRegistry?.["dev-impl"]?.states).toEqual(
@@ -408,7 +411,7 @@ describe("INF-1205 AC6: canonical dev-impl mirror matches registered v20", () =>
     const canonical = readDef(CANONICAL_DEV_IMPL);
 
     expect(canonical).toEqual(registered);
-    expect(canonical.version).toBe(20);
+    expect(canonical.version).toBe(21);
     expect(stateIds(canonical)).toEqual(V20_STATES);
     expect(stateIds(canonical)).toEqual(expect.not.arrayContaining(REMOVED_INF_695_STATES));
   });

@@ -1492,7 +1492,7 @@ describe("applyStateTransition — break-glass escape", () => {
   beforeEach(() => { originalFetch = globalThis.fetch; });
   afterEach(() => { globalThis.fetch = originalFetch; });
 
-  it("transitions to state:intake from any state on 'escape' command (AI-1710: escape re-enters at intake)", async () => {
+  it("preserves spine position (noop) on 'escape' from a mid-spine state (INF-1260 AC3: escape no longer re-enters at intake)", async () => {
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
@@ -1501,13 +1501,13 @@ describe("applyStateTransition — break-glass escape", () => {
       teamLabels: [{ id: "intake-lbl", name: "state:intake" }],
     });
     globalThis.fetch = mock;
-    await applyStateTransition("escape", "issue-uuid", "Bearer tok");
+    const result = await applyStateTransition("escape", "issue-uuid", "Bearer tok");
 
+    // INF-1260 AC3: escape from a mid-spine state (implementation is beyond
+    // the break-glass target, intake) preserves position — noop, no write.
+    expect(result.status).toBe("noop");
     const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
-    expect(updateCall).toBeDefined();
-    const vars = updateCall!.body.variables as { labelIds: string[] };
-    expect(vars.labelIds).toContain("intake-lbl");
-    expect(vars.labelIds).not.toContain("state-lbl");
+    expect(updateCall).toBeUndefined();
   });
 });
 
@@ -7205,18 +7205,17 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     }
   });
 
-  it("escape transition writes todo native stateId (AI-1710: escape re-enters at intake)", async () => {
+  it("escape from a mid-spine state preserves position, no mutation written (INF-1260 AC3: escape no longer re-enters at intake)", async () => {
     resetWorkflowCache();
     resetNativeStateCache();
     const { fetch, mutations } = makeConformanceFetch(["wf:dev-impl", "state:implementation"]);
     globalThis.fetch = fetch;
 
-    await applyStateTransition("escape", "AI-CONF-ESC", "Bearer tok", { bodyId: "astrid" });
+    const result = await applyStateTransition("escape", "AI-CONF-ESC", "Bearer tok", { bodyId: "astrid" });
 
+    expect(result.status).toBe("noop");
     const atomicMutation = mutations.find((m) => m.query.includes("ApplyAtomicTransition"));
-    expect(atomicMutation).toBeDefined();
-    const vars = atomicMutation!.variables as { stateId?: string };
-    expect(vars.stateId).toBe(SEMANTIC_TO_UUID["todo"]);
+    expect(atomicMutation).toBeUndefined();
   });
 
   it("reject transition routes back to implementation with todo resting native state", async () => {
