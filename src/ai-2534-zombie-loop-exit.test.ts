@@ -479,9 +479,21 @@ async function waitForMutation(
   throw new Error(message);
 }
 
-function expectGovernanceRemovalForwarded(calls: FetchCall[], issueId = ISSUE_UUID): void {
-  const removals = governanceRemovalCalls(calls, issueId);
-  expect(removals.length).toBeGreaterThanOrEqual(1);
+/**
+ * INF-1262 review follow-up: the demote/complete handlers await their own
+ * label-removal mutation before responding, so this assertion is normally
+ * satisfied the instant the preceding `request(...)` resolves. But under
+ * full-suite contention (many jest workers, several of which boot a real
+ * connector child process the way inf-1262's AC6/AC7 tests do) that
+ * "instant" is not guaranteed — a synchronous post-response check has no
+ * margin for scheduler jitter. Bounded-poll it with the file's own
+ * `waitForMutation`, same as every other governance-mutation wait here.
+ */
+async function expectGovernanceRemovalForwarded(calls: FetchCall[], issueId = ISSUE_UUID): Promise<void> {
+  await waitForMutation(
+    () => governanceRemovalCalls(calls, issueId).length >= 1,
+    `expected a governance-removal label mutation to be forwarded for issue ${issueId}`,
+  );
 }
 
 // ── Test setup ────────────────────────────────────────────────────────────
@@ -595,7 +607,7 @@ describe("AC1 — demote/escape permanently exits (no re-apply within 5m)", () =
       code: "demoted-ad-hoc",
       to: "__ad_hoc__",
     });
-    expectGovernanceRemovalForwarded(mf.calls);
+    await expectGovernanceRemovalForwarded(mf.calls);
     const afterDemote = mf.calls.length;
 
     // Step 3: Simulate the webhook echo — Linear fires an Issue event with
@@ -674,7 +686,7 @@ describe("AC1 — demote/escape permanently exits (no re-apply within 5m)", () =
       code: "demoted-ad-hoc",
       to: "__ad_hoc__",
     });
-    expectGovernanceRemovalForwarded(mf.calls);
+    await expectGovernanceRemovalForwarded(mf.calls);
 
     // Step 3: Switch to fake timers for the time-window checks
     jest.useFakeTimers();
@@ -739,7 +751,7 @@ describe("AC2 — demoted/escaped ticket can complete without re-entering dev-im
       .set("X-Openclaw-Linear-Intent", "demote")
       .send(commentCreateBody("Demoting before completing."));
     expect(demoteRes.status).toBe(200);
-    expectGovernanceRemovalForwarded(mf.calls);
+    await expectGovernanceRemovalForwarded(mf.calls);
     const afterDemote = mf.calls.length;
 
     // Step 3: Complete the ticket (close it)
@@ -779,7 +791,7 @@ describe("AC2 — demoted/escaped ticket can complete without re-entering dev-im
       .set("X-Openclaw-Linear-Intent", "escape")
       .send(commentCreateBody("Escaping before completing."));
     expect(escapeRes.status).toBe(200);
-    expectGovernanceRemovalForwarded(mf.calls);
+    await expectGovernanceRemovalForwarded(mf.calls);
     const afterEscape = mf.calls.length;
 
     // Step 3: Complete
@@ -839,7 +851,7 @@ describe("AC3 — AI-2307-equivalent scenario (ops-only, no pending impl work)",
       .set("X-Openclaw-Linear-Intent", "demote")
       .send(commentCreateBody("Credential cleanup — no code changes, demoting from dev-impl.", "issue-new-ai2307"));
     expect(demoteRes.status).toBe(200);
-    expectGovernanceRemovalForwarded(mf.calls, "issue-new-ai2307");
+    await expectGovernanceRemovalForwarded(mf.calls, "issue-new-ai2307");
     const afterDemote = mf.calls.length;
 
     // Phase 3: Issue echo webhook — the label removal fires a Linear webhook.
@@ -905,7 +917,7 @@ describe("AC3 — AI-2307-equivalent scenario (ops-only, no pending impl work)",
       .set("X-Openclaw-Linear-Intent", "demote")
       .send(commentCreateBody("Demoting one issue."));
     expect(demoteRes.status).toBe(200);
-    expectGovernanceRemovalForwarded(mf.calls);
+    await expectGovernanceRemovalForwarded(mf.calls);
 
     // Step 2: A completely new, unrelated AI-team issue should still
     // auto-enroll (suppression is per-ticket, not global)

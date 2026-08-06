@@ -296,6 +296,67 @@ async function pollHealth(url: string, timeoutMs: number): Promise<Record<string
   throw lastErr;
 }
 
+/**
+ * Poll a JSON file written by the `--import` listen-port probe below until it
+ * carries a real bound port.
+ */
+async function pollBoundPort(portFile: string, timeoutMs: number): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  let lastErr: unknown = new Error("port file was never written");
+  while (Date.now() < deadline) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(portFile, "utf8")) as { port?: number };
+      if (typeof parsed.port === "number" && parsed.port > 0) return parsed.port;
+    } catch (err) {
+      lastErr = err;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw lastErr;
+}
+
+/**
+ * `PORT=0` (ephemeral, OS-assigned) instead of a formulaic fixed port. Under
+ * the full suite, ~20 other test files spawn this SAME dist/index.js entry
+ * point concurrently across jest workers; a `4700 + pid%200 + rand(100)`
+ * formula (the previous approach here) can collide with another worker's
+ * server, leaving one instance stuck retrying its `listen()` call — its
+ * cron/heartbeat timers still armed — well past this test's own teardown,
+ * which is consistent with the "active timers" leak into a later test file
+ * flagged in review. Mirrors the same `--import` net.Server.listen probe
+ * inf-784-dept-engine.test.ts already uses for this exact reason.
+ */
+function writeListenPortProbe(tmpDir: string): { preload: string; portFile: string; envVar: string } {
+  const portFile = path.join(tmpDir, "bound-port.json");
+  const preload = path.join(tmpDir, "record-listen-port.mjs");
+  const envVar = "INF1262_LISTEN_PORT_FILE";
+  fs.writeFileSync(
+    preload,
+    `
+import fs from "node:fs";
+import net from "node:net";
+
+const originalListen = net.Server.prototype.listen;
+net.Server.prototype.listen = function patchedListen(...args) {
+  const result = originalListen.apply(this, args);
+  this.once("listening", () => {
+    const address = this.address();
+    if (address && typeof address === "object" && address.port > 0) {
+      fs.writeFileSync(
+        process.env.${envVar},
+        JSON.stringify({ port: address.port }),
+        "utf8",
+      );
+    }
+  });
+  return result;
+};
+`,
+    "utf8",
+  );
+  return { preload, portFile, envVar };
+}
+
 interface EntryPointHarness {
   dir: string;
   port: number;
@@ -303,7 +364,7 @@ interface EntryPointHarness {
   stderr: () => string;
 }
 
-function startEntryPoint(prefix: string): EntryPointHarness {
+async function startEntryPoint(prefix: string): Promise<EntryPointHarness> {
   if (!fs.existsSync(DIST_ENTRY)) {
     throw new Error(
       `dist/index.js not found at ${DIST_ENTRY} — run \`npm run build\` before jest (CI does; see ci.yml)`,
@@ -312,7 +373,7 @@ function startEntryPoint(prefix: string): EntryPointHarness {
 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   const agentsFile = path.join(dir, "agents.json");
-  const port = 4700 + (process.pid % 200) + Math.floor(Math.random() * 100);
+  const { preload, portFile, envVar } = writeListenPortProbe(dir);
   let childStderr = "";
   fs.writeFileSync(agentsFile, JSON.stringify({ agents: [sampleAgent] }), "utf8");
 
@@ -322,11 +383,19 @@ function startEntryPoint(prefix: string): EntryPointHarness {
       ...process.env,
       AGENTS_FILE: agentsFile,
       DATA_DIR: path.join(dir, "data"),
-      PORT: String(port),
+      PORT: "0",
+      [envVar]: portFile,
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import ${preload}`.trim(),
       LOG_LEVEL: "error",
       LINEAR_WEBHOOK_SECRET: process.env.LINEAR_WEBHOOK_SECRET ?? "test-secret",
       LINEAR_OAUTH_TOKEN: "test-linear-oauth-token",
-      OPENCLAW_HOOKS_URL: `http://127.0.0.1:${port}/nonexistent-hooks`,
+      // AI-2420: this connector's own delivery config resolves hooksUrl from
+      // agents.json, not this env var — the previous same-port
+      // "/nonexistent-hooks" self-target only worked because the fixed port
+      // was known before spawn. With PORT=0 the port isn't known yet, so
+      // point at the conventional unused discard port instead (matches
+      // inf-784-dept-engine.test.ts).
+      OPENCLAW_HOOKS_URL: "http://127.0.0.1:9/nonexistent-hooks",
       OPENCLAW_HOOKS_TOKEN: "test-token",
     },
     stdio: ["ignore", "ignore", "pipe"],
@@ -335,98 +404,92 @@ function startEntryPoint(prefix: string): EntryPointHarness {
     childStderr += chunk.toString("utf8");
   });
 
+  const port = await pollBoundPort(portFile, 30_000).catch((err) => {
+    throw new Error(
+      `entry point never bound a listen port: ${err instanceof Error ? err.message : String(err)}\nchild stderr:\n${childStderr}`,
+    );
+  });
+
   return { dir, port, child, stderr: () => childStderr };
 }
 
 async function stopEntryPoint(harness: EntryPointHarness | undefined): Promise<void> {
   if (!harness) return;
-  if (!harness.child.killed) {
-    harness.child.kill("SIGTERM");
+  if (harness.child.exitCode === null && harness.child.signalCode === null) {
+    // Always wait for the real "exit" event, even after escalating to
+    // SIGKILL — resolving as soon as kill() is CALLED (rather than once the
+    // process has actually terminated) can return control to the next test
+    // file while this entry point is still releasing its port and tearing
+    // down its own cron/heartbeat timers, which is exactly the kind of
+    // cross-test-file contention under the full suite this harness must not
+    // cause (review finding on this file).
     await new Promise<void>((resolve) => {
+      harness.child.once("exit", () => resolve());
+      harness.child.kill("SIGTERM");
       const force = setTimeout(() => {
         harness.child.kill("SIGKILL");
-        resolve();
       }, 2000);
-      harness.child.on("exit", () => {
-        clearTimeout(force);
-        resolve();
-      });
+      force.unref?.();
+      harness.child.once("exit", () => clearTimeout(force));
     });
   }
   fs.rmSync(harness.dir, { recursive: true, force: true });
 }
 
-describe("INF-1262 AC6: production bootstrap registers controller and acked delivery scheduler", () => {
+describe("INF-1262 AC6/AC7: production bootstrap registers controller + scheduler, liveness observable without triggers", () => {
+  // AC6 and AC7 both assert on /health.dispatchReliability from the SAME
+  // production boot — one entry-point child process serves both, fetched
+  // once in beforeAll, rather than two. Booting dist/index.js is genuinely
+  // heavy (cron registration, DB init, workflow registry load); under the
+  // full suite, ~20 other files boot this same entry point concurrently
+  // across jest workers, and this file previously doubled that footprint
+  // for no assertion this couldn't already share (review finding: cross-
+  // test-file contention from this file's resource use).
   let harness: EntryPointHarness | undefined;
+  let body: Record<string, any>;
+
+  beforeAll(async () => {
+    harness = await startEntryPoint("inf-1262-ac6-ac7-bootstrap-");
+    try {
+      body = await pollHealth(`http://127.0.0.1:${harness.port}/health`, 30_000);
+    } catch (err) {
+      throw new Error(
+        `entry point never responded on /health: ${err instanceof Error ? err.message : String(err)}\n` +
+        `child stderr:\n${harness.stderr()}`,
+      );
+    }
+  }, 60_000);
 
   afterAll(async () => {
     await stopEntryPoint(harness);
   });
 
-  test(
-    "boots dist/index.js and /health proves dispatchReliability registration",
-    async () => {
-      harness = startEntryPoint("inf-1262-ac6-bootstrap-");
-      let body: Record<string, any>;
-      try {
-        body = await pollHealth(`http://127.0.0.1:${harness.port}/health`, 30_000);
-      } catch (err) {
-        throw new Error(
-          `entry point never responded on /health: ${err instanceof Error ? err.message : String(err)}\n` +
-          `child stderr:\n${harness.stderr()}`,
-        );
-      }
-
-      expect(body.dispatchReliability).toBeDefined();
-      expect(body.dispatchReliability).toEqual(
-        expect.objectContaining({
-          controllerRegistered: true,
-          schedulerRegistered: true,
-          controllerActive: true,
-          schedulerActive: true,
-        }),
-      );
-    },
-    60_000,
-  );
-});
-
-describe("INF-1262 AC7: dispatch-reliability liveness is observable at ac-validate without triggers", () => {
-  let harness: EntryPointHarness | undefined;
-
-  afterAll(async () => {
-    await stopEntryPoint(harness);
+  test("AC6: /health proves dispatchReliability registration", () => {
+    expect(body.dispatchReliability).toBeDefined();
+    expect(body.dispatchReliability).toEqual(
+      expect.objectContaining({
+        controllerRegistered: true,
+        schedulerRegistered: true,
+        controllerActive: true,
+        schedulerActive: true,
+      }),
+    );
   });
 
-  test(
-    "/health exposes scheduled/subscribed liveness before any breaker or stuck-delegate condition fires",
-    async () => {
-      harness = startEntryPoint("inf-1262-ac7-liveness-");
-      let body: Record<string, any>;
-      try {
-        body = await pollHealth(`http://127.0.0.1:${harness.port}/health`, 30_000);
-      } catch (err) {
-        throw new Error(
-          `entry point never responded on /health: ${err instanceof Error ? err.message : String(err)}\n` +
-          `child stderr:\n${harness.stderr()}`,
-        );
-      }
-
-      expect(body.dispatchReliability).toEqual(
-        expect.objectContaining({
-          controllerActive: true,
-          controllerScheduled: true,
-          schedulerActive: true,
-          schedulerSubscribed: true,
-          wakePolicyPrimitive: "dispatchWithAck",
-          subscribedWakePaths: expect.arrayContaining([
-            "governed-transition",
-            "stuck-delegate-reprompt",
-            "delegate-clear-recovery",
-          ]),
-        }),
-      );
-    },
-    60_000,
-  );
+  test("AC7: /health exposes scheduled/subscribed liveness before any breaker or stuck-delegate condition fires", () => {
+    expect(body.dispatchReliability).toEqual(
+      expect.objectContaining({
+        controllerActive: true,
+        controllerScheduled: true,
+        schedulerActive: true,
+        schedulerSubscribed: true,
+        wakePolicyPrimitive: "dispatchWithAck",
+        subscribedWakePaths: expect.arrayContaining([
+          "governed-transition",
+          "stuck-delegate-reprompt",
+          "delegate-clear-recovery",
+        ]),
+      }),
+    );
+  });
 });

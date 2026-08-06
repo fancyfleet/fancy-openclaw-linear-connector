@@ -4,9 +4,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import request from "supertest";
-import { afterEach, beforeEach, describe, expect, test } from "@jest/globals";
+import { afterEach, beforeEach, describe, expect, jest, test } from "@jest/globals";
 import { reloadAgents } from "../agents.js";
-import { createWebhookRouter } from "./index.js";
+import { createWebhookRouter, type WebhookDispatchReliabilityController } from "./index.js";
 
 const SECRET = "inf-334-plain-delegation-secret";
 const IGOR_LINEAR_ID = "linear-user-igor";
@@ -48,6 +48,30 @@ function createTestApp(onDispatched?: (agentId: string, ticketId: string) => voi
       undefined,
       undefined,
       onDispatched,
+    ),
+  );
+  return app;
+}
+
+/** INF-1262 AC4: same router, with a stub dispatchReliabilityController wired in (21st positional param). */
+function createTestAppWithController(dispatchReliabilityController: WebhookDispatchReliabilityController): express.Express {
+  const app = express();
+  app.use(
+    express.raw({ type: "application/json", limit: "1mb" }),
+    (req, _res, next) => {
+      if (Buffer.isBuffer(req.body)) {
+        (req as express.Request & { rawBody?: Buffer }).rawBody = req.body;
+      }
+      next();
+    },
+  );
+  app.use(
+    "/",
+    createWebhookRouter(
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined,
+      dispatchReliabilityController,
     ),
   );
   return app;
@@ -292,5 +316,39 @@ describe("INF-334 plain delegation webhook dispatch", () => {
     expect(deliveries).toHaveLength(1);
     expect(deliveries[0].agentId).toBe("sage");
     expect(deliveries[0].sessionKey).toBe("linear-DSN-334");
+  });
+
+  // INF-1262 AC4 (review finding 21fbae6d): the delegate-clear webhook path
+  // must route through dispatchWithAck({ delegateCleared: true }) instead of
+  // being suppressed with nothing else happening — previously no production
+  // call site ever set delegateCleared, so a cleared delegate only recovered
+  // via the hourly rescue-sweep.
+  test("INF-1262 AC4: delegate clear routes through dispatchWithAck({ delegateCleared: true }) when the controller is wired", async () => {
+    const dispatchWithAck = jest.fn(async () => ({
+      status: "delivered" as const,
+      attempts: 1,
+      dispatchId: "stub-dispatch-id",
+    }));
+    const controller: WebhookDispatchReliabilityController = {
+      checkCommentFedSuppression: jest.fn(() => ({ suppressed: false })),
+      checkWebhookDispatchGate: jest.fn(() => ({ blocked: false })),
+      recordWebhookDispatch: jest.fn(),
+      dispatchWithAck,
+    };
+    const app = createTestAppWithController(controller);
+
+    await postWebhook(app, issueUpdate(null, { delegateId: IGOR_LINEAR_ID }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(dispatchWithAck).toHaveBeenCalledTimes(1);
+    expect(dispatchWithAck).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ticketId: "linear-DSN-334",
+        delegateCleared: true,
+      }),
+    );
+    // No direct wake was delivered by this call — recovery re-seats the
+    // delegate via the Linear API and the follow-on webhook wakes it normally.
+    expect(deliveries).toHaveLength(0);
   });
 });

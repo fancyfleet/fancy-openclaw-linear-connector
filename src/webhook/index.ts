@@ -14,7 +14,7 @@ import type { DispatchLeaseStore } from "../store/dispatch-lease-store.js";
 import type { DispatchInFlightStore } from "../store/dispatch-inflight-store.js";
 import type { SessionSpawnIdempotencyStore } from "../store/session-spawn-idempotency-store.js";
 import { extractWebhookMutations } from "./mutation-extraction.js";
-import { routeEvent, routeEventAll, unresolvedRoutingCandidates } from "../router.js";
+import { routeEvent, routeEventAll, extractAgentTarget, unresolvedRoutingCandidates } from "../router.js";
 import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
 import { deliverToAgent, DeliveryThrottle, type DeliveryConfig, type DeliveryResult, assertDispatchTargetFetchable } from "../delivery/index.js";
 import { markDispatchIntegrityGateActive } from "../dispatch-integrity-state.js";
@@ -38,7 +38,7 @@ import { type WakeUpConfig } from "../bag/wake-up.js";
 import { createModuleLogger } from "../logging.js";
 import { checkLinearIssueRouting, isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
 import { onChildTerminal } from "../barrier.js";
-import { maybeBootstrapWorkflow } from "../workflow-bootstrap.js";
+import { maybeBootstrapWorkflow, fetchIssueContext } from "../workflow-bootstrap.js";
 import { notify } from "../alerts/alert-bus.js";
 import { loadKnownHumans } from "../known-humans.js";
 import { emitStreamTopic } from "../admin-stream.js";
@@ -99,6 +99,8 @@ export interface WebhookDispatchReliabilityController {
     gateway?: string;
     dispatchId: string;
     labels?: string[];
+    /** INF-1262 AC4: run inline delegate-clear recovery before delivery. */
+    delegateCleared?: boolean;
     deliver: (ctx: { attempt: number; dispatchId: string }) => Promise<DeliveryResult>;
     maxRetries?: number;
     backoffMs?: (attempt: number) => number;
@@ -664,6 +666,90 @@ async function deliverGovernedTransitionWake(
   return { dispatched: outcome.status !== "undeliverable" };
 }
 
+/**
+ * INF-1262 AC4: inline delegate-clear recovery.
+ *
+ * router.ts's extractAgentTarget correctly suppresses dispatch when a
+ * webhook Issue-update event clears the delegate field — there is no target
+ * to route to at that instant. Previously nothing else happened until the
+ * hourly rescue-sweep found the orphaned ticket. This routes that specific
+ * suppression through dispatchWithAck({ delegateCleared: true }) so the SAME
+ * wake-policy pre-flight (circuit-breaker / redispatch budget) that governs
+ * every other wake also bounds recovery-attempt frequency, and so recovery
+ * is attempted immediately rather than on the next hourly sweep.
+ *
+ * dispatchWithAck's injected recoverDelegateClearInline (index.ts) re-seats
+ * the delegate via the Linear API before this function's `deliver()` runs,
+ * but the controller does not surface who got re-seated back to its caller
+ * — so `deliver()` re-fetches the ticket's live delegate itself. If the
+ * mutation is still propagating on the first attempt, the scheduler's
+ * bounded retry/backoff gives it another look; an `undeliverable` outcome
+ * after retries are exhausted means recovery genuinely failed to re-seat
+ * within the bounded latency (a real signal, not noise).
+ */
+async function deliverDelegateClearRecoveryWake(
+  event: LinearEvent,
+  issueUuid: string,
+  dispatchReliabilityController: WebhookDispatchReliabilityController,
+  throttle: DeliveryThrottle | undefined,
+  dispatchLeaseStore: DispatchLeaseStore | undefined,
+  dispatchInFlightStore: DispatchInFlightStore | undefined,
+  sessionSpawnStore: SessionSpawnIdempotencyStore | undefined,
+): Promise<void> {
+  const authToken = resolveServiceCredential();
+  if (!authToken) {
+    log.warn("Delegate-clear recovery: no service credential available — deferring to hourly rescue-sweep");
+    return;
+  }
+  const initialContext = await fetchIssueContext(issueUuid, authToken);
+  if (!initialContext) {
+    log.warn(`Delegate-clear recovery: could not fetch issue context for ${issueUuid} — deferring to hourly rescue-sweep`);
+    return;
+  }
+  const sessionKey = normalizeSessionKey(initialContext.identifier);
+  const labelNames = initialContext.labels.map((l) => l.name);
+
+  try {
+    const outcome = await dispatchReliabilityController.dispatchWithAck({
+      agentId: "delegate-clear-recovery",
+      ticketId: sessionKey,
+      dispatchId: `delegate-clear-${sessionKey}-${crypto.randomUUID()}`,
+      labels: labelNames,
+      delegateCleared: true,
+      deliver: async () => {
+        const live = await fetchIssueContext(issueUuid, authToken);
+        const agentName = live?.delegateId ? buildAgentMap()[live.delegateId] : undefined;
+        if (!agentName) return { dispatched: false };
+        const route: RouteResult = {
+          agentId: agentName,
+          sessionKey,
+          priority: 0,
+          routingReason: "delegate",
+          event,
+        };
+        const agentCfg = getAgent(agentName);
+        const deliveryConfig: DeliveryConfig = {
+          nodeBin: process.execPath,
+          hooksUrl: agentCfg?.hooksUrl ?? process.env.OPENCLAW_HOOKS_URL,
+          hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
+          hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
+          hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+          gatewayUrl: agentCfg?.gatewayUrl,
+          gatewayToken: agentCfg?.gatewayToken,
+        };
+        if (throttle) {
+          await throttle.wait(route.agentId);
+          throttle.record(route.agentId);
+        }
+        return deliverWithSlot(route, deliveryConfig, throttle, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore);
+      },
+    });
+    log.info(`Delegate-clear inline recovery for ${initialContext.identifier}: ${outcome.status}`);
+  } catch (err) {
+    log.warn(`Delegate-clear inline recovery blocked for ${initialContext.identifier}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 export function createWebhookRouter(
   eventStore?: EventStore,
   nudgeStore?: NudgeStore,
@@ -1157,6 +1243,29 @@ export function createWebhookRouter(
       }
 
       await enrichCommentEventForRouting(event);
+
+      // INF-1262 AC4: a delegate-clear suppression is not a generic no-route
+      // — react to it with inline recovery instead of falling through to the
+      // no-route/dead-letter logging below (and the hourly rescue-sweep).
+      const primaryTarget = extractAgentTarget(event);
+      if (primaryTarget && "suppressed" in primaryTarget && primaryTarget.suppressedReason === "delegate-clear") {
+        const clearedIssueId = (event as { data?: Record<string, unknown> }).data?.id;
+        if (dispatchReliabilityController && typeof clearedIssueId === "string") {
+          await deliverDelegateClearRecoveryWake(
+            event,
+            clearedIssueId,
+            dispatchReliabilityController,
+            throttle,
+            dispatchLeaseStore,
+            dispatchInFlightStore,
+            sessionSpawnStore,
+          );
+        } else {
+          log.info("Delegate-clear event but no controller/issue id available — deferring to hourly rescue-sweep");
+        }
+        return;
+      }
+
       const routes = routeEventAll(event);
       if (routes.length === 0) {
         log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);
