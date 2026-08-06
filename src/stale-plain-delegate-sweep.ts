@@ -78,7 +78,7 @@ async function queryStalePlainTickets(
   // candidate set. `first: 100` alone silently drops stale tickets beyond the
   // first 100. Mirrors delegation-reconciliation-sweep.ts.
   const query = `
-    query StalePlainDelegates($cutoff: DateTime!, $after: String) {
+    query StalePlainDelegates($cutoff: DateTimeOrDuration!, $after: String) {
       issues(
         filter: {
           updatedAt: { lte: $cutoff }

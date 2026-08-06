@@ -149,6 +149,41 @@ describe("runTranscriptRedaction", () => {
     }
   }, 30_000);
 
+  it("discovers prefixed <id>.trajectory.jsonl files in nested session dirs (INF-1279)", async () => {
+    // Regression: real transcripts are named "<sessionUuid>.trajectory.jsonl"
+    // and live under agents/<agent>/sessions/. The walk previously exact-matched
+    // entry === ".trajectory.jsonl", so it silently discovered ZERO real files —
+    // a false-green sweep. endsWith(".trajectory.jsonl") is the fix.
+    const { mkdir, writeFile, rm } = await import("node:fs/promises");
+    const ids = Date.now() + "-" + Math.random().toString(36).slice(2, 6);
+    const root = "/tmp/tr-prefixed-" + ids;
+    const sessionsDir = root + "/agents/grover/sessions";
+    await mkdir(sessionsDir, { recursive: true });
+    await writeFile(
+      sessionsDir + "/1eb8b80c-d307-4168-9ed6-e77b9b02b8e5.trajectory.jsonl",
+      '{"data":"clean line"}\n',
+    );
+
+    const stubsDir = "/tmp/tr-stubs-" + ids;
+    await mkdir(stubsDir, { recursive: true });
+    const secretPatternsPath = await writeStubSecretPatterns(stubsDir);
+
+    const config: TranscriptRedactionConfig = {
+      intervalMs: 60 * 60 * 1_000,
+      secretPatternsPath,
+      scanRoots: [root],
+    };
+
+    try {
+      const result = await runTranscriptRedaction(config);
+      expect(result.filesScanned).toBe(1);
+      expect(result.errors).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(stubsDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("errors on unreadable scan roots without crashing the entire sweep", async () => {
     // AC1: inaccessible directory must not kill the sweep.
     const { mkdir, writeFile, rm } = await import("node:fs/promises");

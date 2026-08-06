@@ -117,7 +117,7 @@ export function createLinearApi(linearToken?: string): LinearApi {
       let hasNextPage = true;
       while (hasNextPage) {
         const data: DoneResp = await graphQL<DoneResp>(
-          `query DoneTickets($since: DateTime!, $after: String) {
+          `query DoneTickets($since: DateTimeOrDuration!, $after: String) {
             issues(
               filter: {
                 state: { type: { eq: "completed" } }

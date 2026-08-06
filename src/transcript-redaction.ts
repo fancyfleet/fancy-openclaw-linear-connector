@@ -91,7 +91,7 @@ async function* walkTrajectoryFiles(root: string): AsyncGenerator<string> {
     }
     if (stat.isDirectory()) {
       yield* walkTrajectoryFiles(fullPath);
-    } else if (entry === ".trajectory.jsonl" && stat.isFile()) {
+    } else if (entry.endsWith(".trajectory.jsonl") && stat.isFile()) {
       yield fullPath;
     }
   }

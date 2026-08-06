@@ -85,7 +85,7 @@ export function createSweepLinearApi(linearToken?: string): LinearSweepApi {
       let hasNextPage = true;
       while (hasNextPage) {
         const data: LeakedResp = await graphQL<LeakedResp>(
-          `query ClosedLeakedCred($since: DateTime!, $label: String!, $after: String) {
+          `query ClosedLeakedCred($since: DateTimeOrDuration!, $label: String!, $after: String) {
             issues(
               filter: {
                 labels: { name: { eq: $label } }
