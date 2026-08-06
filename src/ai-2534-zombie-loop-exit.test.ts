@@ -60,6 +60,7 @@ import { reloadAgents } from "./agents.js";
 import { resetConfigHealth } from "./config-health.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { resetWorkflowCache } from "./workflow-gate.js";
+import { _resetAppliedStateStore } from "./store/applied-state-store.js";
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
 
@@ -508,6 +509,11 @@ beforeEach(() => {
   resetWorkflowCache();
   resetConfigHealth();
   reloadAgents();
+  // Module-level applied-state store is keyed by ticket identifier and
+  // otherwise leaks across tests in this file (all reuse ISSUE_IDENTIFIER),
+  // causing later escape/transition assertions to see a stale recorded
+  // state from an earlier test (same root cause as AI-2542).
+  _resetAppliedStateStore();
 
   originalFetch = globalThis.fetch;
   appState = createApp({

@@ -498,6 +498,19 @@ export async function autoAcceptCommitmentOnActivity(
       log.info("Skipping commitment auto-accept: activity is the connector's own AC-capture warning comment");
       return;
     }
+    // INF-1260 AC6: hold/decline comments must NOT trigger auto-accept.
+    // Only comments that look like acceptance (contain an explicit accept
+    // keyword or the CLI's acceptance markers) should advance the gate.
+    // A comment that signals holding, declining, blocking, or deferring
+    // must be silently ignored.
+    if (typeof commentBody === "string") {
+      const lower = commentBody.toLowerCase();
+      const holdPatterns = /^(holding|declin|out of scope|not ready|blocked|defer|on hold|wait|pause|need more)/i;
+      if (holdPatterns.test(lower)) {
+        log.info(`Skipping commitment auto-accept: comment appears to be a hold/decline: "${commentBody.slice(0, 120)}"`);
+        return;
+      }
+    }
   }
   const issue = data?.issue as Record<string, unknown> | undefined;
   const sessionIssue = ((data?.agentSession as Record<string, unknown> | undefined)?.issue ?? {}) as Record<string, unknown>;

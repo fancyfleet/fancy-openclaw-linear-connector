@@ -3649,7 +3649,7 @@ function validateRoutineEdges(def: WorkflowDef): string[] {
  * transitions (request-changes, block, refuse-work, needs-human) which must
  * keep requiring one.
  */
-const ROUTINE_FORWARD_COMMANDS = new Set(["continue", "begin", "accept", "submit", "complete"]);
+const ROUTINE_FORWARD_COMMANDS = new Set(["continue", "begin", "accept", "submit", "complete", "resume-review"]);
 
 /**
  * Resolve a meta-intent (`continue-workflow` or `request-revision`) to the actual
@@ -6253,19 +6253,62 @@ export async function applyStateTransition(
   // stateId, delegateId: null, and assigneeId: null — the proxy now exempts
   // the nulls (stripNullDelegateAssigneeFields) so they reach Linear directly.
   if (intent === breakGlassCommand) {
-    toStateName = def.break_glass?.to ?? "escape";
-    // INF-146/INF-135: break-glass escape from the break-glass target state
-    // itself (e.g. `intake` for dev-impl) is a self-loop that no-ops through
-    // the idempotency check below. INF-311: escape from the recovery target
-    // itself must never redirect to entry_state (which destroys completed arm
-    // progress). Instead, exit the workflow cleanly via __ad_hoc__ — tickets
-    // already in the recovery state have nothing more to recover.
-    if (currentStateName && currentStateName === toStateName) {
+    // INF-1260 AC3: escape must preserve the furthest-reached spine position,
+    // not reset to intake. When the ticket is already in a state beyond intake,
+    // escape stays at the current state — the delegate is cleared but the
+    // position is preserved so re-intake can route forward via resume-review.
+    // Only reset to the break_glass target (intake) when already AT or BEFORE it.
+    //
+    // INF-792 AC3: position preservation is for mid-spine states only. A
+    // *terminal* state (done/invalid/cancelled/...) has no forward progress to
+    // preserve — "preserving" it means escape becomes a noop and the ticket
+    // stays stuck at done forever, killing the only governed reopen path for
+    // finished work. Terminal states always reopen to the break-glass target.
+    // Resolve the escape source the same way the AI-2035 terminal-reentry guard
+    // above does: the applied-state store is lag-proof and authoritative, while
+    // currentStateName (sourceStateOverride ?? actualStateName) can still show a
+    // stale pre-terminal state inside Linear's read-after-write lag window. Without
+    // this, an escape issued in that window would treat the ticket as mid-spine
+    // (per the stale live read) and wrongly noop instead of reopening a terminal.
+    const escapeSource = getAppliedState(issue.identifier) ?? currentStateName;
+    const breakGlassTarget = def.break_glass?.to ?? "escape";
+    const spineIndex = (stateId: string | null | undefined) => {
+      if (!stateId) return -1;
+      return def.states.findIndex((s) => s.id === stateId);
+    };
+    const targetIdx = spineIndex(breakGlassTarget);
+    const currentIdx = spineIndex(escapeSource);
+    const currentStateNode = escapeSource ? def.states.find((s) => s.id === escapeSource) : undefined;
+    const currentIsTerminal = currentStateNode?.kind === "terminal";
+
+    if (breakGlassTarget === "__ad_hoc__") {
+      // The def declares a full-exit break-glass target (not a spine re-entry
+      // point like intake) — there is no spine position to preserve relative
+      // to it. spineIndex("__ad_hoc__") is always -1, which would otherwise
+      // make every real state look "beyond" the target and wrongly trigger
+      // position-preservation below. Always exit to __ad_hoc__.
       toStateName = "__ad_hoc__";
       log.info(
-        `workflow-gate: B2 apply: ${issueId} break-glass escape from state '${currentStateName}' ` +
+        `workflow-gate: B2 apply: ${issueId} break-glass escape from state '${escapeSource ?? "unknown"}' ` +
+        `— break-glass target is __ad_hoc__ (full exit), demoting`,
+      );
+    } else if (escapeSource && !currentIsTerminal && currentIdx > targetIdx && currentIdx >= 0) {
+      // Ticket has progressed beyond the break-glass target — preserve position.
+      toStateName = escapeSource;
+      log.info(
+        `workflow-gate: B2 apply: ${issueId} break-glass escape from state '${escapeSource}' ` +
+        `— preserving spine position (furthest reached: '${escapeSource}')`,
+      );
+    } else if (escapeSource && !currentIsTerminal && escapeSource === breakGlassTarget) {
+      // INF-146/INF-135: self-loop on the target — no-op through idempotency.
+      // INF-311: redirect to __ad_hoc__ instead of entry_state.
+      toStateName = "__ad_hoc__";
+      log.info(
+        `workflow-gate: B2 apply: ${issueId} break-glass escape from state '${escapeSource}' ` +
         `which IS the break-glass target — redirecting to '${toStateName}'`,
       );
+    } else {
+      toStateName = breakGlassTarget;
     }
   } else if (intent === "park") {
     toStateName = "__ad_hoc__";
@@ -8287,12 +8330,21 @@ async function issueUpdateAtomicVerified(
     return { ok: true, attempts: maxAttempts, failureKind: "none", divergent, unverified: true };
   }
 
-  // INF-562 / AC1: the transition did NOT fully apply (a delegate/native-state
+  // INF-562 / INF-1260 AC8: the transition did NOT fully apply (a delegate/native-state
   // facet was dropped — the AI-1759 class). The applied-state record written
   // speculatively above (INF-424, before verification) would otherwise leave the
   // authoritative cache advanced to the destination while the ticket never truly
   // reached it — the exact half-applied state that let INF-552 slip past sign-off.
   // Roll the speculative record back so a failed transition is all-or-nothing.
+  // AI-1762/INF-1222: the rollback stays a SINGLE, unretried mutation — the
+  // existing regression suites (ai-1762, inf-1222) lock this call count, and
+  // retrying it would just repeat a read the caller has no new information
+  // about. INF-1260 AC8 targets a narrower gap: if that one rollback call
+  // fails OUTRIGHT (a hard mutation failure, distinct from succeeding but
+  // failing verification), the speculative forward write already landed the
+  // destination label with no compensating action at all. Attempt a single
+  // delegate-only repair at the destination in that case only, so a second
+  // transient failure doesn't strand the ticket half-applied.
   if (issueIdentifier) {
     clearAppliedState(issueIdentifier);
   }
@@ -8306,7 +8358,33 @@ async function issueUpdateAtomicVerified(
       rollbackSnapshot.nativeStateId,
       rollbackSnapshot.assigneeId,
     );
-    if (rollbackApplied) {
+    if (!rollbackApplied) {
+      divergent = [...divergent, "rollback mutation failed"];
+      log.error(`workflow-gate: INF-562: rollback mutation failed for ${internalId}`);
+
+      // INF-1260 AC8: the rollback mutation call itself hard-failed (not
+      // merely a verification mismatch) — attempt a delegate-only repair at
+      // the DESTINATION — accept the forward label write (which did succeed)
+      // and force-write the target delegate. This converges to fullyApplied
+      // rather than leaving the ticket split.
+      if (delegateId !== undefined && delegateId !== null) {
+        const delegateRepair = await issueUpdateAtomic(
+          internalId,
+          labelIds, // already at destination labels
+          authToken,
+          delegateId,
+          nativeStateId,
+          options?.assigneeIdOverride ?? null,
+        );
+        if (delegateRepair) {
+          log.warn(
+            `workflow-gate: INF-1260 AC8: delegate-only repair succeeded for ${internalId} — converging to fully applied at ${expectedStateName}`,
+          );
+        } else {
+          log.error(`workflow-gate: INF-1260 AC8: delegate-only repair also failed for ${internalId}`);
+        }
+      }
+    } else {
       const rollbackVerification = await verifyTransitionWritePersisted(
         internalId,
         {
@@ -8326,20 +8404,20 @@ async function issueUpdateAtomicVerified(
           `workflow-gate: INF-562: rolled back partial transition write for ${internalId} to state:${rollbackSnapshot.stateName}`,
         );
       } else {
-        divergent = [
-          ...divergent,
-          `rollback failed verification: ${rollbackVerification.join("; ")}`,
-        ];
+        divergent = [...divergent, `rollback failed verification: ${rollbackVerification.join("; ")}`];
         log.error(
           `workflow-gate: INF-562: rollback write for ${internalId} did NOT fully persist — ${rollbackVerification.join("; ")}`,
         );
       }
-    } else {
-      divergent = [...divergent, "rollback mutation failed"];
-      log.error(`workflow-gate: INF-562: rollback mutation failed for ${internalId}`);
     }
   }
 
+  // INF-1260 AC8: the delegate-repair attempt above tried to converge the
+  // ticket to fully-applied when rollback failed. Whether it succeeded or
+  // not, the caller must still see `ok: false` so that its own verification
+  // / loud-failure / operational-event path runs correctly. Returning
+  // `ok: true` here would bypass the caller's transition-write-unverified
+  // detection (AI-1762 / INF-724), masking a genuine consistency failure.
   return { ok: false, attempts: maxAttempts, failureKind, divergent, unverified: false };
 }
 

@@ -345,6 +345,15 @@ async function processIssue(
   const stateLabel = getStateLabelName(labels);
   const workflowId = getWorkflowId(labels);
 
+  // INF-1260 AC4: a ticket with wf:* but NO state:* label is a 3-way desync
+  // (native state may be fine, but the label is missing). Flag it instead of
+  // silently skipping.
+  if (workflowId && !stateLabel) {
+    result.errors.push(
+      `${issue.identifier}: enrolled in wf:${workflowId} but has NO state:* label — label-loss desync detected`,
+    );
+    return;
+  }
   if (!stateLabel || !workflowId) return;
 
   const def = registry.get(workflowId);

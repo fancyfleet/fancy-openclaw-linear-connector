@@ -396,7 +396,7 @@ describe("AI-2532: demote/escape actually apply state changes", () => {
     }
   });
 
-  it("AC2: escape transitions state:* label to intake via ApplyAtomicTransition", async () => {
+  it("AC2 (INF-1260 AC3): escape from a mid-spine state preserves position — noop, no ApplyAtomicTransition write", async () => {
     const mf = makeMockFetch("implementation");
     globalThis.fetch = mf.fetch;
 
@@ -411,32 +411,16 @@ describe("AI-2532: demote/escape actually apply state changes", () => {
     expect(res.status).toBe(200);
     expect(res.body.errors).toBeUndefined();
 
-    // AC4: response must indicate the transition was applied toward intake
+    // INF-1260 AC3: escape from a mid-spine state (implementation is beyond
+    // the break-glass target, intake) now preserves position instead of
+    // resetting to intake — a noop, with no state-label write.
     expect(res.body._workflowTransition).toBeDefined();
-    expect(res.body._workflowTransition.status).toBe("applied");
-    expect(res.body._workflowTransition.to).toBe("intake");
+    expect(res.body._workflowTransition.status).toBe("noop");
 
-    // AC2: An ApplyAtomicTransition call must swap the state label to intake
     const appAtomicCalls = mf.calls.filter(
       (c) => c.query.includes("ApplyAtomicTransition"),
     );
-    expect(appAtomicCalls.length).toBeGreaterThanOrEqual(1);
-
-    // After escape, the label set must include state:intake label
-    // wf:dev-impl should still be present (the ticket remains in the workflow)
-    let foundIntakeLabel = false;
-    for (const call of appAtomicCalls) {
-      const labelIds = call.variables.labelIds as string[] | undefined;
-      if (labelIds) {
-        // Must include "intake-lbl" (the state:intake label id)
-        // Must NOT include "implementation-lbl" (the old state)
-        if (labelIds.includes("intake-lbl")) {
-          foundIntakeLabel = true;
-        }
-        expect(labelIds).not.toContain("implementation-lbl");
-      }
-    }
-    expect(foundIntakeLabel).toBe(true);
+    expect(appAtomicCalls.length).toBe(0);
   });
 
   it("AC4: escape from intake re-stamps state:intake (idempotency does not skip stale-cleanup)", async () => {

@@ -18,9 +18,16 @@ describe("INF-1218 universal workflow verbs", () => {
     const reg = await loadWorkflowRegistry();
     const dev = reg.get("dev-impl")!;
     expect(dev).toBeTruthy();
-    // state -> expected forward command hidden behind continue-workflow
+    // INF-1260 AC5: intake now has a resume-review edge to code-review, making it
+    // a branch state (accept → write-tests, resume-review → code-review).
+    // resolveRoutineEdge correctly returns null/error for branch states — the
+    // CLI prompts the agent to choose.
+    const intakeNode = dev.states.find((s) => s.id === "intake")!;
+    const intakeFwd = resolveRoutineEdge(dev, intakeNode, "forward");
+    expect(intakeFwd).toBeNull(); // branch: accept vs resume-review
+
+    // Non-intake states remain linear with their expected forward command.
     const spine: Record<string, string> = {
-      intake: "accept",
       "write-tests": "tests-ready",
       implementation: "submit",
       "code-review": "approve",

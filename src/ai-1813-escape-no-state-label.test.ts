@@ -664,7 +664,7 @@ describe("AI-1813 AC3: existing escape-from-known-state regression guard", () =>
     globalThis.fetch = originalFetch;
   });
 
-  it("applyStateTransition: escape from a known state (implementation) still stamps state:intake", async () => {
+  it("applyStateTransition: escape from a known mid-spine state (implementation) preserves position — noop, no write (INF-1260 AC3)", async () => {
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
@@ -673,13 +673,11 @@ describe("AI-1813 AC3: existing escape-from-known-state regression guard", () =>
       teamLabels: [{ id: "intake-lbl", name: "state:intake" }],
     });
     globalThis.fetch = mock;
-    await applyStateTransition("escape", "AI-1813", "Bearer tok");
+    const result = await applyStateTransition("escape", "AI-1813", "Bearer tok");
 
+    expect(result.status).toBe("noop");
     const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
-    expect(updateCall).toBeDefined();
-    const vars = updateCall!.body.variables as { labelIds: string[] };
-    expect(vars.labelIds).toContain("intake-lbl");
-    expect(vars.labelIds).not.toContain("state-lbl"); // old state removed
+    expect(updateCall).toBeUndefined();
   });
 
   it("checkWorkflowRules: escape is still legal from every known state (AC3 non-regression)", async () => {

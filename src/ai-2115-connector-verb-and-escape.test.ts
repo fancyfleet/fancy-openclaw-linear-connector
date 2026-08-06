@@ -468,11 +468,14 @@ describe("AI-2115 Bug 2: stale state:* labels never survive a transition silentl
     globalThis.fetch = originalFetch;
   });
 
-  it("escape on a ticket carrying a stale state:routing label strips it — regression guard for AI-2094 (#218)", async () => {
-    // GEN-33 corruption: a stale state:routing label alongside the resolved
-    // state. Def-aware resolution picks the most-advanced label (routing), so
-    // escape → intake takes the normal swap path and strips every state:* label,
-    // stamping only state:intake. Must NOT silently no-op with routing surviving.
+  it("escape on a ticket carrying a stale state:intake label strips it — regression guard for AI-2094 (#218)", async () => {
+    // GEN-33 corruption: a stale state:intake label alongside the resolved
+    // state. Def-aware resolution picks the most-advanced label (routing).
+    // INF-1260 AC3: escape from a mid-spine state (routing is beyond the
+    // break-glass target, intake) now preserves position instead of resetting
+    // to intake — but the idempotency path still purges any stale, lower-ranked
+    // state:* label it finds alongside the preserved target. Must NOT silently
+    // no-op with the stale intake label surviving.
     const { fetch: mock } = makeApplyFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:task" },
@@ -486,9 +489,9 @@ describe("AI-2115 Bug 2: stale state:* labels never survive a transition silentl
     const result = await applyStateTransition("escape", "AI-2115", "Bearer tok");
 
     expect(result.status).toBe("applied");
-    // Final label set carries only the intake state label; the stale one is gone.
-    const stateLabels = result.to; // to === "intake"
-    expect(stateLabels).toBe("intake");
+    // Position is preserved at routing; the stale intake label is purged.
+    const stateLabels = result.to; // to === "routing"
+    expect(stateLabels).toBe("routing");
   });
 
   it("idempotency re-apply purges a stale lower-ranked state:* label instead of a silent no-op (AC2 hardening)", async () => {

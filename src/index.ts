@@ -61,6 +61,7 @@ import { registerBootstrapReconciliationCron } from "./bootstrap-reconciliation-
 import { registerDelegationReconciliationCron, runDelegationReconciliationSweep } from "./delegation-reconciliation-sweep.js";
 import { registerStalePlainDelegateCron } from "./stale-plain-delegate-sweep.js";
 import { registerRegistryIntegrityCron } from "./registry-integrity-cron.js";
+import { registerDispatchLeaseRecoveryCron } from "./cron/dispatch-lease-recovery.js";
 import { getAlertBus } from "./alerts/alert-bus.js";
 import { getRateLimitClient } from "./linear-rate-limit-client.js";
 import { registerSlaSweepCron } from "./sla-sweep.js";
@@ -450,6 +451,10 @@ export function createApp(options?: CreateAppOptions) {
     enrolledTicketsStore,
     mutationAuditStore,
     commandAuthSnapshots,
+    // INF-1260 AC1+AC2: was never wired here, so checkStaleSnapshotForTerminal
+    // always received `undefined` and its zombie/stale-lease check fail-opened
+    // unconditionally on every proxied transition, terminal intents included.
+    dispatchLeaseStore,
     onProxyCall: (agentId, ticketId) => {
       // Any proxy call = implicit acknowledgment. Prevents the dispatch watchdog from
       // re-signaling agents that are working silently (e.g. sessions_yield during image gen).
@@ -2303,6 +2308,16 @@ export function createApp(options?: CreateAppOptions) {
   registerNativeStateReconcilerCron(
     createLinearReconcilerDataPlane({ authToken: reconcilerAuthToken }),
   );
+
+  // INF-1260 AC9: dispatch-lease-recovery sweep — clean up zombie/stale
+  // dispatch leases left behind by crashed or orphaned sessions.
+  registerDispatchLeaseRecoveryCron({
+    sweepFn: async () => {
+      if (!dispatchLeaseStore) return { expired: 0, recovered: 0 };
+      const pruned = dispatchLeaseStore.pruneExpired();
+      return { expired: pruned, recovered: 0 };
+    },
+  });
 
   return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore, livenessDispatchStore, linearRateLimitClient, globalRedispatchBudget, transcriptRedactionHealth: getTranscriptRedactionHealth(), startupCommitPromise });
 }

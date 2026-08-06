@@ -18,6 +18,7 @@ import { applyStateTransition, resetWorkflowCache } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { reloadAgents } from "./agents.js";
 import { getBinding, getBindings, recordBinding, clearImplementerStore } from "./implementer-store.js";
+import { _resetAppliedStateStore } from "./store/applied-state-store.js";
 
 const ISSUE = "internal-uuid-chore";
 const TOK = "Bearer test-token";
@@ -177,6 +178,10 @@ describe("INF-996 PR-D — wf:chore bound-seat behavior", () => {
     reloadAgents();
     process.env.IMPLEMENTER_STORE_PATH = path.join(tmpDir, `store-${Date.now()}-${Math.floor(process.hrtime()[1])}.json`);
     clearImplementerStore();
+    // Module-level applied-state store is keyed by ticket identifier ("CHO-1"
+    // here) and otherwise leaks across tests in this describe block, since
+    // every test shares that hardcoded identifier (same root cause as AI-2542).
+    _resetAppliedStateStore();
     originalFetch = globalThis.fetch;
   });
 
@@ -216,15 +221,19 @@ describe("INF-996 PR-D — wf:chore bound-seat behavior", () => {
     expect(capturedDelegate).not.toBe("lin-igor");               // reviewer != implementer
   });
 
-  it("escape --> intake CLEARS the ticket's bindings so a re-intake re-binds fresh", async () => {
+  it("escape from implementation preserves position (INF-1260 AC3) — bindings cleared for fresh re-intake", async () => {
     await recordBinding(ISSUE, "implementer", "igor", "chore");
     expect(await getBindings(ISSUE)).toEqual({ implementer: "igor" });
 
     globalThis.fetch = makeFetch("implementation", "lin-igor");
     const escaped = await applyStateTransition("escape", ISSUE, TOK, { sourceStateOverride: "implementation" });
-    expect(escaped.status).toBe("applied");
-    // Bindings cleared on escape — the seat is re-openable.
-    expect(await getBindings(ISSUE)).toBeNull();
+    // INF-1260 AC3: escape from implementation (beyond break-glass target intake)
+    // preserves spine position — noop rather than demoting to intake.
+    // Bindings are NOT cleared (noop means no write occurred).
+    expect(escaped.status).toBe("noop");
+    expect(escaped.to).toBe("implementation");
+    // Bindings remain intact — the seat is still held.
+    expect(await getBindings(ISSUE)).toEqual({ implementer: "igor" });
 
     // Re-intake re-binds to a DIFFERENT implementer cleanly.
     globalThis.fetch = makeFetch("intake", "lin-astrid");
