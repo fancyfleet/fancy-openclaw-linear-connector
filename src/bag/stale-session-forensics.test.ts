@@ -1,6 +1,7 @@
 import { jest } from "@jest/globals";
 import { classify, buildRecoveryComment, assessUnpushedArtifactRisk, type ToolCallSummary, type LastAssistantMessage, type StaleSnapshot, STALE_CLASS_NAMES, buildSnapshot, writeSnapshot, aggregateDigest, formatDigestSummary, recoverTicket, collectSameKeySessionReplay } from "./stale-session-forensics.js";
 import { StaleRedispatchCounter } from "./stale-redispatch-counter.js";
+import { resetWorkflowCache } from "../workflow-gate.js";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -1157,5 +1158,158 @@ describe("recoverTicket — robust state-name resolution", () => {
     const recoverCall = (fetchMock.mock.calls as Array<[string, RequestInit]>).find(([, o]) => JSON.parse((o?.body ?? "{}") as string).query?.includes("RecoverIssue"));
     const recoverBody = JSON.parse((recoverCall![1].body ?? "{}") as string);
     expect(recoverBody.variables.input.stateId).toBe("s-ready");
+  });
+});
+
+// ── INF-1292: Barrier-parent C4 re-poke guard ──────────────────────────────
+
+describe("recoverTicket — INF-1292 barrier-parent C4 re-poke guard", () => {
+  let dbPath: string;
+  let origDefsDir: string | undefined;
+
+  beforeEach(() => {
+    dbPath = `/tmp/stale-redispatch-barrier-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+    process.env.LINEAR_API_KEY = "test-key";
+    origDefsDir = process.env.WORKFLOW_DEFS_DIR;
+    process.env.WORKFLOW_DEFS_DIR = path.resolve(process.cwd(), "src/__fixtures__");
+  });
+
+  afterEach(() => {
+    delete process.env.LINEAR_API_KEY;
+    if (origDefsDir !== undefined) process.env.WORKFLOW_DEFS_DIR = origDefsDir;
+    else delete process.env.WORKFLOW_DEFS_DIR;
+    // Reset the workflow cache so the next test loads fresh defs
+    resetWorkflowCache();
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+    try { fs.unlinkSync(dbPath + "-wal"); } catch { /* ignore */ }
+    try { fs.unlinkSync(dbPath + "-shm"); } catch { /* ignore */ }
+  });
+
+  /**
+   * Fetch mock that returns a barrier parent ticket (sprint workflow, managing state)
+   * with children that are NOT all terminal.
+   */
+  function makeBarrierParentFetchMock(mockOpts: { allChildrenTerminal: boolean }) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return jest.fn<(...args: Parameters<typeof fetch>) => Promise<any>>().mockImplementation(async (_url: unknown, fetchOpts?: unknown) => {
+      const reqOpts = fetchOpts as RequestInit | undefined;
+      const body = reqOpts?.body ? JSON.parse(reqOpts.body as string) : {};
+      const query: string = body.query ?? "";
+
+      if (query.includes("IssueWithTeam")) {
+        return {
+          ok: true,
+          json: async () => ({
+            data: {
+              issue: {
+                id: "issue-barrier-parent",
+                team: { id: "team-456" },
+                state: { name: "Managing", type: "started" },
+                delegate: { id: "delegate-linear-id" },
+                labels: {
+                  nodes: [
+                    { id: "lbl-wf", name: "wf:sprint", team: { id: "team-456" } },
+                    { id: "lbl-state", name: "state:managing", team: { id: "team-456" } },
+                  ],
+                },
+              },
+            },
+          }),
+        };
+      }
+      if (query.includes("ParentChildren")) {
+        const children = mockOpts.allChildrenTerminal
+          ? [
+              { identifier: "CHILD-1", state: { name: "Done", type: "completed" }, labels: { nodes: [{ name: "state:done" }] } },
+              { identifier: "CHILD-2", state: { name: "Done", type: "completed" }, labels: { nodes: [{ name: "state:done" }] } },
+            ]
+          : [
+              { identifier: "CHILD-1", state: { name: "Done", type: "completed" }, labels: { nodes: [{ name: "state:done" }] } },
+              { identifier: "CHILD-2", state: { name: "In Progress", type: "started" }, labels: { nodes: [{ name: "state:doing" }] } },
+            ];
+        return {
+          ok: true,
+          json: async () => ({
+            data: {
+              issue: {
+                children: { nodes: children },
+              },
+            },
+          }),
+        };
+      }
+      if (query.includes("TeamStates") || query.includes("workflow")) {
+        return { ok: true, json: async () => ({ data: { team: { workflow: { states: [{ id: "state-todo", name: "Todo", type: "unstarted" }] } } } }) };
+      }
+      if (query.includes("commentCreate")) {
+        return { ok: true, json: async () => ({ data: { commentCreate: { comment: { id: "comment-1" } } } }) };
+      }
+      if (query.includes("RecoverIssue") || query.includes("issueUpdate")) {
+        return { ok: true, json: async () => ({ data: { issueUpdate: { success: true, issue: { id: "issue-barrier-parent", state: { name: "Todo" } } } } }) };
+      }
+      return { ok: true, json: async () => ({}) };
+    });
+  }
+
+  test("C4 stale session on barrier parent with unsatisfied barrier: skips re-poke, returns barrier-wait", async () => {
+    global.fetch = makeBarrierParentFetchMock({ allChildrenTerminal: false }) as unknown as typeof fetch;
+
+    const snapshot = makeSnapshot("C4");
+    const result = await recoverTicket(snapshot, "igor", {
+      redispatchDbPath: dbPath,
+      maxRedispatchAttempts: 3,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.action).toBe("skipped-barrier-wait");
+    expect(result.rePoke).toBeFalsy();
+    expect(result.detail).toContain("barrier");
+    expect(result.detail).toContain("1/2");
+
+    // No re-poke comment should be posted
+    const fetchMock = global.fetch as ReturnType<typeof jest.fn>;
+    const commentCall = (fetchMock.mock.calls as Array<[string, RequestInit]>).find(([, opts]) => {
+      const b = JSON.parse((opts?.body ?? "{}") as string);
+      return b.query?.includes("commentCreate");
+    });
+    expect(commentCall).toBeUndefined();
+  });
+
+  test("C4 stale session on barrier parent with satisfied barrier: proceeds with normal re-poke", async () => {
+    global.fetch = makeBarrierParentFetchMock({ allChildrenTerminal: true }) as unknown as typeof fetch;
+
+    const snapshot = makeSnapshot("C4");
+    const result = await recoverTicket(snapshot, "igor", {
+      redispatchDbPath: dbPath,
+      maxRedispatchAttempts: 3,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.action).toBe("re-poke-c4");
+    expect(result.rePoke).toBe(true);
+
+    // Re-poke comment IS posted (barrier satisfied, agent should have advanced)
+    const fetchMock = global.fetch as ReturnType<typeof jest.fn>;
+    const commentCall = (fetchMock.mock.calls as Array<[string, RequestInit]>).find(([, opts]) => {
+      const b = JSON.parse((opts?.body ?? "{}") as string);
+      return b.query?.includes("commentCreate");
+    });
+    expect(commentCall).toBeDefined();
+    const commentBody = JSON.parse((commentCall![1].body ?? "{}") as string);
+    expect(commentBody.variables.body).toContain("re-poking delegate");
+  });
+
+  test("C4 stale session on non-barrier ticket: normal re-poke (no regression)", async () => {
+    global.fetch = makeFetchMock() as unknown as typeof fetch;
+
+    const snapshot = makeSnapshot("C4");
+    const result = await recoverTicket(snapshot, "igor", {
+      redispatchDbPath: dbPath,
+      maxRedispatchAttempts: 3,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.action).toBe("re-poke-c4");
+    expect(result.rePoke).toBe(true);
   });
 });

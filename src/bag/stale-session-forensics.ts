@@ -18,7 +18,8 @@ import os from "node:os";
 import { createModuleLogger } from "../logging.js";
 import { getAccessToken, getAgent, getLinearUserIdForAgent, getOpenclawAgentName } from "../agents.js";
 import { tryNormalizeSessionKey } from "../session-key.js";
-import { setStateAtomic } from "../workflow-gate.js";
+import { setStateAtomic, getWorkflowId, getCurrentState, loadWorkflowDefById } from "../workflow-gate.js";
+import { isBarrierState, evaluateBarrier } from "../barrier.js";
 import { GlobalRedispatchBudget } from "./global-redispatch-budget.js";
 import { StaleRedispatchCounter } from "./stale-redispatch-counter.js";
 import { LINEAR_API_URL } from "../linear-helpers.js";
@@ -1353,6 +1354,58 @@ export async function recoverTicket(
         action: "skipped-terminal",
         detail: `Ticket already in terminal state "${liveStateName}" — no recovery needed`,
       };
+    }
+
+    // INF-1292: Barrier-parent C4 re-poke guard. A barrier parent in a barrier
+    // state (e.g. "managing") is *supposed* to wait for its children to reach
+    // terminal state. When the agent's session goes stale because it literally
+    // cannot do anything (the barrier isn't satisfied), classifying it as C4 and
+    // re-poking creates an infinite churn loop: re-poke → agent wakes → barrier
+    // still unsatisfied → no output → stale → C4 → re-poke → … The barrier
+    // machinery (onChildTerminal webhook) handles advancement automatically when
+    // the last child goes terminal — no agent re-poke is needed.
+    //
+    // Guard: if the ticket is a workflow ticket in a barrier state AND the
+    // barrier is NOT satisfied, skip the C4 re-poke entirely. The session is
+    // cleaned up silently; the delegate is retained so the barrier machinery
+    // can advance the parent when children complete.
+    if (snapshot.classification === "C4" && workflowLabel && currentWorkflowState) {
+      try {
+        const wfDef = await loadWorkflowDefById(workflowLabel.replace(/^wf:/i, ""));
+        const stateDef = wfDef?.states.find((s) => s.id === currentWorkflowState);
+        if (isBarrierState(stateDef)) {
+          const barrier = await evaluateBarrier(identifier, authHeader);
+          if (!barrier.allTerminal) {
+            log.info(
+              `Recovery for ${identifier}: barrier parent in state '${currentWorkflowState}' ` +
+              `with ${barrier.terminalCount}/${barrier.totalChildren} children terminal — ` +
+              `skipping C4 re-poke (barrier not satisfied, session was legitimately waiting)`,
+            );
+            return {
+              success: true,
+              action: "skipped-barrier-wait",
+              detail:
+                `Barrier parent in '${currentWorkflowState}' — ` +
+                `${barrier.terminalCount}/${barrier.totalChildren} children terminal. ` +
+                `C4 re-poke suppressed; barrier machinery will advance parent when children complete.`,
+            };
+          }
+          // Barrier IS satisfied — the agent should have advanced it. Fall through
+          // to the normal C4 re-poke path; the agent genuinely failed to act.
+          log.info(
+            `Recovery for ${identifier}: barrier parent in state '${currentWorkflowState}' ` +
+            `but barrier IS satisfied (${barrier.terminalCount}/${barrier.totalChildren}) — ` +
+            `agent should have advanced; proceeding with normal C4 recovery`,
+          );
+        }
+      } catch (barrierErr) {
+        // Fail-open: a barrier-check error must not block normal C4 recovery.
+        log.warn(
+          `Recovery for ${identifier}: barrier check failed (fail-open): ${
+            barrierErr instanceof Error ? barrierErr.message : String(barrierErr)
+          }`,
+        );
+      }
     }
 
     // AI-1578 (AC2): C4 re-poke before orphan. C4 = session spawned but produced
