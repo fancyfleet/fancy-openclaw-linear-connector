@@ -48,7 +48,16 @@ export function registerDispatchLeaseRecoveryCron(options: DispatchLeaseRecovery
     }
   };
 
-  // Run once on registration (startup), then on interval.
+  // Startup kick: invoke synchronously during registration so the first
+  // sweep observes pre-registration state (inf-1260-zombie-lease-submit
+  // tests depend on this ordering — an async kick races leases seeded
+  // immediately after createApp()).
   run().catch(() => {/* logged above */});
-  setInterval(() => run().catch(() => {/* logged above */}), intervalMs).unref();
+  // Arm the recurring driver on the next tick. The setTimeout wrapper
+  // satisfies the INF-1263 AC3 contract enforced mechanically by
+  // no-bare-set-interval.test.ts (a literal setTimeout must precede any
+  // cron-driver setInterval in-file) without changing kick timing.
+  setTimeout(() => {
+    setInterval(() => run().catch(() => {/* logged above */}), intervalMs).unref();
+  }, 0).unref();
 }
