@@ -5,6 +5,7 @@ export default {
   extensionsToTreatAsEsm: ['.ts'],
   roots: ['<rootDir>/src'],
   setupFiles: ['<rootDir>/jest.setup.ts'],
+  setupFilesAfterEnv: ['<rootDir>/jest.setup-after-env.ts'],
   testMatch: ['**/*.test.ts'],
   collectCoverageFrom: ['src/**/*.ts', '!src/**/*.test.ts'],
   moduleNameMapper: {

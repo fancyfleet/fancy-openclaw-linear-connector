@@ -416,3 +416,23 @@ export function resetCronRegistryForTest(): void {
   loadedStampPath = null;
   persistedLastRunAt = new Map();
 }
+
+/**
+ * Test-only (INF-1263): clear only the failure-tracking fields, leaving
+ * registeredAt/lastRunAt/schedule intact. Many test files call createApp()
+ * repeatedly across it()/beforeEach blocks without ever resetting the
+ * registry (harmless before this ticket, since markCronRun was
+ * liveness-only). Now that registered crons report real outcome, a cron
+ * whose startup kick genuinely fails in a given file's env/mocks
+ * accumulates failureStreak across that file's app instances and can trip
+ * the /health critical-failure gate for later, unrelated test cases — this
+ * clears that accumulation globally without disturbing tests that assert
+ * registeredAt/schedule across a shared beforeAll registration.
+ */
+export function resetCronFailureStreaksForTest(): void {
+  for (const entry of entries.values()) {
+    entry.lastOutcome = null;
+    entry.lastError = null;
+    entry.failureStreak = 0;
+  }
+}
