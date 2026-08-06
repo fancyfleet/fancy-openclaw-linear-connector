@@ -98,6 +98,13 @@ interface MockIssue {
   /** The Linear native state currently on the ticket (may differ from what label implies). */
   nativeStateId: string;
   nativeStateName: string;
+  /**
+   * The Linear native state *type* (unstarted/started/completed/canceled).
+   * Defaults to a non-terminal "started" when omitted so pre-INF-1287 fixtures
+   * keep their behavior. INF-1287 uses completed/canceled to exercise the
+   * terminal-skip guard in the label-loss desync check.
+   */
+  nativeStateType?: string;
   /** Child issues (for ux-audit/sprint managing tickets). */
   children?: Array<{
     identifier: string;
@@ -172,7 +179,7 @@ function makeMockFetch(opts: {
         id: iss.id,
         identifier: iss.identifier,
         team: { id: iss.teamId },
-        state: { id: iss.nativeStateId, name: iss.nativeStateName },
+        state: { id: iss.nativeStateId, name: iss.nativeStateName, type: iss.nativeStateType ?? "started" },
         labels: { nodes: iss.labels },
         children: {
           nodes: (iss.children ?? []).map((c) => ({
@@ -201,7 +208,7 @@ function makeMockFetch(opts: {
               id: found.id,
               identifier: found.identifier,
               team: { id: found.teamId },
-              state: { id: found.nativeStateId, name: found.nativeStateName },
+              state: { id: found.nativeStateId, name: found.nativeStateName, type: found.nativeStateType ?? "started" },
               labels: { nodes: found.labels },
               children: {
                 nodes: (found.children ?? []).map((c) => ({
@@ -878,6 +885,84 @@ describe("AC3 — anti-entropy runs on a cadence and alerts on drift", () => {
     // (Node.js Timeout objects always expose .unref(); we call it here and verify no error.)
     expect(() => timer.unref?.()).not.toThrow();
     clearInterval(timer);
+  });
+});
+
+// ── INF-1287: terminal-state tickets must not trip label-loss desync ────────
+
+describe("INF-1287 — closed/retired tickets with wf:* but no state:* label do NOT trip the label-loss check", () => {
+  it("skips a CANCELED ticket that carries wf:dev-impl but no state:* label (no error)", async () => {
+    // Mirrors the 27 retired-AI-team tickets: closed, wf:dev-impl still attached,
+    // state:* label gone, and immutable because the team is retired.
+    const { fetch, issueUpdateCalls } = makeMockFetch({
+      issues: [
+        {
+          id: "uuid-AI-1350",
+          identifier: "AI-1350",
+          teamId: "team-ai",
+          labels: [{ id: "lbl-wf", name: "wf:dev-impl" }],
+          nativeStateId: "ns-invalid-1",
+          nativeStateName: "Invalid",
+          nativeStateType: "canceled",
+        },
+      ],
+    });
+    globalThis.fetch = fetch;
+
+    const result = await runAntiEntropyPass({ authToken: "tok-test" });
+
+    expect(result.errors).toHaveLength(0);
+    // Must not attempt to mutate an immutable retired-team ticket.
+    expect(issueUpdateCalls).toHaveLength(0);
+  });
+
+  it("skips a COMPLETED ticket that carries wf:dev-impl but no state:* label (no error)", async () => {
+    const { fetch } = makeMockFetch({
+      issues: [
+        {
+          id: "uuid-AI-1379",
+          identifier: "AI-1379",
+          teamId: "team-ai",
+          labels: [
+            { id: "lbl-wf", name: "wf:dev-impl" },
+            { id: "lbl-gate", name: "gate:agent-review" },
+          ],
+          nativeStateId: "ns-done-1",
+          nativeStateName: "Done",
+          nativeStateType: "completed",
+        },
+      ],
+    });
+    globalThis.fetch = fetch;
+
+    const result = await runAntiEntropyPass({ authToken: "tok-test" });
+
+    expect(result.errors).toHaveLength(0);
+  });
+
+  it("STILL flags a non-terminal ticket enrolled in wf:* that lost its state:* label", async () => {
+    // Regression guard: the INF-1260 AC4 label-loss detection must remain intact
+    // for genuinely-active tickets — the terminal skip must not silence real desync.
+    const { fetch } = makeMockFetch({
+      issues: [
+        {
+          id: "uuid-AI-6000",
+          identifier: "AI-6000",
+          teamId: "team-ai",
+          labels: [{ id: "lbl-wf", name: "wf:dev-impl" }],
+          nativeStateId: "ns-doing-1",
+          nativeStateName: "In Progress",
+          nativeStateType: "started",
+        },
+      ],
+    });
+    globalThis.fetch = fetch;
+
+    const result = await runAntiEntropyPass({ authToken: "tok-test" });
+
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toContain("AI-6000");
+    expect(result.errors[0]).toContain("label-loss desync detected");
   });
 });
 

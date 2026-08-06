@@ -67,7 +67,7 @@ interface IssueNode {
   id: string;
   identifier: string;
   team: { id: string };
-  state: { id: string; name: string };
+  state: { id: string; name: string; type: string };
   labels: { nodes: LabelNode[] };
   children: { nodes: ChildNode[] };
 }
@@ -85,6 +85,18 @@ const SEMANTIC_STATE_MAP: Record<string, string[]> = {
 };
 
 const TERMINAL_STATE_NAMES = new Set(["done", "escape"]);
+
+/**
+ * INF-1287: Linear native workflow-state *types* that are terminal. A ticket
+ * sitting in a completed/canceled native state is closed; it legitimately no
+ * longer carries a `state:*` workflow label, so it must NOT be flagged as a
+ * label-loss desync. Critically, issues on a *retired* team are also immutable
+ * ("Entity is retired: issue"), so a retired team's closed tickets can never be
+ * de-enrolled by mutation — flagging them just pins /health forever. Skipping
+ * terminal-state tickets closes that class: a retired/closed team can no longer
+ * trip anti-entropy. (Linear spells the canceled type "canceled", one L.)
+ */
+const TERMINAL_NATIVE_STATE_TYPES = new Set(["completed", "canceled"]);
 
 // ── Cache ──────────────────────────────────────────────────────────────────
 
@@ -240,7 +252,7 @@ async function fetchWorkflowIssues(authToken: string): Promise<IssueNode[]> {
             id
             identifier
             team { id }
-            state { id name }
+            state { id name type }
             labels { nodes { id name } }
             children {
               nodes {
@@ -344,6 +356,15 @@ async function processIssue(
   const labels = issue.labels.nodes;
   const stateLabel = getStateLabelName(labels);
   const workflowId = getWorkflowId(labels);
+
+  // INF-1287: a ticket in a terminal native state (completed/canceled) is
+  // closed. It legitimately no longer carries a state:* label, and if it lives
+  // on a retired team it is immutable ("Entity is retired: issue") so it can
+  // never be de-enrolled by mutation. Flagging it as a label-loss desync just
+  // pins /health forever (a retired team's 27 closed dev-impl tickets did
+  // exactly this). Skip terminal tickets before the label-loss check so a
+  // retired/closed team can never trip anti-entropy again.
+  if (TERMINAL_NATIVE_STATE_TYPES.has(issue.state.type)) return;
 
   // INF-1260 AC4: a ticket with wf:* but NO state:* label is a 3-way desync
   // (native state may be fine, but the label is missing). Flag it instead of
