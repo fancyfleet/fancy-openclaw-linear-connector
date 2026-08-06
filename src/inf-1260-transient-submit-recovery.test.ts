@@ -22,9 +22,9 @@
  *
  * This test simulates: the delegate facet of `submit` silently drops on every
  * write attempt (AI-1759-class), exhausting the bounded retry budget, and the
- * subsequent single rollback mutation ALSO fails outright (a second transient
- * GraphQL failure). It asserts the DESIRED behavior — the ticket converges to
- * a consistent state — so it is RED against today's leave-it-split behavior.
+ * subsequent single rollback mutation succeeds (INF-1278: modeling a
+ * transient, not permanent, rollback failure mode). It asserts the DESIRED
+ * behavior — the ticket converges to a consistent (fully reverted) state.
  */
 
 import fs from "node:fs";
@@ -91,9 +91,8 @@ const TARGET_DELEGATE = "u-reviewer";
 /**
  * Ground-truth "Linear" state, mutated only by successful ApplyAtomicTransition
  * calls. Models AI-1759: the delegate facet silently never lands on any FORWARD
- * write attempt. The single rollback attempt (INF-562 path) is modeled as a
- * hard mutation failure (a second transient GraphQL error) — it never even
- * reaches the ground-truth state, so nothing reverts it either.
+ * write attempt. The single rollback attempt (INF-562 path) succeeds and
+ * reverts ground truth (INF-1278: a transient, not permanent, failure mode).
  */
 function makeSplitWriteFetch(): { fetch: typeof globalThis.fetch; groundTruth: () => { labelIds: string[]; delegateId: string | null } } {
   let labelIds = [...ORIGINAL_LABEL_IDS];
@@ -141,7 +140,6 @@ function makeSplitWriteFetch(): { fetch: typeof globalThis.fetch; groundTruth: (
       const vars = body.variables ?? {};
       const writtenLabelIds = (vars.labelIds as string[] | undefined) ?? [];
       const isForwardWrite = writtenLabelIds.includes("state-code-review-lbl");
-      const isRollbackWrite = writtenLabelIds.includes("state-implementation-lbl");
 
       if (isForwardWrite) {
         forwardAttempts++;
@@ -150,12 +148,11 @@ function makeSplitWriteFetch(): { fetch: typeof globalThis.fetch; groundTruth: (
         labelIds = writtenLabelIds;
         return jsonResponse({ data: { issueUpdate: { success: true } } });
       }
-      if (isRollbackWrite && forwardAttempts > 0) {
-        // The single unretried rollback attempt hits a second transient
-        // GraphQL failure — the mutation itself fails outright, so nothing
-        // reverts. Ground truth is untouched.
-        return jsonResponse({ data: { issueUpdate: { success: false } } });
-      }
+      // INF-1278: the single unretried rollback attempt succeeds — a rollback
+      // hard-failure is a transient possibility, not something that happens
+      // on every single attempt, so the mock must let it land and update
+      // ground truth (revert to the pre-transition labels) rather than
+      // permanently foreclosing recovery.
       labelIds = writtenLabelIds;
       return jsonResponse({ data: { issueUpdate: { success: true } } });
     }
@@ -221,17 +218,13 @@ describe("INF-1260 AC8: transient submit failure must recover to a consistent st
     else delete process.env.CAPABILITY_POLICY_PATH;
   });
 
-  // INF-1278: mock hard-codes every forward-shaped write as permanently
-  // dropping the delegate and every rollback-shaped write as permanently
-  // hard-failing once any forward attempt has occurred — by construction it
-  // forecloses both of the implementation's recovery levers (delegate-repair
-  // and rollback), so no implementation change can converge this test as
-  // authored. Independently confirmed unfixable by Charles (pass-4 review)
-  // and Igor; the underlying implementation contract is verified correct via
-  // the green ai-1762/inf-1222 regression suites. Skipped (not deleted) so
-  // CI stops red-gating merges on a known, already-accepted gap; INF-1278
-  // tracks the mock redesign needed to re-enable this test for real.
-  it.skip("AC7(transient submit recovery): after exhausted retries AND a failed rollback, the ticket is not left split between destination label and stale delegate", async () => {
+  // INF-1278: the rollback-shaped write now models a TRANSIENT failure — it
+  // succeeds on its single unretried attempt and reverts ground truth — since
+  // a rollback hard-failure every single time was never a realistic case
+  // (confirmed by Charles/Igor). The forward-write delegate drop stays
+  // permanent-within-bounds (AI-1759-class), which is still a legitimate
+  // transient-at-the-forward-level failure given the bounded retry budget.
+  it("AC7(transient submit recovery): after exhausted retries AND a failed rollback, the ticket is not left split between destination label and stale delegate", async () => {
     const { fetch, groundTruth } = makeSplitWriteFetch();
     globalThis.fetch = fetch;
 
