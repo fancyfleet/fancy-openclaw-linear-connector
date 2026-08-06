@@ -307,7 +307,12 @@ function makeFetch(labelResponse: object, mutationResponse = MOCK_MUTATION_SUCCE
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
-    if (parsed.query?.includes("IssueContext") || parsed.query?.includes("IssueLabels") || parsed.query?.includes("delegate")) {
+    // INF-1288: the atomic ApplyAtomicTransition mutation now carries a delegateId
+    // (migrate-state seats the owner_role body), so its query text contains
+    // "delegate". Exclude mutations (anything carrying an issueUpdate) from this
+    // greedy label-read branch so the atomic write falls through to the issueUpdate
+    // handler below instead of being answered with a label-query shape.
+    if ((parsed.query?.includes("IssueContext") || parsed.query?.includes("IssueLabels") || parsed.query?.includes("delegate")) && !parsed.query?.includes("issueUpdate")) {
       return new Response(JSON.stringify(labelResponse), { status: 200, headers: { "Content-Type": "application/json" } });
     }
     // The atomic write's post-write verification re-fetch (VerifyTransitionWrite) —
