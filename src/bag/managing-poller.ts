@@ -28,6 +28,7 @@ import type { DeliveryConfig } from "../delivery/index.js";
 import { sendManagingWakeSignal, type ManagingWakeTicket } from "./managing-wake.js";
 import { surfaceStalledChildren, evaluateBarrier, attemptBarrierTransition, isManagedBarrierFromLabels } from "../barrier.js";
 import { notify } from "../alerts/alert-bus.js";
+import { LINEAR_API_URL } from "../linear-helpers.js";
 
 const log = createModuleLogger("managing-poller", "info");
 
@@ -203,7 +204,7 @@ async function fetchManagingTicketsForAgent(agent: AgentConfig): Promise<LinearM
   let cursor: string | null = null;
   let hasNextPage = true;
   while (hasNextPage) {
-    const res = await fetch("https://api.linear.app/graphql", {
+    const res = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: authHeader },
       body: JSON.stringify({ query, variables: { delegateId: agent.linearUserId, after: cursor } }),

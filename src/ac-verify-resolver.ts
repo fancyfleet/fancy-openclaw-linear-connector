@@ -12,7 +12,7 @@
  * Config-driven dimension→verifier map (not hardcoded).
  */
 
-const LINEAR_API_URL = "https://api.linear.app/graphql";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 
 /** Configuration for the verify-owner resolver. */
 export interface VerifyConfig {

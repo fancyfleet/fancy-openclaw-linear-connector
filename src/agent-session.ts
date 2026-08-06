@@ -6,9 +6,9 @@
 
 import { getAccessToken } from "./agents.js";
 import { createModuleLogger } from "./logging.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 
 const log = createModuleLogger("agent-session", "info");
-const LINEAR_API = "https://api.linear.app/graphql";
 
 // Dedup: track recently-created sessions per issue
 const recentSessions = new Map<string, { timestamp: number; sessionId: string | null }>();
@@ -69,7 +69,7 @@ async function doCreateSessionAndEmitThought(
 
   try {
     // Step 1: Create agent session on the issue
-    const createRes = await fetch(LINEAR_API, {
+    const createRes = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
@@ -145,7 +145,7 @@ export async function emitThought(
   if (!token) return false;
 
   try {
-    const res = await fetch(LINEAR_API, {
+    const res = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
@@ -183,7 +183,7 @@ export async function emitResponse(
   if (!token) return false;
 
   try {
-    const res = await fetch(LINEAR_API, {
+    const res = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,

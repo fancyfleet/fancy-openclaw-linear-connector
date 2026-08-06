@@ -28,6 +28,7 @@
 import { registerCron, markCronRun, formatIntervalMs } from "./cron/registry.js";
 import { getFirstActionWatchdogState } from "./first-action-watchdog-state.js";
 import { createModuleLogger } from "./logging.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 
 const log = createModuleLogger("native-state-reconciler", "info");
 
@@ -303,8 +304,6 @@ interface DeadCandidate {
   identifier: string;
   connectorState: string;
 }
-
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 /**
  * Build the production I/O for the reconciler, wired to live Linear + the

@@ -25,6 +25,7 @@
 
 import { createModuleLogger } from "./logging.js";
 import { resolveNativeStateId, loadWorkflowDefById, getWorkflowId, getCurrentState } from "./workflow-gate.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 
 const log = createModuleLogger("engagement-status", "info");
 
@@ -43,8 +44,6 @@ export function registerEngagementNativeStateOverlay(): void {
   _nativeStateAware = true;
   log.info("[engagement-status] native_state-aware overlay registered (AI-2568)");
 }
-
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 export type EngagementSemantic = "thinking" | "doing" | "todo";
 

@@ -46,6 +46,7 @@ import { DelegatePingPongDetector, shouldCheckDelegatePingPong } from "../delega
 import type { DispatchRecordStore } from "../liveness-channel/dispatch-record-store.js";
 import type { GatewayDispatchAck } from "../liveness-channel/gateway-ack-types.js";
 import { extractRejectedWebhookDiagnostic, WebhookSecretDriftTracker } from "./drift.js";
+import { LINEAR_API_URL } from "../linear-helpers.js";
 
 const log = createModuleLogger("webhook", "info");
 
@@ -216,7 +217,7 @@ export async function findUnblockWakeRoutesForTerminalIssue(event: LinearEvent):
   const token = resolveServiceCredential() || undefined;
   if (!token) return [];
 
-  const response = await fetch("https://api.linear.app/graphql", {
+  const response = await fetch(LINEAR_API_URL, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -420,7 +421,7 @@ export async function enrichCommentEventForRouting(event: LinearEvent): Promise<
     return undefined;
   })();
   try {
-    const res = await fetch("https://api.linear.app/graphql", {
+    const res = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

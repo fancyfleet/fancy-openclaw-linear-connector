@@ -46,6 +46,7 @@ import {
 } from "./admin-session.js";
 import { mountStreamRoute } from "./admin-stream.js";
 import { listWebhooks, addWebhook, removeWebhook } from "./webhook/registry.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 
 const log = createModuleLogger("admin");
 
@@ -1414,7 +1415,7 @@ export function createAdminRouter(deps: AdminDeps): Router {
     const auditCommentBody =
       `[Admin set-state by ${invoker}] ${result.from ?? "?"} → ${targetState} — ${reason}`;
     const auditIssueId = result.internalId ?? ticketId;
-    await fetch("https://api.linear.app/graphql", {
+    await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({
@@ -1486,7 +1487,7 @@ export function createAdminRouter(deps: AdminDeps): Router {
 
       // AI-1954 AC2: post audit comment naming the true invoker.
       const auditCommentBody = `[Admin recapture-ac by ${invoker}] ${reason}`;
-      await fetch("https://api.linear.app/graphql", {
+      await fetch(LINEAR_API_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: authToken },
         body: JSON.stringify({

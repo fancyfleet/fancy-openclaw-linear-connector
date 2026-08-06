@@ -19,9 +19,9 @@ import {
   type SweepIssue,
 } from "../leaked-credential-sweep.js";
 import { SEC_LEAKED_CREDENTIAL_LABEL } from "../leaked-credential-artifact.js";
+import { LINEAR_API_URL } from "../linear-helpers.js";
 
 const log = createModuleLogger("leaked-credential-sweep-cron");
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 export interface LeakedCredSweepCronOptions {
   lookbackDays?: number;

@@ -45,10 +45,9 @@ import { buildAgentMap, getLinearUserIdForAgent, getOpenclawAgentName } from "./
 import { resolveBodiesForRole } from "./escalation-gate.js";
 import { boundSeatFor } from "./implementer-store.js";
 import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 
 const log = createModuleLogger("bootstrap-reconciliation");
-
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 /**
  * INF-719: page size for the paginated wf:* sweep. Linear caps an unpaginated

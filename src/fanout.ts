@@ -26,7 +26,7 @@
  */
 
 import { createModuleLogger } from "./logging.js";
-import { findLabel, findOrCreateLabel } from "./linear-helpers.js";
+import { findLabel, findOrCreateLabel, LINEAR_API_URL } from "./linear-helpers.js";
 import { loadEnrollmentPolicy } from "./enrollment-policy.js";
 import { generateSpawnPreview, checkCaps, formatPreviewComment, formatCapRefusalComment, parseSpawnCaps, type SpawnPreview, type CapCheckResult, type SpawnCaps, type FindingInput } from "./spawn-preview.js";
 import type { FanoutConfig, SpawnIfConfig, WorkflowDef } from "./workflow-gate.js";
@@ -34,8 +34,6 @@ import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
 import type { FanoutChildForVerification } from "./post-fanout-child-verification.js";
 
 const log = createModuleLogger("fanout");
-
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 /**
  * AI-1994: prefix of the HTML-comment marker embedded in each spawned child's

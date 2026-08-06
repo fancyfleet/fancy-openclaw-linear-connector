@@ -51,10 +51,9 @@ import { IssueCreateDedupCache, extractIssueCreateInput, fingerprintIssueCreate,
 import { checkArtifactDisclosure } from "./artifact-disclosure.js";
 import { recordTransitionCarriedComment } from "./transition-comment-logic.js";
 import { LINEAR_PROXY_PROTOCOL_VERSION, minWorkflowCliVersion } from "./proxy-compatibility.js";
-import { findOrCreateLabel } from "./linear-helpers.js";
+import { findOrCreateLabel, LINEAR_API_URL } from "./linear-helpers.js";
 
 const log = createModuleLogger("proxy");
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 /**
  * AGI-3: process-local dedup window for agent-driven `issueCreate`.

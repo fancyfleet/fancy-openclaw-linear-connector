@@ -15,10 +15,9 @@
 
 import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import { createModuleLogger } from "./logging.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 
 const log = createModuleLogger("proxy");
-
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 /** Terminal / delegate-routing intents that may race with sibling sessions. */
 const TERMINAL_INTS = new Set([

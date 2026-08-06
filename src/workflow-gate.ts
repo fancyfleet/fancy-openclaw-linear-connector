@@ -66,6 +66,7 @@ import { reposWithoutCiAutoDeploy, githubRepoFromUrl } from "./deploy-policy.js"
 import { notify } from "./alerts/alert-bus.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import { checkDefAgainstFixture } from "./fixture-drift-core.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 
 /**
  * Phase 6.5 / H-6: Label read-only projection + override path + drift reconciliation.
@@ -96,8 +97,6 @@ let log = createModuleLogger("workflow-gate");
 export function _setLogForTests(testLogger?: Logger): void {
   log = testLogger ?? createModuleLogger("workflow-gate");
 }
-
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 /**
  * Base URL for the GitHub REST API. Used to verify PR merge state directly

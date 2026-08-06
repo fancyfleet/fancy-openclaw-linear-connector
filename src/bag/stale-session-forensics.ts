@@ -21,6 +21,7 @@ import { tryNormalizeSessionKey } from "../session-key.js";
 import { setStateAtomic } from "../workflow-gate.js";
 import { GlobalRedispatchBudget } from "./global-redispatch-budget.js";
 import { StaleRedispatchCounter } from "./stale-redispatch-counter.js";
+import { LINEAR_API_URL } from "../linear-helpers.js";
 
 const log = createModuleLogger("stale-forensics", "info");
 
@@ -900,7 +901,7 @@ export async function fetchLinearTicketState(
   const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
 
   try {
-    const res = await fetch("https://api.linear.app/graphql", {
+    const res = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -965,7 +966,7 @@ async function fetchWorkflowStates(
   const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
 
   try {
-    const res = await fetch("https://api.linear.app/graphql", {
+    const res = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: authHeader },
       body: JSON.stringify({
@@ -984,7 +985,7 @@ async function fetchWorkflowStates(
 
 async function fetchTeamLabels(teamId: string, authHeader: string): Promise<Array<{ id: string; name: string }>> {
   try {
-    const res = await fetch("https://api.linear.app/graphql", {
+    const res = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: authHeader },
       body: JSON.stringify({
@@ -1057,7 +1058,7 @@ async function applyGovernedRecoveryAtomicWrite(args: {
     variables.delegateId = args.delegateId ?? null;
     variables.assigneeId = args.assigneeId ?? null;
   }
-  const writeRes = await fetch("https://api.linear.app/graphql", {
+  const writeRes = await fetch(LINEAR_API_URL, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: args.authHeader },
     body: JSON.stringify({ query: mutation, variables }),
@@ -1067,7 +1068,7 @@ async function applyGovernedRecoveryAtomicWrite(args: {
     return { ok: false, error: "atomic issueUpdate mutation failed" };
   }
 
-  const verifyRes = await fetch("https://api.linear.app/graphql", {
+  const verifyRes = await fetch(LINEAR_API_URL, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: args.authHeader },
     body: JSON.stringify({
@@ -1293,7 +1294,7 @@ export async function recoverTicket(
     // Fetch the issue to get its ID, team, and current state. We need the live
     // state to guard against clobbering a ticket that already reached a terminal
     // state between stale-detection and recovery-execution (see terminal guard below).
-    const issueRes = await fetch("https://api.linear.app/graphql", {
+    const issueRes = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: authHeader },
       body: JSON.stringify({
@@ -1368,7 +1369,7 @@ export async function recoverTicket(
         `so the ticket stays with you (delegate retained, state unchanged) instead of being orphaned.\n\n` +
         `Resume now and run the pending transition verb. If you genuinely cannot proceed, run ` +
         `\`linear escape ${identifier}\`.${diagSuffix}`;
-      await fetch("https://api.linear.app/graphql", {
+      await fetch(LINEAR_API_URL, {
         method: "POST",
         headers: { "content-type": "application/json", authorization: authHeader },
         body: JSON.stringify({
@@ -1404,7 +1405,7 @@ export async function recoverTicket(
     }
 
     // Post comment
-    await fetch("https://api.linear.app/graphql", {
+    await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: authHeader },
       body: JSON.stringify({
@@ -1604,7 +1605,7 @@ export async function recoverTicket(
       }
     }
 
-    const updateRes = await fetch("https://api.linear.app/graphql", {
+    const updateRes = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: authHeader },
       body: JSON.stringify({

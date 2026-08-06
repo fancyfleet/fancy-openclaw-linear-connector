@@ -29,11 +29,9 @@ import yaml from "js-yaml";
 import { createModuleLogger } from "../logging.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
 import { type WorkflowDef } from "../workflow-gate.js";
-import { findOrCreateLabel } from "../linear-helpers.js";
+import { findOrCreateLabel, LINEAR_API_URL } from "../linear-helpers.js";
 
 const log = createModuleLogger("anti-entropy");
-
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 /** INF-719: page size for the paginated wf:* sweep (Linear caps unpaginated issues() at 50). */
 const LINEAR_ISSUES_PAGE_SIZE = 50;

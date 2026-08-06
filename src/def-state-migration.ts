@@ -26,10 +26,9 @@ import type { WorkflowDef } from "./workflow-gate.js";
 import { getWorkflowId, getCurrentState } from "./workflow-gate.js";
 import { resolveBodiesForRole, roleResolutionScopeForOwnerRole } from "./escalation-gate.js";
 import type { OperationalEventInput } from "./store/operational-event-store.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 
 const log = createModuleLogger("def-state-migration");
-
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 /** INF-719: page size for the paginated wf:* enumeration (Linear caps unpaginated issues() at 50). */
 const LINEAR_ISSUES_PAGE_SIZE = 50;

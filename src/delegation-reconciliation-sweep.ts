@@ -35,10 +35,9 @@ import type { SessionTracker } from "./bag/session-tracker.js";
 import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import { type DispatchIdempotencyStore } from "./store/dispatch-idempotency-store.js";
+import { LINEAR_API_URL } from "./linear-helpers.js";
 
 const log = createModuleLogger("delegation-reconciliation");
-
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 /** Default sweep cadence. */
 const DEFAULT_INTERVAL_MS = 5 * 60 * 1000; // 5 min
