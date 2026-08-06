@@ -1152,9 +1152,14 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         // not the migrate-specific X-Openclaw-Migrate-Target. Accept either so the steward
         // can run the sanctioned verb from the CLI without hand-crafted curl. The
         // migrate-specific header wins when both are present (explicit > generic).
-        const migrateTarget =
+        const rawMigrateTarget =
           ((req.headers["x-openclaw-migrate-target"] as string | undefined) ?? null) ??
           ((req.headers["x-openclaw-linear-target"] as string | undefined) ?? null);
+        // INF-1288 (Bug B): stewards naturally pass the *label* form `state:<name>`
+        // (that is how the state appears on the ticket), but def state ids are bare
+        // (`<name>`). Normalize a single leading `state:` prefix so both forms resolve;
+        // without this every `state:<name>` target was rejected as "not in live def".
+        const migrateTarget = rawMigrateTarget?.replace(/^state:/, "") ?? null;
 
         // Capability gate — mirror the break-glass identity gate: name the caller
         // and the capability so the denial is unambiguous (AC5).
@@ -1218,6 +1223,11 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           operationalEventStore: deps?.operationalEventStore,
           enrolledTicketsStore: deps?.enrolledTicketsStore,
           transitionSource: "migrate-state",
+          // INF-1288 (Bug C): seat the destination owner_role's singleton body as the
+          // Linear delegate in the same atomic write, so a forward migration no longer
+          // leaves the prior body delegated (the drift that forced a separate
+          // handoff-work repair after every migrate-state).
+          seatOwnerRoleDelegate: true,
         });
         if (!migrateResult.ok) {
           const failCode = migrateResult.code ?? "unknown";
@@ -1256,7 +1266,32 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           });
         }
 
-        res.status(200).json({ data: { migrateState: { success: true, from: migrateResult.from, to: migrateTarget, redispatched: migrateResult.redispatched ?? null } } });
+        // INF-1288 (Bug A): return the *issueUpdate*-shaped payload the CLI's
+        // migrate-state/rewind verbs actually parse. The CLI routes migrate-state
+        // through executeTransition → updateIssue, which reads
+        // `data.issueUpdate.success` / `data.issueUpdate.issue.id` and then re-fetches
+        // via getIssue(id). The pre-fix `{ data: { migrateState: {...} } }` shape left
+        // `data.issueUpdate` undefined, so the CLI threw `Cannot read properties of
+        // undefined (reading 'success')` even though setStateAtomic had already
+        // advanced label/native/ledger/comment server-side — the misleading error that
+        // forced the "ignore the client error, then observe" manual-kick. Returning the
+        // issueUpdate shape makes a successful migration exit cleanly on the deployed
+        // CLI (0.4.12) with no fleet-wide CLI converge required. The migrate metadata
+        // is carried alongside under `migrateState` for any caller that wants it.
+        res.status(200).json({
+          data: {
+            issueUpdate: {
+              success: true,
+              issue: { id: migrateResult.internalId ?? issueId },
+            },
+            migrateState: {
+              success: true,
+              from: migrateResult.from,
+              to: migrateTarget,
+              redispatched: migrateResult.redispatched ?? null,
+            },
+          },
+        });
         return;
       }
 
@@ -1264,7 +1299,10 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // ticket's own workflow. This is not a def transition and must not fall
       // through to the normal transition-legality path.
       if (effectiveIntent === "rewind") {
-        const rewindTarget = (req.headers["x-openclaw-rewind-target"] as string | undefined) ?? null;
+        // INF-1288 (Bug B, mirror): normalize a single leading `state:` prefix so the
+        // label form `state:<name>` resolves to the bare def state id, same as
+        // migrate-state. Without this a `state:<name>` rewind target was rejected.
+        const rewindTarget = ((req.headers["x-openclaw-rewind-target"] as string | undefined) ?? null)?.replace(/^state:/, "") ?? null;
 
         let hasBreakGlass = false;
         try {
@@ -1342,7 +1380,19 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           });
         }
 
-        res.status(200).json({ data: { rewind: { success: true, from: rewindResult.from, to: rewindTarget } } });
+        // INF-1288 (Bug A, mirror): return the issueUpdate-shaped payload the CLI's
+        // rewind verb parses (executeTransition → updateIssue reads data.issueUpdate),
+        // so a successful rewind no longer throws `reading 'success'` on the deployed
+        // CLI. The rewind metadata is carried alongside under `rewind`.
+        res.status(200).json({
+          data: {
+            issueUpdate: {
+              success: true,
+              issue: { id: rewindResult.internalId ?? issueId },
+            },
+            rewind: { success: true, from: rewindResult.from, to: rewindTarget },
+          },
+        });
         return;
       }
 

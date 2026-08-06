@@ -8911,6 +8911,18 @@ export interface SetStateAtomicOptions {
   assigneeIdOverride?: string | null;
   /** Observable source for redispatch-capable state repairs. */
   transitionSource?: string;
+  /**
+   * INF-1288 (Bug C): when set and the target is a governed non-terminal state
+   * whose owner_role resolves to exactly one body, seat that body as the Linear
+   * delegate in the same atomic write — even on a genuine forward transition
+   * (fromState !== targetState). The migrate-state steward verb passes this so a
+   * forward migration seats the destination owner atomically instead of leaving
+   * the prior body delegated (the "delegate drift" that forced a separate
+   * handoff-work repair after every migrate-state). Opt-in so the INF-979 guard
+   * on the generic omitted-delegate path (escape re-open, ac-validate) is not
+   * regressed.
+   */
+  seatOwnerRoleDelegate?: boolean;
 }
 
 async function dispatchWithRetry(
@@ -9106,7 +9118,19 @@ export async function setStateAtomic(
     // Fires only when there is a hole to fill (live delegate null), the move is a
     // same-state redispatch, the destination is a governed non-terminal state, and its
     // role resolves to exactly one body.
-    if (issue.delegateId == null && def && fromState != null && fromState === targetState) {
+    //
+    // INF-1288 (Bug C): the migrate-state steward verb sets seatOwnerRoleDelegate to
+    // ALSO seat the singleton owner on a genuine forward transition (fromState !==
+    // targetState) — that is the whole point of migrating to e.g. code-review (seat
+    // the reviewer). Without it the forward migration left the prior body delegated
+    // and the steward had to run a separate handoff-work to repair the drift. This is
+    // opt-in via the option so the INF-979 same-state-only guard still protects the
+    // generic omitted-delegate paths (escape re-open, ac-validate) from over-seating.
+    const shouldSeatOwner =
+      def != null &&
+      fromState != null &&
+      (fromState === targetState ? issue.delegateId == null : options?.seatOwnerRoleDelegate === true);
+    if (shouldSeatOwner && def) {
       const destNode = def.states.find((s) => s.id === targetState);
       const ownerRole = destNode?.owner_role;
       const isTerminal = destNode?.kind === "terminal" || !ownerRole;
@@ -9121,7 +9145,7 @@ export async function setStateAtomic(
             if (seat?.linearUserId) {
               resolvedDelegateId = seat.linearUserId;
               log.info(
-                `workflow-gate: set-state: INF-979 bootstrap-seating null delegate on governed state '${targetState}' → '${roleBodies[0]}' (singleton role '${ownerRole}')`,
+                `workflow-gate: set-state: seating delegate on governed state '${targetState}' → '${roleBodies[0]}' (singleton role '${ownerRole}'${fromState === targetState ? "; INF-979 null-delegate re-seat" : "; INF-1288 migrate-state owner-seat"})`,
               );
             } else {
               log.warn(
