@@ -110,8 +110,11 @@ describe("AI-2070 — distillation cadence: the registered timer fires the engin
     // Before the first tick the store is empty.
     expect(proposalStore.list().length).toBe(0);
 
-    // Advance past one interval and flush the scheduled async run.
-    await jest.advanceTimersByTimeAsync(25);
+    // INF-1263 AC3: registerDistillationCron now also fires an immediate
+    // startup-kick tick (t=0), so advance only enough to observe that single
+    // kick — advancing past the 20ms interval too would double-run
+    // distillation against the same still-crossing pattern.
+    await jest.advanceTimersByTimeAsync(5);
 
     // The scheduled tick drove generateProposals + persistGeneratedProposals into
     // the unified store — the console queue now has the proposal.

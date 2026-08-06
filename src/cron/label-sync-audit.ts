@@ -9,7 +9,7 @@
  */
 
 import { createModuleLogger } from "../logging.js";
-import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
+import { registerCron, formatIntervalMs, markCronRunSuccess, markCronRunFailure } from "./registry.js";
 import { checkLabelSyncForTicket, emitLabelSyncWarning, type LabelSyncDivergence } from "../transition-audit.js";
 import type { EnrolledTicketsStore } from "../store/enrolled-tickets-store.js";
 
@@ -104,7 +104,7 @@ export function registerLabelSyncAuditCron(opts: LabelSyncAuditOptions): ReturnT
   );
 
   registerCron("label-sync-audit", `every ${formatIntervalMs(intervalMs)}`);
-  const timer = setInterval(() => {
+  const tick = () => {
     void (async () => {
       try {
         const result = await runLabelSyncAuditPass(opts);
@@ -114,15 +114,24 @@ export function registerLabelSyncAuditCron(opts: LabelSyncAuditOptions): ReturnT
             `divergences=${result.divergencesFound} errors=${result.errors.length}`,
           );
         }
+        if (result.errors.length > 0) {
+          markCronRunFailure("label-sync-audit", result.errors.join("; "));
+        } else {
+          markCronRunSuccess("label-sync-audit");
+        }
       } catch (err) {
         log.error(
           `[label-sync-audit] Scheduled pass failed: ${err instanceof Error ? err.message : String(err)}`,
         );
-      } finally {
-        markCronRun("label-sync-audit");
+        markCronRunFailure("label-sync-audit", err);
       }
     })();
-  }, intervalMs);
+  };
+
+  // INF-1263 AC3: kick off a first pass immediately so deploy churn cannot
+  // starve the audit until the first interval tick.
+  setTimeout(tick, 0);
+  const timer = setInterval(tick, intervalMs);
 
   timer.unref();
   return timer;

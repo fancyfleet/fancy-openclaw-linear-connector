@@ -16,7 +16,7 @@ import fs from "node:fs/promises";
 import type { Stats } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
-import { registerCron, markCronRun, formatIntervalMs } from "./cron/registry.js";
+import { registerCron, markCronRunSuccess, markCronRunFailure, formatIntervalMs } from "./cron/registry.js";
 import { createModuleLogger } from "./logging.js";
 
 const execFileAsync = promisify(execFile);
@@ -261,11 +261,15 @@ export function registerTranscriptRedaction(
   // Register with the cron registry for AI-1808 /health observability.
   registerCron(CRON_NAME, `every ${formatIntervalMs(intervalMs)}`);
 
-  const timer = setInterval(async () => {
+  const tick = async () => {
     _health.lastRun = Date.now();
     log.info(`transcript-redaction sweep starting (${scanRoots.length} scan roots)`);
     const result = await runTranscriptRedaction(effectiveConfig);
-    markCronRun(CRON_NAME);
+    if (result.errors.length > 0) {
+      markCronRunFailure(CRON_NAME, result.errors.join("; "));
+    } else {
+      markCronRunSuccess(CRON_NAME);
+    }
     log.info(
       `transcript-redaction sweep complete: ${result.filesScanned} files scanned, ` +
       `${result.filesRedacted} redacted, ${result.errors.length} errors`,
@@ -273,7 +277,13 @@ export function registerTranscriptRedaction(
     if (result.errors.length > 0) {
       log.error(`transcript-redaction errors: ${result.errors.join("; ")}`);
     }
-  }, intervalMs);
+  };
+
+  // INF-1263 AC3: kick off a first sweep immediately so deploy churn cannot
+  // starve it until the first interval tick. Tracked so stop() can cancel it
+  // before it fires.
+  const initialTimer = setTimeout(() => void tick(), 0);
+  const timer = setInterval(() => void tick(), intervalMs);
 
   // Allow the Node.js process to exit even if the timer is still active.
   timer.unref();
@@ -281,6 +291,7 @@ export function registerTranscriptRedaction(
   return {
     health: _health,
     stop: () => {
+      clearTimeout(initialTimer);
       clearInterval(timer);
       _health.enabled = false;
       log.info("transcript-redaction sweep stopped");

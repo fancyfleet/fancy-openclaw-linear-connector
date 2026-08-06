@@ -29,7 +29,7 @@ import { isBlockedByOpenIssue, isTerminalIssueState, type LinearIssueRelation } 
 import { getAgentIdForLinearUserId, getOpenclawAgentName } from "./agents.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { getRateLimitClient } from "./linear-rate-limit-client.js";
-import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
+import { registerCron, formatIntervalMs, markCronRunSuccess, markCronRunFailure } from "./cron/registry.js";
 import { OperationalEventStore, type OperationalEventStore as OperationalEventStoreType } from "./store/operational-event-store.js";
 import type { SessionTracker } from "./bag/session-tracker.js";
 import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
@@ -1035,7 +1035,7 @@ export function registerDelegationReconciliationCron(opts: {
     `every ${formatIntervalMs(intervalMs)} (${intervalMs}ms)`,
   );
 
-  const timer = setInterval(() => {
+  const tick = () => {
     // Fire-and-forget — errors are captured inside the sweep and surfaced
     // via the alert bus.
     // If no operationalEventStore is provided, create a transient in-memory
@@ -1051,14 +1051,23 @@ export function registerDelegationReconciliationCron(opts: {
       dispatchLeaseStore: opts.dispatchLeaseStore,
       enrolledTicketsStore: opts.enrolledTicketsStore,
       dispatchIdempotencyStore: opts.dispatchIdempotencyStore,
+    }).then((result) => {
+      if (result.errors.length > 0) {
+        markCronRunFailure("delegation-reconciliation-sweep", result.errors.join("; "));
+      } else {
+        markCronRunSuccess("delegation-reconciliation-sweep");
+      }
     }).catch((err) => {
       log.error(
         `delegation-reconciliation: unexpected sweep failure: ${err instanceof Error ? err.message : String(err)}`,
       );
-    }).finally(() => {
-      markCronRun("delegation-reconciliation-sweep");
+      markCronRunFailure("delegation-reconciliation-sweep", err);
     });
-  }, intervalMs);
+  };
+  // INF-1263 AC3: kick off a first sweep immediately so deploy churn cannot
+  // starve it until the first interval tick.
+  setTimeout(tick, 0);
+  const timer = setInterval(tick, intervalMs);
 
   timer.unref();
 

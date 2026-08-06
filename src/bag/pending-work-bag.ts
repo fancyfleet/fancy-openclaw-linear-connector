@@ -57,7 +57,10 @@ export class PendingWorkBag {
     this.db.pragma("journal_mode = WAL");
     this.migrate();
 
-    // Start periodic prune
+    // Start periodic prune. INF-1263 AC3: kick off an immediate prune so
+    // deploy churn cannot leave expired entries unpruned until the first
+    // interval tick.
+    setTimeout(() => this.prune(), 0);
     this.pruneTimer = setInterval(() => this.prune(), PRUNE_INTERVAL_MS);
     this.pruneTimer.unref();
   }
@@ -261,6 +264,10 @@ export class PendingWorkBag {
 
   /** Prune all expired entries. */
   private prune(): void {
+    // The startup kick (INF-1263 AC3) can fire after a short-lived instance
+    // (e.g. a test) has already closed the connection; a closed db is not an
+    // error condition for a periodic prune, just nothing left to do.
+    if (!this.db.open) return;
     const cutoff = this.ttlCutoff();
     const result = this.db
       .prepare("DELETE FROM pending_bag WHERE updated_at < ?")

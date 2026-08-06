@@ -23,7 +23,7 @@ import { runRescueSweep } from "../rescue-sweep.js";
 import type { OperationalEventStore } from "../store/operational-event-store.js";
 import { loadWorkflowRegistry } from "../workflow-gate.js";
 import { createModuleLogger } from "../logging.js";
-import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
+import { registerCron, formatIntervalMs, markCronRunSuccess, markCronRunFailure } from "./registry.js";
 import { resolveServiceCredential } from "../service-credential.js";
 import {
   recordRescueSweepRun,
@@ -68,6 +68,7 @@ async function runSweepIteration(operationalEventStore?: OperationalEventStore):
       const reason = "No LINEAR_OAUTH_TOKEN or LINEAR_API_KEY configured";
       log.warn(`[rescue-sweep] ${reason} — skipping sweep`);
       recordRescueSweepSkip(reason);
+      markCronRunFailure("rescue-sweep", reason);
       return;
     }
     const workflowRegistry = await loadWorkflowRegistry();
@@ -78,12 +79,16 @@ async function runSweepIteration(operationalEventStore?: OperationalEventStore):
         `[rescue-sweep] Sweep complete: scanned=${result.scanned} rescued=${result.rescued} errors=${result.errors.length}`,
       );
     }
+    if (result.errors.length > 0) {
+      markCronRunFailure("rescue-sweep", result.errors.join("; "));
+    } else {
+      markCronRunSuccess("rescue-sweep");
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log.error(`[rescue-sweep] Scheduled sweep failed: ${msg}`);
     recordRescueSweepFail(msg);
-  } finally {
-    markCronRun("rescue-sweep");
+    markCronRunFailure("rescue-sweep", err);
   }
 }
 

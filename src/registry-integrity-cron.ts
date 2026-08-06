@@ -15,7 +15,7 @@
  */
 
 import { createModuleLogger } from "./logging.js";
-import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
+import { registerCron, formatIntervalMs, markCronRunSuccess, markCronRunFailure } from "./cron/registry.js";
 import { runRegistryPolicyCheck } from "./registry-policy.js";
 
 const log = createModuleLogger("registry-integrity");
@@ -44,7 +44,7 @@ export function registerRegistryIntegrityCron(
 ): NodeJS.Timeout {
   registerCron("registry-integrity-check", formatIntervalMs(intervalMs));
 
-  const timer = setInterval(() => {
+  const tick = () => {
     void runRegistryPolicyCheck("cron")
       .then((status) => {
         // AC4: surface recovery URLs for unregistered bodies
@@ -68,15 +68,20 @@ export function registerRegistryIntegrityCron(
             }
           }
         }
+        markCronRunSuccess("registry-integrity-check");
       })
       .catch((err) => {
         log.error(
           `registry-integrity: unexpected check failure: ${err instanceof Error ? err.message : String(err)}`,
         );
-      }).finally(() => {
-        markCronRun("registry-integrity-check");
+        markCronRunFailure("registry-integrity-check", err);
       });
-  }, intervalMs);
+  };
+
+  // INF-1263 AC3: kick off a first check immediately so deploy churn cannot
+  // starve it until the first interval tick.
+  setTimeout(tick, 0);
+  const timer = setInterval(tick, intervalMs);
 
   timer.unref();
 

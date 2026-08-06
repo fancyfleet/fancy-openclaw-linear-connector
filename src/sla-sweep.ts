@@ -23,7 +23,7 @@ import yaml from "js-yaml";
 import { getWorkflowId, getCurrentState, type WorkflowDef } from "./workflow-gate.js";
 import { isManagedBarrierFromLabels } from "./barrier.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
-import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
+import { registerCron, formatIntervalMs, markCronRunSuccess, markCronRunFailure } from "./cron/registry.js";
 
 /**
  * INF-719: page size for the paginated wf:* sweep. Unpaginated issues() is
@@ -358,16 +358,27 @@ const DEFAULT_CADENCE_MS = 5 * 60 * 1000; // 5 minutes
 export function registerSlaSweepCron(opts: SlaSweepOptions): ReturnType<typeof setInterval> {
   const cadenceMs = opts.cadenceMs ?? DEFAULT_CADENCE_MS;
   registerCron("sla-sweep", `every ${formatIntervalMs(cadenceMs)}`);
-  const timer = setInterval(() => {
-    runSlaSweep(opts).catch((err) => {
-      // Sweep errors are non-fatal (result.errors captures per-ticket issues),
-      // but a whole-sweep failure (e.g. unreadable workflowDefPath) must not
-      // be silent — that would be dead-code-in-prod with a registry entry.
-      console.error(`[sla-sweep] sweep failed: ${err instanceof Error ? err.message : String(err)}`);
-    }).finally(() => {
-      markCronRun("sla-sweep");
-    });
-  }, cadenceMs);
+  const tick = () => {
+    runSlaSweep(opts)
+      .then((result) => {
+        if (result.errors.length > 0) {
+          markCronRunFailure("sla-sweep", result.errors.map((e) => (e instanceof Error ? e.message : String(e))).join("; "));
+        } else {
+          markCronRunSuccess("sla-sweep");
+        }
+      })
+      .catch((err) => {
+        markCronRunFailure("sla-sweep", err);
+        // Sweep errors are non-fatal (result.errors captures per-ticket issues),
+        // but a whole-sweep failure (e.g. unreadable workflowDefPath) must not
+        // be silent — that would be dead-code-in-prod with a registry entry.
+        console.error(`[sla-sweep] sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+  };
+  // INF-1263 AC3: kick off a first sweep immediately so deploy churn cannot
+  // starve it until the first interval tick.
+  setTimeout(tick, 0);
+  const timer = setInterval(tick, cadenceMs);
   if (typeof timer.unref === "function") timer.unref();
   return timer;
 }

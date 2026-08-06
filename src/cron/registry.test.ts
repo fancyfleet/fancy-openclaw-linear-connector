@@ -128,6 +128,62 @@ function getStaleCronsForTest(opts: { now: Date; stalenessMultiplier?: number })
   return fn!(opts);
 }
 
+type CronOutcome = "success" | "fail" | null;
+type CronOutcomeEntry = {
+  name: string;
+  lastRunAt: string | null;
+  lastOutcome: CronOutcome;
+  lastError: string | null;
+  failureStreak: number;
+};
+
+type CriticalCronFailure = {
+  name: string;
+  schedule: string;
+  lastOutcome: "fail";
+  lastError: string;
+  failureStreak: number;
+  severity: "critical";
+};
+
+function getOutcomeApiForTest() {
+  // INF-1263 contract introduced by these RED tests:
+  // - markCronRunSuccess(name, now?) records a successful run, clears lastError,
+  //   resets failureStreak to 0, and updates lastRunAt.
+  // - markCronRunFailure(name, error, now?) records a failed run, stores the
+  //   human-readable error message in lastError, increments failureStreak, and
+  //   updates lastRunAt.
+  // - getRegisteredCrons() entries expose lastOutcome, lastError, and
+  //   failureStreak so /health can surface run outcome without waiting for the
+  //   next trigger.
+  // - getCriticalCronFailures({ failureThreshold }) returns crons whose
+  //   consecutive failureStreak has reached the configured threshold.
+  const api = cronRegistry as unknown as {
+    markCronRunSuccess?: (name: string, now?: Date) => void;
+    markCronRunFailure?: (name: string, error: unknown, now?: Date) => void;
+    getCriticalCronFailures?: (opts: { failureThreshold: number }) => CriticalCronFailure[];
+  };
+  expect(api.markCronRunSuccess).toEqual(expect.any(Function));
+  expect(api.markCronRunFailure).toEqual(expect.any(Function));
+  expect(api.getCriticalCronFailures).toEqual(expect.any(Function));
+  return {
+    markCronRunSuccess: api.markCronRunSuccess!,
+    markCronRunFailure: api.markCronRunFailure!,
+    getCriticalCronFailures: api.getCriticalCronFailures!,
+  };
+}
+
+function getCronOutcomeEntryForTest(name: string): CronOutcomeEntry {
+  const entry = getRegisteredCrons().find((cron) => cron.name === name) as CronOutcomeEntry | undefined;
+  expect(entry).toBeDefined();
+  expect(entry).toEqual(expect.objectContaining({
+    lastOutcome: expect.anything(),
+    failureStreak: expect.any(Number),
+  }));
+  expect(entry).toHaveProperty("lastError");
+  return entry!;
+}
+
 describe("INF-339 stale cron detection", () => {
   beforeEach(() => {
     resetCronRegistryForTest();
@@ -252,6 +308,66 @@ describe("INF-339 stale cron detection", () => {
         overdueByMs: 60_000,
       },
     ]);
+  });
+});
+
+describe("INF-1263 cron run outcome tracking and failure streak escalation", () => {
+  beforeEach(() => resetCronRegistryForTest());
+  afterEach(() => resetCronRegistryForTest());
+
+  test("AC1/AC7: registry records success outcome, clears error, and exposes streak fields per cron", () => {
+    const { markCronRunSuccess } = getOutcomeApiForTest();
+    registerCron("outcome-driver", "every 1m");
+
+    markCronRunSuccess("outcome-driver", new Date("2026-08-05T12:00:00.000Z"));
+
+    expect(getCronOutcomeEntryForTest("outcome-driver")).toEqual(expect.objectContaining({
+      name: "outcome-driver",
+      lastRunAt: "2026-08-05T12:00:00.000Z",
+      lastOutcome: "success",
+      lastError: null,
+      failureStreak: 0,
+    }));
+  });
+
+  test("AC1/AC2/AC7: registry records failed outcome, error message, and consecutive failure streak", () => {
+    const { markCronRunFailure } = getOutcomeApiForTest();
+    registerCron("failing-driver", "every 1m");
+
+    markCronRunFailure("failing-driver", new Error("Linear API 503"), new Date("2026-08-05T12:00:00.000Z"));
+    markCronRunFailure("failing-driver", "timeout waiting for Linear", new Date("2026-08-05T12:01:00.000Z"));
+
+    expect(getCronOutcomeEntryForTest("failing-driver")).toEqual(expect.objectContaining({
+      name: "failing-driver",
+      lastRunAt: "2026-08-05T12:01:00.000Z",
+      lastOutcome: "fail",
+      lastError: "timeout waiting for Linear",
+      failureStreak: 2,
+    }));
+  });
+
+  test("AC2/AC5: N-in-a-row failures surface as critical and a success resets the streak", () => {
+    const { markCronRunSuccess, markCronRunFailure, getCriticalCronFailures } = getOutcomeApiForTest();
+    registerCron("flaky-driver", "every 1m");
+
+    markCronRunFailure("flaky-driver", new Error("first failure"), new Date("2026-08-05T12:00:00.000Z"));
+    markCronRunFailure("flaky-driver", new Error("second failure"), new Date("2026-08-05T12:01:00.000Z"));
+    expect(getCriticalCronFailures({ failureThreshold: 3 })).toEqual([]);
+
+    markCronRunFailure("flaky-driver", new Error("third failure"), new Date("2026-08-05T12:02:00.000Z"));
+    expect(getCriticalCronFailures({ failureThreshold: 3 })).toEqual([
+      expect.objectContaining({
+        name: "flaky-driver",
+        lastOutcome: "fail",
+        lastError: "third failure",
+        failureStreak: 3,
+        severity: "critical",
+      }),
+    ]);
+
+    markCronRunSuccess("flaky-driver", new Date("2026-08-05T12:03:00.000Z"));
+    expect(getCronOutcomeEntryForTest("flaky-driver").failureStreak).toBe(0);
+    expect(getCriticalCronFailures({ failureThreshold: 3 })).toEqual([]);
   });
 });
 

@@ -12,7 +12,7 @@
 
 import { createModuleLogger } from "../logging.js";
 import { resolveServiceCredential } from "../service-credential.js";
-import { formatIntervalMs, registerCron, markCronRun } from "./registry.js";
+import { formatIntervalMs, registerCron, markCronRunSuccess, markCronRunFailure } from "./registry.js";
 import {
   LeakedCredentialSweep,
   type LinearSweepApi,
@@ -187,7 +187,13 @@ export function registerLeakedCredentialSweepCron(options?: LeakedCredSweepCronO
     linear: createSweepLinearApi(options?.linearToken),
     config: { lookbackDays, pollIntervalMs, maxReopensPerCycle },
   });
-  sweep.start(() => markCronRun("leaked-credential-sweep"));
+  sweep.start((result) => {
+    if (result && result.errors.length > 0) {
+      markCronRunFailure("leaked-credential-sweep", result.errors.join("; "));
+    } else {
+      markCronRunSuccess("leaked-credential-sweep");
+    }
+  });
   log.info(`leaked-credential reopen sweep armed — lookbackDays=${lookbackDays} pollInterval=${formatIntervalMs(pollIntervalMs)}`);
   return sweep;
 }

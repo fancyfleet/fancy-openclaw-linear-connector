@@ -16,7 +16,7 @@
 
 import { OperationalEventStore } from "../store/operational-event-store.js";
 import { DispatchAckTracker } from "../bag/dispatch-ack-tracker.js";
-import { registerCron, formatIntervalMs, markCronRun } from "../cron/registry.js";
+import { registerCron, formatIntervalMs, markCronRunSuccess } from "../cron/registry.js";
 import { createModuleLogger } from "../logging.js";
 import {
   deliverWithAck,
@@ -55,10 +55,14 @@ export class DispatchDeliveryScheduler {
   start(): void {
     if (this.active) return;
     this.active = true;
-    this.heartbeat = setInterval(() => {
+    const beat = () => {
       // Liveness heartbeat only — the retry loop runs inline in dispatch().
-      markCronRun("dispatch-delivery-scheduler");
-    }, this.heartbeatMs);
+      markCronRunSuccess("dispatch-delivery-scheduler");
+    };
+    // INF-1263 AC3: kick off an immediate heartbeat so deploy churn cannot
+    // starve liveness until the first interval tick.
+    setTimeout(beat, 0);
+    this.heartbeat = setInterval(beat, this.heartbeatMs);
     this.heartbeat.unref?.();
     registerCron(
       "dispatch-delivery-scheduler",

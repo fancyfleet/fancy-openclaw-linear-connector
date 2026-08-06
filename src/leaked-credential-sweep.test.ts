@@ -2,13 +2,16 @@
  * INF-529: unit tests for the leaked-credential reopen sweep (Layer 2).
  */
 
-import { describe, it, expect } from "@jest/globals";
+import { afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals";
 import {
   LeakedCredentialSweep,
   REOPEN_MARKER,
   type LinearSweepApi,
   type SweepIssue,
 } from "./leaked-credential-sweep.js";
+import { getRegisteredCrons, resetCronRegistryForTest } from "./cron/registry.js";
+import * as cronRegistry from "./cron/registry.js";
+import { registerLeakedCredentialSweepCron } from "./cron/leaked-credential-sweep-cron.js";
 
 class FakeApi implements LinearSweepApi {
   reopened: string[] = [];
@@ -37,6 +40,29 @@ const CONFIG = { lookbackDays: 14, pollIntervalMs: 3_600_000, maxReopensPerCycle
 
 function sweep(api: LinearSweepApi, cfgOverrides: Partial<typeof CONFIG> = {}) {
   return new LeakedCredentialSweep({ linear: api, config: { ...CONFIG, ...cfgOverrides } });
+}
+
+type CronOutcomeEntry = {
+  name: string;
+  lastRunAt: string | null;
+  lastOutcome: "success" | "fail" | null;
+  lastError: string | null;
+  failureStreak: number;
+};
+
+function getOutcomeEntryForTest(name: string): CronOutcomeEntry {
+  // INF-1263 AC1/AC4/AC7 contract: credential-sweep failures must be visible
+  // in the real cron registry as lastOutcome="fail", lastError=<message>, and
+  // failureStreak>=1. A captured SweepCycleResult.errors count alone is not
+  // observable at ac-validate.
+  const entry = getRegisteredCrons().find((cron) => cron.name === name) as CronOutcomeEntry | undefined;
+  expect(entry).toBeDefined();
+  expect(entry).toEqual(expect.objectContaining({
+    lastOutcome: expect.anything(),
+    failureStreak: expect.any(Number),
+  }));
+  expect(entry).toHaveProperty("lastError");
+  return entry!;
 }
 
 describe("LeakedCredentialSweep.runCycle", () => {
@@ -105,5 +131,87 @@ describe("LeakedCredentialSweep.runCycle", () => {
     expect(r.skippedConfirmed).toBe(1);
     expect(r.skippedAlreadyReopened).toBe(1);
     expect(api.reopened.sort()).toEqual(["reopen1", "reopen2"]);
+  });
+});
+
+describe("INF-1263 leaked-credential sweep cron reliability", () => {
+  beforeEach(() => {
+    resetCronRegistryForTest();
+    jest.restoreAllMocks();
+  });
+
+  afterEach(() => {
+    resetCronRegistryForTest();
+    jest.restoreAllMocks();
+  });
+
+  test("AC3/AC5: start() queues a first run immediately instead of waiting for the interval", async () => {
+    const api = new FakeApi([]);
+    const firstRun = jest.fn();
+    const s = sweep(api, { pollIntervalMs: 24 * 60 * 60 * 1000 });
+
+    s.start(firstRun);
+
+    expect(firstRun).not.toHaveBeenCalled();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(firstRun).toHaveBeenCalledTimes(1);
+    s.stop();
+  });
+
+  test("AC4/AC5: registrar startup kick marks leaked-credential-sweep as run after bootstrap", async () => {
+    jest.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: {
+          issues: {
+            nodes: [],
+            pageInfo: { hasNextPage: false, endCursor: null },
+          },
+        },
+      }),
+    } as Response);
+
+    const s = registerLeakedCredentialSweepCron({
+      enabled: true,
+      linearToken: "test-linear-token",
+      pollIntervalMs: 24 * 60 * 60 * 1000,
+    });
+
+    expect(s).not.toBeNull();
+    const armed = getRegisteredCrons().find((cron) => cron.name === "leaked-credential-sweep");
+    expect(armed).toBeDefined();
+    expect(armed!.lastRunAt).toBeNull();
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const ran = getRegisteredCrons().find((cron) => cron.name === "leaked-credential-sweep");
+    expect(ran!.lastRunAt).not.toBeNull();
+    expect(Number.isNaN(Date.parse(ran!.lastRunAt as string))).toBe(false);
+    s?.stop();
+  });
+
+  test("AC1/AC4/AC7: registrar records the fetch failure message in cron outcome state", async () => {
+    const markFailure = (cronRegistry as unknown as {
+      markCronRunFailure?: (name: string, error: unknown, now?: Date) => void;
+    }).markCronRunFailure;
+    expect(markFailure).toEqual(expect.any(Function));
+
+    jest.spyOn(globalThis, "fetch").mockRejectedValue(new Error("credential fetch exploded"));
+
+    const s = registerLeakedCredentialSweepCron({
+      enabled: true,
+      linearToken: "test-linear-token",
+      pollIntervalMs: 24 * 60 * 60 * 1000,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(getOutcomeEntryForTest("leaked-credential-sweep")).toEqual(expect.objectContaining({
+      lastOutcome: "fail",
+      lastError: expect.stringContaining("credential fetch exploded"),
+      failureStreak: 1,
+    }));
+    s?.stop();
   });
 });

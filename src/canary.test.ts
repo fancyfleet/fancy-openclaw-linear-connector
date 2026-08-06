@@ -160,6 +160,11 @@ describe("canary", () => {
       fixtureTicketId: "AI-CANARY",
       proxyUrl: "http://localhost:3456",
     });
+    // INF-1263 AC3: startCanary's initial check is now deferred via
+    // setTimeout(0) (was a synchronous fire-and-forget call) so deploy churn
+    // cannot starve it before the first interval tick. Flush it before
+    // driving the manual sequence below, so it still counts as failure #1.
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     // First 3 failures: no alert yet (threshold)
     const r1 = await runCheck();

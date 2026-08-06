@@ -27,7 +27,7 @@ import { isBarrierState, resolveBarrierTarget } from "../barrier.js";
 import fs from "node:fs/promises";
 import yaml from "js-yaml";
 import { createModuleLogger } from "../logging.js";
-import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
+import { registerCron, formatIntervalMs, markCronRunSuccess, markCronRunFailure } from "./registry.js";
 import { type WorkflowDef } from "../workflow-gate.js";
 import { findOrCreateLabel, LINEAR_API_URL } from "../linear-helpers.js";
 
@@ -530,7 +530,7 @@ export function registerAntiEntropyCron(opts?: {
 
   registerCron("anti-entropy", `every ${formatIntervalMs(intervalMs)}`);
 
-  const timer = setInterval(() => {
+  const tick = () => {
     void (async () => {
       try {
         const result = await runAntiEntropyPass({ authToken });
@@ -543,15 +543,24 @@ export function registerAntiEntropyCron(opts?: {
             `errors=${result.errors.length}`,
           );
         }
+        if (result.errors.length > 0) {
+          markCronRunFailure("anti-entropy", result.errors.join("; "));
+        } else {
+          markCronRunSuccess("anti-entropy");
+        }
       } catch (err) {
         log.error(
           `[anti-entropy] Scheduled pass failed: ${err instanceof Error ? err.message : String(err)}`,
         );
-      } finally {
-        markCronRun("anti-entropy");
+        markCronRunFailure("anti-entropy", err);
       }
     })();
-  }, intervalMs);
+  };
+
+  // INF-1263 AC3: kick off a first pass immediately so deploy churn cannot
+  // starve anti-entropy detection until the first interval tick.
+  setTimeout(tick, 0);
+  const timer = setInterval(tick, intervalMs);
 
   timer.unref();
   return timer;

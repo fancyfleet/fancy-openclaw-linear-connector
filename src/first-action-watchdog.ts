@@ -29,7 +29,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
-import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
+import { registerCron, formatIntervalMs, markCronRunSuccess, markCronRunFailure } from "./cron/registry.js";
 import {
   markFirstActionWatchdogScheduled,
   getFirstActionLadder,
@@ -698,13 +698,22 @@ export function registerFirstActionWatchdogCron(
   registerCron(CRON_NAME, `every ${formatIntervalMs(cadenceMs)}`);
   markFirstActionWatchdogScheduled();
 
-  const timer = setInterval(() => {
-    runFirstActionWatchdogSweep(opts).catch((err) => {
+  const tick = () => {
+    runFirstActionWatchdogSweep(opts).then((result) => {
+      if (result.errors.length > 0) {
+        markCronRunFailure(CRON_NAME, result.errors.map((e) => (e instanceof Error ? e.message : String(e))).join("; "));
+      } else {
+        markCronRunSuccess(CRON_NAME);
+      }
+    }).catch((err) => {
       console.error(`[${CRON_NAME}] sweep failed:`, err);
-    }).finally(() => {
-      markCronRun(CRON_NAME);
+      markCronRunFailure(CRON_NAME, err);
     });
-  }, cadenceMs);
+  };
+  // INF-1263 AC3: kick off a first sweep immediately so deploy churn cannot
+  // starve it until the first interval tick.
+  setTimeout(tick, 0);
+  const timer = setInterval(tick, cadenceMs);
   if (typeof timer.unref === "function") timer.unref();
   return timer;
 }

@@ -27,7 +27,7 @@ import { createModuleLogger } from "./logging.js";
 import type { MutationAuditStore, MutationAuditRecord, ChangeType } from "./store/mutation-audit-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import { getAlertBus } from "./alerts/alert-bus.js";
-import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
+import { registerCron, formatIntervalMs, markCronRunSuccess, markCronRunFailure } from "./cron/registry.js";
 
 const log = createModuleLogger("oob-reconcile");
 
@@ -202,12 +202,15 @@ export function registerOobReconcileCron(
   registerCron("oob-reconcile-sweep", formatIntervalMs(interval));
 
   const runSweep = (): void => {
-    reconcileOobMutations(store, { operationalEventStore }).catch((err) => {
-      const msg = err instanceof Error ? err.message : String(err);
-      log.error(`reconcile sweep failed: ${msg}`);
-    }).finally(() => {
-      markCronRun("oob-reconcile-sweep");
-    });
+    reconcileOobMutations(store, { operationalEventStore })
+      .then(() => {
+        markCronRunSuccess("oob-reconcile-sweep");
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.error(`reconcile sweep failed: ${msg}`);
+        markCronRunFailure("oob-reconcile-sweep", err);
+      });
   };
 
   // INF-1081: fire a first run shortly after startup (unref'd) so the sweep

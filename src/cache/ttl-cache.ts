@@ -11,7 +11,7 @@
  * AC3 — flushAll() clears the entire cache
  */
 
-import { registerCron, markCronRun, formatIntervalMs } from "../cron/registry.js";
+import { registerCron, markCronRunSuccess, formatIntervalMs } from "../cron/registry.js";
 
 // ── Module-level liveness state ───────────────────────────────────────────────
 // These are set by the TtlCache constructor and the bootstrap-wiring helpers so
@@ -240,7 +240,7 @@ export function markCacheFlushRouteMounted(): void {
  * Register and start the periodic TTL invalidation cron. Calls
  * `registerCron` to make the timer visible in /health.crons, then starts
  * the interval. Each tick purges expired entries from the cache and stamps
- * lastRunAt via markCronRun.
+ * lastRunAt via markCronRunSuccess.
  *
  * The cache instance is passed explicitly so the /health handler and flush
  * route can reference the same object without a module-level singleton.
@@ -252,10 +252,14 @@ export function registerTtlInvalidationCron(
   _ttlSchedulerActive = true;
   registerCron("ttl-cache-invalidation", `every ${formatIntervalMs(intervalMs)}`);
 
-  const timer = setInterval(() => {
+  const tick = () => {
     cache.purgeExpired();
-    markCronRun("ttl-cache-invalidation");
-  }, intervalMs);
+    markCronRunSuccess("ttl-cache-invalidation");
+  };
+  // INF-1263 AC3: kick off an immediate purge so deploy churn cannot starve
+  // invalidation until the first interval tick.
+  setTimeout(tick, 0);
+  const timer = setInterval(tick, intervalMs);
   timer.unref();
 
   return timer;

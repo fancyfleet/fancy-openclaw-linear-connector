@@ -25,7 +25,7 @@
  * wires the same contract to live Linear I/O.
  */
 
-import { registerCron, markCronRun, formatIntervalMs } from "./cron/registry.js";
+import { registerCron, markCronRunSuccess, markCronRunFailure, formatIntervalMs } from "./cron/registry.js";
 import { getFirstActionWatchdogState } from "./first-action-watchdog-state.js";
 import { createModuleLogger } from "./logging.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
@@ -264,8 +264,9 @@ export function registerNativeStateReconcilerCron(
   liveness.lastRunAt = new Date().toISOString();
 
   const runOnce = async () => {
+    let res: NativeStateReconcilerResult | undefined;
     try {
-      const res = await runNativeStateReconcilerSweep(opts);
+      res = await runNativeStateReconcilerSweep(opts);
       liveness.lastResult = res;
       if (res.failed > 0) {
         for (const e of res.errors) {
@@ -277,13 +278,23 @@ export function registerNativeStateReconcilerCron(
       }
     } catch (err) {
       log.error(`native-state-reconciler: sweep failed: ${errMsg(err)}`);
+      markCronRunFailure(CRON_NAME, err);
     } finally {
       // Stamp the run and refresh /health liveness even on a thrown sweep.
       liveness.lastRunAt = new Date().toISOString();
-      markCronRun(CRON_NAME);
+      if (res) {
+        if (res.failed > 0) {
+          markCronRunFailure(CRON_NAME, res.errors.map((e) => e.message).join("; "));
+        } else {
+          markCronRunSuccess(CRON_NAME);
+        }
+      }
     }
   };
 
+  // INF-1263 AC3: kick off a first sweep immediately so deploy churn cannot
+  // starve it until the first interval tick.
+  setTimeout(() => void runOnce(), 0);
   const timer = setInterval(() => void runOnce(), cadenceMs);
   timer.unref();
 

@@ -8,7 +8,7 @@
  */
 
 import { createModuleLogger } from "../logging.js";
-import { markCronRun } from "../cron/registry.js";
+import { markCronRunSuccess, markCronRunFailure } from "../cron/registry.js";
 import type { DeployVerdict, DeployVerdictApi } from "./deploy-verdict.js";
 
 const log = createModuleLogger("done-ticket-detector", "info");
@@ -94,15 +94,31 @@ export class DoneTicketDetector {
       `graceHours=${config.graceHours} pollInterval=${config.pollIntervalMs}ms ` +
       `repoPath=${config.repoPath}`,
     );
-    this.timer = setInterval(() => {
-      this.runCycle().catch((err) => {
-        log.error(
-          `Done ticket detector cycle error: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }).finally(() => {
-        markCronRun("done-ticket-detector");
-      });
-    }, config.pollIntervalMs);
+    // INF-1263 AC3: self-rescheduling setTimeout instead of setInterval — the
+    // first cycle fires immediately (deploy churn cannot starve it until a
+    // fixed-interval tick), and each subsequent cycle is scheduled only after
+    // the previous one settles, so a single timer handle exists at any time.
+    const runCycleTick = () => {
+      this.runCycle()
+        .then((result) => {
+          if (result.errors.length > 0) {
+            markCronRunFailure("done-ticket-detector", result.errors.join("; "));
+          } else {
+            markCronRunSuccess("done-ticket-detector");
+          }
+        })
+        .catch((err) => {
+          log.error(
+            `Done ticket detector cycle error: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          markCronRunFailure("done-ticket-detector", err);
+        })
+        .finally(() => {
+          this.timer = setTimeout(runCycleTick, config.pollIntervalMs);
+          this.timer.unref();
+        });
+    };
+    this.timer = setTimeout(runCycleTick, 0);
     this.timer.unref();
   }
 

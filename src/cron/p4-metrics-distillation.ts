@@ -37,7 +37,7 @@ import {
 } from "../proposal/generated-proposal-adapter.js";
 import { defaultGuidanceDir, instanceConfigRoot } from "../instance-config.js";
 import { createModuleLogger } from "../logging.js";
-import { registerCron, markCronRun, formatIntervalMs } from "./registry.js";
+import { registerCron, markCronRunSuccess, markCronRunFailure, formatIntervalMs } from "./registry.js";
 
 const log = createModuleLogger("p4-metrics-distillation");
 
@@ -188,13 +188,24 @@ export function registerDistillationCron(
 ): void {
   const intervalMs = DEFAULT_INTERVAL_MS;
   registerCron(DISTILLATION_CRON_NAME, `every ${formatIntervalMs(intervalMs)}`);
-  const timer = setInterval(() => {
+  const tick = () => {
     runDistillation(observationStore, proposalStore, ctx)
-      .then(() => markCronRun(DISTILLATION_CRON_NAME))
+      .then((result) => {
+        if (result.error) {
+          markCronRunFailure(DISTILLATION_CRON_NAME, result.error);
+        } else {
+          markCronRunSuccess(DISTILLATION_CRON_NAME);
+        }
+      })
       .catch((err) => {
+        markCronRunFailure(DISTILLATION_CRON_NAME, err);
         log.error(`[P4-C3] Scheduled distillation failed: ${err instanceof Error ? err.message : String(err)}`);
       });
-  }, intervalMs);
+  };
+  // INF-1263 AC3: kick off a first distillation immediately so deploy churn
+  // cannot starve it until the first interval tick.
+  setTimeout(tick, 0);
+  const timer = setInterval(tick, intervalMs);
   timer.unref();
   log.info(`[P4-C3] Distillation scheduled every ${intervalMs}ms (P4_DISTILL_INTERVAL=${process.env.P4_DISTILL_INTERVAL ?? "1h"})`);
 }

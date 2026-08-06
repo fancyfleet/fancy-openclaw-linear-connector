@@ -79,7 +79,7 @@ import { DispatchInFlightStore } from "./store/dispatch-inflight-store.js";
 import { SessionSpawnIdempotencyStore } from "./store/session-spawn-idempotency-store.js";
 import { ProposalStore } from "./store/proposal-store.js";
 import { clearAcRecordStore } from "./ac-record-store.js";
-import { getCronStalenessMultiplierFromEnv, getRegisteredCrons, getStaleCrons } from "./cron/registry.js";
+import { getCriticalCronFailures, getCronStalenessMultiplierFromEnv, getRegisteredCrons, getStaleCrons } from "./cron/registry.js";
 import { evaluateCronStartupReadiness, parseCronStartupGraceMs } from "./cron/startup-readiness.js";
 import { buildRequiredCronHealth, getRequiredCronRetirements, isRequiredCron } from "./cron/required-crons.js";
 import { getRescueSweepState } from "./rescue-sweep-state.js";
@@ -119,10 +119,18 @@ const log = createModuleLogger("server", "info");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3100;
 const DEPLOYMENT_NAME = process.env.DEPLOYMENT_NAME ?? "fancymatt";
 const DEFAULT_CRITICAL_STALE_CRON_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_CRON_FAILURE_THRESHOLD = 3;
 
 function parseCriticalStaleCronMs(env: NodeJS.ProcessEnv = process.env): number {
   const parsed = Number(env.CRON_CRITICAL_STALE_MS);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_CRITICAL_STALE_CRON_MS;
+}
+
+// INF-1263 AC2: consecutive-failure threshold before a cron's failure streak
+// escalates to a critical /health warning (mirrors parseCriticalStaleCronMs).
+function parseCronFailureThreshold(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number(env.CRON_FAILURE_THRESHOLD);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_CRON_FAILURE_THRESHOLD;
 }
 
 // ── Startup commit (exposed via /health for deploy verification) ─────
@@ -567,7 +575,14 @@ export function createApp(options?: CreateAppOptions) {
         ...cron,
         ...(isRequiredCron(cron.name) ? { required: true } : {}),
       }));
-    const healthy = agents.length > 0 && cronReadiness.status === "ok" && criticalStaleCrons.length === 0;
+    // INF-1263 AC2: crons that have failed N-in-a-row (default 3), not merely
+    // gone dark. This is distinct from criticalStaleCrons (age-based) — a
+    // cron that fires on schedule but errors every time never goes stale.
+    const criticalCronFailures = getCriticalCronFailures({ failureThreshold: parseCronFailureThreshold() });
+    const healthy = agents.length > 0
+      && cronReadiness.status === "ok"
+      && criticalStaleCrons.length === 0
+      && criticalCronFailures.length === 0;
 
     // AI-2008 AC3: loud dispatch-undeliverable surfacing. Every dispatch that
     // exhausted its bounded retries is a first-class operational event; project
@@ -596,6 +611,15 @@ export function createApp(options?: CreateAppOptions) {
       lastRunAt: cron.lastRunAt,
       overdueByMs: cron.overdueByMs,
       ...(cron.required === true ? { required: true } : {}),
+    })));
+    // INF-1263 AC2: N-in-a-row cron failures are loud at /health, the same
+    // way critical-stale-cron already is — folded into warnings + healthy.
+    warnings.push(...criticalCronFailures.map((failure) => ({
+      kind: "critical-cron-failure",
+      cron: failure.name,
+      schedule: failure.schedule,
+      lastError: failure.lastError,
+      failureStreak: failure.failureStreak,
     })));
 
     res.status(healthy ? 200 : 503).json({
@@ -640,6 +664,9 @@ export function createApp(options?: CreateAppOptions) {
       crons,
       staleCrons,
       criticalStaleCrons,
+      // INF-1263 AC2/AC7: crons whose consecutive-failure streak has reached
+      // the escalation threshold, observable without waiting for a trigger.
+      criticalCronFailures,
       requiredCrons,
       cronReadiness,
       // AI-2036 AC1.6: observation write-path liveness. `wired`/`subscribed` are
@@ -1581,7 +1608,7 @@ export function createApp(options?: CreateAppOptions) {
   // its own. unref() so it never holds the process open; try/catch so a sweep
   // error can never crash the server loop.
   const SESSION_SPAWN_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
-  const sessionSpawnSweepTimer = setInterval(() => {
+  const sessionSpawnSweepTick = () => {
     try {
       const { released } = sessionSpawnStore.sweepExpiredClaims();
       if (released > 0) {
@@ -1590,7 +1617,11 @@ export function createApp(options?: CreateAppOptions) {
     } catch (err) {
       log.warn(`session-spawn claim sweep failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-  }, SESSION_SPAWN_SWEEP_INTERVAL_MS);
+  };
+  // INF-1263 AC3: kick off a first sweep immediately so deploy churn cannot
+  // starve it until the first interval tick.
+  setTimeout(sessionSpawnSweepTick, 0);
+  const sessionSpawnSweepTimer = setInterval(sessionSpawnSweepTick, SESSION_SPAWN_SWEEP_INTERVAL_MS);
   sessionSpawnSweepTimer.unref();
 
   // ── Stuck-delegate detector (AI-1578 / AI-1451) ──────────────────────

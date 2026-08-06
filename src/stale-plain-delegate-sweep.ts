@@ -26,7 +26,7 @@
  */
 
 import { createModuleLogger } from "./logging.js";
-import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
+import { registerCron, formatIntervalMs, markCronRunSuccess, markCronRunFailure } from "./cron/registry.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
 import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
@@ -426,7 +426,7 @@ export function registerStalePlainDelegateCron(opts: {
     `every ${formatIntervalMs(intervalMs)} (stale=${formatIntervalMs(staleTimeoutMs)})`,
   );
 
-  const timer = setInterval(() => {
+  const tick = () => {
     const store = opts.operationalEventStore ?? new OperationalEventStore(":memory:");
     const alert = opts.alertBus ?? getAlertBus();
 
@@ -439,12 +439,22 @@ export function registerStalePlainDelegateCron(opts: {
       staleTimeoutMs,
       fetchFn: opts.fetchFn,
       postLinearComment: opts.postLinearComment,
-    }).then(() => {
-      markCronRun("stale-plain-delegate-sweep");
+    }).then((result) => {
+      if (result.errors.length > 0) {
+        markCronRunFailure("stale-plain-delegate-sweep", result.errors.join("; "));
+      } else {
+        markCronRunSuccess("stale-plain-delegate-sweep");
+      }
     }).catch((err: unknown) => {
+      markCronRunFailure("stale-plain-delegate-sweep", err);
       log.error(`stale-plain-delegate: sweep error: ${err instanceof Error ? err.message : String(err)}`);
     });
-  }, intervalMs);
+  };
+
+  // INF-1263 AC3: kick off a first sweep immediately so deploy churn cannot
+  // starve it until the first interval tick.
+  setTimeout(tick, 0);
+  const timer = setInterval(tick, intervalMs);
 
   timer.unref();
   log.info(`stale-plain-delegate: cron registered (${intervalMs}ms, stale=${staleTimeoutMs}ms)`);

@@ -96,14 +96,14 @@ export class LeakedCredentialSweep {
     this.deps = deps;
   }
 
-  start(onCycle?: () => void): void {
+  start(onCycle?: (result?: SweepCycleResult) => void): void {
     if (this.timer) return;
     const { config } = this.deps;
     log.info(
       `Leaked-credential reopen sweep started — lookbackDays=${config.lookbackDays} ` +
       `pollInterval=${config.pollIntervalMs}ms maxReopensPerCycle=${config.maxReopensPerCycle}`,
     );
-    this.timer = setInterval(() => {
+    const runOneCycle = () => {
       this.runCycle()
         .then((r) => {
           if (r.reopened > 0 || r.errors.length > 0) {
@@ -112,12 +112,18 @@ export class LeakedCredentialSweep {
               `skippedConfirmed=${r.skippedConfirmed} errors=${r.errors.length}`,
             );
           }
+          onCycle?.(r);
         })
         .catch((err) => {
           log.error(`sweep cycle error: ${err instanceof Error ? err.message : String(err)}`);
-        })
-        .finally(() => onCycle?.());
-    }, config.pollIntervalMs);
+          onCycle?.();
+        });
+    };
+    // INF-1263 AC3/AC5: kick off a first cycle immediately instead of waiting
+    // for the first interval tick, so deploy churn (a restart shortly before
+    // the next scheduled tick) cannot starve the sweep indefinitely.
+    setTimeout(runOneCycle, 0);
+    this.timer = setInterval(runOneCycle, config.pollIntervalMs);
     this.timer.unref();
   }
 

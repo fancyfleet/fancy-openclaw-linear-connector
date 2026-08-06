@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { createModuleLogger } from "./logging.js";
 import { notify } from "./alerts/alert-bus.js";
-import { registerCron, markCronRun, formatIntervalMs } from "./cron/registry.js";
+import { registerCron, markCronRunSuccess, markCronRunFailure, formatIntervalMs } from "./cron/registry.js";
 
 const log = createModuleLogger("deploy-drift");
 
@@ -107,7 +107,7 @@ async function performCheck(): Promise<DeployDriftCheckResult> {
     mainCommit: result.mainCommit,
     lastCheckAt: result.checkedAt,
   };
-  markCronRun(CRON_NAME);
+  markCronRunSuccess(CRON_NAME);
   return result;
 }
 
@@ -118,14 +118,20 @@ export function registerDeployDriftCron(options: DeployDriftCronOptions): void {
   registerCron(CRON_NAME, `every ${formatIntervalMs(cadenceMs)}`);
   healthState = { ...healthState, scheduled: true };
   // Fire an immediate check so /health is observable without waiting for the
-  // cadence to elapse (AC6) — not awaited; production callers see it land on
-  // the next event-loop tick, tests use runDeployDriftCheckForTest() instead.
-  performCheck().catch((err) => {
-    log.error(`[deploy-drift] initial check failed: ${err instanceof Error ? err.message : String(err)}`);
-  });
+  // cadence to elapse (AC6), and so deploy churn can't starve the first check
+  // until the interval's first tick (INF-1263 AC3) — not awaited; production
+  // callers see it land on the next event-loop tick, tests use
+  // runDeployDriftCheckForTest() instead.
+  setTimeout(() => {
+    performCheck().catch((err) => {
+      log.error(`[deploy-drift] initial check failed: ${err instanceof Error ? err.message : String(err)}`);
+      markCronRunFailure(CRON_NAME, err);
+    });
+  }, 0);
   const timer = setInterval(() => {
     performCheck().catch((err) => {
       log.error(`[deploy-drift] scheduled check failed: ${err instanceof Error ? err.message : String(err)}`);
+      markCronRunFailure(CRON_NAME, err);
     });
   }, cadenceMs);
   timer.unref();
