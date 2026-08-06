@@ -121,6 +121,7 @@ class ValidationNudgeStore {
     ticketId: string,
     stateEnteredAtMs: number,
     cooldownMs: number,
+    nowMs: number = Date.now(),
   ): { nudgeDue: boolean; lastNudgeAgeMs: number | null } {
     const acquire = this.db.transaction((): { nudgeDue: boolean; lastNudgeAgeMs: number | null } => {
       const row = this.db
@@ -134,12 +135,12 @@ class ValidationNudgeStore {
           .prepare(
             "INSERT INTO validation_nudge (ticket_id, state_entered_at_ms, last_nudge_at, nudge_count) VALUES (?, ?, ?, 1)",
           )
-          .run(ticketId, stateEnteredAtMs, new Date().toISOString());
+          .run(ticketId, stateEnteredAtMs, new Date(nowMs).toISOString());
         return { nudgeDue: true, lastNudgeAgeMs: null };
       }
 
-      const lastNudgeMs = new Date(row.last_nudge_at + "Z").getTime();
-      const ageMs = Date.now() - lastNudgeMs;
+      const lastNudgeMs = new Date(row.last_nudge_at).getTime();
+      const ageMs = nowMs - lastNudgeMs;
 
       if (ageMs < cooldownMs) {
         return { nudgeDue: false, lastNudgeAgeMs: ageMs };
@@ -149,7 +150,7 @@ class ValidationNudgeStore {
         .prepare(
           "UPDATE validation_nudge SET last_nudge_at = ?, nudge_count = nudge_count + 1 WHERE ticket_id = ? AND state_entered_at_ms = ?",
         )
-        .run(new Date().toISOString(), ticketId, stateEnteredAtMs);
+        .run(new Date(nowMs).toISOString(), ticketId, stateEnteredAtMs);
       return { nudgeDue: true, lastNudgeAgeMs: ageMs };
     });
 
@@ -347,6 +348,7 @@ export async function runValidationWatchdog(
           node.identifier,
           stateEnteredAtMs,
           cooldownMs,
+          nowMs,
         );
         if (!nudgeDue) continue;
 
