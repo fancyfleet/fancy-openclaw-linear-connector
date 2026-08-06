@@ -19,6 +19,20 @@ export interface DeployDriftCheckResult {
   checkedAt: string;
 }
 
+/**
+ * Live and main commits are independently-abbreviated git SHAs of possibly
+ * different lengths (resolveStartupCommit's `git rev-parse --short HEAD` picks
+ * a dynamic disambiguation length; resolveMainCommit() hardcodes 7 chars) — the
+ * same commit can legitimately show up as "34e8130c" on one side and "34e8130"
+ * on the other. Compare on the shorter common prefix rather than raw equality
+ * so that length alone never manufactures a false drift alert.
+ */
+function commitsMatch(a: string, b: string): boolean {
+  const len = Math.min(a.length, b.length);
+  if (len === 0) return a === b;
+  return a.slice(0, len) === b.slice(0, len);
+}
+
 export async function checkDeployDrift(opts: DeployDriftCheckOptions): Promise<DeployDriftCheckResult> {
   const checkedAt = new Date().toISOString();
   const [liveResult, mainResult] = await Promise.allSettled([opts.getLiveCommit(), opts.getMainCommit()]);
@@ -27,7 +41,7 @@ export async function checkDeployDrift(opts: DeployDriftCheckOptions): Promise<D
   const resolvedBoth = liveResult.status === "fulfilled" && mainResult.status === "fulfilled";
   // A failure to resolve either side must NEVER collapse to driftDetected: false —
   // that would be a false-positive "healthy" during an outage of the check itself.
-  const driftDetected = resolvedBoth ? liveCommit !== mainCommit : true;
+  const driftDetected = resolvedBoth ? !commitsMatch(liveCommit as string, mainCommit as string) : true;
   const alertRaised = driftDetected;
   const result: DeployDriftCheckResult = { liveCommit, mainCommit, driftDetected, alertRaised, checkedAt };
   if (alertRaised) {
