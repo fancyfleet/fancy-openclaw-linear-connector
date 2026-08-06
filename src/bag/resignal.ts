@@ -3,6 +3,7 @@ import { createModuleLogger } from "../logging.js";
 import { sendWakeUpSignal, MENTION_TICKET_TEMPLATE, type WakeUpConfig } from "./wake-up.js";
 import { PendingWorkBag } from "./pending-work-bag.js";
 import { SessionTracker } from "./session-tracker.js";
+import type { DispatchAckTracker } from "./dispatch-ack-tracker.js";
 import { isLinearIssueActionable, isLinearIssueStillRoutedToAgent, checkLinearIssueRouting, type RoutingReason } from "../linear-actionable.js";
 
 const log = createModuleLogger("resignal", "info");
@@ -52,6 +53,14 @@ export interface ResignalOptions {
    * (`linear-INF-982`), so dedup and tracking remain coherent across version boundaries.
    */
   staleRecoveryKeys?: Map<string, Map<string, string>>;
+  /**
+   * INF-1295: optional ack tracker reference for escalation suppression.
+   * When provided, resignal checks whether a (agent, ticket) pair has been
+   * escalated (automated recovery exhausted) and skips dispatch. This prevents
+   * the blind re-dispatch loop where the watchdog escalates, but the next
+   * webhook event or sweep re-dispatches the same ticket to the same agent.
+   */
+  ackTracker?: DispatchAckTracker;
 }
 
 /**
@@ -76,6 +85,19 @@ export async function resignalPendingTickets(
 
   for (const ticketId of normalizedTickets) {
     try {
+      // INF-1295: skip dispatch for escalated (agent, ticket) pairs.
+      // Escalation means automated recovery has been exhausted — re-dispatching
+      // the same agent for the same ticket would repeat the loop. The ticket
+      // needs human intervention or a different agent, not another blind wake.
+      if (options.ackTracker?.isEscalated(agentId, ticketId)) {
+        log.info(
+          `Resignal suppressed for ${agentId} [${ticketId}] — dispatch is escalated ` +
+          `(automated recovery exhausted, manual intervention required)`,
+        );
+        results.push({ ticketId, dispatched: false });
+        continue;
+      }
+
       // Skip if this ticket already has an active session — don't double-dispatch
       if (sessionTracker.isActiveForTicket(agentId, ticketId)) {
         log.info(`Session already active for ${agentId} [${ticketId}] — skipping resignal`);

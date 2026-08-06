@@ -437,6 +437,24 @@ export class DispatchAckTracker {
   }
 
   /**
+   * Check whether a (agent, ticket) pair is currently escalated.
+   * Escalated dispatches should not be re-dispatched — the loop-suppression
+   * gate (INF-1295) uses this to block blind re-dispatch after automated
+   * recovery has been exhausted.
+   */
+  isEscalated(agentId: string, ticketId: string): boolean {
+    const normalizedId = normalizeSessionKey(ticketId);
+    const row = this.db
+      .prepare(
+        `SELECT 1 FROM dispatch_acks
+         WHERE agent_id = ? AND ticket_id = ? AND ack_status = 'escalated'
+         LIMIT 1`,
+      )
+      .get(agentId, normalizedId);
+    return row !== undefined;
+  }
+
+  /**
    * Mark a dispatch as escalated — max re-signals exhausted, admin action required.
    */
   markEscalated(agentId: string, ticketId: string): void {
