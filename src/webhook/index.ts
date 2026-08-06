@@ -47,6 +47,7 @@ import type { DispatchRecordStore } from "../liveness-channel/dispatch-record-st
 import type { GatewayDispatchAck } from "../liveness-channel/gateway-ack-types.js";
 import { extractRejectedWebhookDiagnostic, WebhookSecretDriftTracker } from "./drift.js";
 import { LINEAR_API_URL } from "../linear-helpers.js";
+import { findNewlyUnblockedTickets } from "../dependency-clear-wake.js";
 
 const log = createModuleLogger("webhook", "info");
 
@@ -981,6 +982,72 @@ export function createWebhookRouter(
               }
             }).catch((err) => {
               log.warn(`Barrier check failed for terminal child ${identifier}: ${err instanceof Error ? err.message : String(err)}`);
+            });
+
+            // INF-1297: Dependency-clear wake — event-driven downstream unblock.
+            // When a ticket reaches terminal, find tickets it was blocking that
+            // are now unblocked and re-dispatch them to their delegates.
+            // Fail-open: errors are logged and never block the terminal prune.
+            findNewlyUnblockedTickets(identifier, barrierToken).then(async (clearResult) => {
+              for (const ticket of clearResult.unblocked) {
+                const ticketSessionKey = normalizeSessionKey(ticket.identifier);
+                const agentName = ticket.delegateName ? getOpenclawAgentName(ticket.delegateName) : null;
+                if (!agentName) {
+                  log.warn(
+                    `dependency-clear-wake: ${ticket.identifier} unblocked but delegate ` +
+                    `'${ticket.delegateName}' not mapped to an openclaw agent`,
+                  );
+                  continue;
+                }
+                if (!bag || !sessionTracker) continue;
+
+                // Add to bag so downstream wake-up mechanisms can see it
+                bag.add(agentName, ticketSessionKey, "Issue", "dependency-clear");
+
+                // Send wake signal via the standard delivery pipeline
+                try {
+                  const agentCfg = getAgent(agentName);
+                  const depClearDeliveryConfig: DeliveryConfig = {
+                    nodeBin: process.execPath,
+                    hooksUrl: agentCfg?.hooksUrl ?? process.env.OPENCLAW_HOOKS_URL,
+                    hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
+                    hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
+                    hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+                  };
+                  const { deliverMessageToAgent: depClearDeliver } = await import("../delivery/index.js");
+                  const wakeResult = await depClearDeliver(agentName, ticketSessionKey,
+                    `[Dependency cleared] ${identifier} is now terminal — ${ticket.identifier} is no longer blocked. ` +
+                    `Run \`linear consider-work ${ticket.identifier}\` to review.`,
+                    depClearDeliveryConfig,
+                  );
+                  log.info(
+                    `dependency-clear-wake: ${ticket.identifier} → ${agentName} ` +
+                    `(unblocked by ${identifier}, dispatched=${wakeResult.dispatched})`,
+                  );
+                  appendOperationalEvent(operationalEventStore, {
+                    outcome: wakeResult.dispatched ? "dependency-clear-wake" : "dependency-clear-failed",
+                    type: event.type,
+                    key: ticketSessionKey,
+                    sessionKey: ticketSessionKey,
+                    deliveryMode: "dependency-clear",
+                    runId: wakeResult.runId ?? null,
+                    detail: { unblockedBy: identifier, delegate: ticket.delegateName },
+                  });
+                } catch (wakeErr) {
+                  log.error(
+                    `dependency-clear-wake delivery failed for ${agentName} / ${ticket.identifier}: ` +
+                    `${wakeErr instanceof Error ? wakeErr.message : String(wakeErr)}`,
+                  );
+                }
+              }
+              if (clearResult.stillBlocked.length > 0) {
+                log.info(
+                  `dependency-clear-wake: ${clearResult.stillBlocked.length} ticket(s) still blocked ` +
+                  `by other prerequisites: ${clearResult.stillBlocked.join(", ")}`,
+                );
+              }
+            }).catch((err) => {
+              log.warn(`dependency-clear-wake failed for terminal ${identifier}: ${err instanceof Error ? err.message : String(err)}`);
             });
           }
         } else {
