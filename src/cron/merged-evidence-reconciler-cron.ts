@@ -9,7 +9,7 @@
  */
 
 import { createModuleLogger } from "../logging.js";
-import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
+import { registerCron, formatIntervalMs, markCronRunSuccess } from "./registry.js";
 
 const log = createModuleLogger("merged-evidence-reconciler-cron");
 
@@ -44,14 +44,14 @@ export function registerMergedEvidenceReconcilerCron(): void {
   registerCron(CRON_NAME, `every ${formatIntervalMs(intervalMs)}`);
   // INF-1263 AC3: deferred via setTimeout so deploy churn cannot starve the
   // liveness stamp until the first interval tick.
-  setTimeout(() => markCronRun(CRON_NAME), 0);
+  setTimeout(() => markCronRunSuccess(CRON_NAME), 0);
 
   const timer = setInterval(() => {
     // Reconciliation logic (Linear query + git ancestry check per ticket) is
     // driven via detectMergedEvidence/resolveEvidenceTransition from
     // ../merged-pr-evidence.js, invoked per in-flight ticket by the caller
     // that owns ticket iteration.
-    markCronRun(CRON_NAME);
+    markCronRunSuccess(CRON_NAME);
   }, Math.min(intervalMs, MAX_TIMEOUT_MS));
   timer.unref();
 

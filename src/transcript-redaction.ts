@@ -16,7 +16,7 @@ import fs from "node:fs/promises";
 import type { Stats } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
-import { registerCron, markCronRun, formatIntervalMs } from "./cron/registry.js";
+import { registerCron, markCronRunSuccess, markCronRunFailure, formatIntervalMs } from "./cron/registry.js";
 import { createModuleLogger } from "./logging.js";
 
 const execFileAsync = promisify(execFile);
@@ -265,7 +265,11 @@ export function registerTranscriptRedaction(
     _health.lastRun = Date.now();
     log.info(`transcript-redaction sweep starting (${scanRoots.length} scan roots)`);
     const result = await runTranscriptRedaction(effectiveConfig);
-    markCronRun(CRON_NAME);
+    if (result.errors.length > 0) {
+      markCronRunFailure(CRON_NAME, result.errors.join("; "));
+    } else {
+      markCronRunSuccess(CRON_NAME);
+    }
     log.info(
       `transcript-redaction sweep complete: ${result.filesScanned} files scanned, ` +
       `${result.filesRedacted} redacted, ${result.errors.length} errors`,

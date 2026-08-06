@@ -37,7 +37,7 @@ import {
 } from "../proposal/generated-proposal-adapter.js";
 import { defaultGuidanceDir, instanceConfigRoot } from "../instance-config.js";
 import { createModuleLogger } from "../logging.js";
-import { registerCron, markCronRun, formatIntervalMs } from "./registry.js";
+import { registerCron, markCronRunSuccess, markCronRunFailure, formatIntervalMs } from "./registry.js";
 
 const log = createModuleLogger("p4-metrics-distillation");
 
@@ -190,8 +190,15 @@ export function registerDistillationCron(
   registerCron(DISTILLATION_CRON_NAME, `every ${formatIntervalMs(intervalMs)}`);
   const tick = () => {
     runDistillation(observationStore, proposalStore, ctx)
-      .then(() => markCronRun(DISTILLATION_CRON_NAME))
+      .then((result) => {
+        if (result.error) {
+          markCronRunFailure(DISTILLATION_CRON_NAME, result.error);
+        } else {
+          markCronRunSuccess(DISTILLATION_CRON_NAME);
+        }
+      })
       .catch((err) => {
+        markCronRunFailure(DISTILLATION_CRON_NAME, err);
         log.error(`[P4-C3] Scheduled distillation failed: ${err instanceof Error ? err.message : String(err)}`);
       });
   };

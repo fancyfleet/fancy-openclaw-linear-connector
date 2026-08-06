@@ -11,7 +11,7 @@
 import { createModuleLogger } from "../logging.js";
 import { runG20Canary, type G20CanaryConfig, type G20CanaryResult } from "./g20-canary-job.js";
 import { notify } from "../alerts/alert-bus.js";
-import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
+import { registerCron, formatIntervalMs, markCronRunSuccess, markCronRunFailure } from "./registry.js";
 
 const log = createModuleLogger("g20-canary");
 
@@ -90,10 +90,11 @@ export function registerG20CanaryCron(): void {
   // must not appear in /health as if it were live (AI-1810).
   registerCron("g20-canary", `every ${formatIntervalMs(intervalMs)}`);
   const tick = () => {
-    runG20Canary(config).catch((err) => {
+    runG20Canary(config).then(() => {
+      markCronRunSuccess("g20-canary");
+    }).catch((err) => {
       log.error(`[G-20 CANARY] Scheduled run threw: ${err instanceof Error ? err.message : String(err)}`);
-    }).finally(() => {
-      markCronRun("g20-canary");
+      markCronRunFailure("g20-canary", err);
     });
   };
   // INF-1263 AC3: kick off a first run immediately so deploy churn cannot

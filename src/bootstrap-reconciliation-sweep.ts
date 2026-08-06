@@ -40,7 +40,7 @@ import { loadWorkflowRegistry, type WorkflowDef } from "./workflow-gate.js";
 import { isTerminalIssueState } from "./linear-actionable.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { getRateLimitClient } from "./linear-rate-limit-client.js";
-import { registerCron, markCronRun, formatIntervalMs } from "./cron/registry.js";
+import { registerCron, markCronRunSuccess, markCronRunFailure, formatIntervalMs } from "./cron/registry.js";
 import { buildAgentMap, getLinearUserIdForAgent, getOpenclawAgentName } from "./agents.js";
 import { resolveBodiesForRole } from "./escalation-gate.js";
 import { boundSeatFor } from "./implementer-store.js";
@@ -1089,7 +1089,11 @@ export async function runBootstrapReconciliationSweep(
     }
   }
 
-  markCronRun("bootstrap-reconciliation-sweep");
+  if (result.errors.length > 0) {
+    markCronRunFailure("bootstrap-reconciliation-sweep", result.errors.join("; "));
+  } else {
+    markCronRunSuccess("bootstrap-reconciliation-sweep");
+  }
   return result;
 }
 
@@ -1146,6 +1150,7 @@ export function registerBootstrapReconciliationCron(
       wakeFn: opts.wakeFn,
       dispatchAckTracker: opts.dispatchAckTracker,
     }).catch((err) => {
+      markCronRunFailure("bootstrap-reconciliation-sweep", err);
       log.error(
         `bootstrap-reconciliation: unexpected sweep failure: ${err instanceof Error ? err.message : String(err)}`,
       );

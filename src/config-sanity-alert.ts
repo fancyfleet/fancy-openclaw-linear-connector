@@ -20,7 +20,7 @@
 
 import { createModuleLogger } from "./logging.js";
 import { notify } from "./alerts/alert-bus.js";
-import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
+import { registerCron, formatIntervalMs, markCronRunSuccess, markCronRunFailure } from "./cron/registry.js";
 import fs from "node:fs";
 
 const log = createModuleLogger("config-sanity-alert");
@@ -250,20 +250,20 @@ export function registerConfigSanityAlertCron(): void {
       } else {
         log.info("config-sanity-alert: initial cycle — no findings (file not available or empty)");
       }
+      markCronRunSuccess("config-sanity-alert");
     } catch (err) {
       log.error(`config-sanity-alert: initial cycle threw: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      markCronRun("config-sanity-alert");
+      markCronRunFailure("config-sanity-alert", err);
     }
   }, 0);
 
   const timer = setInterval(() => {
     try {
       runCycle();
+      markCronRunSuccess("config-sanity-alert");
     } catch (err) {
       log.error(`config-sanity-alert: cycle threw: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      markCronRun("config-sanity-alert");
+      markCronRunFailure("config-sanity-alert", err);
     }
   }, intervalMs);
   timer.unref();

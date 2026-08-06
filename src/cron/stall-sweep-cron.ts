@@ -11,13 +11,13 @@
  *   - registerCron() called from inside the registrar (not at module load).
  *   - Timer is unref'd so it won't prevent graceful shutdown.
  *   - First run fires immediately after registration (unref'd setTimeout 0).
- *   - markCronRun() at the end of each iteration.
+ *   - markCronRunSuccess()/markCronRunFailure() at the end of each iteration.
  */
 
 import type { LivenessRecord, StallClassifierConfig } from "../stall-detection.js";
 import { getStalledTickets } from "../stall-detection.js";
 import { createModuleLogger } from "../logging.js";
-import { registerCron, markCronRun, formatIntervalMs } from "./registry.js";
+import { registerCron, markCronRunSuccess, markCronRunFailure, formatIntervalMs } from "./registry.js";
 import { recordStallDetectionActive } from "../stall-detection-state.js";
 
 const log = createModuleLogger("stall-sweep-cron");
@@ -68,8 +68,10 @@ function runSweepIteration(options: StallSweepCronOptions): void {
     log.error(
       `[stall-sweep] Iteration failed: ${err instanceof Error ? err.message : String(err)}`,
     );
+    markCronRunFailure("stall-liveness-sweep", err);
+    return;
   }
-  markCronRun("stall-liveness-sweep");
+  markCronRunSuccess("stall-liveness-sweep");
 }
 
 /**

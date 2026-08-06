@@ -27,7 +27,7 @@ import { isBarrierState, resolveBarrierTarget } from "../barrier.js";
 import fs from "node:fs/promises";
 import yaml from "js-yaml";
 import { createModuleLogger } from "../logging.js";
-import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
+import { registerCron, formatIntervalMs, markCronRunSuccess, markCronRunFailure } from "./registry.js";
 import { type WorkflowDef } from "../workflow-gate.js";
 import { findOrCreateLabel, LINEAR_API_URL } from "../linear-helpers.js";
 
@@ -534,12 +534,16 @@ export function registerAntiEntropyCron(opts?: {
             `errors=${result.errors.length}`,
           );
         }
+        if (result.errors.length > 0) {
+          markCronRunFailure("anti-entropy", result.errors.join("; "));
+        } else {
+          markCronRunSuccess("anti-entropy");
+        }
       } catch (err) {
         log.error(
           `[anti-entropy] Scheduled pass failed: ${err instanceof Error ? err.message : String(err)}`,
         );
-      } finally {
-        markCronRun("anti-entropy");
+        markCronRunFailure("anti-entropy", err);
       }
     })();
   };

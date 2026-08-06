@@ -29,7 +29,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
-import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
+import { registerCron, formatIntervalMs, markCronRunSuccess, markCronRunFailure } from "./cron/registry.js";
 import {
   markFirstActionWatchdogScheduled,
   getFirstActionLadder,
@@ -699,10 +699,15 @@ export function registerFirstActionWatchdogCron(
   markFirstActionWatchdogScheduled();
 
   const tick = () => {
-    runFirstActionWatchdogSweep(opts).catch((err) => {
+    runFirstActionWatchdogSweep(opts).then((result) => {
+      if (result.errors.length > 0) {
+        markCronRunFailure(CRON_NAME, result.errors.map((e) => (e instanceof Error ? e.message : String(e))).join("; "));
+      } else {
+        markCronRunSuccess(CRON_NAME);
+      }
+    }).catch((err) => {
       console.error(`[${CRON_NAME}] sweep failed:`, err);
-    }).finally(() => {
-      markCronRun(CRON_NAME);
+      markCronRunFailure(CRON_NAME, err);
     });
   };
   // INF-1263 AC3: kick off a first sweep immediately so deploy churn cannot

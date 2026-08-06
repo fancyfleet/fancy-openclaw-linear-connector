@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { createModuleLogger } from "./logging.js";
 import { notify } from "./alerts/alert-bus.js";
-import { registerCron, markCronRun, formatIntervalMs } from "./cron/registry.js";
+import { registerCron, markCronRunSuccess, markCronRunFailure, formatIntervalMs } from "./cron/registry.js";
 
 const log = createModuleLogger("deploy-drift");
 
@@ -107,7 +107,7 @@ async function performCheck(): Promise<DeployDriftCheckResult> {
     mainCommit: result.mainCommit,
     lastCheckAt: result.checkedAt,
   };
-  markCronRun(CRON_NAME);
+  markCronRunSuccess(CRON_NAME);
   return result;
 }
 
@@ -125,11 +125,13 @@ export function registerDeployDriftCron(options: DeployDriftCronOptions): void {
   setTimeout(() => {
     performCheck().catch((err) => {
       log.error(`[deploy-drift] initial check failed: ${err instanceof Error ? err.message : String(err)}`);
+      markCronRunFailure(CRON_NAME, err);
     });
   }, 0);
   const timer = setInterval(() => {
     performCheck().catch((err) => {
       log.error(`[deploy-drift] scheduled check failed: ${err instanceof Error ? err.message : String(err)}`);
+      markCronRunFailure(CRON_NAME, err);
     });
   }, cadenceMs);
   timer.unref();
