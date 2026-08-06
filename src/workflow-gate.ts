@@ -93,6 +93,8 @@ let log = createModuleLogger("workflow-gate");
 /**
  * AI-2544: Test hook to inject a spy logger for verifying error-payload logging.
  * Call with no args or undefined to reset to the real logger.
+ *
+ * @internal exported only for test-suite logger injection; not part of the production API.
  */
 export function _setLogForTests(testLogger?: Logger): void {
   log = testLogger ?? createModuleLogger("workflow-gate");
@@ -1078,6 +1080,8 @@ export async function reloadWorkflowDefs(): Promise<
 /**
  * AI-2359: Alias for resetWorkflowCache() used by the singleton-fail-closed
  * test to clear the workflow registry between cases.
+ *
+ * @internal exported only for the singleton fail-closed test reset hook.
  */
 export function resetWorkflowRegistry(): void {
   _registryCache = null;
@@ -1134,11 +1138,6 @@ export function getTicketNoActivityTimeoutMs(ticketId: string): number | undefin
   return _noActivityTimeoutCache.get(_noActivityTimeoutKey(ticketId));
 }
 
-/** Test helper — reset the no-activity timeout cache between cases. */
-export function _resetNoActivityTimeoutCache(): void {
-  _noActivityTimeoutCache.clear();
-}
-
 /**
  * AI-1498: Semantic-to-native mapping — mirrors the CLI's SEMANTIC_STATE_MAP
  * so the proxy can resolve native Linear stateId UUIDs without depending on the CLI.
@@ -1170,6 +1169,8 @@ const VALID_SEMANTIC_STATES = new Set(Object.keys(SEMANTIC_STATE_MAP));
  * invalid native_state means the proxy cannot compute the native Linear stateId,
  * making desync structurally impossible. Returns an array of diagnostic errors.
  * The caller should throw when errors is non-empty for governed workflows.
+ *
+ * @internal exported for registry validation tests that exercise this load-time invariant directly.
  */
 export function validateNativeStateMappings(def: WorkflowDef): string[] {
   const warnings: string[] = [];
@@ -1209,6 +1210,8 @@ export function validateNativeStateMappings(def: WorkflowDef): string[] {
  * validateNativeStateMappings).
  *
  * Non-dev-impl workflows are unrelated to this gate and always pass.
+ *
+ * @internal exported for drift-guard tests that exercise this load-time invariant directly.
  */
 export function validateGateAnchorDefs(def: WorkflowDef): string[] {
   // Only dev-impl v10+ has gate-anchor states (merge/deploy) for the
@@ -1257,6 +1260,8 @@ export function validateGateAnchorDefs(def: WorkflowDef): string[] {
  *
  * Called at registry load time; a non-empty return excludes the def from the
  * registry (same fail-closed pattern as validateGateAnchorDefs).
+ *
+ * @internal exported for dangling-target tests that exercise this load-time invariant directly.
  */
 export function validateTransitionTargets(def: WorkflowDef): string[] {
   const errors: string[] = [];
@@ -1294,6 +1299,8 @@ export function validateTransitionTargets(def: WorkflowDef): string[] {
  * a non-empty result excludes the def from the registry (the loader throws), so
  * the engine can never fan out to a non-workflow child type, misread a malformed
  * barrier flag, or activate an ambiguous fan-out pair.
+ *
+ * @internal exported for fanout/barrier config tests that exercise this load-time invariant directly.
  */
 export function validateFanoutBarrierConfig(def: WorkflowDef): string[] {
   const errors: string[] = [];
@@ -1461,7 +1468,11 @@ export function validateFanoutBarrierConfig(def: WorkflowDef): string[] {
 /** Cache: teamId → array of team workflow states from Linear API. */
 let _teamStateCache: Map<string, Array<{ id: string; name: string; type: string }>> = new Map();
 
-/** Reset the native-state cache (used in tests). */
+/**
+ * Reset the native-state cache.
+ *
+ * @internal exported only for test-suite state reset between cases.
+ */
 export function resetNativeStateCache(): void {
   _teamStateCache.clear();
 }
@@ -2209,6 +2220,8 @@ export async function resolveTransitionDelegate(
  *
  * @returns resolvedDelegateId when the single body has a linearUserId;
  *          { failed: true, code, detail } when resolution fails.
+ *
+ * @internal exported for focused singleton delegate resolution tests.
  */
 export function resolveSingletonDelegate(
   roleBodies: string[],
@@ -3269,7 +3282,7 @@ async function fetchIssueDescription(issueId: string, authToken: string): Promis
   }
 }
 
-export function hasCapabilityStatementEvidence(description: string | null | undefined): boolean {
+function hasCapabilityStatementEvidence(description: string | null | undefined): boolean {
   if (!description) return false;
   return (
     /<!--\s*capability-statement\b[\s\S]*?-->/i.test(description) ||
@@ -3277,7 +3290,7 @@ export function hasCapabilityStatementEvidence(description: string | null | unde
   );
 }
 
-export function hasPassedDemonstrationWalkEvidence(description: string | null | undefined): boolean {
+function hasPassedDemonstrationWalkEvidence(description: string | null | undefined): boolean {
   if (!description) return false;
   return (
     /<!--\s*demonstration-walk:\s*pass(?:ed)?\s*-->/i.test(description) ||
@@ -3458,7 +3471,7 @@ type RoutineClass = "forward" | "revision" | "special";
 function stateNodeById(def: WorkflowDef, id: string): WorkflowState | undefined {
   return def.states?.find((s) => s.id === id);
 }
-export function isTerminalStateId(def: WorkflowDef, id: string): boolean {
+function isTerminalStateId(def: WorkflowDef, id: string): boolean {
   const s = stateNodeById(def, id);
   if (!s) return false;
   if (s.kind === "terminal") return true;
@@ -3491,7 +3504,7 @@ function isSpecialTransition(def: WorkflowDef, stateId: string, t: WorkflowTrans
  * only appear "later" are not caught here -- those keep needing a `generic:
  * revision` tag, and the load validator surfaces them.
  */
-export function buildStateRank(def: WorkflowDef): Map<string, number> {
+function buildStateRank(def: WorkflowDef): Map<string, number> {
   const adj = new Map<string, string[]>();
   for (const s of def.states ?? []) {
     const outs: string[] = [];
@@ -3518,7 +3531,7 @@ export function buildStateRank(def: WorkflowDef): Map<string, number> {
   return rank;
 }
 
-export function classifyRoutineTransition(
+function classifyRoutineTransition(
   def: WorkflowDef, stateId: string, t: WorkflowTransition, rank: Map<string, number>,
 ): RoutineClass {
   if (isSpecialTransition(def, stateId, t)) return "special";
@@ -3539,7 +3552,7 @@ type StateRoutineShape =
   | { shape: "branch"; forwardCommands: string[] }
   | { shape: "ambiguous"; detail: string };
 
-export function analyzeStateRoutine(def: WorkflowDef, node: WorkflowState, rank: Map<string, number>): StateRoutineShape {
+function analyzeStateRoutine(def: WorkflowDef, node: WorkflowState, rank: Map<string, number>): StateRoutineShape {
   // Edges to an undefined destination are malformed — a different validator
   // (transition-walk canary) reports them; they must not preempt the routine
   // check or trip a spurious ambiguity here.
@@ -3581,6 +3594,8 @@ export function analyzeStateRoutine(def: WorkflowDef, node: WorkflowState, rank:
  * such edge (terminal / branch-forward), or an `error` when a non-branch state
  * is ambiguous. Branch states resolve their named forward verb, not a collapsed
  * continue-workflow -- so the CLI still hands the decision to the agent.
+ *
+ * @internal exported for routine-verb resolver tests that validate workflow definitions.
  */
 export function resolveRoutineEdge(
   def: WorkflowDef, node: WorkflowState, kind: "forward" | "revision", rank?: Map<string, number>,
@@ -3767,6 +3782,9 @@ export async function resolveMetaIntent(
  * transitions resolve via the meta-intent commands; def-internal command
  * names (e.g. task.yaml's `request`) do not exist as CLI commands, so
  * rejection hints must never render them bare (pilot finding, 2026-07-03).
+ *
+ * @internal exported for conformance-matrix generation so production and conformance
+ * guidance use the same CLI verb resolver.
  */
 export function cliVerbFor(
   t: WorkflowTransition,
@@ -3794,7 +3812,7 @@ export function cliVerbFor(
  * their literal names, and the break-glass command. Literal spine verbs are
  * collapsed into the routine verbs, so agents never see submit/approve/etc.
  */
-export function legalMovesFor(
+function legalMovesFor(
   def: WorkflowDef,
   node: WorkflowState | undefined,
   breakGlass: string,
@@ -6008,6 +6026,8 @@ async function postComment(internalIssueId: string, body: string, authToken: str
     log.error(`workflow-gate: failed to post comment on ${internalIssueId}: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
+
+/** @internal exported only for comment-post validation tests. */
 export const _postCommentForTests = postComment;
 
 /**
@@ -8045,6 +8065,8 @@ async function postFanoutSummaryComment(
  *
  * AI-2544: Exported as _issueUpdateAtomicForTests so tests can verify log behavior
  * without going through the full proxy stack. Underscore-prefixed per project convention.
+ *
+ * @internal exported only for atomic issue-update logging tests.
  */
 export const _issueUpdateAtomicForTests = issueUpdateAtomic;
 
@@ -8125,7 +8147,11 @@ export interface TransitionWritePolicy {
 const DEFAULT_TRANSITION_WRITE_POLICY: TransitionWritePolicy = { maxAttempts: 3, retryDelayMs: 250 };
 let transitionWritePolicy: TransitionWritePolicy = { ...DEFAULT_TRANSITION_WRITE_POLICY };
 
-/** Test hook: override (or reset, with no args) the transition write retry policy. */
+/**
+ * Test hook: override (or reset, with no args) the transition write retry policy.
+ *
+ * @internal exported only for tests that need deterministic transition-write retries.
+ */
 export function _setTransitionWritePolicyForTests(policy?: Partial<TransitionWritePolicy>): void {
   transitionWritePolicy = { ...DEFAULT_TRANSITION_WRITE_POLICY, ...(policy ?? {}) };
 }
