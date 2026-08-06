@@ -41,6 +41,7 @@ import type { OperationalEventStore } from "./store/operational-event-store.js";
 import { getAlertBus } from "./alerts/alert-bus.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import type { MutationAuditStore, MutationAuditInput, ChangeType } from "./store/mutation-audit-store.js";
+import type { TransitionAuditStore } from "./store/transition-audit-store.js";
 import { isTerminalState } from "./barrier.js";
 import { getAgent, getAgentByProxyToken, getAgentIdForLinearUserId } from "./agents.js";
 import type { NoActivityDetector } from "./bag/no-activity-detector.js";
@@ -979,6 +980,8 @@ export interface ProxyDeps {
   getDispatchAckTracker?: () => DispatchAckTracker | undefined;
   /** INF-696: liveness dispatch store for post-fanout child dispatch verification. */
   postFanoutDispatchStore?: DispatchRecordStore;
+  /** INF-1277: transition-audit persistence store — durable record of each governed transition. */
+  transitionAuditStore?: TransitionAuditStore;
 }
 
 export async function handleProxyRequest(req: Request, res: Response, deps?: ProxyDeps): Promise<void> {
@@ -2064,6 +2067,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
 
           // ── AI-2554: Structured transition audit record ──────────────
           if (issueId && transitionResult) {
+            let persistedAuditId: number | null = null;
             try {
               const gateResults: GateResult[] = [];
               gateResults.push({ name: "phase-2-escalation-gate", passed: true, detail: null });
@@ -2084,6 +2088,26 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
                 gateResults,
               );
               emitTransitionAuditRecord(auditRecord);
+
+              // ── INF-1277: durable persistence of the same record ──────
+              if (deps?.transitionAuditStore) {
+                try {
+                  persistedAuditId = deps.transitionAuditStore.record({
+                    ticket: issueId,
+                    intent: effectiveIntent,
+                    fromState: transitionResult.from ?? null,
+                    toState: transitionResult.to ?? null,
+                    agent: agentId,
+                    status: transitionResult.status,
+                    code: transitionResult.code,
+                    detail: transitionResult.detail ?? null,
+                    gateResults,
+                    labelMismatch: null,
+                  });
+                } catch (persistErr) {
+                  log.warn(`[transition-audit] failed to persist audit record (non-blocking): ${persistErr instanceof Error ? persistErr.message : String(persistErr)}`);
+                }
+              }
             } catch (auditErr) {
               log.warn(`[transition-audit] failed to emit audit record: ${auditErr instanceof Error ? auditErr.message : String(auditErr)}`);
             }
@@ -2104,6 +2128,13 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
                     `[transition-audit] post-transition LABEL MISMATCH for ${issueId} ${ticketCtx}: ` +
                     `expected state:${verifyTargetState}, got ${verification.actualState ?? "(null)"}`,
                   );
+                }
+                if (verification && persistedAuditId !== null && deps?.transitionAuditStore) {
+                  try {
+                    deps.transitionAuditStore.updateLabelMismatch(persistedAuditId, !verification.match);
+                  } catch (updateErr) {
+                    log.warn(`[transition-audit] failed to update label-mismatch (non-blocking): ${updateErr instanceof Error ? updateErr.message : String(updateErr)}`);
+                  }
                 }
               }).catch((verifyErr: unknown) => {
                 const vm = verifyErr instanceof Error ? verifyErr.message : String(verifyErr);

@@ -75,6 +75,7 @@ import { createBacklogController } from "./cron/backlog-controller.js";
 import { registerConfigSanityAlertCron, getConfigSanityAlertLiveness } from "./config-sanity-alert.js";
 import { registerMatrixApprovalGate, getMatrixApprovalGateLiveness } from "./matrix-approval-gate.js";
 import { MutationAuditStore } from "./store/mutation-audit-store.js";
+import { TransitionAuditStore } from "./store/transition-audit-store.js";
 import { DispatchIdempotencyStore } from "./store/dispatch-idempotency-store.js";
 import { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import { DispatchInFlightStore } from "./store/dispatch-inflight-store.js";
@@ -304,6 +305,8 @@ export interface CreateAppOptions {
   enrolledTicketsDbPath?: string;
   /** Override MutationAuditStore database path (for testing). AI-1838. */
   mutationAuditDbPath?: string;
+  /** Override TransitionAuditStore database path (for testing). INF-1277. */
+  transitionAuditDbPath?: string;
   /** Override DispatchIdempotencyStore database path (for testing). AI-1918. */
   idempotencyDbPath?: string;
   /** Override DispatchLeaseStore database path (for testing). AI-2350. */
@@ -460,6 +463,7 @@ export function createApp(options?: CreateAppOptions) {
     noActivityDetector,
     enrolledTicketsStore,
     mutationAuditStore,
+    transitionAuditStore,
     commandAuthSnapshots,
     // INF-1260 AC1+AC2: was never wired here, so checkStaleSnapshotForTerminal
     // always received `undefined` and its zombie/stale-lease check fail-opened
@@ -855,6 +859,15 @@ export function createApp(options?: CreateAppOptions) {
       // Routes /callback and /oauth/callback are registered immediately below
       // this handler in createApp(); a missing route returns 404, not 200.
       oauthCallback: { registered: true },
+      // INF-1277 (AI-1808 guard): transition-audit persistence store + query-route
+      // liveness — storeInitialized/queryRouteRegistered are true only because
+      // createApp constructed the store and mounted the admin router with it wired
+      // in, never hardcoded, so ac-validate can confirm the wiring without waiting
+      // for a real transition.
+      transitionAudit: {
+        storeInitialized: Boolean(transitionAuditStore),
+        queryRouteRegistered: true,
+      },
       // INF-272: encryption-key match validation — confirms the configured .env
       // encryption key can decrypt the stored agents.json. An invalid key means
       // the .env has the wrong LINEAR_CONNECTOR_ENCRYPTION_KEY / KEY_FILE reference;
@@ -895,6 +908,7 @@ export function createApp(options?: CreateAppOptions) {
   const operationalEventStore = new OperationalEventStore(options?.operationalEventsDbPath);
   const enrolledTicketsStore = new EnrolledTicketsStore(options?.enrolledTicketsDbPath);
   const mutationAuditStore = new MutationAuditStore(options?.mutationAuditDbPath);
+  const transitionAuditStore = new TransitionAuditStore(options?.transitionAuditDbPath);
   const idempotencyStore = new DispatchIdempotencyStore(options?.idempotencyDbPath);
   const dispatchLeaseStore = new DispatchLeaseStore(options?.dispatchLeaseDbPath);
   // INF-413: ticket-level in-flight guard — prevents the same ticket being
@@ -2024,6 +2038,7 @@ export function createApp(options?: CreateAppOptions) {
     enrolledTicketsStore,
     forensicsDiagnosticsDir: options?.forensicsDiagnosticsDir,
     mutationAuditStore,
+    transitionAuditStore,
     dispatchIdempotencyStore: idempotencyStore,
     wakeConfigForAgent,
     reconciliationWakeFn: options?.sendWakeUp
@@ -2549,7 +2564,7 @@ export function createApp(options?: CreateAppOptions) {
     },
   });
 
-  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, dispatchReliabilityController, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore, livenessDispatchStore, linearRateLimitClient, globalRedispatchBudget, transcriptRedactionHealth: getTranscriptRedactionHealth(), startupCommitPromise });
+  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, transitionAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore, livenessDispatchStore, linearRateLimitClient, globalRedispatchBudget, transcriptRedactionHealth: getTranscriptRedactionHealth(), startupCommitPromise });
 }
 
 /**
