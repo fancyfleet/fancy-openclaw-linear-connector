@@ -31,6 +31,7 @@ import { makeFreshSessionKey, normalizeSessionKey } from "./session-key.js";
 import { applyEngagementStatus, registerEngagementNativeStateOverlay } from "./engagement-status.js";
 import { createAdminRouter } from "./admin.js";
 import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, collectSameKeySessionReplay, STALE_CLASS_NAMES, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
+import { rescueDormant } from "./rescue-sweep.js";
 import {
   getStaleSessionRecoveryLiveness,
   markStaleSessionRecoveryDriverRegistered,
@@ -41,7 +42,8 @@ import {
 import { checkLinearIssueRouting } from "./linear-actionable.js";
 import { assertDispatchTargetFetchable } from "./delivery/index.js";
 import { markDispatchIntegrityGateActive, getDispatchIntegrityState } from "./dispatch-integrity-state.js";
-import { getCircuitBreakerHealth, recordRepokeAndCheckBreaker } from "./dispatch-circuit-breaker.js";
+import { getCircuitBreakerHealth } from "./dispatch-circuit-breaker.js";
+import { DispatchReliabilityController } from "./dispatch-reliability-controller.js";
 import { getRemediationHealth } from "./remediation/remediation-state.js";
 import { getCommentStats, getTransitionCommentLogicHealth } from "./transition-comment-logic.js";
 import { getStewardStateLiveness, registerStewardStateLiveness } from "./steward-state-liveness.js";
@@ -826,6 +828,13 @@ export function createApp(options?: CreateAppOptions) {
       // a health event to fire.
       healthSnapshot: getSnapshotLiveness(),
       dispatchCircuitBreaker: getCircuitBreakerHealth(),
+      // INF-1262 AC6/AC7: unified dispatch-reliability controller liveness —
+      // proves the controller and acked delivery scheduler are registered at
+      // server bootstrap (reachable from index.ts), observable at ac-validate
+      // without waiting for any trigger condition. Every field comes straight
+      // from the controller's own liveness() — no hardcoded literals here
+      // (the AI-1808 dead-code-in-prod guard this ticket must not repeat).
+      dispatchReliability: dispatchReliabilityController.liveness(),
       // AI-2116 AC8/AC9: dispatch watchdog hardening liveness — confirms the
       // retry-hardening and precondition-guard features are wired and active,
       // observable at ac-validate without waiting for a re-dispatch cycle.
@@ -949,17 +958,18 @@ export function createApp(options?: CreateAppOptions) {
   // no-activity-detector, dispatch-watchdog). Ensures all three use the same cap.
   const globalRedispatchBudget = new GlobalRedispatchBudget();
 
-  // INF-1214: governed-transition wake entry point, exposed directly on
-  // `bag` so it's independently exercisable (AC1/AC2) without the full
-  // webhook round-trip. Always routes through dispatchDeliveryScheduler —
-  // even in test mode with an injected sendWakeUp stub, which becomes the
-  // single-attempt delivery primitive the scheduler retries around, so
-  // every attempt still records a delivery outcome and a dropped attempt is
-  // retried instead of being fire-and-forget.
+  // INF-1214/INF-1262: governed-transition wake entry point, exposed directly
+  // on `bag` so it's independently exercisable (AC1/AC2) without the full
+  // webhook round-trip. Routes through dispatchReliabilityController.
+  // dispatchWithAck — even in test mode with an injected sendWakeUp stub —
+  // so this wake-policy pre-flights like every other wake caller (AC2) and
+  // its delivery is the acked/retried primitive the scheduler retries
+  // around, so every attempt still records a delivery outcome and a dropped
+  // attempt is retried instead of being fire-and-forget.
   (bag as unknown as { sendWakeUp: (agentId: string, ticketIds: string[]) => Promise<void> }).sendWakeUp =
     async (agentId: string, ticketIds: string[]): Promise<void> => {
       const primaryTicket = ticketIds[0];
-      const outcome = await dispatchDeliveryScheduler.dispatch({
+      const outcome = await dispatchReliabilityController.dispatchWithAck({
         agentId,
         ticketId: primaryTicket,
         gateway: getAgent(agentId)?.host ?? undefined,
@@ -1192,7 +1202,11 @@ export function createApp(options?: CreateAppOptions) {
             .map((name) => name.slice(name.indexOf(":") + 1).toLowerCase())
             .sort()
             .join(",") || null;
-        const breaker = recordRepokeAndCheckBreaker(sessionKey, repokeStateLabel);
+        // INF-1262: the controller is now the sole call surface for this
+        // gate — no code outside dispatch-reliability-controller.ts calls
+        // dispatch-circuit-breaker.js directly. checkAndRecordRepoke wraps
+        // the SAME legacy recordRepokeAndCheckBreaker unchanged.
+        const breaker = dispatchReliabilityController.checkAndRecordRepoke(sessionKey, repokeStateLabel);
         if (breaker.suppress) {
           const reason =
             `circuit breaker tripped: ${breaker.state.wakeCount} consecutive re-pokes on ` +
@@ -1213,7 +1227,25 @@ export function createApp(options?: CreateAppOptions) {
             `Your session for ${ticketId.replace(/^linear-/, "")} stalled before producing output. ` +
             `Resume now and run the pending transition verb to hand off. Do NOT reply HEARTBEAT_OK.`;
           log.info(`Stale C4 re-poke: re-waking ${stale.agentId} for ${ticketId}`);
-          const delivered = await deliverMessageToAgent(stale.agentId, sessionKey, rePokeMsg, wakeConfigForAgent(stale.agentId));
+          // INF-1262 AC2/AC3: route through dispatchWithAck instead of a
+          // single fire-and-forget deliverMessageToAgent call, so this wake
+          // gets wake-policy pre-flight + acked/retried delivery like every
+          // other caller.
+          let delivered: { dispatched: boolean };
+          try {
+            const outcome = await dispatchReliabilityController.dispatchWithAck({
+              agentId: stale.agentId,
+              ticketId: sessionKey,
+              gateway: getAgent(stale.agentId)?.host ?? undefined,
+              dispatchId: `stale-c4-repoke-${normalizeSessionKey(sessionKey)}-${crypto.randomUUID()}`,
+              labels: (linearState?.labels?.nodes ?? []).map((l) => l.name),
+              deliver: async () => deliverMessageToAgent(stale.agentId, sessionKey, rePokeMsg, wakeConfigForAgent(stale.agentId)),
+            });
+            delivered = { dispatched: outcome.status !== "undeliverable" };
+          } catch (err) {
+            delivered = { dispatched: false };
+            log.warn(`Stale C4 re-poke wake-policy blocked for ${ticketId} → ${stale.agentId}: ${err instanceof Error ? err.message : String(err)}`);
+          }
           operationalEventStore.append({
             outcome: delivered.dispatched ? "stale-c4-repoke" : "stale-c4-repoke-failed",
             agent: stale.agentId,
@@ -1327,6 +1359,125 @@ export function createApp(options?: CreateAppOptions) {
   // scheduler wired in — never a hardcoded literal (the AI-1808
   // dead-code-in-prod guard this ticket must not repeat).
   let governedTransitionWakeSchedulerWired = false;
+
+  // ── INF-1262: Unified Dispatch Reliability Controller ────────────────
+  // Single owner of circuit-breaker + redispatch-budget + stuck-delegate
+  // detection. Wake-policy enforced in the `dispatchWithAck` delivery
+  // primitive; all wake callers route through it. Governed-transition wakes
+  // use the acked delivery scheduler — no fire-and-forget drops.
+  // Delegate-clear tickets recover inline with bounded latency.
+  const dispatchReliabilityController = new DispatchReliabilityController({
+    dispatchDeliveryScheduler,
+    maxConsecutiveWakes: 3,
+    redispatchBudgetPerTicket: 5,
+    maxStuckPromptsPerTicket: 2,
+    // INF-1262 AC1: the SAME shared SQLite-backed instance already injected
+    // into stale-session-forensics/no-activity-detector/dispatch-watchdog —
+    // not a second instance — so there is one redispatch-budget source of
+    // truth, not a shadow counter.
+    globalRedispatchBudget,
+    wakePolicySubscribers: [
+      "governed-transition",
+      "stuck-delegate-reprompt",
+      "delegate-clear-recovery",
+      "reconciliation-wake",
+    ],
+    delegateClearRecoveryMaxLatencyMs: 30_000,
+    recoverDelegateClearInline: async ({ ticketId, labels }) => {
+      return recoverDelegateClearInline(ticketId, labels);
+    },
+    hourlyRescueSweep: {
+      run: async () => {
+        // The rescue sweep is registered separately via registerRescueSweepCron;
+        // this reference exists for liveness/diagnostics only.
+      },
+    },
+    fireAndForgetWake: () => {
+      // Legacy path — intentionally never called by dispatchWithAck.
+      // Present for diagnostics: if anything still routes here, it's a bug.
+      throw new Error(
+        "INF-1262: fire-and-forget wake is decommissioned — route through dispatchReliabilityController.dispatchWithAck",
+      );
+    },
+  });
+  dispatchReliabilityController.start();
+
+  /**
+   * INF-1262 AC4: real inline delegate-clear recovery, called from
+   * dispatchWithAck when a wake carries `delegateCleared: true`. Reuses
+   * `rescueDormant` — the SAME re-seat logic (including the INF-753 live-race
+   * guard) the hourly rescue-sweep uses — instead of duplicating it; only the
+   * role-body resolution glue below is new, since `rescueDormant` wants a
+   * synchronous resolver and `resolveBodiesForRole` (the canonical resolver
+   * used elsewhere in this file, e.g. break-glass routing) is async, so the
+   * one role this ticket's current state needs is resolved up front.
+   *
+   * The caller (dispatchWithAck) races this against
+   * `delegateClearRecoveryMaxLatencyMs`, so a slow attempt here degrades to
+   * "not recovered" rather than blocking the wake. Any failure here (thrown
+   * or returned) falls through to existing behavior — no dispatch; the
+   * ticket waits for the hourly sweep or human review, exactly as before
+   * this ticket. This function only ever ADDS a faster success path; it
+   * never removes the existing safety net.
+   */
+  async function recoverDelegateClearInline(
+    ticketId: string,
+    labels: string[],
+  ): Promise<{ recovered: boolean }> {
+    const identifier = ticketId.replace(/^linear-/, "");
+    const wfLabel = labels.find((l) => /^wf:/i.test(l));
+    const stateLabel = labels.find((l) => /^state:/i.test(l));
+    if (!wfLabel || !stateLabel) {
+      // Ad-hoc ticket, or no state to re-seat against — nothing to recover.
+      return { recovered: false };
+    }
+    const wfId = wfLabel.slice(wfLabel.indexOf(":") + 1);
+    const stateId = stateLabel.slice(stateLabel.indexOf(":") + 1);
+
+    try {
+      const registry = await loadWorkflowRegistry();
+      const wfDef = registry.get(wfId);
+      const stateDef = wfDef?.states.find((s) => s.id === stateId);
+      const ownerRole = stateDef?.owner_role;
+      if (!wfDef || !ownerRole) {
+        // No role constraint on this state, or unknown workflow — the hourly
+        // sweep's classifyTicket would call this "healthy" or "malformed",
+        // neither of which this inline path re-seats.
+        return { recovered: false };
+      }
+
+      const bodyIds = await resolveBodiesForRole(ownerRole);
+      const candidateUuids = bodyIds
+        .map((bodyId) => getLinearUserIdForAgent(bodyId))
+        .filter((uuid): uuid is string => typeof uuid === "string" && uuid.length > 0);
+      const roleBodiesForRole = (roleId: string): string[] =>
+        roleId === ownerRole ? candidateUuids : [];
+
+      const authToken = resolveServiceCredential();
+      const action = await rescueDormant(
+        {
+          id: identifier,
+          identifier,
+          labels,
+          delegateId: null,
+          labelNodes: [],
+          teamId: "",
+        },
+        wfDef,
+        roleBodiesForRole,
+        authToken,
+      );
+      log.info(
+        `INF-1262: inline delegate-clear recovery for ${identifier}: ${action.outcome} — ${action.action}`,
+      );
+      return { recovered: action.outcome === "rescued" };
+    } catch (err) {
+      log.warn(
+        `INF-1262: inline delegate-clear recovery failed for ${identifier}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return { recovered: false };
+    }
+  }
 
   /**
    * Post a comment on a Linear ticket via the GraphQL API.
@@ -1638,14 +1789,39 @@ export function createApp(options?: CreateAppOptions) {
     ackTracker,
     operationalEventStore,
     deliveryConfig: wakeConfig,
+    // INF-1262 AC1: delegate re-prompt counting to the unified controller
+    // instead of this detector's own private PromptCounter — one counter,
+    // not two competing ones.
+    promptCounter: {
+      increment: (ticketId) => {
+        dispatchReliabilityController.recordStuckPrompt(ticketId);
+        return dispatchReliabilityController.getStuckPromptCount(ticketId);
+      },
+      get: (ticketId) => dispatchReliabilityController.getStuckPromptCount(ticketId),
+      clear: (ticketId) => dispatchReliabilityController.clearStuckPromptCount(ticketId),
+    },
+    // INF-1262 AC2/AC3: route the stuck-delegate re-prompt through
+    // dispatchWithAck instead of a single fire-and-forget deliverMessageToAgent
+    // call. wakeConfigForAgent's `deliveryScheduler` field was never actually
+    // honored by deliverMessageToAgent (only sendWakeUpSignal reads it) — this
+    // wake was genuinely fire-and-forget despite superficially looking wired
+    // to the scheduler. This is a strict improvement: same delivery call,
+    // wrapped in wake-policy pre-flight + acked retry.
     sendWake: async (agentOpenclawName, ticketId, prompt) => {
-      const result = await deliverMessageToAgent(
-        agentOpenclawName,
-        normalizeSessionKey(ticketId),
-        prompt,
-        wakeConfigForAgent(agentOpenclawName),
-      );
-      return result.dispatched;
+      const normalizedTicketId = normalizeSessionKey(ticketId);
+      try {
+        const outcome = await dispatchReliabilityController.dispatchWithAck({
+          agentId: agentOpenclawName,
+          ticketId: normalizedTicketId,
+          gateway: getAgent(agentOpenclawName)?.host ?? undefined,
+          dispatchId: `stuck-delegate-reprompt-${normalizedTicketId}-${crypto.randomUUID()}`,
+          deliver: async () => deliverMessageToAgent(agentOpenclawName, normalizedTicketId, prompt, wakeConfigForAgent(agentOpenclawName)),
+        });
+        return outcome.status !== "undeliverable";
+      } catch (err) {
+        log.warn(`Stuck-delegate re-prompt wake-policy blocked for ${normalizedTicketId} → ${agentOpenclawName}: ${err instanceof Error ? err.message : String(err)}`);
+        return false;
+      }
     },
   });
   stuckDelegateDetector.start();
@@ -2035,6 +2211,11 @@ export function createApp(options?: CreateAppOptions) {
     // through the acked/retried scheduler instead of a single fire-and-forget
     // deliverWithSlot() attempt.
     dispatchDeliveryScheduler,
+    // INF-1262: the unified dispatch-reliability controller — the webhook
+    // router's primary breaker gate, comment-fed suppression, bootstrap
+    // wake, and governed-transition wake all route through this single
+    // instance so there is one call surface for wake-policy decisions.
+    dispatchReliabilityController,
   ));
   governedTransitionWakeSchedulerWired = true;
 
@@ -2350,7 +2531,7 @@ export function createApp(options?: CreateAppOptions) {
     },
   });
 
-  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore, livenessDispatchStore, linearRateLimitClient, globalRedispatchBudget, transcriptRedactionHealth: getTranscriptRedactionHealth(), startupCommitPromise });
+  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, dispatchReliabilityController, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore, livenessDispatchStore, linearRateLimitClient, globalRedispatchBudget, transcriptRedactionHealth: getTranscriptRedactionHealth(), startupCommitPromise });
 }
 
 /**
@@ -2469,7 +2650,7 @@ if (isEntryPoint) {
     startTokenRefresh();
   }
 
-  const { app, agentQueue, bag, sessionTracker, operationalEventStore, observationStore, proposalStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, mutationAuditStore, enrolledTicketsStore, idempotencyStore, dispatchLeaseStore } = createApp();
+  const { app, agentQueue, bag, sessionTracker, operationalEventStore, observationStore, proposalStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, mutationAuditStore, enrolledTicketsStore, idempotencyStore, dispatchLeaseStore, dispatchReliabilityController } = createApp();
 
   // P4-C3: periodic distillation of reject metrics into the deterministic
   // generation engine, persisted into the unified C4 store (AI-2070). The prod
@@ -2525,6 +2706,11 @@ if (isEntryPoint) {
     // INF-282: Wire DispatchLeaseStore check into reconciliation wake path.
     // Call the module version which checks hasActiveLease and acquires a lease
     // before delivering, preventing duplicate wakes on connector restart.
+    // INF-1262 AC2/AC3: route the actual delivery through dispatchWithAck
+    // instead of a bare deliverMessageToAgent call — the lease-acquire logic
+    // in reconciliationWakeWithLeaseCheck is unchanged (still gates whether
+    // sendWake is even invoked); only the delivery attempt itself is now
+    // wake-policy-checked and acked/retried instead of fire-and-forget.
     const wake = await reconciliationWakeWithLeaseCheck({
       agentId: agentName,
       ticketId: ticketIdentifier,
@@ -2532,7 +2718,19 @@ if (isEntryPoint) {
       leaseTtlMs: 30_000,
       deliveryConfig,
       sendWake: async (agId, _tId, msg, cfg) => {
-        return await deliverMessageToAgent(agId, sessionKey, msg, cfg);
+        try {
+          const outcome = await dispatchReliabilityController.dispatchWithAck({
+            agentId: agId,
+            ticketId: sessionKey,
+            gateway: cfg.gatewayUrl ? undefined : getAgent(agId)?.host ?? undefined,
+            dispatchId: `reconciliation-wake-${sessionKey}-${crypto.randomUUID()}`,
+            deliver: async () => deliverMessageToAgent(agId, sessionKey, msg, cfg),
+          });
+          return { dispatched: outcome.status !== "undeliverable" };
+        } catch (err) {
+          log.warn(`Reconciliation wake-policy blocked for ${sessionKey} → ${agId}: ${err instanceof Error ? err.message : String(err)}`);
+          return { dispatched: false, hookErrorSummary: err instanceof Error ? err.message : String(err) };
+        }
       },
     });
     // INF-1026: propagate the real disposition so the reconciliation sweep only

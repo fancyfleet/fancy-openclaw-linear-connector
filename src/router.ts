@@ -23,12 +23,15 @@ const log = createModuleLogger("router", "info");
  * - `{ name, reason }` — a routable agent was found
  * - `{ suppressed: true }` — the AI-1573 guard or self-trigger filter
  *   intentionally suppressed this event (should NOT fall through to
- *   department-prefix / steward-escalation)
+ *   department-prefix / steward-escalation). `suppressedReason` distinguishes
+ *   the specific suppression cause when a caller needs to react to it (e.g.
+ *   INF-1262: a "delegate-clear" suppression should still trigger inline
+ *   recovery, not just be dropped as an unactionable no-route).
  * - `null` — genuinely no route found (may fall through to department-prefix)
  */
 export type AgentTargetResult =
   | { name: string; reason: "delegate" | "assignee" | "mention" | "body-mention" }
-  | { suppressed: true }
+  | { suppressed: true; suppressedReason?: "delegate-clear" }
   | null;
 
 /**
@@ -102,7 +105,7 @@ export function extractAgentTarget(event: LinearEvent): AgentTargetResult {
       !extractId(data?.delegateId)
     ) {
       log.info("Delegate clear event — skipping dispatch instead of falling through to assignee");
-      return { suppressed: true };
+      return { suppressed: true, suppressedReason: "delegate-clear" };
     }
   }
 

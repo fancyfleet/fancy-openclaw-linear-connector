@@ -175,6 +175,12 @@ export interface IssueContext {
    * names the requested workflow id. Absent when not fetched (older callers).
    */
   description?: string | null;
+  /**
+   * INF-1262: current delegate's Linear user id, or null when unassigned.
+   * Used by the delegate-clear inline recovery wake to check whether a
+   * concurrent re-seat already landed before this fetch resolved.
+   */
+  delegateId?: string | null;
 }
 
 /** Re-export so callers (sweep) can import from a single module. */
@@ -232,6 +238,7 @@ export async function fetchIssueContext(issueId: string, authToken: string): Pro
       labels: issue.labels.nodes,
       creatorId: issue.creator?.id,
       description: issue.description,
+      delegateId: issue.delegate?.id ?? null,
     };
   } catch {
     return null;

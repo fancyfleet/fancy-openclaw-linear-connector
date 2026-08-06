@@ -183,7 +183,7 @@ export function classifyTicket(
 
 // ── Capability policy loading ──────────────────────────────────────────────
 
-function loadCapabilityPolicy(policyPath: string): CapabilityPolicy | null {
+export function loadCapabilityPolicy(policyPath: string): CapabilityPolicy | null {
   try {
     const raw = fs.readFileSync(policyPath, "utf8");
     return yaml.load(raw) as CapabilityPolicy;
@@ -203,7 +203,7 @@ function loadCapabilityPolicy(policyPath: string): CapabilityPolicy | null {
  * does not silently shrink a role and mis-classify its correctly-delegated siblings) and is
  * WARN-logged, since delegate mutations for it will fail until the mapping is fixed.
  */
-function buildRoleResolver(
+export function buildRoleResolver(
   policy: CapabilityPolicy | null,
   bodyIdToLinearUserId: (bodyId: string) => string | null,
 ): (roleId: string) => string[] {
@@ -654,7 +654,15 @@ async function rescueMalformed(
   };
 }
 
-async function rescueDormant(
+/**
+ * INF-1262: exported so the webhook-time inline delegate-clear recovery path
+ * (index.ts recoverDelegateClearInline) can reuse this exact re-seat logic —
+ * including the INF-753 live-race guard — instead of duplicating it. The
+ * hourly sweep and the inline path share one implementation; only the
+ * ticket-discovery mechanism differs (batch enumeration vs. a single webhook
+ * event).
+ */
+export async function rescueDormant(
   ticket: FetchedTicket,
   wfDef: WorkflowDef,
   roleBodiesForRole: (roleId: string) => string[],
