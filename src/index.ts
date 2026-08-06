@@ -1129,6 +1129,20 @@ export function createApp(options?: CreateAppOptions) {
       sameKeySessionReplay: buildSameKeySessionReplay(stale),
       recoveryRoleContext: buildRecoveryRoleContext(stale, linearState, snapshot),
     });
+
+    // INF-1295: for C5 (loop/runaway) and C6 (errored) classifications, escalate
+    // the ack tracker entry to suppress future blind re-dispatches. These classes
+    // indicate the agent is fundamentally stuck — re-dispatching the same agent
+    // for the same ticket will repeat the loop. The escalation prevents the
+    // watchdog and no-activity detector from re-firing until a human intervenes.
+    if (snapshot.classification === "C5" || snapshot.classification === "C6") {
+      const ticketId = snapshot.metadata.ticketId;
+      ackTracker.markEscalated(stale.agentId, ticketId);
+      log.info(
+        `INF-1295: escalated ack for ${stale.agentId} [${ticketId}] after ${snapshot.classification} — ` +
+        `suppressing future blind re-dispatch until manual intervention`,
+      );
+    }
     if (!recovery.success) {
       log.error(`Recovery failed for ${stale.sessionKey}: ${recovery.detail}`);
     } else if (recovery.rePoke) {
@@ -1269,7 +1283,7 @@ export function createApp(options?: CreateAppOptions) {
         ? new Map([[stale.agentId, new Map(agentFreshKeys)]])
         : undefined;
       log.info(`Stale session drain: re-signaling ${stale.agentId} for ${stale.pendingTickets.length} ticket(s)`);
-      const sent = await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfigForAgent(stale.agentId), { markActive: true, staleRecoveryKeys, ...resignalOptions });
+      const sent = await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfigForAgent(stale.agentId), { markActive: true, staleRecoveryKeys, ackTracker, ...resignalOptions });
       operationalEventStore.append({
         outcome: "stale-resignaled",
         agent: stale.agentId,
@@ -2216,6 +2230,9 @@ export function createApp(options?: CreateAppOptions) {
     // wake, and governed-transition wake all route through this single
     // instance so there is one call surface for wake-policy decisions.
     dispatchReliabilityController,
+    // INF-1295: pass ackTracker so the webhook router's resignal calls can
+    // suppress blind re-dispatch of escalated (agent, ticket) pairs.
+    ackTracker,
   ));
   governedTransitionWakeSchedulerWired = true;
 
@@ -2375,7 +2392,7 @@ export function createApp(options?: CreateAppOptions) {
       // Re-signal: agent has work waiting. Send one signal per ticket so each
       // issue is delivered into its own canonical per-ticket session key.
       try {
-        await resignalPendingTickets(agentId, regularPending, bag, sessionTracker, wakeConfigForAgent(agentId), { markActive: true, ...resignalOptions });
+        await resignalPendingTickets(agentId, regularPending, bag, sessionTracker, wakeConfigForAgent(agentId), { markActive: true, ackTracker, ...resignalOptions });
       } catch (err) {
         log.error(`Session-end re-signal failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -2385,6 +2402,7 @@ export function createApp(options?: CreateAppOptions) {
       try {
         await resignalPendingTickets(agentId, newHoldIds, bag, sessionTracker, wakeConfigForAgent(agentId), {
           markActive: true,
+          ackTracker,
           ...resignalOptions,
           onDispatched: (aid, tid) => ackTracker.recordDispatch(aid, tid),
         });
@@ -3272,6 +3290,7 @@ if (isEntryPoint) {
     replayPendingBag(bag, sessionTracker, wakeConfig, operationalEventStore, {
       ...resignalOptions,
       wakeConfigForAgent,
+      ackTracker,
       onDispatched: (agentId, ticketId) => ackTracker.recordDispatch(agentId, ticketId),
     }).catch((err) => {
       log.error(`Startup replay failed: ${err instanceof Error ? err.message : String(err)}`);
