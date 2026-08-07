@@ -2200,10 +2200,16 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         // beside a nominally-successful `commentCreate.success: true`. The comment
         // has already posted upstream at that point, so the loud decline must
         // acknowledge the posted comment (AC3) — never imply the whole operation
-        // rolled back. Cover `blocked` here (not just `failed`) and accept
-        // commentCreate-carried bodies; the comment-preservation clause is carried
-        // by the message wording (the delivered comment is acknowledged, not
-        // rolled back).
+        // rolled back. Cover `blocked` (not just `failed`) on commentCreate-carried
+        // bodies; the comment-preservation clause is carried by the message wording
+        // (the delivered comment is acknowledged, not rolled back).
+        //
+        // INF-1222 stays intact: commentCreate-carried payloads with a write-stage
+        // `failed` (e.g. post-write-diverge) still preserve their delivered comment
+        // (AI-1809/AI-2472) and keep `_workflowTransition` metadata attached — the
+        // CLI throws on `status === "failed"` (INF-1261) without an errors[]
+        // envelope (ai-2091 test 3 depends on this). Only `blocked` (gate-block,
+        // e.g. push-before-claim) declines loudly on commentCreate-carried bodies.
         //
         // Replace the body with an explicit GraphQL error envelope (no `data`),
         // carrying the decline reason. The delegate is now written only by the
@@ -2217,7 +2223,11 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           !nonAppliedForward &&
           (transitionResult?.status === "failed" || transitionResult?.status === "blocked") &&
           transitionResult?.to != null &&
-          (isIssueUpdateMutation(body) || isCommentCreateMutation(body));
+          // INF-1222: write-stage `failed` on commentCreate-carried payloads keeps
+          // the preserved-comment pass-through (AI-1809/AI-2472) — only the
+          // gate-block `blocked` case declines loudly on commentCreate bodies.
+          (isIssueUpdateMutation(body) ||
+            (isCommentCreateMutation(body) && transitionResult?.status === "blocked"));
         const loudDecline = nonAppliedForward || loudPeerFail;
         if (loudDecline && transitionResult) {
           const detail = transitionResult.detail
