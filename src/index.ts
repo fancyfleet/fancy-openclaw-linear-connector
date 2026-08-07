@@ -2564,7 +2564,7 @@ export function createApp(options?: CreateAppOptions) {
     },
   });
 
-  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, transitionAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore, livenessDispatchStore, linearRateLimitClient, globalRedispatchBudget, transcriptRedactionHealth: getTranscriptRedactionHealth(), startupCommitPromise });
+  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, dispatchReliabilityController, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, transitionAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, dispatchInFlightStore, sessionSpawnStore, livenessDispatchStore, linearRateLimitClient, globalRedispatchBudget, transcriptRedactionHealth: getTranscriptRedactionHealth(), startupCommitPromise });
 }
 
 /**
