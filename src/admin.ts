@@ -30,6 +30,7 @@ import { getFirstActionLadder } from "./first-action-watchdog-state.js";
 import type { DispatchAckEntry, AckStatus } from "./bag/dispatch-ack-tracker.js";
 import { recaptureAc } from "./ac-record-store.js";
 import type { MutationAuditStore } from "./store/mutation-audit-store.js";
+import type { TransitionAuditStore } from "./store/transition-audit-store.js";
 import { getStatus as getConfigHealthStatus } from "./config-health.js";
 import { getRegistryPolicyStatus } from "./registry-policy.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
@@ -74,6 +75,8 @@ interface AdminDeps {
   proposalStore?: ProposalStore;
   /** Test hook for governed redispatch; production uses sendWakeUpSignal. */
   reconciliationWakeFn?: (agentId: string, ticketId: string) => Promise<void>;
+  /** INF-1277: transition-audit persistence store, queried by GET /api/transition-audit. */
+  transitionAuditStore?: TransitionAuditStore;
 }
 
 type Severity = "green" | "yellow" | "red" | "gray";
@@ -1887,6 +1890,29 @@ export function createAdminRouter(deps: AdminDeps): Router {
 
     res.json({
       dispatches: ackStore.listFiltered({ agentId, ackStatus, limit }),
+    });
+  });
+
+  // ── INF-1277 AC2: filterable transition-audit history ──────────────────
+  // Pulls from the transition-audit.db (TransitionAuditStore) with optional
+  // ticket/status/code/since/until/limit query-param filters.
+  router.get("/api/transition-audit", (req: Request, res: Response) => {
+    const store = deps.transitionAuditStore;
+    if (!store) {
+      res.json({ records: [] });
+      return;
+    }
+
+    const ticket = typeof req.query.ticket === "string" ? req.query.ticket : undefined;
+    const status = typeof req.query.status === "string" ? req.query.status : undefined;
+    const code = typeof req.query.code === "string" ? req.query.code : undefined;
+    const since = typeof req.query.since === "string" ? req.query.since : undefined;
+    const until = typeof req.query.until === "string" ? req.query.until : undefined;
+    const limitRaw = typeof req.query.limit === "string" ? Number.parseInt(req.query.limit, 10) : undefined;
+    const limit = Number.isFinite(limitRaw ?? NaN) ? limitRaw : undefined;
+
+    res.json({
+      records: store.query({ ticket, status, code, since, until, limit }),
     });
   });
 
