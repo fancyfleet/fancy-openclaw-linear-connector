@@ -481,16 +481,24 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
   // Build label name → UUID resolver. Use injected resolver if provided (tests); otherwise
   // fetch team labels once per unique team so rescueMalformed can pass real UUIDs to labelIds.
   let labelNameToId: (name: string) => string | null;
+  const fetchedLabelMap = new Map<string, string>();
   if (injectedLabelNameToId) {
     labelNameToId = injectedLabelNameToId;
   } else {
-    const labelMap = new Map<string, string>();
     const teamIds = [...new Set(tickets.map((t) => t.teamId).filter(Boolean))];
     for (const teamId of teamIds) {
       const teamMap = await fetchTeamLabelMap(teamId, authToken);
-      for (const [name, id] of teamMap) labelMap.set(name, id);
+      for (const [name, id] of teamMap) fetchedLabelMap.set(name, id);
     }
-    labelNameToId = (name: string) => labelMap.get(name) ?? null;
+    labelNameToId = (name: string) => fetchedLabelMap.get(name) ?? null;
+  }
+
+  // INF-1304 r2: inverse map for resolving Linear addedLabelIds UUIDs → state names
+  // Built from the same team-label fetch as labelNameToId so no extra API call.
+  let labelIdToNameForHistory: Map<string, string> | undefined;
+  if (!injectedLabelNameToId && fetchedLabelMap.size > 0) {
+    labelIdToNameForHistory = new Map<string, string>();
+    for (const [name, id] of fetchedLabelMap.entries()) labelIdToNameForHistory.set(id, name);
   }
 
   // ── xfn/intake history-aware helpers (INF-1304) ────────────────────────
@@ -499,16 +507,33 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
     // Ledger-first (INF-1304 AC1 "ledger"): if transitionAuditStore or fetchTransitionAudit is injected, prefer it.
     if (options.transitionAuditStore) {
       try {
-        const rows = options.transitionAuditStore.query({ ticket: tid, limit: 100 });
+        const rows = (options.transitionAuditStore.query as (f: { ticket?: string; status?: string; limit?: number }) => Array<{ fromState: string | null; toState: string | null; ts: string; status?: string }> )({ ticket: tid, status: "applied", limit: 100 });
         if (rows.length > 0) {
           return rows.map((r) => ({ to: r.toState ?? undefined, from: r.fromState ?? undefined, createdAt: r.ts }));
+        }
+        // Fallback: store may not support status filter or no applied rows — try unfiltered
+        // but exclude explicitly blocked/failed if the rows carry status.
+        const allRows = options.transitionAuditStore.query({ ticket: tid, limit: 100 });
+        const appliedFallback = (allRows as Array<{ fromState: string | null; toState: string | null; ts: string; status?: string }>).filter(
+          (r) => !r.status || r.status === "applied",
+        );
+        if (appliedFallback.length > 0) {
+          return appliedFallback.map((r) => ({ to: r.toState ?? undefined, from: r.fromState ?? undefined, createdAt: r.ts }));
         }
       } catch {}
     }
     if (options.fetchTransitionAudit) {
       try {
         const rows = await options.fetchTransitionAudit(tid);
-        if (rows.length > 0) {
+        const appliedRows = (rows as Array<{ from: string | null; to: string | null; createdAt: string; status?: string }>).filter(
+          (r) => !r.status || r.status === "applied",
+        );
+        const effective = appliedRows.length > 0 ? appliedRows : (rows as Array<{ from: string | null; to: string | null; createdAt: string; status?: string }>).filter((r) => !r.status);
+        if (appliedRows.length === 0 && rows.some((r) => (r as { status?: string }).status)) {
+          // Every row is explicitly blocked/failed — no real position
+        } else if (effective.length > 0) {
+          return effective.map((r) => ({ to: r.to ?? undefined, from: r.from ?? undefined, createdAt: r.createdAt }));
+        } else if (rows.length > 0) {
           return rows.map((r) => ({ to: r.to ?? undefined, from: r.from ?? undefined, createdAt: r.createdAt }));
         }
       } catch {}
@@ -627,7 +652,7 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
       let hist: Array<{ state?: string; to?: string; comment?: string; createdAt?: string; fromStateId?: string; toStateId?: string; addedLabelIds?: string[]; from?: string; body?: string }> = [];
       try { hist = await fetchHistoryForSweep(ticket.id); } catch { hist = []; }
       if (hist.length > 0) {
-        const pos = resolveTruePosition({ labels: ticket.labels, identifier: ticket.identifier, id: ticket.id }, hist as unknown as Parameters<typeof resolveTruePosition>[1]);
+        const pos = resolveTruePosition({ labels: ticket.labels, identifier: ticket.identifier, id: ticket.id }, hist as unknown as Parameters<typeof resolveTruePosition>[1], labelIdToNameForHistory ? { labelIdToName: labelIdToNameForHistory } : undefined);
         if (pos) {
           const currentStateLabel = ticket.labels.find((l) => l.startsWith("state:"))?.slice("state:".length) ?? null;
           if (pos.stateId !== currentStateLabel) {

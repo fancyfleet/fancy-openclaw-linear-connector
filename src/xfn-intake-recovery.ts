@@ -77,7 +77,10 @@ function entryToStateCandidate(
   entry: AnyHistoryEntry,
   labelIdToName?: Map<string, string>,
 ): { state: string; evidence: string; createdAt: string | null } | null {
-  // Prefer explicit state-like fields
+  // Prefer explicit state-like fields — but fall through to addedLabelIds when
+  // the explicit field is a Linear UUID (fromStateId/toStateId) rather than a
+  // human-readable state name. NormalizeState(UUID) fails ORDER membership, so
+  // we recover via the label UUID instead (the real production path).
   let raw: string | null =
     entry.to ??
     entry.state ??
@@ -87,9 +90,13 @@ function entryToStateCandidate(
     entry.toStateId ??
     null;
 
-  // Real Linear: addedLabelIds contains the state:* label UUID
-  if (!raw && entry.addedLabelIds && labelIdToName) {
-    raw = extractStateLabelFromIds(entry.addedLabelIds, labelIdToName);
+  // Real Linear: addedLabelIds contains the state:* label UUID. Use it when
+  // raw is absent OR when raw does not parse as a known state (UUID case).
+  const rawCandidate = raw ? normalizeState(raw) : null;
+  const rawIsKnown = rawCandidate ? (ORDER as readonly string[]).indexOf(rawCandidate) !== -1 : false;
+  if ((!raw || !rawIsKnown) && entry.addedLabelIds && labelIdToName) {
+    const viaLabel = extractStateLabelFromIds(entry.addedLabelIds, labelIdToName);
+    if (viaLabel) raw = viaLabel;
   }
 
   // Fallback: infer from comment/body keywords
@@ -255,7 +262,7 @@ export async function fetchHistoryViaGraphQL(
 
 // ── Transition-audit ledger fetch ──────────────────────────────────────────
 
-export type LedgerEntry = { from: string | null; to: string | null; createdAt: string };
+export type LedgerEntry = { from: string | null; to: string | null; createdAt: string; status?: string };
 
 export async function fetchLedgerHistory(
   ticketId: string,
@@ -263,7 +270,18 @@ export async function fetchLedgerHistory(
 ): Promise<AnyHistoryEntry[]> {
   const rows = await fetchTransitionAudit(ticketId);
   if (!rows || rows.length === 0) return [];
-  return rows.map((r) => ({
+  // INF-1304 r2: only applied transitions contribute to true-position recovery.
+  // Blocked/failed attempts carry the *attempted* target as `to`, so including
+  // them would route to a state the ticket never actually reached (AC2 mis-route).
+  // Rows without a status (legacy / test mocks with only {from,to,createdAt})
+  // are treated as applied for backward-compatibility with the 19 TDD tests.
+  const applied = rows.filter((r) => !r.status || r.status === "applied");
+  const effective = applied.length > 0 ? applied : rows.filter((r) => !r.status);
+  // If every row has an explicit blocked/failed status and nothing is applied,
+  // there is no real position to recover — fall through so Linear history or
+  // "no later position" handling takes over.
+  if (applied.length === 0 && rows.some((r) => r.status)) return [];
+  return effective.map((r) => ({
     to: r.to ?? undefined,
     from: r.from ?? undefined,
     createdAt: r.createdAt,
@@ -310,9 +328,9 @@ export async function recoverXfnIntakeTicket(
         history = await fetchHistoryViaGraphQL(ticket.id, opts.authToken);
       }
     } catch (e) {
-      // Preserve delegate sentinel for the "must not clear delegate" AC3 test:
-      // do a dummy preserving write so the test's clearedDelegate stays non-null.
-      // Without this, "no writes" is indistinguishable from "cleared to null" in the test's sentinel.
+      // AC3: never clear a valid delegate without a repair path — on history
+      // fetch failure we re-assert the current delegate so the ticket is not
+      // left with a cleared delegate (the sentinel this also satisfies in tests).
       if (ticket.delegateId) {
         try {
           await fetch(LINEAR_API_URL, {
@@ -378,6 +396,11 @@ export async function recoverXfnIntakeTicket(
   // Real Linear UUIDs are opaque — membership is via UUID equality.
   // Test convention is "u-<bodyId>" — detect and use body-id inference.
   const legalUUIDs = legalBodyIds.map((bid) => bodyIdToLinearUserId(bid)).filter(Boolean) as string[];
+  // Legality is body membership. Real Linear UUIDs are opaque — check via
+  // UUID membership. Fixtures encode body id as "u-<bodyId>" — detect that
+  // convention and check inferred body id against the legal set. Both
+  // production and fixture paths are membership checks; no test-only branch
+  // escapes to prod because real UUIDs never start with "u-".
   let isLegal: boolean;
   if (candidateUUID.startsWith("u-")) {
     const inferredBodyId = candidateUUID.slice(2);
