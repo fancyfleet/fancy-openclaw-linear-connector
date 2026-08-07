@@ -396,7 +396,11 @@ describe("AI-2532: demote/escape actually apply state changes", () => {
     }
   });
 
-  it("AC2 (INF-1260 AC3): escape from a mid-spine state preserves position — noop, no ApplyAtomicTransition write", async () => {
+  // INF-1294: mid-spine escape now clears the delegate via the atomic write
+  // (documented at INF-1260 AC3: "the delegate is cleared but the position is
+  // preserved"), so it is no longer a silent noop — an ApplyAtomicTransition
+  // must fire that preserves the spine position and writes delegateId:null.
+  it("AC2 (INF-1260 AC3 + INF-1294): escape from a mid-spine state preserves position and clears delegate — applied", async () => {
     const mf = makeMockFetch("implementation");
     globalThis.fetch = mf.fetch;
 
@@ -411,16 +415,17 @@ describe("AI-2532: demote/escape actually apply state changes", () => {
     expect(res.status).toBe(200);
     expect(res.body.errors).toBeUndefined();
 
-    // INF-1260 AC3: escape from a mid-spine state (implementation is beyond
-    // the break-glass target, intake) now preserves position instead of
-    // resetting to intake — a noop, with no state-label write.
     expect(res.body._workflowTransition).toBeDefined();
-    expect(res.body._workflowTransition.status).toBe("noop");
+    expect(res.body._workflowTransition.status).toBe("applied");
 
     const appAtomicCalls = mf.calls.filter(
       (c) => c.query.includes("ApplyAtomicTransition"),
     );
-    expect(appAtomicCalls.length).toBe(0);
+    expect(appAtomicCalls.length).toBeGreaterThan(0);
+    // The atomic write preserves position (state:implementation label still present)
+    // and clears the delegate.
+    const lastAtomic = appAtomicCalls[appAtomicCalls.length - 1];
+    expect(lastAtomic.variables.delegateId).toBeNull();
   });
 
   it("AC4: escape from intake re-stamps state:intake (idempotency does not skip stale-cleanup)", async () => {

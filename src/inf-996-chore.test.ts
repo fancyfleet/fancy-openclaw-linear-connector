@@ -221,19 +221,22 @@ describe("INF-996 PR-D — wf:chore bound-seat behavior", () => {
     expect(capturedDelegate).not.toBe("lin-igor");               // reviewer != implementer
   });
 
-  it("escape from implementation preserves position (INF-1260 AC3) — bindings cleared for fresh re-intake", async () => {
+  it("escape from implementation preserves position (INF-1260 AC3 + INF-1294) — delegate+binding cleared, re-intake re-binds fresh", async () => {
     await recordBinding(ISSUE, "implementer", "igor", "chore");
     expect(await getBindings(ISSUE)).toEqual({ implementer: "igor" });
 
     globalThis.fetch = makeFetch("implementation", "lin-igor");
     const escaped = await applyStateTransition("escape", ISSUE, TOK, { sourceStateOverride: "implementation" });
-    // INF-1260 AC3: escape from implementation (beyond break-glass target intake)
-    // preserves spine position — noop rather than demoting to intake.
-    // Bindings are NOT cleared (noop means no write occurred).
-    expect(escaped.status).toBe("noop");
+    // INF-1260 AC3: preserves spine position (not back to intake).
+    // INF-1294: spine-preserved escape clears the delegate via the atomic write
+    // and the cleanup path clears bound seats (clearTicketBindings) so re-intake
+    // re-binds fresh — the prior silent noop left the seat wedged (INF-1278 loop).
+    expect(escaped.status).toBe("applied");
     expect(escaped.to).toBe("implementation");
-    // Bindings remain intact — the seat is still held.
-    expect(await getBindings(ISSUE)).toEqual({ implementer: "igor" });
+    expect(capturedDelegate).toBeNull();
+    // Bindings are cleared on escape (recovery path) — getBindings returns
+    // null (no record) once clearTicketBindings drops the ticket.
+    expect(await getBindings(ISSUE)).toBeNull();
 
     // Re-intake re-binds to a DIFFERENT implementer cleanly.
     globalThis.fetch = makeFetch("intake", "lin-astrid");

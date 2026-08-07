@@ -1504,10 +1504,14 @@ describe("applyStateTransition — break-glass escape", () => {
     const result = await applyStateTransition("escape", "issue-uuid", "Bearer tok");
 
     // INF-1260 AC3: escape from a mid-spine state (implementation is beyond
-    // the break-glass target, intake) preserves position — noop, no write.
-    expect(result.status).toBe("noop");
+    // the break-glass target, intake) preserves position — no re-entry to intake.
+    // INF-1294: the spine-preserved escape must clear the delegate (documented
+    // intent at workflow-gate.ts:6280) via an atomic write — the prior silent
+    // noop is the INF-1278 dead loop.
+    expect(result.status).toBe("applied");
     const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
-    expect(updateCall).toBeUndefined();
+    expect(updateCall).toBeDefined();
+    expect((updateCall!.body.variables as { delegateId?: string | null }).delegateId).toBeNull();
   });
 });
 
@@ -7205,7 +7209,7 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     }
   });
 
-  it("escape from a mid-spine state preserves position, no mutation written (INF-1260 AC3: escape no longer re-enters at intake)", async () => {
+  it("escape from a mid-spine state preserves position, delegate cleared (INF-1260 AC3 + INF-1294: escape no longer re-enters at intake; delegate cleared)", async () => {
     resetWorkflowCache();
     resetNativeStateCache();
     const { fetch, mutations } = makeConformanceFetch(["wf:dev-impl", "state:implementation"]);
@@ -7213,9 +7217,12 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
 
     const result = await applyStateTransition("escape", "AI-CONF-ESC", "Bearer tok", { bodyId: "astrid" });
 
-    expect(result.status).toBe("noop");
+    // INF-1260 AC3: preserves spine position (not back to intake).
+    // INF-1294: spine-preserved escape clears the delegate via the atomic write.
+    expect(result.status).toBe("applied");
     const atomicMutation = mutations.find((m) => m.query.includes("ApplyAtomicTransition"));
-    expect(atomicMutation).toBeUndefined();
+    expect(atomicMutation).toBeDefined();
+    expect((atomicMutation!.variables as { delegateId?: string | null }).delegateId).toBeNull();
   });
 
   it("reject transition routes back to implementation with todo resting native state", async () => {

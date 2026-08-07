@@ -664,7 +664,11 @@ describe("AI-1813 AC3: existing escape-from-known-state regression guard", () =>
     globalThis.fetch = originalFetch;
   });
 
-  it("applyStateTransition: escape from a known mid-spine state (implementation) preserves position — noop, no write (INF-1260 AC3)", async () => {
+  // INF-1294: mid-spine escape with spine preservation now clears the delegate
+  // via the atomic write (documented intent at INF-1260 AC3: "the delegate is
+  // cleared but the position is preserved"), mirroring handoff-work fall-through.
+  // Previously this returned noop (no write); the silent noop is the INF-1278 loop.
+  it("applyStateTransition: escape from a known mid-spine state (implementation) preserves position and clears delegate (INF-1294)", async () => {
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
@@ -675,9 +679,10 @@ describe("AI-1813 AC3: existing escape-from-known-state regression guard", () =>
     globalThis.fetch = mock;
     const result = await applyStateTransition("escape", "AI-1813", "Bearer tok");
 
-    expect(result.status).toBe("noop");
+    expect(result.status).toBe("applied");
     const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
-    expect(updateCall).toBeUndefined();
+    expect(updateCall).toBeDefined();
+    expect(updateCall!.body.variables!.delegateId).toBeNull();
   });
 
   it("checkWorkflowRules: escape is still legal from every known state (AC3 non-regression)", async () => {
