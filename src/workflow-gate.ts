@@ -7633,7 +7633,7 @@ export async function applyStateTransition(
           nativeStateId: issue.nativeStateId,
         }
       : undefined,
-    isTerminal && workflowId === "task"
+    isTerminal
       ? {
           requireReadableVerification: true,
           allowStateLabelLagFallback: false,

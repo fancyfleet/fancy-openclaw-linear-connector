@@ -1256,7 +1256,21 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           });
         }
 
-        res.status(200).json({ data: { migrateState: { success: true, from: migrateResult.from, to: migrateTarget, redispatched: migrateResult.redispatched ?? null } } });
+        // INF-1280 AC3: the CLI's break-glass migrate-state path issues an
+        // `issueUpdate ... { success }` mutation and reads `data.issueUpdate.success`
+        // off the response. Returning ONLY `data.migrateState` leaves `data.issueUpdate`
+        // undefined, so the CLI throws `Cannot read properties of undefined (reading
+        // 'success')` even though the write applied — a spurious failure on a
+        // successful break-glass. Alias the outcome under `issueUpdate` (and keep the
+        // structured `migrateState` for machine readers) so the CLI reports the true
+        // outcome. `issueUpdate.issue.id` is included because the CLI's updateIssue
+        // reader also asserts on it before re-fetching.
+        res.status(200).json({
+          data: {
+            issueUpdate: { success: true, issue: { id: migrateResult.internalId ?? issueId } },
+            migrateState: { success: true, from: migrateResult.from, to: migrateTarget, redispatched: migrateResult.redispatched ?? null },
+          },
+        });
         return;
       }
 
