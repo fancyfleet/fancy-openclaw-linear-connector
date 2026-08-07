@@ -277,10 +277,16 @@ describe("INF-1170 — multi-body requester role resolution", () => {
     globalThis.fetch = originalFetch;
   });
 
-  it("AC1: escape preserves position when beyond break-glass target (INF-1260 AC3)", async () => {
+  it("AC1: escape preserves position when beyond break-glass target (INF-1260 AC3 + INF-1294)", async () => {
     // INF-1260 AC3: escape from merge/sign-off (beyond break-glass target intake)
-    // preserves spine position — noop rather than demoting to intake.
+    // preserves spine position — no re-entry to intake.
+    // INF-1294: spine-preserved escape clears the delegate via the atomic write
+    // (documented intent at workflow-gate.ts:6280); the prior silent noop is the
+    // INF-1278 dead loop. The loop resets applied-state between iterations so
+    // the second escape still reads the live label (otherwise the first
+    // recordAppliedState would poison escapeSource for the second).
     for (const sourceState of ["merge", "sign-off"]) {
+      _resetAppliedStateStore();
       captured = { comments: [], writes: [] };
       globalThis.fetch = makeFetch({
         labelNames: ["wf:task", `state:${sourceState}`],
@@ -292,10 +298,11 @@ describe("INF-1170 — multi-body requester role resolution", () => {
         sourceStateOverride: sourceState,
       });
 
-      // Position preserved — noop, stays at current state.
-      expect(result).toMatchObject({ status: "noop", from: sourceState, to: sourceState });
-      // No label write should occur (noop).
-      expect(captured.writes.find((call) => call.query.includes("ApplyAtomicTransition"))).toBeUndefined();
+      // Position preserved, delegate cleared via atomic write.
+      expect(result).toMatchObject({ status: "applied", from: sourceState, to: sourceState });
+      const write = captured.writes.find((call) => call.query.includes("ApplyAtomicTransition"));
+      expect(write).toBeDefined();
+      expect((write!.variables as { delegateId?: string | null }).delegateId).toBeNull();
       expect(captured.comments).toEqual([]);
     }
   });
