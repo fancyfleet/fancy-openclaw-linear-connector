@@ -313,6 +313,8 @@ type IssueContext = {
   teamId: string | null;
   stateType: string | null;
   labelNames: string[];
+  /** INF-1298: true when the ticket currently has a delegate set. */
+  hasDelegate: boolean;
   /**
    * INF-1219: false when the `labels` sub-field was absent from a partial GraphQL
    * response (a real upstream failure mode — the field errored and was dropped,
@@ -349,6 +351,7 @@ async function fetchIssueContext(issueId: string, authToken: string): Promise<Is
           team?: { id?: string } | null;
           state?: { type?: string } | null;
           labels?: { nodes?: { name?: string }[] } | null;
+          delegate?: { id?: string } | null;
         } | null;
       };
     };
@@ -360,6 +363,7 @@ async function fetchIssueContext(issueId: string, authToken: string): Promise<Is
       labelNames: (issue.labels?.nodes ?? [])
         .map((n) => n.name)
         .filter((n): n is string => typeof n === "string"),
+      hasDelegate: issue.delegate?.id != null,
       labelsVerified: "labels" in issue && issue.labels !== undefined,
     };
   } catch (err) {
@@ -561,6 +565,34 @@ async function maybeDemoteCrossFunctionalRequest(
     issueCtx.stateType !== null &&
     issueCtx.stateType !== "backlog" &&
     issueCtx.labelNames.includes("cross-functional-request")
+  ) {
+    return null;
+  }
+
+  // INF-1298: active-dispatch guard. A ticket that carries a live delegate
+  // has been deliberately dispatched — it is not an un-triaged cross-functional
+  // request. The AC4 guard above only fires when the `cross-functional-request`
+  // label is still attached AND the ticket is already in a non-backlog state,
+  // but the label can be stripped by a prior demoter's own rewrite, and the
+  // state is Backlog whenever the demoter just re-parked it. Checking delegate
+  // presence is label- and state-independent and directly tests the signal
+  // that matters: someone owns this ticket.
+  //
+  // Without this guard, every follow-up mutation on a restored xfn ticket
+  // (consider-work, begin-work, handoff-work) re-triggers the demoter:
+  // the mutation carries `stateId` (target=active), the ticket has no wf:*
+  // label, and the agent is not a steward — so the demoter rewrites it to
+  // Backlog and clears the delegate, defeating the restoration. Observed on
+  // INF-1295: 6 demotions in 58 minutes after the INF-1230 deploy, each one
+  // firing on a legitimate follow-up mutation from the dispatched agent.
+  //
+  // State-independent: a Backlog ticket with a delegate is still dispatched —
+  // the delegate was set by an authorized agent and the Backlog state may be
+  // the result of a prior demotion, not a deliberate park. The demoter must
+  // not clear the delegate and re-apply xfn labels in this case.
+  if (
+    issueCtx &&
+    issueCtx.hasDelegate
   ) {
     return null;
   }
