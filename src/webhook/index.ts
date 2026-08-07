@@ -37,6 +37,7 @@ import { PendingWorkBag, SessionTracker, resignalPendingTickets, type NoActivity
 import { type WakeUpConfig } from "../bag/wake-up.js";
 import { createModuleLogger } from "../logging.js";
 import { checkLinearIssueRouting, isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
+import { findUnblockWakeRoutesForTerminalIssue } from "../unblock-wake.js";
 import { onChildTerminal } from "../barrier.js";
 import { maybeBootstrapWorkflow, fetchIssueContext } from "../workflow-bootstrap.js";
 import { notify } from "../alerts/alert-bus.js";
@@ -47,7 +48,6 @@ import type { DispatchRecordStore } from "../liveness-channel/dispatch-record-st
 import type { GatewayDispatchAck } from "../liveness-channel/gateway-ack-types.js";
 import { extractRejectedWebhookDiagnostic, WebhookSecretDriftTracker } from "./drift.js";
 import { LINEAR_API_URL } from "../linear-helpers.js";
-import { findNewlyUnblockedTickets } from "../dependency-clear-wake.js";
 
 const log = createModuleLogger("webhook", "info");
 
@@ -177,170 +177,6 @@ function appendOperationalEvent(store: OperationalEventStore | undefined, input:
   try { store.append(input); } catch (err) { log.error(`Operational event write failed: ${errorSummary(err)}`); }
 }
 
-const unblockWakeClaims = new Set<string>();
-
-function authHeaderForLinear(token: string): string {
-  return /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
-}
-
-function terminalEventUpdatedAt(event: LinearEvent): string {
-  const data = (event.data as Record<string, unknown> | undefined) ?? {};
-  return (data.updatedAt as string | undefined) ?? event.createdAt ?? "unknown";
-}
-
-function sameLinearIssueRef(a: Record<string, unknown> | null | undefined, b: Record<string, unknown>): boolean {
-  if (!a) return false;
-  return Boolean(
-    (typeof a.id === "string" && typeof b.id === "string" && a.id === b.id) ||
-    (typeof a.identifier === "string" && typeof b.identifier === "string" && a.identifier === b.identifier),
-  );
-}
-
-function isDoneOrCanceledState(state: unknown): boolean {
-  if (!state || typeof state !== "object") return false;
-  const record = state as Record<string, unknown>;
-  const type = typeof record.type === "string" ? record.type.toLowerCase() : "";
-  const name = typeof record.name === "string" ? record.name.toLowerCase() : "";
-  return type === "completed" || type === "canceled" || type === "cancelled" ||
-    name === "done" || name === "canceled" || name === "cancelled";
-}
-
-function syntheticUnblockEvent(target: Record<string, unknown>, blocker: Record<string, unknown>, sourceEvent: LinearEvent): LinearEvent {
-  const now = new Date().toISOString();
-  const targetIdentifier = target.identifier as string | undefined;
-  const team = target.team as Record<string, unknown> | undefined;
-  const state = target.state as Record<string, unknown> | undefined;
-  return {
-    type: "Issue",
-    action: "update",
-    createdAt: now,
-    actor: sourceEvent.actor,
-    data: {
-      ...target,
-      identifier: targetIdentifier,
-      updatedAt: (target.updatedAt as string | undefined) ?? now,
-      state: {
-        id: (state?.id as string | undefined) ?? "unknown",
-        name: (state?.name as string | undefined) ?? "unknown",
-        type: (state?.type as string | undefined) ?? "unknown",
-      },
-      priority: (target.priority as number | undefined) ?? 0,
-      priorityLabel: (target.priorityLabel as string | undefined) ?? "No priority",
-      teamId: (team?.id as string | undefined) ?? "unknown",
-      teamKey: (team?.key as string | undefined) ?? "",
-      labelIds: Array.isArray(target.labelIds) ? target.labelIds : [],
-      url: (target.url as string | undefined) ?? "",
-      createdAt: (target.createdAt as string | undefined) ?? now,
-    },
-    updatedFrom: {
-      blockedBy: String(blocker.identifier ?? blocker.id ?? "unknown"),
-    },
-    raw: { synthetic: "unblock-wake", source: sourceEvent.raw },
-  } as unknown as LinearEvent;
-}
-
-/**
- * INF-794 AC2/AC3: when a blocker reaches Done/Canceled, Linear sends the
- * webhook for the blocker, not for each newly-unblocked target. Fan out from
- * the blocker relation graph and synthesize ordinary delegate/assignee routes
- * for live targets, so they pass through the normal dispatch pipeline.
- */
-export async function findUnblockWakeRoutesForTerminalIssue(event: LinearEvent): Promise<RouteResult[]> {
-  if (!isTerminalIssueEvent(event)) return [];
-  const blocker = ((event.data as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
-  const blockerId = blocker.id as string | undefined;
-  const blockerIdentifier = issueIdentifierFromEvent(event);
-  const blockerLookup = blockerId ?? blockerIdentifier;
-  if (!blockerLookup || !isDoneOrCanceledState(blocker.state)) return [];
-
-  const token = resolveServiceCredential() || undefined;
-  if (!token) return [];
-
-  const response = await fetch(LINEAR_API_URL, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: authHeaderForLinear(token),
-    },
-    body: JSON.stringify({
-      query: `query BlockedTargets($id: String!) {
-        issue(id: $id) {
-          id identifier
-          relations(first: 50) {
-            nodes {
-              type
-              issue { id identifier }
-              relatedIssue {
-                id identifier title url priority priorityLabel createdAt updatedAt
-                state { id name type }
-                team { id key }
-                labelIds
-                delegate { id name app }
-                assignee { id name app }
-              }
-            }
-          }
-        }
-      }`,
-      variables: { id: blockerLookup },
-    }),
-  });
-  if (!response.ok) {
-    log.warn(`Blocked-target lookup failed for ${blockerIdentifier ?? blockerLookup}: HTTP ${response.status}`);
-    return [];
-  }
-  const body = await response.json() as {
-    data?: { issue?: { id?: string; identifier?: string; relations?: { nodes?: Array<Record<string, unknown>> | null } | null } | null };
-    errors?: Array<{ message?: string }>;
-  };
-  if (body.errors?.length) {
-    log.warn(`Blocked-target lookup errored for ${blockerIdentifier ?? blockerLookup}: ${body.errors.map((e) => e.message).join("; ")}`);
-    return [];
-  }
-
-  const sourceIssue = {
-    id: body.data?.issue?.id ?? blockerId,
-    identifier: body.data?.issue?.identifier ?? blockerIdentifier,
-  } as Record<string, unknown>;
-  const agentMap = buildAgentMap();
-  const routes: RouteResult[] = [];
-  for (const rel of body.data?.issue?.relations?.nodes ?? []) {
-    const type = typeof rel.type === "string" ? rel.type.toLowerCase() : "";
-    if (type !== "blocks" && type !== "blocking") continue;
-    const issue = rel.issue as Record<string, unknown> | null | undefined;
-    if (!sameLinearIssueRef(issue, sourceIssue)) continue;
-    const target = rel.relatedIssue as Record<string, unknown> | null | undefined;
-    const targetIdentifier = target?.identifier as string | undefined;
-    if (!target || !targetIdentifier) continue;
-
-    const delegate = target.delegate as { id?: string } | null | undefined;
-    const assignee = target.assignee as { id?: string } | null | undefined;
-    const delegateAgent = delegate?.id ? agentMap[delegate.id] : undefined;
-    const assigneeAgent = assignee?.id ? agentMap[assignee.id] : undefined;
-    const agentId = delegateAgent ?? assigneeAgent;
-    const routingReason = delegateAgent ? "delegate" : assigneeAgent ? "assignee" : undefined;
-    if (!agentId || !routingReason) continue;
-
-    const claimKey = [
-      sourceIssue.identifier ?? sourceIssue.id ?? blockerLookup,
-      terminalEventUpdatedAt(event),
-      targetIdentifier,
-      agentId,
-    ].join("->");
-    if (unblockWakeClaims.has(claimKey)) continue;
-    unblockWakeClaims.add(claimKey);
-
-    const targetEvent = syntheticUnblockEvent(target, sourceIssue, event);
-    routes.push({
-      agentId: getOpenclawAgentName(agentId),
-      sessionKey: normalizeSessionKey(targetIdentifier),
-      priority: 0,
-      routingReason,
-      event: targetEvent,
-    });
-  }
-  return routes;
-}
 
 function labelNamesFromUnknown(value: unknown): string[] {
   if (!value) return [];
@@ -982,72 +818,6 @@ export function createWebhookRouter(
               }
             }).catch((err) => {
               log.warn(`Barrier check failed for terminal child ${identifier}: ${err instanceof Error ? err.message : String(err)}`);
-            });
-
-            // INF-1297: Dependency-clear wake — event-driven downstream unblock.
-            // When a ticket reaches terminal, find tickets it was blocking that
-            // are now unblocked and re-dispatch them to their delegates.
-            // Fail-open: errors are logged and never block the terminal prune.
-            findNewlyUnblockedTickets(identifier, barrierToken).then(async (clearResult) => {
-              for (const ticket of clearResult.unblocked) {
-                const ticketSessionKey = normalizeSessionKey(ticket.identifier);
-                const agentName = ticket.delegateName ? getOpenclawAgentName(ticket.delegateName) : null;
-                if (!agentName) {
-                  log.warn(
-                    `dependency-clear-wake: ${ticket.identifier} unblocked but delegate ` +
-                    `'${ticket.delegateName}' not mapped to an openclaw agent`,
-                  );
-                  continue;
-                }
-                if (!bag || !sessionTracker) continue;
-
-                // Add to bag so downstream wake-up mechanisms can see it
-                bag.add(agentName, ticketSessionKey, "Issue", "dependency-clear");
-
-                // Send wake signal via the standard delivery pipeline
-                try {
-                  const agentCfg = getAgent(agentName);
-                  const depClearDeliveryConfig: DeliveryConfig = {
-                    nodeBin: process.execPath,
-                    hooksUrl: agentCfg?.hooksUrl ?? process.env.OPENCLAW_HOOKS_URL,
-                    hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
-                    hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
-                    hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
-                  };
-                  const { deliverMessageToAgent: depClearDeliver } = await import("../delivery/index.js");
-                  const wakeResult = await depClearDeliver(agentName, ticketSessionKey,
-                    `[Dependency cleared] ${identifier} is now terminal — ${ticket.identifier} is no longer blocked. ` +
-                    `Run \`linear consider-work ${ticket.identifier}\` to review.`,
-                    depClearDeliveryConfig,
-                  );
-                  log.info(
-                    `dependency-clear-wake: ${ticket.identifier} → ${agentName} ` +
-                    `(unblocked by ${identifier}, dispatched=${wakeResult.dispatched})`,
-                  );
-                  appendOperationalEvent(operationalEventStore, {
-                    outcome: wakeResult.dispatched ? "dependency-clear-wake" : "dependency-clear-failed",
-                    type: event.type,
-                    key: ticketSessionKey,
-                    sessionKey: ticketSessionKey,
-                    deliveryMode: "dependency-clear",
-                    runId: wakeResult.runId ?? null,
-                    detail: { unblockedBy: identifier, delegate: ticket.delegateName },
-                  });
-                } catch (wakeErr) {
-                  log.error(
-                    `dependency-clear-wake delivery failed for ${agentName} / ${ticket.identifier}: ` +
-                    `${wakeErr instanceof Error ? wakeErr.message : String(wakeErr)}`,
-                  );
-                }
-              }
-              if (clearResult.stillBlocked.length > 0) {
-                log.info(
-                  `dependency-clear-wake: ${clearResult.stillBlocked.length} ticket(s) still blocked ` +
-                  `by other prerequisites: ${clearResult.stillBlocked.join(", ")}`,
-                );
-              }
-            }).catch((err) => {
-              log.warn(`dependency-clear-wake failed for terminal ${identifier}: ${err instanceof Error ? err.message : String(err)}`);
             });
           }
         } else {
