@@ -1284,6 +1284,36 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           intent: "steward break-glass forward migration (INF-1268)",
         });
 
+        // INF-1303 (AC4): persist the migrate in the INF-1277 transition-audit
+        // ledger so workflow recovery can see the write applied. The migrate-state
+        // branch previously returned before the normal transition path's audit
+        // persistence, so a migrate was invisible to recovery tooling — which then
+        // still demanded a delegate repair after every migrate (the
+        // INF-1277/04:04Z residue shape). Mirrors the normal path's record shape
+        // (intent, from/to, agent, status applied).
+        if (deps?.transitionAuditStore) {
+          try {
+            deps.transitionAuditStore.record({
+              ticket: issueId ?? "",
+              intent: "migrate-state",
+              fromState: migrateResult.from ?? null,
+              toState: migrateTarget,
+              agent: agentId,
+              status: "applied",
+              code: "migrate-state",
+              detail: `steward break-glass forward migration (INF-1268); redispatched=${migrateResult.redispatched ?? "none"}`,
+              gateResults: [
+                { name: "migrate-state-capability", passed: true, detail: null },
+                { name: "migrate-state-target-validation", passed: true, detail: null },
+                { name: "set-state-atomic", passed: true, detail: null },
+              ],
+              labelMismatch: null,
+            });
+          } catch (persistErr) {
+            log.warn(`[transition-audit] failed to persist migrate-state audit record (non-blocking): ${persistErr instanceof Error ? persistErr.message : String(persistErr)}`);
+          }
+        }
+
         // Audit comment naming the steward, mirroring the rewind path's receipt.
         const migrateCommentIssueId = migrateResult.internalId ?? issueId;
         if (migrateCommentIssueId) {
@@ -1301,18 +1331,86 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           });
         }
 
-        // INF-1288 (Bug A): return the *issueUpdate*-shaped payload the CLI's
-        // migrate-state/rewind verbs actually parse. The CLI routes migrate-state
-        // through executeTransition → updateIssue, which reads
-        // `data.issueUpdate.success` / `data.issueUpdate.issue.id` and then re-fetches
-        // via getIssue(id). The pre-fix `{ data: { migrateState: {...} } }` shape left
-        // `data.issueUpdate` undefined, so the CLI threw `Cannot read properties of
-        // undefined (reading 'success')` even though setStateAtomic had already
-        // advanced label/native/ledger/comment server-side — the misleading error that
-        // forced the "ignore the client error, then observe" manual-kick. Returning the
-        // issueUpdate shape makes a successful migration exit cleanly on the deployed
-        // CLI (0.4.12) with no fleet-wide CLI converge required. The migrate metadata
-        // is carried alongside under `migrateState` for any caller that wants it.
+        // INF-1288 (Bug A) + INF-1303 (body-shaped envelope): return the payload
+        // matching the intercepted mutation's own shape, so the deployed CLI's
+        // post-write read never hits an undefined field.
+        //
+        // The no-comment migrate routes through executeTransition → updateIssue,
+        // which reads `data.issueUpdate.success` / `data.issueUpdate.issue.id` and
+        // then re-fetches via getIssue(id) — the issueUpdate shape below (INF-1288).
+        //
+        // But the steward commonly runs `migrate-state <id> --target <state>
+        // --comment "..."` — a documented option. The CLI posts the comment FIRST
+        // via addComment (a commentCreate mutation, commentTriggersProxy=true), and
+        // the proxy's migrate-state branch intercepts THAT request. INF-1288's
+        // issueUpdate-only envelope left `data.commentCreate` undefined, so the
+        // deployed CLI's addComment read `data.commentCreate.success` and threw
+        // `Cannot read properties of undefined (reading 'success')` — the exact old
+        // client error — AFTER the server-side write applied (the INF-1277/04:04Z
+        // recurrence). The commentCreate envelope must therefore carry
+        // `data.commentCreate.success` + the REAL posted comment, and the steward's
+        // comment text must actually be delivered to Linear — a success envelope
+        // must not lie about a dropped comment (AC5). The migrate metadata rides
+        // alongside under `migrateState` either way.
+        if (isCommentCreateMutation(body)) {
+          const stewardCommentVars = (body?.variables ?? {}) as Record<string, unknown>;
+          const stewardCommentBody =
+            (typeof stewardCommentVars.body === "string" && stewardCommentVars.body) || "";
+          let deliveredComment: { id: string; body: string; createdAt: string; url: string } | null = null;
+          if (stewardCommentBody) {
+            try {
+              const commentRes = await fetch(LINEAR_API_URL, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", Authorization: authorization },
+                body: JSON.stringify({
+                  query: `mutation($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id body createdAt url } } }`,
+                  variables: { issueId: migrateCommentIssueId, body: stewardCommentBody },
+                }),
+              });
+              if (commentRes.ok) {
+                const commentJson = (await commentRes.json()) as {
+                  data?: {
+                    commentCreate?: {
+                      success?: boolean;
+                      comment?: { id: string; body: string; createdAt: string; url: string } | null;
+                    } | null;
+                  };
+                  errors?: unknown;
+                };
+                if (commentJson.data?.commentCreate?.comment) {
+                  deliveredComment = commentJson.data.commentCreate.comment;
+                }
+              }
+            } catch (err) {
+              log.warn(`migrate-state steward comment delivery failed for ${migrateCommentIssueId}: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          }
+          // Truthful envelope: if the steward's comment could not be delivered, fail
+          // loudly with the real reason rather than claiming success for a comment
+          // that never landed. The state write DID apply — the message says so — so
+          // the steward is not misled into the old observe→handoff-work repair loop.
+          if (!deliveredComment) {
+            log.warn(`migrate-state-audit agent=${agentId} authorized=true result=comment-delivery-failed${ticketCtx} target=${migrateTarget}`);
+            res.status(200).json({ errors: [{ message: `[Proxy] migrate-state applied (${migrateResult.from ?? "?"} -> ${migrateTarget}) but the steward's comment could not be delivered to Linear.` }] });
+            return;
+          }
+          res.status(200).json({
+            data: {
+              commentCreate: {
+                success: true,
+                comment: deliveredComment,
+              },
+              migrateState: {
+                success: true,
+                from: migrateResult.from,
+                to: migrateTarget,
+                redispatched: migrateResult.redispatched ?? null,
+              },
+            },
+          });
+          return;
+        }
+
         res.status(200).json({
           data: {
             issueUpdate: {
