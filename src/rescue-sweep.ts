@@ -26,6 +26,7 @@ import { getLinearUserIdForAgent } from "./agents.js";
 import { boundSeatFor } from "./implementer-store.js";
 import type { OperationalEventInput } from "./store/operational-event-store.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
+import { isXfnIntakeResidue, resolveTruePosition } from "./xfn-intake-recovery.js";
 
 const log = createModuleLogger("rescue-sweep");
 
@@ -487,6 +488,66 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
     labelNameToId = (name: string) => labelMap.get(name) ?? null;
   }
 
+  // ── xfn/intake history-aware helpers (INF-1304) ────────────────────────
+  async function fetchHistoryForSweep(tid: string): Promise<Array<{ state?: string; to?: string; comment?: string }>> {
+    const q = `query TicketHistory($id: String!) { issue(id: $id) { history { state to comment } comments { nodes { body } } } }`;
+    try {
+      const res = await fetch(LINEAR_API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authToken },
+        body: JSON.stringify({ query: q, variables: { id: tid } }),
+      });
+      type HR = { data?: { issue?: { history?: Array<{ state?: string; to?: string; comment?: string }>; comments?: { nodes: Array<{ body?: string }> } } } };
+      const d = (await res.json()) as HR;
+      if (Array.isArray(d.data?.issue?.history) && d.data!.issue!.history!.length > 0) return d.data!.issue!.history as Array<{ state?: string; to?: string; comment?: string }>; 
+      const nodes = d.data?.issue?.comments?.nodes;
+      if (Array.isArray(nodes)) return nodes.map((n) => ({ comment: (n as { body?: string }).body ?? "" }));
+      return [];
+    } catch { return []; }
+  }
+  async function rescueXfnTruePosition(
+    t: FetchedTicket,
+    pos: { stateId: string; ownerRole: string; evidence: string },
+    labelResolver: (name: string) => string | null,
+  ): Promise<RescueAction | null> {
+    const candidates = pos.ownerRole ? roleBodiesForRole(pos.ownerRole) : [];
+    if (candidates.length !== 1) {
+      return {
+        ticketId: t.id,
+        identifier: t.identifier,
+        classification: "drifted" as const,
+        action: `xfn recovery: ambiguous delegation for ${pos.ownerRole} (${candidates.length} candidates) — cannot recover to state:${pos.stateId}`,
+        outcome: candidates.length === 0 ? "failed" : "ambiguous",
+      };
+    }
+    const delegateId = candidates[0];
+    const stateLabelName = `state:${pos.stateId}`;
+    const uuid = labelResolver(stateLabelName);
+    if (!uuid) {
+      return { ticketId: t.id, identifier: t.identifier, classification: "drifted" as const, action: `xfn recovery: could not resolve label ${stateLabelName}`, outcome: "failed" };
+    }
+    // Apply label: keep non-state ids + new state
+    const keepIds = t.labelNodes.filter((n) => !n.name.startsWith("state:")) .map((n) => n.id);
+    const newIds = [...new Set([...keepIds, uuid])];
+    const labelOk = await applyLabelIds(t.id, newIds, authToken);
+    if (!labelOk) {
+      return { ticketId: t.id, identifier: t.identifier, classification: "drifted" as const, action: `recovered to state:${pos.stateId} delegated to ${delegateId} (${pos.ownerRole}) — label update failed`, outcome: "failed" };
+    }
+    // Guard before delegate write (INF-753 terminal check)
+    const guard = await liveSeatBlocked(t.id, authToken);
+    if (guard.blocked && guard.reason === "terminal-label") {
+      return { ticketId: t.id, identifier: t.identifier, classification: "drifted" as const, action: `re-seat skipped — terminal`, outcome: "ambiguous" };
+    }
+    const ok = (await writeDelegate(t.id, delegateId, authToken)).ok;
+    return {
+      ticketId: t.id,
+      identifier: t.identifier,
+      classification: "drifted" as const,
+      action: `recovered to state:${pos.stateId} delegated to ${delegateId} (${pos.ownerRole})`,
+      outcome: ok ? "rescued" : "failed",
+    };
+  }
+
   for (const ticket of tickets) {
     // INF-1287: a terminal ticket (state:done / state:escape / state:canceled)
     // is closed and never needs rescuing — classifyTicket already returns
@@ -515,6 +576,44 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
     }
 
     const wfDef = workflowRegistry.get(wfId)!;
+    // INF-1304: history-aware override must run even for tickets that currently
+    // look healthy (snapshot shows correct delegate for an early state), because
+    // history may reveal a later true position (e.g. code-review) whose owner
+    // differs. So check history BEFORE the healthy skip.
+    const isXfn = isXfnIntakeResidue(ticket.labels);
+    const isEarly = ticket.labels.includes("state:intake") || ticket.labels.includes("state:write-tests");
+    if (isXfn || isEarly) {
+      let hist: Array<{ state?: string; to?: string; comment?: string }> = [];
+      try { hist = await fetchHistoryForSweep(ticket.id); } catch { hist = []; }
+      if (hist.length > 0) {
+        const pos = resolveTruePosition({ labels: ticket.labels, identifier: ticket.identifier, id: ticket.id }, hist as any);
+        if (pos) {
+          const currentStateLabel = ticket.labels.find((l) => l.startsWith("state:"))?.slice("state:".length) ?? null;
+          if (pos.stateId !== currentStateLabel) {
+            try {
+              const tr = await rescueXfnTruePosition(ticket, pos, labelNameToId);
+              if (tr) {
+                rescues.push(tr);
+                if (tr.outcome === "rescued") rescuedIds.add(ticket.id);
+                operationalEventStore?.append({
+                  outcome: `rescue:${tr.outcome}` as OperationalEventInput["outcome"],
+                  type: "rescue",
+                  detail: { ticketId: ticket.id, identifier: ticket.identifier, classification: tr.classification, action: tr.action },
+                });
+                byClassification[tr.classification] = (byClassification[tr.classification] ?? 0) + 1;
+                continue;
+              }
+            } catch (err: any) {
+              const msg = err instanceof Error ? err.message : String(err);
+              rescues.push({ ticketId: ticket.id, identifier: ticket.identifier, classification: "drifted" as const, action: `xfn recovery failed: ${msg}`, outcome: "failed" });
+              byClassification["drifted"] = (byClassification["drifted"] ?? 0) + 1;
+              continue;
+            }
+          }
+        }
+      }
+      // No later position -> fall through to normal classification path
+    }
     const classification = classifyTicket(ticket.labels, ticket.delegateId, wfDef, roleBodiesForRole);
     byClassification[classification] = (byClassification[classification] ?? 0) + 1;
 

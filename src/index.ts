@@ -32,6 +32,7 @@ import { applyEngagementStatus, registerEngagementNativeStateOverlay } from "./e
 import { createAdminRouter } from "./admin.js";
 import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, collectSameKeySessionReplay, STALE_CLASS_NAMES, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
 import { rescueDormant } from "./rescue-sweep.js";
+import { resolveTruePosition } from "./xfn-intake-recovery.js";
 import {
   getStaleSessionRecoveryLiveness,
   markStaleSessionRecoveryDriverRegistered,
