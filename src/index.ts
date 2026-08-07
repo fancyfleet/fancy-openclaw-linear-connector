@@ -435,19 +435,42 @@ export function createApp(options?: CreateAppOptions) {
   // NOT owner activity (Shape B — C6 bootstrap/model errors write
   // wake-turn-failed/delivery-failed but produce no artifact). Counting them
   // as activity would hide C6 stalls forever.
-  const CONNECTOR_FAILURE_OUTCOMES = new Set([
+  // INF-1305: connector-side outcomes that are NOT owner artifact production.
+  // Any operational event with these outcomes — even when attributed as agent=tdd —
+  // is dispatch bookkeeping, not evidence the owner produced a test artifact.
+  // Counting them as "owner activity" hides the primary stall shape (INF-1301/1302
+  // delivered + no-activity-warn/failed/redispatch with zero artifact).
+  // This set unions: failure outcomes (Shape B C6) + dispatch bookkeeping +
+  // no-activity family (Shape A). Only outcomes outside this set count as activity.
+  const CONNECTOR_NON_ARTIFACT_OUTCOMES = new Set([
+    // Shape B — C6 bootstrap/model errors
     "wake-turn-failed",
     "delivery-failed",
     "delivery-unconfirmed",
     "dispatch-undeliverable",
     "bootstrap-wake-failed",
     "delegation-reconciliation-failed",
+    // Shape A — no-activity bookkeeping (all authored as agent=tdd)
+    "no-activity-warn",
+    "no-activity-failed",
+    "no-activity-redispatch",
+    "no-activity-redispatch-failed",
+    // Dispatch/connector bookkeeping (all authored as agent routing)
+    "delivered",
+    "dispatch-accepted",
+    "delivery-pending-ack",
+    "dedup-suppressed",
+    "queued",
+    "bag-added",
+    "bootstrap-wake-delivered",
+    "bootstrap-wake-dispatched",
   ]);
+  // Keep old name as alias for any external probe that references it.
+  const CONNECTOR_FAILURE_OUTCOMES = CONNECTOR_NON_ARTIFACT_OUTCOMES;
   const isOwnerArtifactActivity = (e: { outcome: string }): boolean => {
     const outcome = String(e.outcome ?? "");
-    if (CONNECTOR_FAILURE_OUTCOMES.has(outcome)) return false;
-    // Treat explicit dispatch/connector failure events as non-owner even if
-    // attributed to the agent — only real artifact production counts.
+    if (CONNECTOR_NON_ARTIFACT_OUTCOMES.has(outcome)) return false;
+    // Only outcomes outside the connector-bookkeeping set count as owner artifact.
     return true;
   };
   const writeTestsStallDeps = {

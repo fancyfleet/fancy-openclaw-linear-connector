@@ -646,7 +646,8 @@ describe("INF-1305 AC2/AC4 behavior: sweep seeds Shape A + Shape B and asserts s
   it("Shape A — no-activity: enrolled write-tests + lease (linear-<ID>) + no owner activity => stalledCount>0, stalledTickets contains ticket", () => {
     // Simulate Shape A (INF-1301/1302/1303/1294): lease stored under production key linear-INF-1302.
     // The sweep receives enrolled row with raw ticket_id = INF-1302 and must normalize to linear-INF-1302.
-    const tickets = [{ ticketId: "INF-1302", delegate: "tdd", state: "write-tests" as const, enteredStateAt: new Date().toISOString() }];
+    // enteredStateAt is well past NO_OUTPUT_WINDOW_MS so the ticket is eligible for stalled.
+    const tickets = [{ ticketId: "INF-1302", delegate: "tdd", state: "write-tests" as const, enteredStateAt: new Date(Date.now() - 10 * 60 * 1000).toISOString() }];
     const leaseKeys = new Set<string>(["linear-INF-1302"]);
     registerWriteTestsNoOutputStall({
       listEnrolledWriteTestsTickets: () => tickets,
@@ -666,7 +667,7 @@ describe("INF-1305 AC2/AC4 behavior: sweep seeds Shape A + Shape B and asserts s
     // failure event that was authored with agent=tdd. The production hasOwnerActivity
     // wrapper filters that outcome via CONNECTOR_FAILURE_OUTCOMES, so the event
     // does NOT count — the ticket is still stalled.
-    const tickets = [{ ticketId: "INF-1304", delegate: "tdd", state: "write-tests" as const, enteredStateAt: new Date().toISOString() }];
+    const tickets = [{ ticketId: "INF-1304", delegate: "tdd", state: "write-tests" as const, enteredStateAt: new Date(Date.now() - 10 * 60 * 1000).toISOString() }];
     const leaseKeys = new Set<string>(["linear-INF-1304"]);
     // The hasOwnerActivity dep is the production-filtered one — it must return false
     // even when operational events include wake-turn-failed. We prove the filtering
@@ -690,7 +691,7 @@ describe("INF-1305 AC2/AC4 behavior: sweep seeds Shape A + Shape B and asserts s
   });
 
   it("Healthy in-progress is NOT stalled: lease active + owner activity present => stalledCount stays 0", () => {
-    const tickets = [{ ticketId: "INF-1310", delegate: "tdd", state: "write-tests" as const, enteredStateAt: new Date().toISOString() }];
+    const tickets = [{ ticketId: "INF-1310", delegate: "tdd", state: "write-tests" as const, enteredStateAt: new Date(Date.now() - 10 * 60 * 1000).toISOString() }];
     const leaseKeys = new Set<string>(["linear-INF-1310"]);
     registerWriteTestsNoOutputStall({
       listEnrolledWriteTestsTickets: () => tickets,
@@ -701,5 +702,134 @@ describe("INF-1305 AC2/AC4 behavior: sweep seeds Shape A + Shape B and asserts s
     const s = getWriteTestsNoOutputStallState();
     expect(s.stalledCount).toBe(0);
     expect(s.stalledTickets).toHaveLength(0);
+  });
+
+  it("Shape A through real wiring: createApp with enrolled write-tests + linear- lease + delivered + no-activity-* MUST surface as stalled (connector bookkeeping is not owner activity)", async () => {
+    // This test exercises the REAL hasOwnerActivity predicate from src/index.ts
+    // through createApp — not a stubbed hasOwnerActivity — so it would fail
+    // against the round-3 wiring where delivered/no-activity-* were counted
+    // as owner activity (the bug that kept INF-1301/1302/1303/1294 invisible).
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-1305-shapeA-real-"));
+    let appState: ReturnType<typeof createApp> | undefined;
+    let savedFetch: typeof globalThis.fetch | undefined;
+    try {
+      makeWorkflowFixtures(dir);
+      const agentsFile = makeAgentsFile(dir);
+      process.env.AGENTS_FILE = agentsFile;
+      process.env.LINEAR_API_KEY = "test-key-shapeA-real";
+      process.env.LINEAR_CONNECTOR_SECRET = "test-secret-shapeA-real";
+      process.env.LINEAR_WEBHOOK_SECRET = "test-webhook-shapeA-real";
+      resetPolicyCache();
+      resetWorkflowCache();
+      reloadAgents();
+      savedFetch = globalThis.fetch;
+      globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+        if (typeof url === "string" && url.includes("api.linear.app")) {
+          return new Response(JSON.stringify({ data: { issues: { nodes: [] } } }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return savedFetch!(url as never, init);
+      }) as typeof globalThis.fetch;
+
+      appState = createApp({
+        bagDbPath: path.join(dir, "bag.db"),
+        agentQueueDbPath: path.join(dir, "queue.db"),
+        operationalEventsDbPath: path.join(dir, "events.db"),
+        dispatchLeaseDbPath: path.join(dir, "dispatch-lease.db"),
+      });
+
+      // Enroll a TDD write-tests ticket in the real enrolledTicketsStore mirror
+      const ticketId = "INF-1301";
+      appState.enrolledTicketsStore.enroll({
+        ticketId,
+        workflow: "dev-impl",
+        state: "write-tests",
+        delegate: "tdd",
+      });
+      // enroll() stamps entered_state_at to now — backdate it past
+      // NO_OUTPUT_WINDOW_MS so the ticket is immediately eligible for stalled.
+      // This matches production: INF-1301 has been in write-tests for hours.
+      {
+        const staleEnteredAt = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+        const anyStore = appState.enrolledTicketsStore as unknown as Record<string, unknown>;
+        const realDb = (anyStore as { db?: { prepare: (sql: string) => { run: (...a: unknown[]) => unknown } } }).db;
+        if (realDb?.prepare) {
+          realDb.prepare(`UPDATE enrolled_tickets SET entered_state_at = ? WHERE ticket_id = ?`).run(staleEnteredAt, ticketId);
+        }
+      }
+
+      // Seed a dispatch lease under the production key linear-INF-1301
+      const sessionKey = `linear-${ticketId}`;
+      appState.dispatchLeaseStore.acquire("tdd", sessionKey, { ttlOverrideMs: 60 * 60 * 1000 });
+
+      // Seed the exact production event stream for Shape A: delivered + the
+      // no-activity family (all connector-side bookkeeping authored as tdd).
+      // None of these are owner artifact production — the sweep must still
+      // surface this ticket as stalled.
+      const enteredAt = appState.enrolledTicketsStore.getAll().find((r) => r.ticket_id === ticketId)?.entered_state_at ?? new Date().toISOString();
+      const events: Array<{ outcome: string; occurred_at: string }> = [
+        { outcome: "delivered", occurred_at: new Date(Date.now() - 60_000).toISOString() },
+        { outcome: "no-activity-warn", occurred_at: new Date(Date.now() - 30_000).toISOString() },
+        { outcome: "no-activity-failed", occurred_at: new Date(Date.now() - 10_000).toISOString() },
+        { outcome: "no-activity-redispatch", occurred_at: new Date(Date.now() - 5_000).toISOString() },
+      ];
+      void enteredAt; // silences lint while documenting the since window aligns to enrolled state
+      for (const e of events) {
+        appState.operationalEventStore.append({
+          outcome: e.outcome as never,
+          type: "Issue" as never,
+          agent: "tdd",
+          key: sessionKey,
+          sessionKey,
+          occurred_at: e.occurred_at,
+        } as never);
+      }
+
+      // Run one sweep synchronously (exposed for this test purpose) — the
+      // sweep reads the real enrolled/lease/operational stores populated above.
+      const { triggerWriteTestsNoOutputSweepForTest, getWriteTestsNoOutputStallState } =
+        await import("./write-tests-no-output-stall.js");
+      triggerWriteTestsNoOutputSweepForTest();
+
+      const stall = getWriteTestsNoOutputStallState();
+      expect(stall.stalledCount).toBeGreaterThan(0);
+      expect(stall.stalledTickets).toContain(ticketId);
+
+      // And the same stall must be visible at /health (warnings kind + field)
+      const res = await request(appState.app).get("/health");
+      const hasStallWarning = Array.isArray(res.body.warnings) &&
+        res.body.warnings.some((w: { kind?: string }) =>
+          String(w.kind ?? "").toLowerCase().includes("stall") ||
+          String(w.kind ?? "").toLowerCase().includes("no-output")
+        );
+      expect(hasStallWarning).toBe(true);
+      const stallField = (res.body as Record<string, unknown>).writeTestsNoOutputStall ??
+        (res.body as Record<string, unknown>).dispatchStall ??
+        (res.body as Record<string, unknown>).tddWriteTestsStall;
+      expect(stallField).toBeDefined();
+      const stalledCount = (stallField as Record<string, unknown>).stalledCount;
+      expect(typeof stalledCount === "number" ? stalledCount : 0).toBeGreaterThan(0);
+    } finally {
+      if (savedFetch) globalThis.fetch = savedFetch;
+      try {
+        appState?.bag?.close();
+        appState?.sessionTracker?.close();
+        appState?.agentQueue?.close();
+        appState?.operationalEventStore?.close();
+        appState?.dispatchLeaseStore?.close?.();
+        try { appState?.watchdog?.stop?.(); } catch {}
+        try { appState?.noActivityDetector?.stop?.(); } catch {}
+        try { appState?.managingPoller?.stop?.(); } catch {}
+      } catch {}
+      fs.rmSync(dir, { recursive: true, force: true });
+      delete process.env.WORKFLOW_DEF_PATH;
+      delete process.env.CAPABILITY_POLICY_PATH;
+      delete process.env.AGENTS_FILE;
+      delete process.env.LINEAR_API_KEY;
+      delete process.env.LINEAR_CONNECTOR_SECRET;
+      delete process.env.LINEAR_WEBHOOK_SECRET;
+    }
   });
 });

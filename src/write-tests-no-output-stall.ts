@@ -80,8 +80,8 @@ export interface WriteTestsNoOutputStallDeps {
   intervalMs?: number;
 }
 
-const DEFAULT_INTERVAL_MS = 5 * 60 * 1000;
-const NO_OUTPUT_WINDOW_MS = 2 * 60 * 1000; // mirror NoActivityDetector default
+export const DEFAULT_INTERVAL_MS = 5 * 60 * 1000;
+export const NO_OUTPUT_WINDOW_MS = 2 * 60 * 1000; // mirror NoActivityDetector default — applied as enter-window guard on stalledTickets (see runSweep)
 
 let deps: WriteTestsNoOutputStallDeps | null = null;
 
@@ -117,6 +117,14 @@ function runSweep(): void {
       const delegate = (row.delegate ?? "").toLowerCase();
       if (delegate !== "tdd") continue;
       const ticketId = row.ticketId;
+      // Apply no-output window: a ticket that only just entered write-tests
+      // is not yet stalled — avoids false positives on fresh dispatches.
+      if (row.enteredStateAt) {
+        const enteredMs = Date.parse(row.enteredStateAt);
+        if (!Number.isNaN(enteredMs) && Date.now() - enteredMs < NO_OUTPUT_WINDOW_MS) {
+          continue;
+        }
+      }
       const leaseKey = toLeaseKey(ticketId);
       let hasLease = deps.hasActiveLease?.(delegate, leaseKey) ?? false;
       if (!hasLease) {
