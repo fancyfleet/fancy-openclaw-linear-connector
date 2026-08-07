@@ -1188,8 +1188,12 @@ describe("recoverTicket — INF-1292 barrier-parent C4 re-poke guard", () => {
   /**
    * Fetch mock that returns a barrier parent ticket (sprint workflow, managing state)
    * with children that are NOT all terminal.
+   *
+   * `childrenReadFailed` simulates the INF-34 unreadable-child-set shape: the
+   * ParentChildren read fails (non-200), so `evaluateBarrier` returns
+   * `readFailed: true` with `allTerminal: false`.
    */
-  function makeBarrierParentFetchMock(mockOpts: { allChildrenTerminal: boolean }) {
+  function makeBarrierParentFetchMock(mockOpts: { allChildrenTerminal: boolean; childrenReadFailed?: boolean }) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     return jest.fn<(...args: Parameters<typeof fetch>) => Promise<any>>().mockImplementation(async (_url: unknown, fetchOpts?: unknown) => {
       const reqOpts = fetchOpts as RequestInit | undefined;
@@ -1218,6 +1222,15 @@ describe("recoverTicket — INF-1292 barrier-parent C4 re-poke guard", () => {
         };
       }
       if (query.includes("ParentChildren")) {
+        if (mockOpts.childrenReadFailed) {
+          // INF-34: a failed child-set read must not read as a vacuous empty set.
+          return {
+            ok: false,
+            status: 502,
+            statusText: "Bad Gateway",
+            json: async () => ({}),
+          };
+        }
         const children = mockOpts.allChildrenTerminal
           ? [
               { identifier: "CHILD-1", state: { name: "Done", type: "completed" }, labels: { nodes: [{ name: "state:done" }] } },
@@ -1311,5 +1324,63 @@ describe("recoverTicket — INF-1292 barrier-parent C4 re-poke guard", () => {
     expect(result.success).toBe(true);
     expect(result.action).toBe("re-poke-c4");
     expect(result.rePoke).toBe(true);
+  });
+
+  test("AC5 fail-open: barrier-check throws (defs dir unreadable) — normal C4 re-poke proceeds, no suppression", async () => {
+    // Force loadWorkflowDefById to throw by pointing the defs dir at a
+    // nonexistent path (loadWorkflowRegistry rethrows on an unreadable dir).
+    // The guard's try/catch must fail OPEN: the throw is logged and recovery
+    // continues down the normal C4 path — a barrier-check error must not
+    // suppress recovery for a genuinely actionable ticket.
+    process.env.WORKFLOW_DEFS_DIR = "/nonexistent/inf-1292-defs-dir";
+    resetWorkflowCache();
+    global.fetch = makeBarrierParentFetchMock({ allChildrenTerminal: false }) as unknown as typeof fetch;
+
+    const snapshot = makeSnapshot("C4");
+    const result = await recoverTicket(snapshot, "igor", {
+      redispatchDbPath: dbPath,
+      maxRedispatchAttempts: 3,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.action).toBe("re-poke-c4");
+    expect(result.rePoke).toBe(true);
+
+    // The re-poke comment IS posted — the throw did not suppress recovery.
+    const fetchMock = global.fetch as ReturnType<typeof jest.fn>;
+    const commentCall = (fetchMock.mock.calls as Array<[string, RequestInit]>).find(([, opts]) => {
+      const b = JSON.parse((opts?.body ?? "{}") as string);
+      return b.query?.includes("commentCreate");
+    });
+    expect(commentCall).toBeDefined();
+    const commentBody = JSON.parse((commentCall![1].body ?? "{}") as string);
+    expect(commentBody.variables.body).toContain("re-poking delegate");
+  });
+
+  test("AC5 unreadable-child variant: evaluateBarrier readFailed — no re-poke, skipped-barrier-wait", async () => {
+    // INF-34 semantics: an unreadable child set is NOT satisfaction. The barrier
+    // parent is still legitimately waiting, so the guard suppresses the C4
+    // re-poke (no churn) and the skip is observable as skipped-barrier-wait —
+    // sweeps can distinguish intentional waiting from silent failure.
+    global.fetch = makeBarrierParentFetchMock({ allChildrenTerminal: false, childrenReadFailed: true }) as unknown as typeof fetch;
+
+    const snapshot = makeSnapshot("C4");
+    const result = await recoverTicket(snapshot, "igor", {
+      redispatchDbPath: dbPath,
+      maxRedispatchAttempts: 3,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.action).toBe("skipped-barrier-wait");
+    expect(result.rePoke).toBeFalsy();
+    expect(result.detail).toContain("barrier");
+
+    // No re-poke comment should be posted.
+    const fetchMock = global.fetch as ReturnType<typeof jest.fn>;
+    const commentCall = (fetchMock.mock.calls as Array<[string, RequestInit]>).find(([, opts]) => {
+      const b = JSON.parse((opts?.body ?? "{}") as string);
+      return b.query?.includes("commentCreate");
+    });
+    expect(commentCall).toBeUndefined();
   });
 });
