@@ -36,6 +36,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "@jest/globals";
 import { applyStateTransition, resetNativeStateCache, resetWorkflowCache } from "./workflow-gate.js";
 import { reloadAgents } from "./agents.js";
+import { _resetAppliedStateStore } from "./store/applied-state-store.js";
 
 // A workflow fixture mirroring dev-impl's spine: break_glass.to is `intake`
 // (same as production src/registered-defs/dev-impl.yaml), so a ticket past
@@ -232,11 +233,13 @@ describe("INF-1294 (escape delegate-clear): mid-spine escape must not short-circ
     reloadAgents();
     resetWorkflowCache();
     resetNativeStateCache();
+    _resetAppliedStateStore();
     originalFetch = globalThis.fetch;
   });
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    _resetAppliedStateStore();
     fs.rmSync(dir, { recursive: true, force: true });
 
     if (originalWorkflowDefPath !== undefined) process.env.WORKFLOW_DEF_PATH = originalWorkflowDefPath;

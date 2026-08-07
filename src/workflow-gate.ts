@@ -6262,6 +6262,7 @@ export async function applyStateTransition(
 
   let toStateName: string = "";
   let matchedTransition: WorkflowTransition | undefined;
+  let escapeSpinePreserved = false;
 
   // AI-1813 fix: break-glass (escape) must be legal when no state:* label is
   // present — that's precisely the corruption escape exists to recover from.
@@ -6314,7 +6315,10 @@ export async function applyStateTransition(
       );
     } else if (escapeSource && !currentIsTerminal && currentIdx > targetIdx && currentIdx >= 0) {
       // Ticket has progressed beyond the break-glass target — preserve position.
+      // INF-1294: mark spine-preserved so the idempotency branch does not silent-noop
+      // before the documented delegate-clear write (mirror handoff-work fall-through).
       toStateName = escapeSource;
+      escapeSpinePreserved = true;
       log.info(
         `workflow-gate: B2 apply: ${issueId} break-glass escape from state '${escapeSource}' ` +
         `— preserving spine position (furthest reached: '${escapeSource}')`,
@@ -6761,8 +6765,10 @@ export async function applyStateTransition(
   // INF-124: for handoff self-loop, don't short-circuit — the delegate
   // write (via delegateOverride or the target field in the forwarded mutation
   // body) must still fire. Skip the idempotency check entirely.
-  if (intent === "handoff-work") {
-    log.info(`workflow-gate: B2 apply: ${issueId} handoff self-loop at state '${toStateName}' — continuing to delegate write`);
+  // INF-1294: mid-spine escape with spine preservation must also not noop — the
+  // documented delegate-clear (delegateId:null) must fire via the atomic write.
+  if (intent === "handoff-work" || (intent === breakGlassCommand && escapeSpinePreserved)) {
+    log.info(`workflow-gate: B2 apply: ${issueId} ${intent} self-loop at state '${toStateName}' — continuing to delegate write${escapeSpinePreserved ? " (spine-preserved delegate-clear)" : ""}`);
   } else if (currentStateName === toStateName) {
     const targetLabelName = `state:${toStateName}`;
     const hasTargetLabel = issue.labels.some((l) => l.name === targetLabelName);
@@ -7175,7 +7181,12 @@ export async function applyStateTransition(
   const destStateNode = def.states.find((s) => s.id === toStateName);
   const destOwnerRole = destStateNode?.owner_role;
   const isTerminal = destStateNode?.kind === 'terminal' || !destOwnerRole;
-  const preserveDelegate = !isTerminal && matchedTransition?.assign?.mode === 'none';
+  // INF-1294: spine-preserved escape must clear the delegate (documented intent at
+  // INF-1260 AC3: "the delegate is cleared but the position is preserved"). The
+  // generic preserveDelegate guard (assign.mode:none) must not fire for this path —
+  // escape has no matchedTransition/assign and must force delegate=null.
+  const isSpinePreservedEscape = intent === breakGlassCommand && escapeSpinePreserved;
+  const preserveDelegate = !isTerminal && !isSpinePreservedEscape && matchedTransition?.assign?.mode === 'none';
   let resolvedDelegateId: string | null | undefined = undefined;
 
   // AI-1977: delegate override — skip resolution entirely when pre-computed by proxy.
@@ -7188,11 +7199,18 @@ export async function applyStateTransition(
     );
   }
 
+  // INF-1294: spine-preserved escape forces delegate=null (cleared) even when the
+  // proxy pre-resolved via resolveTransitionDelegate — override must not survive.
+  if (isSpinePreservedEscape && options?.delegateOverride !== undefined) {
+    resolvedDelegateId = null;
+    log.info(`workflow-gate: B2 apply: ${issueId} ${intent} — spine-preserved escape forces delegate=cleared (overrode delegateOverride)`);
+  }
+
   // Only resolve the delegate if not overridden by delegateOverride.
   // When delegateOverride is provided, the proxy already set delegateId in the
   // forwarded mutation — skip the full resolution path to avoid conflicting with
   // the pre-forward determination or overwriting a terminal null.
-  if (options?.delegateOverride === undefined && !preserveDelegate) {
+  if (options?.delegateOverride === undefined && !preserveDelegate && !isSpinePreservedEscape) {
     // Rebuild WS2 (2026-07-03): delegate routing is DEF-DRIVEN, not state-name-
     // driven. The matched transition's `assign.default: prior-implementer` marks
     // deterministic return-to-worker routing (dev-impl: → implementation; task:
@@ -7467,6 +7485,9 @@ export async function applyStateTransition(
         }
       }
     }
+  } else if (isSpinePreservedEscape) {
+    resolvedDelegateId = null;
+    log.info(`workflow-gate: B2 apply: ${issueId} ${intent} — spine-preserved escape: delegate cleared`);
   } else if (preserveDelegate) {
     log.info(
       `workflow-gate: B2 apply: ${issueId} ${intent} — assign.mode=none; preserving existing delegate`,
