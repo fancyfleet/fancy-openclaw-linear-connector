@@ -91,6 +91,7 @@ import { evaluateCronStartupReadiness, parseCronStartupGraceMs } from "./cron/st
 import { buildRequiredCronHealth, getRequiredCronRetirements, isRequiredCron } from "./cron/required-crons.js";
 import { getRescueSweepState } from "./rescue-sweep-state.js";
 import { getDetectorState } from "./done-ticket-detector-state.js";
+import { getWriteTestsNoOutputStallState, registerWriteTestsNoOutputStall } from "./write-tests-no-output-stall.js";
 import { registerFirstActionWatchdogCron } from "./first-action-watchdog.js";
 import { getFirstActionWatchdogState } from "./first-action-watchdog-state.js";
 import { classifyCrossCheckIssue, type CrossCheckIssue } from "./first-action-crosscheck.js";
@@ -429,6 +430,72 @@ export function createApp(options?: CreateAppOptions) {
   // AI-1773/AI-1775 shipped without. `subscribed` records the second half: the
   // transition handler in workflow-gate receives this exact instance.
   registerObservationWritePath(observationStore, { subscribed: true });
+  // INF-1305: TDD write-tests no-output stall — register at the production
+  // entry point (createApp) so AC7 source probe and AC8 /health liveness
+  // pass without waiting for a failure trigger (AI-1808 dead-code guard).
+  // The sweep is wired to the live enrolled-tickets mirror + dispatch-lease
+  // store + operational events so stalledCount/stalledTickets are real (AC2/AC6).
+  // INF-1305 AC4 fix contract item 2: connector-side failure outcomes are
+  // NOT owner activity (Shape B — C6 bootstrap/model errors write
+  // wake-turn-failed/delivery-failed but produce no artifact). Counting them
+  // as activity would hide C6 stalls forever.
+  // INF-1305: connector-side outcomes that are NOT owner artifact production.
+  // Any operational event with these outcomes — even when attributed as agent=tdd —
+  // is dispatch bookkeeping, not evidence the owner produced a test artifact.
+  // Counting them as "owner activity" hides the primary stall shape (INF-1301/1302
+  // delivered + no-activity-warn/failed/redispatch with zero artifact).
+  // This set unions: failure outcomes (Shape B C6) + dispatch bookkeeping +
+  // no-activity family (Shape A). Only outcomes outside this set count as activity.
+  const CONNECTOR_NON_ARTIFACT_OUTCOMES = new Set([
+    // Shape B — C6 bootstrap/model errors
+    "wake-turn-failed",
+    "delivery-failed",
+    "delivery-unconfirmed",
+    "dispatch-undeliverable",
+    "bootstrap-wake-failed",
+    "delegation-reconciliation-failed",
+    // Shape A — no-activity bookkeeping (all authored as agent=tdd)
+    "no-activity-warn",
+    "no-activity-failed",
+    "no-activity-redispatch",
+    "no-activity-redispatch-failed",
+    // Dispatch/connector bookkeeping (all authored as agent routing)
+    "delivered",
+    "dispatch-accepted",
+    "delivery-pending-ack",
+    "dedup-suppressed",
+    "queued",
+    "bag-added",
+    "bootstrap-wake-delivered",
+    "bootstrap-wake-dispatched",
+  ]);
+  // Keep old name as alias for any external probe that references it.
+  const CONNECTOR_FAILURE_OUTCOMES = CONNECTOR_NON_ARTIFACT_OUTCOMES;
+  const isOwnerArtifactActivity = (e: { outcome: string }): boolean => {
+    const outcome = String(e.outcome ?? "");
+    if (CONNECTOR_NON_ARTIFACT_OUTCOMES.has(outcome)) return false;
+    // Only outcomes outside the connector-bookkeeping set count as owner artifact.
+    return true;
+  };
+  const writeTestsStallDeps = {
+    listEnrolledWriteTestsTickets: () =>
+      enrolledTicketsStore.getAll()
+        .filter((r) => r.terminal !== 1 && String(r.state ?? "").toLowerCase() === "write-tests")
+        .map((r) => ({ ticketId: r.ticket_id, delegate: r.delegate, state: r.state, enteredStateAt: r.entered_state_at })),
+    hasActiveLease: (agentId: string, ticketId: string) => dispatchLeaseStore.hasActiveLease(agentId, ticketId),
+    hasOwnerActivity: (agentId: string, ticketId: string) => {
+      const rows = enrolledTicketsStore.getAll().find((r) => r.ticket_id === ticketId);
+      const since = rows?.entered_state_at ?? new Date(Date.now() - 60 * 60 * 1000).toISOString();
+      try {
+        const events = operationalEventStore.query({ key: `linear-${ticketId}`, since, limit: 50 });
+        return events.some((e) => {
+          if ((e.agent ?? "").toLowerCase() !== agentId.toLowerCase()) return false;
+          return isOwnerArtifactActivity(e as { outcome: string });
+        });
+      } catch { return false; }
+    },
+  };
+  registerWriteTestsNoOutputStall(writeTestsStallDeps);
   // AI-2568: enable native_state-aware engagement overlay so "doing" semantics
   // respect the workflow state's native_state declaration on delegate assignment.
   registerEngagementNativeStateOverlay();
@@ -631,6 +698,23 @@ export function createApp(options?: CreateAppOptions) {
       lastError: failure.lastError,
       failureStreak: failure.failureStreak,
     })));
+    // INF-1305 AC2/AC6: surface write-tests no-output stalls as actionable warnings
+    // so engine-watch can distinguish healthy in-progress from idempotent-but-stalled.
+    // The stall field itself is the primary signal; this warnings entry is the
+    // secondary loud path that makes the stall visible in the same warnings array
+    // every operator already watches for dispatch-undeliverable/critical-stale-cron.
+    const wtStall = getWriteTestsNoOutputStallState();
+    if (wtStall.stalledTickets.length > 0) {
+      for (const ticket of wtStall.stalledTickets) {
+        warnings.push({
+          kind: "write-tests-no-output-stall",
+          ticket,
+          delegate: "tdd",
+          state: "write-tests",
+          occurredAt: wtStall.lastRunAt,
+        });
+      }
+    }
 
     res.status(healthy ? 200 : 503).json({
       status: healthy ? "ok" : "degraded",
@@ -688,6 +772,11 @@ export function createApp(options?: CreateAppOptions) {
       observations: getObservationWritePathState(),
       // AI-1857 AC3: rescue-sweep last-run visibility — "did it run" without log access.
       rescueSweep: getRescueSweepState(),
+      // INF-1305 AC6/AC8: TDD write-tests no-output stall liveness — scheduled/active
+      // prove the component is registered at bootstrap (AC7/AC8), stalledCount/
+      // stalledTickets let engine-watch distinguish healthy in-progress from
+      // idempotent-but-stalled write-tests (AC6). Observable without trigger.
+      writeTestsNoOutputStall: getWriteTestsNoOutputStallState(),
       // INF-314 AC9: stall detection liveness — active state + thresholds
       // observable at /health without waiting for a stall to occur.
       stallDetection: getStallDetectionState(),

@@ -58,6 +58,7 @@ const EXPECTED_CRONS = [
   "stall-liveness-sweep", // INF-314: stall detection liveness sweep
   "transcript-redaction", // AI-2582: periodic .trajectory.jsonl credential redaction sweep
   "ttl-cache-invalidation", // AI-2200: TTL cache invalidation liveness
+  "write-tests-no-output-stall", // INF-1305: TDD write-tests no-output stall
 ].sort();
 
 const PORT = 4100 + (process.pid % 400);
