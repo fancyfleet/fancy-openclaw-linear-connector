@@ -60,7 +60,7 @@ const DEFAULT_INTERVAL_MS = parseIntervalMs(process.env.RESCUE_SWEEP_INTERVAL ??
  * per-ticket rescue:* outcomes reach operational-events.db and are queryable.
  * Absent store → events are silently skipped (unchanged prior behaviour).
  */
-async function runSweepIteration(operationalEventStore?: OperationalEventStore): Promise<void> {
+async function runSweepIteration(operationalEventStore?: OperationalEventStore, transitionAuditStore?: { query(filter: { ticket?: string; limit?: number }): Array<{ fromState: string | null; toState: string | null; ts: string }> }): Promise<void> {
   try {
     // INF-1212: dedicated service credential, decoupled from any individual agent's token.
     const authToken = resolveServiceCredential();
@@ -72,7 +72,7 @@ async function runSweepIteration(operationalEventStore?: OperationalEventStore):
       return;
     }
     const workflowRegistry = await loadWorkflowRegistry();
-    const result = await runRescueSweep({ authToken, workflowRegistry, operationalEventStore });
+    const result = await runRescueSweep({ authToken, workflowRegistry, operationalEventStore, transitionAuditStore });
     recordRescueSweepRun(result);
     if (result.rescued > 0 || result.errors.length > 0) {
       log.info(
@@ -94,11 +94,12 @@ async function runSweepIteration(operationalEventStore?: OperationalEventStore):
 
 export async function _runRescueSweepIterationForTest(
   operationalEventStore?: OperationalEventStore,
+  transitionAuditStore?: { query(filter: { ticket?: string; limit?: number }): Array<{ fromState: string | null; toState: string | null; ts: string }> },
 ): Promise<void> {
   if (process.env.NODE_ENV !== "test") {
     throw new Error("_runRescueSweepIterationForTest is test-only");
   }
-  await runSweepIteration(operationalEventStore);
+  await runSweepIteration(operationalEventStore, transitionAuditStore);
 }
 
 /**
@@ -110,19 +111,19 @@ export async function _runRescueSweepIterationForTest(
  * (also unref'd) so the sweep doesn't wait a full interval before initial
  * execution.
  */
-export function registerRescueSweepCron(operationalEventStore?: OperationalEventStore): void {
+export function registerRescueSweepCron(operationalEventStore?: OperationalEventStore, transitionAuditStore?: { query(filter: { ticket?: string; limit?: number }): Array<{ fromState: string | null; toState: string | null; ts: string }> }): void {
   const intervalMs = DEFAULT_INTERVAL_MS;
   registerCron("rescue-sweep", `every ${formatIntervalMs(intervalMs)}`);
 
   // AI-1970: first run shortly after startup (unref'd).
   const firstRunTimer = setTimeout(() => {
-    void runSweepIteration(operationalEventStore);
+    void runSweepIteration(operationalEventStore, transitionAuditStore);
   }, 0);
   if (process.env.NODE_ENV !== "test") firstRunTimer.unref();
 
   // Recurring interval.
   const timer = setInterval(() => {
-    void runSweepIteration(operationalEventStore);
+    void runSweepIteration(operationalEventStore, transitionAuditStore);
   }, intervalMs);
   if (process.env.NODE_ENV !== "test") timer.unref();
 

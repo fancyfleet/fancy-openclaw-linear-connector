@@ -110,6 +110,11 @@ export interface RescueSweepOptions {
    * "drifted" and every corrective `setDelegate` is rejected with `delegateId must be a UUID`.
    */
   bodyIdToLinearUserId?: (bodyId: string) => string | null;
+  /** Transition-audit ledger store for history-aware recovery (INF-1304).
+   *  When provided, ledger records are consulted before Linear history.
+   *  Tests can also inject fetchTransitionAudit directly. */
+  transitionAuditStore?: { query(filter: { ticket?: string; limit?: number }): Array<{ fromState: string | null; toState: string | null; ts: string }> };
+  fetchTransitionAudit?: (ticketId: string) => Promise<Array<{ from: string | null; to: string | null; createdAt: string }>>;
 }
 
 // ── Internal types ─────────────────────────────────────────────────────────
@@ -489,19 +494,55 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
   }
 
   // ── xfn/intake history-aware helpers (INF-1304) ────────────────────────
-  async function fetchHistoryForSweep(tid: string): Promise<Array<{ state?: string; to?: string; comment?: string }>> {
-    const q = `query TicketHistory($id: String!) { issue(id: $id) { history { state to comment } comments { nodes { body } } } }`;
+  // Real Linear API: history is a connection — must use history(first:N){ nodes{...}}
+  async function fetchHistoryForSweep(tid: string): Promise<Array<{ state?: string; to?: string; comment?: string; createdAt?: string; fromStateId?: string; toStateId?: string; addedLabelIds?: string[]; from?: string; body?: string }>> {
+    // Ledger-first (INF-1304 AC1 "ledger"): if transitionAuditStore or fetchTransitionAudit is injected, prefer it.
+    if (options.transitionAuditStore) {
+      try {
+        const rows = options.transitionAuditStore.query({ ticket: tid, limit: 100 });
+        if (rows.length > 0) {
+          return rows.map((r) => ({ to: r.toState ?? undefined, from: r.fromState ?? undefined, createdAt: r.ts }));
+        }
+      } catch {}
+    }
+    if (options.fetchTransitionAudit) {
+      try {
+        const rows = await options.fetchTransitionAudit(tid);
+        if (rows.length > 0) {
+          return rows.map((r) => ({ to: r.to ?? undefined, from: r.from ?? undefined, createdAt: r.createdAt }));
+        }
+      } catch {}
+    }
+    const q = `query TicketHistory($id: String!) { issue(id: $id) { history(first: 100) { nodes { fromStateId toStateId addedLabelIds removedLabelIds createdAt } } comments(first: 50) { nodes { body createdAt } } } }`;
     try {
       const res = await fetch(LINEAR_API_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: authToken },
         body: JSON.stringify({ query: q, variables: { id: tid } }),
       });
-      type HR = { data?: { issue?: { history?: Array<{ state?: string; to?: string; comment?: string }>; comments?: { nodes: Array<{ body?: string }> } } } };
+      // Handle both real Linear shape (history:{nodes:[...]}) and test-mock flat shape (history:[...])
+      type HR = { data?: { issue?: { history?: { nodes?: Array<{ fromStateId?: string | null; toStateId?: string | null; addedLabelIds?: string[] | null; removedLabelIds?: string[] | null; createdAt?: string; state?: string; to?: string; comment?: string }> } | Array<{ state?: string; to?: string; comment?: string; createdAt?: string; fromStateId?: string; toStateId?: string; addedLabelIds?: string[] }>; comments?: { nodes: Array<{ body?: string; createdAt?: string }> } } } };
       const d = (await res.json()) as HR;
-      if (Array.isArray(d.data?.issue?.history) && d.data!.issue!.history!.length > 0) return d.data!.issue!.history as Array<{ state?: string; to?: string; comment?: string }>; 
-      const nodes = d.data?.issue?.comments?.nodes;
-      if (Array.isArray(nodes)) return nodes.map((n) => ({ comment: (n as { body?: string }).body ?? "" }));
+      const rawHistory: unknown = d.data?.issue?.history;
+      if (Array.isArray(rawHistory) && rawHistory.length > 0) {
+        // Flat array from test mocks (and old code path)
+        return (rawHistory as Array<{ state?: string; to?: string; comment?: string; createdAt?: string; fromStateId?: string; toStateId?: string; addedLabelIds?: string[]; from?: string; body?: string }>).map((n) => ({
+          state: n.state, to: n.to, comment: n.comment ?? n.body, createdAt: n.createdAt, fromStateId: n.fromStateId, toStateId: n.toStateId, addedLabelIds: n.addedLabelIds, from: n.from,
+        }));
+      }
+      const nodes = (rawHistory as { nodes?: Array<{ fromStateId?: string | null; toStateId?: string | null; addedLabelIds?: string[] | null; removedLabelIds?: string[] | null; createdAt?: string }> } | undefined)?.nodes;
+      if (Array.isArray(nodes) && nodes.length > 0) {
+        return nodes.map((n) => ({
+          fromStateId: n.fromStateId ?? undefined,
+          toStateId: n.toStateId ?? undefined,
+          addedLabelIds: (n.addedLabelIds as string[] | undefined) ?? undefined,
+          createdAt: n.createdAt,
+        }));
+      }
+      const commentNodes = d.data?.issue?.comments?.nodes;
+      if (Array.isArray(commentNodes) && commentNodes.length > 0) {
+        return commentNodes.map((n) => ({ comment: n.body ?? "", createdAt: n.createdAt }));
+      }
       return [];
     } catch { return []; }
   }
@@ -583,10 +624,10 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
     const isXfn = isXfnIntakeResidue(ticket.labels);
     const isEarly = ticket.labels.includes("state:intake") || ticket.labels.includes("state:write-tests");
     if (isXfn || isEarly) {
-      let hist: Array<{ state?: string; to?: string; comment?: string }> = [];
+      let hist: Array<{ state?: string; to?: string; comment?: string; createdAt?: string; fromStateId?: string; toStateId?: string; addedLabelIds?: string[]; from?: string; body?: string }> = [];
       try { hist = await fetchHistoryForSweep(ticket.id); } catch { hist = []; }
       if (hist.length > 0) {
-        const pos = resolveTruePosition({ labels: ticket.labels, identifier: ticket.identifier, id: ticket.id }, hist as any);
+        const pos = resolveTruePosition({ labels: ticket.labels, identifier: ticket.identifier, id: ticket.id }, hist as unknown as Parameters<typeof resolveTruePosition>[1]);
         if (pos) {
           const currentStateLabel = ticket.labels.find((l) => l.startsWith("state:"))?.slice("state:".length) ?? null;
           if (pos.stateId !== currentStateLabel) {

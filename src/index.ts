@@ -32,7 +32,9 @@ import { applyEngagementStatus, registerEngagementNativeStateOverlay } from "./e
 import { createAdminRouter } from "./admin.js";
 import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, collectSameKeySessionReplay, STALE_CLASS_NAMES, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
 import { rescueDormant } from "./rescue-sweep.js";
-import { resolveTruePosition } from "./xfn-intake-recovery.js";
+import { isXfnIntakeResidue, resolveTruePosition } from "./xfn-intake-recovery.js";
+void isXfnIntakeResidue;
+void resolveTruePosition;
 import {
   getStaleSessionRecoveryLiveness,
   markStaleSessionRecoveryDriverRegistered,
@@ -2684,7 +2686,7 @@ if (isEntryPoint) {
     startTokenRefresh();
   }
 
-  const { app, agentQueue, bag, sessionTracker, operationalEventStore, observationStore, proposalStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, mutationAuditStore, enrolledTicketsStore, idempotencyStore, dispatchLeaseStore, dispatchReliabilityController } = createApp();
+  const { app, agentQueue, bag, sessionTracker, operationalEventStore, observationStore, proposalStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, mutationAuditStore, enrolledTicketsStore, idempotencyStore, dispatchLeaseStore, dispatchReliabilityController, transitionAuditStore } = createApp();
 
   // P4-C3: periodic distillation of reject metrics into the deterministic
   // generation engine, persisted into the unified C4 store (AI-2070). The prod
@@ -2692,7 +2694,7 @@ if (isEntryPoint) {
   registerDistillationCron(observationStore, proposalStore, createProdGenerationContext());
   // AI-1566: periodic rescue sweep — detect and repair dormant/malformed wf:* tickets
   // AI-2093: pass the operationalEventStore so rescue:* outcomes are persisted + queryable.
-  registerRescueSweepCron(operationalEventStore);
+  registerRescueSweepCron(operationalEventStore, transitionAuditStore);
 
   // AI-1775: periodic reconciliation sweep — heal wf:* tickets that never
   // enrolled (dropped Issue-update webhook). Safety net for the bootstrap path.
