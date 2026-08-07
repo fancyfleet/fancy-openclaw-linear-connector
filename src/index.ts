@@ -431,18 +431,40 @@ export function createApp(options?: CreateAppOptions) {
   // pass without waiting for a failure trigger (AI-1808 dead-code guard).
   // The sweep is wired to the live enrolled-tickets mirror + dispatch-lease
   // store + operational events so stalledCount/stalledTickets are real (AC2/AC6).
+  // INF-1305 AC4 fix contract item 2: connector-side failure outcomes are
+  // NOT owner activity (Shape B — C6 bootstrap/model errors write
+  // wake-turn-failed/delivery-failed but produce no artifact). Counting them
+  // as activity would hide C6 stalls forever.
+  const CONNECTOR_FAILURE_OUTCOMES = new Set([
+    "wake-turn-failed",
+    "delivery-failed",
+    "delivery-unconfirmed",
+    "dispatch-undeliverable",
+    "bootstrap-wake-failed",
+    "delegation-reconciliation-failed",
+  ]);
+  const isOwnerArtifactActivity = (e: { outcome: string }): boolean => {
+    const outcome = String(e.outcome ?? "");
+    if (CONNECTOR_FAILURE_OUTCOMES.has(outcome)) return false;
+    // Treat explicit dispatch/connector failure events as non-owner even if
+    // attributed to the agent — only real artifact production counts.
+    return true;
+  };
   const writeTestsStallDeps = {
     listEnrolledWriteTestsTickets: () =>
       enrolledTicketsStore.getAll()
         .filter((r) => r.terminal !== 1 && String(r.state ?? "").toLowerCase() === "write-tests")
-        .map((r) => ({ ticketId: r.ticket_id, delegate: r.delegate, state: r.state })),
+        .map((r) => ({ ticketId: r.ticket_id, delegate: r.delegate, state: r.state, enteredStateAt: r.entered_state_at })),
     hasActiveLease: (agentId: string, ticketId: string) => dispatchLeaseStore.hasActiveLease(agentId, ticketId),
     hasOwnerActivity: (agentId: string, ticketId: string) => {
       const rows = enrolledTicketsStore.getAll().find((r) => r.ticket_id === ticketId);
       const since = rows?.entered_state_at ?? new Date(Date.now() - 60 * 60 * 1000).toISOString();
       try {
         const events = operationalEventStore.query({ key: `linear-${ticketId}`, since, limit: 50 });
-        return events.some((e) => (e.agent ?? "").toLowerCase() === agentId.toLowerCase());
+        return events.some((e) => {
+          if ((e.agent ?? "").toLowerCase() !== agentId.toLowerCase()) return false;
+          return isOwnerArtifactActivity(e as { outcome: string });
+        });
       } catch { return false; }
     },
   };

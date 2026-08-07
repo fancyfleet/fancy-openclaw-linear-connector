@@ -35,6 +35,7 @@
 
 import { registerCron, markCronRunSuccess, markCronRunFailure, formatIntervalMs } from "./cron/registry.js";
 import { createModuleLogger } from "./logging.js";
+import { normalizeSessionKey } from "./session-key.js";
 
 const log = createModuleLogger("write-tests-no-output-stall");
 
@@ -70,7 +71,7 @@ let state: WriteTestsNoOutputStallState = {
 
 export interface WriteTestsNoOutputStallDeps {
   /** Returns enrolled write-tests tickets that are not terminal. */
-  listEnrolledWriteTestsTickets?: () => Array<{ ticketId: string; delegate: string | null; state: string }>;
+  listEnrolledWriteTestsTickets?: () => Array<{ ticketId: string; delegate: string | null; state: string; enteredStateAt?: string | null }>;
   /** Returns true if an active dispatch lease exists for (agent, ticket). */
   hasActiveLease?: (agentId: string, ticketId: string) => boolean;
   /** Returns true if the delegate has produced owner activity since entering write-tests. */
@@ -83,6 +84,21 @@ const DEFAULT_INTERVAL_MS = 5 * 60 * 1000;
 const NO_OUTPUT_WINDOW_MS = 2 * 60 * 1000; // mirror NoActivityDetector default
 
 let deps: WriteTestsNoOutputStallDeps | null = null;
+
+/**
+ * Normalize a ticket identifier to the production lease key format.
+ * Production leases are stored under `linear-<ID>` (see webhook/deliver
+ * write paths). The sweep must query with that form or hasActiveLease
+ * is always false (INF-1305 fix contract item 1).
+ */
+function toLeaseKey(ticketId: string): string {
+  try {
+    return normalizeSessionKey(ticketId);
+  } catch {
+    if (ticketId.startsWith("linear-")) return ticketId;
+    return `linear-${ticketId}`;
+  }
+}
 
 /**
  * Run one sweep iteration: collect write-tests tickets, check lease + owner
@@ -99,14 +115,16 @@ function runSweep(): void {
     const tickets = deps.listEnrolledWriteTestsTickets?.() ?? [];
     for (const row of tickets) {
       const delegate = (row.delegate ?? "").toLowerCase();
-      // Only TDD write-tests tickets are in scope for this lane.
       if (delegate !== "tdd") continue;
       const ticketId = row.ticketId;
-      const hasLease = deps.hasActiveLease?.(delegate, ticketId) ?? false;
+      const leaseKey = toLeaseKey(ticketId);
+      let hasLease = deps.hasActiveLease?.(delegate, leaseKey) ?? false;
+      if (!hasLease) {
+        hasLease = deps.hasActiveLease?.(delegate, ticketId) ?? false;
+      }
       if (!hasLease) continue;
       const hasActivity = deps.hasOwnerActivity?.(delegate, ticketId) ?? false;
       if (hasActivity) continue;
-      // Lease active + no owner activity => stalled for this lane (both Shape A and Shape B)
       stalled.push(ticketId);
     }
     state.stalledCount = stalled.length;
@@ -157,6 +175,15 @@ export function registerWriteTestsNoOutputStall(options?: WriteTestsNoOutputStal
   setTimeout(() => {
     setInterval(() => runSweep(), intervalMs).unref();
   }, 0).unref();
+}
+
+/**
+ * Test-only: synchronously run one sweep iteration outside the timer.
+ * Exposed so behavior tests can seed leases/events and assert stalledCount
+ * without racing a setTimeout.
+ */
+export function triggerWriteTestsNoOutputSweepForTest(): void {
+  runSweep();
 }
 
 /** Read the current liveness state for /health.writeTestsNoOutputStall. */
