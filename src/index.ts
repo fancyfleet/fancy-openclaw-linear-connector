@@ -429,7 +429,24 @@ export function createApp(options?: CreateAppOptions) {
   // INF-1305: TDD write-tests no-output stall — register at the production
   // entry point (createApp) so AC7 source probe and AC8 /health liveness
   // pass without waiting for a failure trigger (AI-1808 dead-code guard).
-  registerWriteTestsNoOutputStall();
+  // The sweep is wired to the live enrolled-tickets mirror + dispatch-lease
+  // store + operational events so stalledCount/stalledTickets are real (AC2/AC6).
+  const writeTestsStallDeps = {
+    listEnrolledWriteTestsTickets: () =>
+      enrolledTicketsStore.getAll()
+        .filter((r) => r.terminal !== 1 && String(r.state ?? "").toLowerCase() === "write-tests")
+        .map((r) => ({ ticketId: r.ticket_id, delegate: r.delegate, state: r.state })),
+    hasActiveLease: (agentId: string, ticketId: string) => dispatchLeaseStore.hasActiveLease(agentId, ticketId),
+    hasOwnerActivity: (agentId: string, ticketId: string) => {
+      const rows = enrolledTicketsStore.getAll().find((r) => r.ticket_id === ticketId);
+      const since = rows?.entered_state_at ?? new Date(Date.now() - 60 * 60 * 1000).toISOString();
+      try {
+        const events = operationalEventStore.query({ key: `linear-${ticketId}`, since, limit: 50 });
+        return events.some((e) => (e.agent ?? "").toLowerCase() === agentId.toLowerCase());
+      } catch { return false; }
+    },
+  };
+  registerWriteTestsNoOutputStall(writeTestsStallDeps);
   // AI-2568: enable native_state-aware engagement overlay so "doing" semantics
   // respect the workflow state's native_state declaration on delegate assignment.
   registerEngagementNativeStateOverlay();
@@ -632,6 +649,23 @@ export function createApp(options?: CreateAppOptions) {
       lastError: failure.lastError,
       failureStreak: failure.failureStreak,
     })));
+    // INF-1305 AC2/AC6: surface write-tests no-output stalls as actionable warnings
+    // so engine-watch can distinguish healthy in-progress from idempotent-but-stalled.
+    // The stall field itself is the primary signal; this warnings entry is the
+    // secondary loud path that makes the stall visible in the same warnings array
+    // every operator already watches for dispatch-undeliverable/critical-stale-cron.
+    const wtStall = getWriteTestsNoOutputStallState();
+    if (wtStall.stalledTickets.length > 0) {
+      for (const ticket of wtStall.stalledTickets) {
+        warnings.push({
+          kind: "write-tests-no-output-stall",
+          ticket,
+          delegate: "tdd",
+          state: "write-tests",
+          occurredAt: wtStall.lastRunAt,
+        });
+      }
+    }
 
     res.status(healthy ? 200 : 503).json({
       status: healthy ? "ok" : "degraded",
