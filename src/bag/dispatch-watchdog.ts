@@ -317,7 +317,7 @@ export class DispatchWatchdog {
         bag,
         sessionTracker,
         agentWakeConfig,
-        { markActive: true, ...this.deps.resignalOptions },
+        { markActive: true, ackTracker: this.deps.ackTracker, ...this.deps.resignalOptions },
       );
       const dispatched = results.some((r) => r.dispatched);
       const pruned = results.some((r) => r.pruned);

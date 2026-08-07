@@ -624,6 +624,11 @@ export function createWebhookRouter(
    * tests that construct this router directly (AC5-style fallback).
    */
   dispatchReliabilityController?: WebhookDispatchReliabilityController,
+  /**
+   * INF-1295: when present, resignal calls from this router check escalation
+   * state and suppress blind re-dispatch of escalated (agent, ticket) pairs.
+   */
+  ackTracker?: import("../bag/dispatch-ack-tracker.js").DispatchAckTracker,
 ): Router {
   const router = Router();
   const delegatePingPongDetector = new DelegatePingPongDetector(undefined, undefined, operationalEventStore);
@@ -1749,7 +1754,7 @@ export function createWebhookRouter(
           await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, {
             ...wakeConfigForAgent(stale.agentId),
             sessionSpawnStore,
-          }, { markActive: true, onDispatched });
+          }, { markActive: true, onDispatched, ackTracker });
         }
 
         if (sessionTracker.isActiveForTicket(agentName, normalizedTicketId)) {
@@ -1787,7 +1792,7 @@ export function createWebhookRouter(
         const dispatchResults = await resignalPendingTickets(agentName, pendingIds, bag, sessionTracker, {
           ...wakeConfigForAgent(agentName),
           sessionSpawnStore,
-        }, { markActive: true, onDispatched });
+        }, { markActive: true, onDispatched, ackTracker });
         const dispatched = dispatchResults.filter(r => r.dispatched).length;
         const firstRunId = dispatchResults.find(r => r.runId)?.runId ?? null;
         const firstCanonVersion = dispatchResults.find(r => r.canonVersion)?.canonVersion ?? null;

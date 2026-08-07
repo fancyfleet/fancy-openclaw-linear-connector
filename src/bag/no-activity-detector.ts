@@ -302,7 +302,7 @@ export class NoActivityDetector {
         bag,
         sessionTracker,
         agentWakeConfig,
-        { markActive: true, ...this.deps.resignalOptions },
+        { markActive: true, ackTracker: this.deps.ackTracker, ...this.deps.resignalOptions },
       );
 
       if (results.some((r) => r.dispatched)) {
@@ -475,7 +475,7 @@ export class NoActivityDetector {
         bag,
         sessionTracker,
         agentWakeConfig,
-        { markActive: true, ...this.deps.resignalOptions },
+        { markActive: true, ackTracker: this.deps.ackTracker, ...this.deps.resignalOptions },
       );
       if (rescueResults.some((r) => r.dispatched)) {
         ackTracker.markResignaled(agentId, ticketId);
@@ -604,7 +604,7 @@ export class NoActivityDetector {
       bag,
       sessionTracker,
       agentWakeConfig,
-      { markActive: true, ...this.deps.resignalOptions },
+      { markActive: true, ackTracker: this.deps.ackTracker, ...this.deps.resignalOptions },
     );
     const dispatched = results.some((r) => r.dispatched);
     const pruned = results.some((r) => r.pruned);
