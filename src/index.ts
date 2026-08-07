@@ -87,6 +87,7 @@ import { evaluateCronStartupReadiness, parseCronStartupGraceMs } from "./cron/st
 import { buildRequiredCronHealth, getRequiredCronRetirements, isRequiredCron } from "./cron/required-crons.js";
 import { getRescueSweepState } from "./rescue-sweep-state.js";
 import { getDetectorState } from "./done-ticket-detector-state.js";
+import { getWriteTestsNoOutputStallState, registerWriteTestsNoOutputStall } from "./write-tests-no-output-stall.js";
 import { registerFirstActionWatchdogCron } from "./first-action-watchdog.js";
 import { getFirstActionWatchdogState } from "./first-action-watchdog-state.js";
 import { classifyCrossCheckIssue, type CrossCheckIssue } from "./first-action-crosscheck.js";
@@ -425,6 +426,10 @@ export function createApp(options?: CreateAppOptions) {
   // AI-1773/AI-1775 shipped without. `subscribed` records the second half: the
   // transition handler in workflow-gate receives this exact instance.
   registerObservationWritePath(observationStore, { subscribed: true });
+  // INF-1305: TDD write-tests no-output stall — register at the production
+  // entry point (createApp) so AC7 source probe and AC8 /health liveness
+  // pass without waiting for a failure trigger (AI-1808 dead-code guard).
+  registerWriteTestsNoOutputStall();
   // AI-2568: enable native_state-aware engagement overlay so "doing" semantics
   // respect the workflow state's native_state declaration on delegate assignment.
   registerEngagementNativeStateOverlay();
@@ -684,6 +689,11 @@ export function createApp(options?: CreateAppOptions) {
       observations: getObservationWritePathState(),
       // AI-1857 AC3: rescue-sweep last-run visibility — "did it run" without log access.
       rescueSweep: getRescueSweepState(),
+      // INF-1305 AC6/AC8: TDD write-tests no-output stall liveness — scheduled/active
+      // prove the component is registered at bootstrap (AC7/AC8), stalledCount/
+      // stalledTickets let engine-watch distinguish healthy in-progress from
+      // idempotent-but-stalled write-tests (AC6). Observable without trigger.
+      writeTestsNoOutputStall: getWriteTestsNoOutputStallState(),
       // INF-314 AC9: stall detection liveness — active state + thresholds
       // observable at /health without waiting for a stall to occur.
       stallDetection: getStallDetectionState(),
