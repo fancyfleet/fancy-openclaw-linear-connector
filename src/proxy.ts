@@ -2193,6 +2193,24 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         //    commentCreate-carried payloads — those preserve their delivered
         //    comment per AI-1809/AI-2472).
         //
+        // INF-1276: commentCreate-carried governed forwards (the CLI's normal
+        // submit path posts the comment FIRST and the comment carries the intent)
+        // hit the SAME false-success shape: the gate blocks (e.g. push-before-claim)
+        // and the decline arrives only as `_workflowTransition.status: "blocked"`
+        // beside a nominally-successful `commentCreate.success: true`. The comment
+        // has already posted upstream at that point, so the loud decline must
+        // acknowledge the posted comment (AC3) — never imply the whole operation
+        // rolled back. Cover `blocked` (not just `failed`) on commentCreate-carried
+        // bodies; the comment-preservation clause is carried by the message wording
+        // (the delivered comment is acknowledged, not rolled back).
+        //
+        // INF-1222 stays intact: commentCreate-carried payloads with a write-stage
+        // `failed` (e.g. post-write-diverge) still preserve their delivered comment
+        // (AI-1809/AI-2472) and keep `_workflowTransition` metadata attached — the
+        // CLI throws on `status === "failed"` (INF-1261) without an errors[]
+        // envelope (ai-2091 test 3 depends on this). Only `blocked` (gate-block,
+        // e.g. push-before-claim) declines loudly on commentCreate-carried bodies.
+        //
         // Replace the body with an explicit GraphQL error envelope (no `data`),
         // carrying the decline reason. The delegate is now written only by the
         // atomic write (see the strip above), so no split-brain delegate/state
@@ -2203,19 +2221,31 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         const loudPeerFail =
           attachTransition &&
           !nonAppliedForward &&
-          transitionResult?.status === "failed" &&
+          (transitionResult?.status === "failed" || transitionResult?.status === "blocked") &&
           transitionResult?.to != null &&
-          isIssueUpdateMutation(body);
+          // INF-1222: write-stage `failed` on commentCreate-carried payloads keeps
+          // the preserved-comment pass-through (AI-1809/AI-2472) — only the
+          // gate-block `blocked` case declines loudly on commentCreate bodies.
+          (isIssueUpdateMutation(body) ||
+            (isCommentCreateMutation(body) && transitionResult?.status === "blocked"));
         const loudDecline = nonAppliedForward || loudPeerFail;
         if (loudDecline && transitionResult) {
           const detail = transitionResult.detail
             ? `: ${transitionResult.detail}`
             : "";
-          const message = acCaptureAcceptForward
+          // INF-1276 AC3: a commentCreate-carried forward has ALREADY posted the
+          // comment upstream by the time the gate blocks — the surfaced failure
+          // must acknowledge the delivered comment instead of implying the whole
+          // operation rolled back.
+          const message = isCommentCreateMutation(body)
             ? `Governed transition ${transitionResult.from ?? "?"} → ${transitionResult.to ?? "?"} ` +
-              `was declined${detail} The delegate and state:* label were not advanced.`
-            : `Governed transition ${transitionResult.from ?? "?"} → ${transitionResult.to ?? "?"} ` +
-              `could not be applied atomically${detail}. The delegate and state:* label were not advanced.`;
+              `was declined${detail} The comment was posted, but the delegate and state:* label were not advanced. ` +
+              `Resolve the blocker and re-run the submit.`
+            : acCaptureAcceptForward
+              ? `Governed transition ${transitionResult.from ?? "?"} → ${transitionResult.to ?? "?"} ` +
+                `was declined${detail} The delegate and state:* label were not advanced.`
+              : `Governed transition ${transitionResult.from ?? "?"} → ${transitionResult.to ?? "?"} ` +
+                `could not be applied atomically${detail}. The delegate and state:* label were not advanced.`;
           res
             .status(upstreamRes.status)
             .set("Content-Type", "application/json")
