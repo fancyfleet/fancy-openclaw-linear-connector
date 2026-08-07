@@ -26,6 +26,7 @@ import { getLinearUserIdForAgent } from "./agents.js";
 import { boundSeatFor } from "./implementer-store.js";
 import type { OperationalEventInput } from "./store/operational-event-store.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
+import { isXfnIntakeResidue, resolveTruePosition } from "./xfn-intake-recovery.js";
 
 const log = createModuleLogger("rescue-sweep");
 
@@ -109,6 +110,11 @@ export interface RescueSweepOptions {
    * "drifted" and every corrective `setDelegate` is rejected with `delegateId must be a UUID`.
    */
   bodyIdToLinearUserId?: (bodyId: string) => string | null;
+  /** Transition-audit ledger store for history-aware recovery (INF-1304).
+   *  When provided, ledger records are consulted before Linear history.
+   *  Tests can also inject fetchTransitionAudit directly. */
+  transitionAuditStore?: { query(filter: { ticket?: string; limit?: number }): Array<{ fromState: string | null; toState: string | null; ts: string }> };
+  fetchTransitionAudit?: (ticketId: string) => Promise<Array<{ from: string | null; to: string | null; createdAt: string }>>;
 }
 
 // ── Internal types ─────────────────────────────────────────────────────────
@@ -475,16 +481,137 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
   // Build label name → UUID resolver. Use injected resolver if provided (tests); otherwise
   // fetch team labels once per unique team so rescueMalformed can pass real UUIDs to labelIds.
   let labelNameToId: (name: string) => string | null;
+  const fetchedLabelMap = new Map<string, string>();
   if (injectedLabelNameToId) {
     labelNameToId = injectedLabelNameToId;
   } else {
-    const labelMap = new Map<string, string>();
     const teamIds = [...new Set(tickets.map((t) => t.teamId).filter(Boolean))];
     for (const teamId of teamIds) {
       const teamMap = await fetchTeamLabelMap(teamId, authToken);
-      for (const [name, id] of teamMap) labelMap.set(name, id);
+      for (const [name, id] of teamMap) fetchedLabelMap.set(name, id);
     }
-    labelNameToId = (name: string) => labelMap.get(name) ?? null;
+    labelNameToId = (name: string) => fetchedLabelMap.get(name) ?? null;
+  }
+
+  // INF-1304 r2: inverse map for resolving Linear addedLabelIds UUIDs → state names
+  // Built from the same team-label fetch as labelNameToId so no extra API call.
+  let labelIdToNameForHistory: Map<string, string> | undefined;
+  if (!injectedLabelNameToId && fetchedLabelMap.size > 0) {
+    labelIdToNameForHistory = new Map<string, string>();
+    for (const [name, id] of fetchedLabelMap.entries()) labelIdToNameForHistory.set(id, name);
+  }
+
+  // ── xfn/intake history-aware helpers (INF-1304) ────────────────────────
+  // Real Linear API: history is a connection — must use history(first:N){ nodes{...}}
+  async function fetchHistoryForSweep(tid: string): Promise<Array<{ state?: string; to?: string; comment?: string; createdAt?: string; fromStateId?: string; toStateId?: string; addedLabelIds?: string[]; from?: string; body?: string }>> {
+    // Ledger-first (INF-1304 AC1 "ledger"): if transitionAuditStore or fetchTransitionAudit is injected, prefer it.
+    if (options.transitionAuditStore) {
+      try {
+        const rows = (options.transitionAuditStore.query as (f: { ticket?: string; status?: string; limit?: number }) => Array<{ fromState: string | null; toState: string | null; ts: string; status?: string }> )({ ticket: tid, status: "applied", limit: 100 });
+        if (rows.length > 0) {
+          return rows.map((r) => ({ to: r.toState ?? undefined, from: r.fromState ?? undefined, createdAt: r.ts }));
+        }
+        // Fallback: store may not support status filter or no applied rows — try unfiltered
+        // but exclude explicitly blocked/failed if the rows carry status.
+        const allRows = options.transitionAuditStore.query({ ticket: tid, limit: 100 });
+        const appliedFallback = (allRows as Array<{ fromState: string | null; toState: string | null; ts: string; status?: string }>).filter(
+          (r) => !r.status || r.status === "applied",
+        );
+        if (appliedFallback.length > 0) {
+          return appliedFallback.map((r) => ({ to: r.toState ?? undefined, from: r.fromState ?? undefined, createdAt: r.ts }));
+        }
+      } catch {}
+    }
+    if (options.fetchTransitionAudit) {
+      try {
+        const rows = await options.fetchTransitionAudit(tid);
+        const appliedRows = (rows as Array<{ from: string | null; to: string | null; createdAt: string; status?: string }>).filter(
+          (r) => !r.status || r.status === "applied",
+        );
+        const effective = appliedRows.length > 0 ? appliedRows : (rows as Array<{ from: string | null; to: string | null; createdAt: string; status?: string }>).filter((r) => !r.status);
+        if (appliedRows.length === 0 && rows.some((r) => (r as { status?: string }).status)) {
+          // Every row is explicitly blocked/failed — no real position
+        } else if (effective.length > 0) {
+          return effective.map((r) => ({ to: r.to ?? undefined, from: r.from ?? undefined, createdAt: r.createdAt }));
+        } else if (rows.length > 0) {
+          return rows.map((r) => ({ to: r.to ?? undefined, from: r.from ?? undefined, createdAt: r.createdAt }));
+        }
+      } catch {}
+    }
+    const q = `query TicketHistory($id: String!) { issue(id: $id) { history(first: 100) { nodes { fromStateId toStateId addedLabelIds removedLabelIds createdAt } } comments(first: 50) { nodes { body createdAt } } } }`;
+    try {
+      const res = await fetch(LINEAR_API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authToken },
+        body: JSON.stringify({ query: q, variables: { id: tid } }),
+      });
+      // Handle both real Linear shape (history:{nodes:[...]}) and test-mock flat shape (history:[...])
+      type HR = { data?: { issue?: { history?: { nodes?: Array<{ fromStateId?: string | null; toStateId?: string | null; addedLabelIds?: string[] | null; removedLabelIds?: string[] | null; createdAt?: string; state?: string; to?: string; comment?: string }> } | Array<{ state?: string; to?: string; comment?: string; createdAt?: string; fromStateId?: string; toStateId?: string; addedLabelIds?: string[] }>; comments?: { nodes: Array<{ body?: string; createdAt?: string }> } } } };
+      const d = (await res.json()) as HR;
+      const rawHistory: unknown = d.data?.issue?.history;
+      if (Array.isArray(rawHistory) && rawHistory.length > 0) {
+        // Flat array from test mocks (and old code path)
+        return (rawHistory as Array<{ state?: string; to?: string; comment?: string; createdAt?: string; fromStateId?: string; toStateId?: string; addedLabelIds?: string[]; from?: string; body?: string }>).map((n) => ({
+          state: n.state, to: n.to, comment: n.comment ?? n.body, createdAt: n.createdAt, fromStateId: n.fromStateId, toStateId: n.toStateId, addedLabelIds: n.addedLabelIds, from: n.from,
+        }));
+      }
+      const nodes = (rawHistory as { nodes?: Array<{ fromStateId?: string | null; toStateId?: string | null; addedLabelIds?: string[] | null; removedLabelIds?: string[] | null; createdAt?: string }> } | undefined)?.nodes;
+      if (Array.isArray(nodes) && nodes.length > 0) {
+        return nodes.map((n) => ({
+          fromStateId: n.fromStateId ?? undefined,
+          toStateId: n.toStateId ?? undefined,
+          addedLabelIds: (n.addedLabelIds as string[] | undefined) ?? undefined,
+          createdAt: n.createdAt,
+        }));
+      }
+      const commentNodes = d.data?.issue?.comments?.nodes;
+      if (Array.isArray(commentNodes) && commentNodes.length > 0) {
+        return commentNodes.map((n) => ({ comment: n.body ?? "", createdAt: n.createdAt }));
+      }
+      return [];
+    } catch { return []; }
+  }
+  async function rescueXfnTruePosition(
+    t: FetchedTicket,
+    pos: { stateId: string; ownerRole: string; evidence: string },
+    labelResolver: (name: string) => string | null,
+  ): Promise<RescueAction | null> {
+    const candidates = pos.ownerRole ? roleBodiesForRole(pos.ownerRole) : [];
+    if (candidates.length !== 1) {
+      return {
+        ticketId: t.id,
+        identifier: t.identifier,
+        classification: "drifted" as const,
+        action: `xfn recovery: ambiguous delegation for ${pos.ownerRole} (${candidates.length} candidates) — cannot recover to state:${pos.stateId}`,
+        outcome: candidates.length === 0 ? "failed" : "ambiguous",
+      };
+    }
+    const delegateId = candidates[0];
+    const stateLabelName = `state:${pos.stateId}`;
+    const uuid = labelResolver(stateLabelName);
+    if (!uuid) {
+      return { ticketId: t.id, identifier: t.identifier, classification: "drifted" as const, action: `xfn recovery: could not resolve label ${stateLabelName}`, outcome: "failed" };
+    }
+    // Apply label: keep non-state ids + new state
+    const keepIds = t.labelNodes.filter((n) => !n.name.startsWith("state:")) .map((n) => n.id);
+    const newIds = [...new Set([...keepIds, uuid])];
+    const labelOk = await applyLabelIds(t.id, newIds, authToken);
+    if (!labelOk) {
+      return { ticketId: t.id, identifier: t.identifier, classification: "drifted" as const, action: `recovered to state:${pos.stateId} delegated to ${delegateId} (${pos.ownerRole}) — label update failed`, outcome: "failed" };
+    }
+    // Guard before delegate write (INF-753 terminal check)
+    const guard = await liveSeatBlocked(t.id, authToken);
+    if (guard.blocked && guard.reason === "terminal-label") {
+      return { ticketId: t.id, identifier: t.identifier, classification: "drifted" as const, action: `re-seat skipped — terminal`, outcome: "ambiguous" };
+    }
+    const ok = (await writeDelegate(t.id, delegateId, authToken)).ok;
+    return {
+      ticketId: t.id,
+      identifier: t.identifier,
+      classification: "drifted" as const,
+      action: `recovered to state:${pos.stateId} delegated to ${delegateId} (${pos.ownerRole})`,
+      outcome: ok ? "rescued" : "failed",
+    };
   }
 
   for (const ticket of tickets) {
@@ -515,6 +642,44 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
     }
 
     const wfDef = workflowRegistry.get(wfId)!;
+    // INF-1304: history-aware override must run even for tickets that currently
+    // look healthy (snapshot shows correct delegate for an early state), because
+    // history may reveal a later true position (e.g. code-review) whose owner
+    // differs. So check history BEFORE the healthy skip.
+    const isXfn = isXfnIntakeResidue(ticket.labels);
+    const isEarly = ticket.labels.includes("state:intake") || ticket.labels.includes("state:write-tests");
+    if (isXfn || isEarly) {
+      let hist: Array<{ state?: string; to?: string; comment?: string; createdAt?: string; fromStateId?: string; toStateId?: string; addedLabelIds?: string[]; from?: string; body?: string }> = [];
+      try { hist = await fetchHistoryForSweep(ticket.id); } catch { hist = []; }
+      if (hist.length > 0) {
+        const pos = resolveTruePosition({ labels: ticket.labels, identifier: ticket.identifier, id: ticket.id }, hist as unknown as Parameters<typeof resolveTruePosition>[1], labelIdToNameForHistory ? { labelIdToName: labelIdToNameForHistory } : undefined);
+        if (pos) {
+          const currentStateLabel = ticket.labels.find((l) => l.startsWith("state:"))?.slice("state:".length) ?? null;
+          if (pos.stateId !== currentStateLabel) {
+            try {
+              const tr = await rescueXfnTruePosition(ticket, pos, labelNameToId);
+              if (tr) {
+                rescues.push(tr);
+                if (tr.outcome === "rescued") rescuedIds.add(ticket.id);
+                operationalEventStore?.append({
+                  outcome: `rescue:${tr.outcome}` as OperationalEventInput["outcome"],
+                  type: "rescue",
+                  detail: { ticketId: ticket.id, identifier: ticket.identifier, classification: tr.classification, action: tr.action },
+                });
+                byClassification[tr.classification] = (byClassification[tr.classification] ?? 0) + 1;
+                continue;
+              }
+            } catch (err: any) {
+              const msg = err instanceof Error ? err.message : String(err);
+              rescues.push({ ticketId: ticket.id, identifier: ticket.identifier, classification: "drifted" as const, action: `xfn recovery failed: ${msg}`, outcome: "failed" });
+              byClassification["drifted"] = (byClassification["drifted"] ?? 0) + 1;
+              continue;
+            }
+          }
+        }
+      }
+      // No later position -> fall through to normal classification path
+    }
     const classification = classifyTicket(ticket.labels, ticket.delegateId, wfDef, roleBodiesForRole);
     byClassification[classification] = (byClassification[classification] ?? 0) + 1;
 
