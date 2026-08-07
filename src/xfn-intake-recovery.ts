@@ -328,21 +328,7 @@ export async function recoverXfnIntakeTicket(
         history = await fetchHistoryViaGraphQL(ticket.id, opts.authToken);
       }
     } catch (e) {
-      // AC3: never clear a valid delegate without a repair path — on history
-      // fetch failure we re-assert the current delegate so the ticket is not
-      // left with a cleared delegate (the sentinel this also satisfies in tests).
-      if (ticket.delegateId) {
-        try {
-          await fetch(LINEAR_API_URL, {
-            method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: opts.authToken },
-            body: JSON.stringify({
-              query: `mutation PreserveDelegate($id: String!, $delegateId: String!) { issueUpdate(id: $id, input: { delegateId: $delegateId }) { success } }`,
-              variables: { id: ticket.id, delegateId: ticket.delegateId },
-            }),
-          });
-        } catch {}
-      }
+      // AC3: no write on failure → delegate never cleared (structural guarantee).
       const msg = e instanceof Error ? e.message : String(e);
       throw new Error(
         `illegal routing: history fetch failed (${msg}) — legal owner check requires history, expected owner for recovery could not be determined; legal candidates depend on true state`,
@@ -391,23 +377,10 @@ export async function recoverXfnIntakeTicket(
     );
   }
 
-  // Legality check: candidate UUID must correspond to a body that fills pos.ownerRole.
-  // Do membership check against legalBodyIds via reverse lookup when possible.
-  // Real Linear UUIDs are opaque — membership is via UUID equality.
-  // Test convention is "u-<bodyId>" — detect and use body-id inference.
+  // Legality check: candidate UUID must be a member of the legal UUID set
+  // (bodies that fill the required owner role, resolved to Linear user UUIDs).
   const legalUUIDs = legalBodyIds.map((bid) => bodyIdToLinearUserId(bid)).filter(Boolean) as string[];
-  // Legality is body membership. Real Linear UUIDs are opaque — check via
-  // UUID membership. Fixtures encode body id as "u-<bodyId>" — detect that
-  // convention and check inferred body id against the legal set. Both
-  // production and fixture paths are membership checks; no test-only branch
-  // escapes to prod because real UUIDs never start with "u-".
-  let isLegal: boolean;
-  if (candidateUUID.startsWith("u-")) {
-    const inferredBodyId = candidateUUID.slice(2);
-    isLegal = legalBodyIds.includes(inferredBodyId);
-  } else {
-    isLegal = legalUUIDs.includes(candidateUUID);
-  }
+  const isLegal = legalUUIDs.includes(candidateUUID);
 
   if (!isLegal) {
     throw new Error(

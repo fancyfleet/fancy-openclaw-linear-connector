@@ -431,18 +431,16 @@ describe("INF-1304 AC3 — illegal routing targets fail loudly with legal owner 
       teamId: "team-test",
     };
     const origFetch = globalThis.fetch;
-    // Simulate the recovery trying to set delegate to an illegal body (e.g., tdd on code-review)
-    // The implementation must validate and reject with legal roles listed
     let threw = false;
     try {
-      // Force an illegal target by mocking bodyIdToLinearUserId to return a non-filling id
       globalThis.fetch = (async () => new Response(JSON.stringify({ data: { issueUpdate: { success: true } } }), { status: 200, headers: { "Content-Type": "application/json" } })) as typeof fetch;
       await mod.recoverXfnIntakeTicket(ticket, {
         authToken: "tok",
         workflowRegistry: makeRegistry(),
         capabilityPolicyPath: policyPath,
         fetchTicketHistory: async () => [{ state: "code-review", to: "code-review" }],
-        bodyIdToLinearUserId: () => "u-tdd",
+        // Simulate missing mapping for the legal body → candidate UUID unresolvable → illegal routing
+        bodyIdToLinearUserId: () => null,
         labelNameToId: (name: string) => `uuid-${name}`,
       });
     } catch (err) {
@@ -470,11 +468,12 @@ describe("INF-1304 AC3 — illegal routing targets fail loudly with legal owner 
       labelNodes: [{ id: "lbl-wf", name: "wf:dev-impl" }, { id: "lbl-intake", name: "state:intake" }],
       teamId: "team-test",
     };
-    let clearedDelegate: string | null = null;
+    let fetchCallCount = 0;
+    let clearedDelegate: string | null | undefined = undefined;
     const origFetch = globalThis.fetch;
     globalThis.fetch = (async (_url, init) => {
+      fetchCallCount++;
       const body = JSON.parse((init?.body as string) ?? "{}") as { variables?: Record<string, unknown> };
-      if (body.variables?.["delegateId"] === null) clearedDelegate = null;
       if (body.variables?.["delegateId"] !== undefined) clearedDelegate = body.variables["delegateId"] as string | null;
       return new Response(JSON.stringify({ data: { issueUpdate: { success: true } } }), { status: 200, headers: { "Content-Type": "application/json" } });
     }) as typeof fetch;
@@ -489,7 +488,9 @@ describe("INF-1304 AC3 — illegal routing targets fail loudly with legal owner 
         bodyIdToLinearUserId: () => "u-tdd",
         labelNameToId: (name: string) => `uuid-${name}`,
       }).catch(() => {});
-      expect(clearedDelegate).not.toBe(null);
+      // AC3 guarantee is structural: no write on failure → delegate never cleared.
+      expect(fetchCallCount).toBe(0);
+      expect(clearedDelegate).toBeUndefined();
     } finally {
       globalThis.fetch = origFetch;
       fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -523,7 +524,8 @@ describe("INF-1304 AC3 — illegal routing targets fail loudly with legal owner 
           workflowRegistry: makeRegistry(),
           capabilityPolicyPath: policyPath,
           fetchTicketHistory: async () => [{ state: "implementation", to: "implementation" }],
-          bodyIdToLinearUserId: () => "u-astrid",
+          // Missing mapping for the legal dev owners → candidate UUID unresolvable → illegal routing with legal owners listed
+          bodyIdToLinearUserId: () => null,
           labelNameToId: (name: string) => `uuid-${name}`,
         },
       );
@@ -800,6 +802,152 @@ describe("INF-1304 AC5 — watch/cron summary reports recovered true state and o
       expect(truePos!.action).not.toBe(plain!.action);
     } finally {
       globalThis.fetch = origFetch;
+    }
+  });
+});
+
+// ── R3 REGRESSION: blocked/failed ledger poison ───────────────────────────
+
+describe("INF-1304 R3 — ledger poisoned by blocked/failed attempts", () => {
+  it("fetchLedgerHistory filters to status applied — blocked latest row not used as true position", async () => {
+    const mod = await loadRecoveryModule() as unknown as {
+      fetchLedgerHistory: (id: string, fn: (id: string) => Promise<Array<{ from: string | null; to: string | null; createdAt: string; status?: string }>>) => Promise<Array<{ to?: string; from?: string; createdAt: string }>>;
+      resolveTruePosition: (ticket: { labels: string[] }, history: Array<{ to?: string; from?: string; createdAt: string }>) => { stateId: string; ownerRole: string } | null;
+    };
+    const ledgerRows = [
+      { from: "intake", to: "implementation", createdAt: "2026-08-07T03:00:00.000Z", status: "applied" },
+      { from: "implementation", to: "code-review", createdAt: "2026-08-07T04:00:00.000Z", status: "blocked" },
+    ];
+    const filtered = await mod.fetchLedgerHistory("id-ledger-poison", async () => ledgerRows);
+    // Only the applied row should survive
+    expect(filtered.length).toBe(1);
+    expect(filtered[0].to).toBe("implementation");
+    const pos = mod.resolveTruePosition({ labels: ["wf:dev-impl", "state:intake"] }, filtered as unknown as Parameters<typeof mod.resolveTruePosition>[1]);
+    expect(pos).not.toBeNull();
+    expect(pos!.stateId).toBe("implementation");
+    expect(pos!.stateId).not.toBe("code-review");
+  });
+
+  it("recoverXfnIntakeTicket via fetchTransitionAudit with blocked latest entry does NOT route to blocked target", async () => {
+    const mod = await loadRecoveryModule();
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-1304-ledger-blocked-"));
+    const policyPath = path.join(tmpDir, "cap.yaml");
+    fs.writeFileSync(
+      policyPath,
+      "bodies:\n  - id: igor\n    fills_roles: [dev]\n  - id: charles\n    fills_roles: [code-review]\n",
+      "utf8",
+    );
+    const ticket = {
+      id: "id-ledger-blocked",
+      identifier: "INF-1304-LEDGER",
+      labels: ["wf:dev-impl", "state:intake", "xfn:workflow"],
+      delegateId: null,
+      labelNodes: [{ id: "lbl-wf", name: "wf:dev-impl" }, { id: "lbl-intake", name: "state:intake" }],
+      teamId: "team-test",
+    };
+    const ledgerRows = [
+      { from: "intake", to: "implementation", createdAt: "2026-08-07T03:00:00.000Z", status: "applied" },
+      { from: "implementation", to: "code-review", createdAt: "2026-08-07T04:00:00.000Z", status: "blocked" },
+    ];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(JSON.stringify({ data: { issueUpdate: { success: true } } }), { status: 200, headers: { "Content-Type": "application/json" } })) as typeof fetch;
+    try {
+      const res = await mod.recoverXfnIntakeTicket(ticket, {
+        authToken: "tok",
+        workflowRegistry: makeRegistry(),
+        capabilityPolicyPath: policyPath,
+        fetchTransitionAudit: async () => ledgerRows,
+        bodyIdToLinearUserId: (id: string) => `u-${id}`,
+        labelNameToId: (name: string) => `uuid-${name}`,
+      });
+      expect(res.recovered).toBe(true);
+      expect(res.stateId).toBe("implementation");
+      expect(res.delegateId).toBe("u-igor");
+      expect(res.stateId).not.toBe("code-review");
+    } finally {
+      globalThis.fetch = origFetch;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── R3 REGRESSION: real Linear nested node shape + rollback ─────────────────
+
+describe("INF-1304 R3 — real Linear history fallback (nested node shape + UUID fallback)", () => {
+  it("resolveTruePosition via addedLabelIds UUID fallback resolves correct state and owner", async () => {
+    const mod = await loadRecoveryModule();
+    const labelIdToName = new Map<string, string>([["uuid-lbl-state-code-review", "state:code-review"]]);
+    // Simulate real Linear node shape: toStateId is an opaque UUID (not parseable), addedLabelIds carries the state label UUID
+    const history = [
+      { toStateId: "uuid-state-opaque-1", addedLabelIds: ["uuid-lbl-state-code-review"], createdAt: "2026-08-07T03:00:00.000Z" } as unknown as Parameters<typeof mod.resolveTruePosition>[1][number],
+    ];
+    const pos = mod.resolveTruePosition({ labels: ["wf:dev-impl", "state:intake"] }, history, { labelIdToName } as unknown as Parameters<typeof mod.resolveTruePosition>[2]);
+    expect(pos).not.toBeNull();
+    expect(pos!.stateId).toBe("code-review");
+    expect(pos!.ownerRole).toBe("code-review");
+  });
+
+  it("rollback sequence (code-review → implementation) via real nested shape + UUIDs: chronological-last wins not max-rank", async () => {
+    const mod = await loadRecoveryModule();
+    const labelIdToName = new Map<string, string>([
+      ["uuid-lbl-state-code-review", "state:code-review"],
+      ["uuid-lbl-state-implementation", "state:implementation"],
+    ]);
+    const history = [
+      { toStateId: "uuid-state-opaque-cr", addedLabelIds: ["uuid-lbl-state-code-review"], createdAt: "2026-08-07T03:00:00.000Z" } as unknown as Parameters<typeof mod.resolveTruePosition>[1][number],
+      { toStateId: "uuid-state-opaque-impl", addedLabelIds: ["uuid-lbl-state-implementation"], createdAt: "2026-08-07T04:00:00.000Z" } as unknown as Parameters<typeof mod.resolveTruePosition>[1][number],
+    ];
+    const pos = mod.resolveTruePosition({ labels: ["wf:dev-impl", "state:intake"] }, history, { labelIdToName } as unknown as Parameters<typeof mod.resolveTruePosition>[2]);
+    expect(pos).not.toBeNull();
+    // Chronological-last is implementation (04:00), even though code-review ranks higher in ORDER
+    expect(pos!.stateId).toBe("implementation");
+    expect(pos!.ownerRole).toBe("dev");
+  });
+
+  it("recoverXfnIntakeTicket with real nested Linear shape via labelIdToName routes correctly including rollback", async () => {
+    const mod = await loadRecoveryModule();
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-1304-real-nested-"));
+    const policyPath = path.join(tmpDir, "cap.yaml");
+    fs.writeFileSync(
+      policyPath,
+      "bodies:\n  - id: igor\n    fills_roles: [dev]\n  - id: charles\n    fills_roles: [code-review]\n",
+      "utf8",
+    );
+    const ticket = {
+      id: "id-real-nested",
+      identifier: "INF-1304-REAL",
+      labels: ["wf:dev-impl", "state:intake", "xfn:workflow"],
+      delegateId: null,
+      labelNodes: [{ id: "lbl-wf", name: "wf:dev-impl" }, { id: "lbl-intake", name: "state:intake" }],
+      teamId: "team-test",
+    };
+    // History mimics real Linear fetch: opaque UUIDs + addedLabelIds, with rollback: code-review at 03:00 then bounce-back to implementation at 04:00
+    const historyWithUUIDs = [
+      { toStateId: "uuid-state-opaque-cr", addedLabelIds: ["uuid-lbl-state-code-review"], createdAt: "2026-08-07T03:00:00.000Z" },
+      { toStateId: "uuid-state-opaque-impl", addedLabelIds: ["uuid-lbl-state-implementation"], createdAt: "2026-08-07T04:00:00.000Z" },
+    ];
+    const labelIdToName = new Map<string, string>([
+      ["uuid-lbl-state-code-review", "state:code-review"],
+      ["uuid-lbl-state-implementation", "state:implementation"],
+    ]);
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(JSON.stringify({ data: { issueUpdate: { success: true } } }), { status: 200, headers: { "Content-Type": "application/json" } })) as typeof fetch;
+    try {
+      const res = await mod.recoverXfnIntakeTicket(ticket, {
+        authToken: "tok",
+        workflowRegistry: makeRegistry(),
+        capabilityPolicyPath: policyPath,
+        fetchTicketHistory: async () => historyWithUUIDs as unknown as Array<{ from?: string; to?: string; state?: string; comment?: string; createdAt?: string }>,
+        bodyIdToLinearUserId: (id: string) => `u-${id}`,
+        labelNameToId: (name: string) => `uuid-${name}`,
+        labelIdToName,
+      } as unknown as Parameters<typeof mod.recoverXfnIntakeTicket>[1]);
+      expect(res.recovered).toBe(true);
+      expect(res.stateId).toBe("implementation");
+      expect(res.delegateId).toBe("u-igor");
+    } finally {
+      globalThis.fetch = origFetch;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 });
