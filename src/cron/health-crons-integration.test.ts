@@ -42,6 +42,7 @@ const EXPECTED_CRONS = [
   "dispatch-delivery-scheduler", // AI-2008: acknowledged dispatch delivery + retry driver
   "dispatch-lease-recovery", // INF-1260 AC9: zombie dispatch-lease recovery cron
   "done-ticket-detector", // AI-2576/INF-331: Done-ticket detector cron liveness
+  "engine-watch", // INF-1302: signal-to-ticket pipeline cron
   "first-action-watchdog",
   "g20-canary",
   "label-sync-audit", // AI-2554: periodic proxy-store vs Linear label divergence check

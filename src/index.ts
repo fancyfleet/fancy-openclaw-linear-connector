@@ -92,6 +92,8 @@ import { buildRequiredCronHealth, getRequiredCronRetirements, isRequiredCron } f
 import { getRescueSweepState } from "./rescue-sweep-state.js";
 import { getDetectorState } from "./done-ticket-detector-state.js";
 import { getWriteTestsNoOutputStallState, registerWriteTestsNoOutputStall } from "./write-tests-no-output-stall.js";
+import { getEngineWatchState } from "./engine-watch-state.js";
+import { registerEngineWatchCron } from "./cron/engine-watch-cron.js";
 import { registerFirstActionWatchdogCron } from "./first-action-watchdog.js";
 import { getFirstActionWatchdogState } from "./first-action-watchdog-state.js";
 import { classifyCrossCheckIssue, type CrossCheckIssue } from "./first-action-crosscheck.js";
@@ -770,6 +772,11 @@ export function createApp(options?: CreateAppOptions) {
       // to reject something. `skippedByReason` names every silent failure the
       // old code swallowed.
       observations: getObservationWritePathState(),
+      // INF-1302: engine-watch liveness — scheduled at bootstrap, observable
+      // at ac-validate without waiting for a signal. Surfaced both as a
+      // dedicated field (engineWatch) and via crons registry (engine-watch).
+      engineWatch: getEngineWatchState(),
+      "engine-watch": getEngineWatchState(),
       // AI-1857 AC3: rescue-sweep last-run visibility — "did it run" without log access.
       rescueSweep: getRescueSweepState(),
       // INF-1305 AC6/AC8: TDD write-tests no-output stall liveness — scheduled/active
@@ -2613,6 +2620,10 @@ export function createApp(options?: CreateAppOptions) {
   // AI-2359: periodic registry-integrity check — runs daily, cross-checks
   // capability-policy bodies against agents.json entries and alerts on mismatches.
   registerRegistryIntegrityCron();
+
+  // INF-1302: engine-watch signal-to-ticket pipeline — periodic scan that
+  // promotes uncovered recurrence into active follow-up tickets.
+  registerEngineWatchCron();
 
   // AI-2582: transcript redaction sweep — periodic .trajectory.jsonl
   // credential redaction. Registered here so the cron registry and /health
