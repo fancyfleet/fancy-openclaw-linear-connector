@@ -25,6 +25,7 @@
  */
 
 // ── Expected imports — these MUST fail until the implementer creates src/promotion-gate.ts ──
+import { jest, describe, it, expect } from "@jest/globals";
 import { PromotionGate } from "./promotion-gate.js";
 
 // ── Helper types / fakes (self-contained, no dependency on unbuilt Slice B) ──
