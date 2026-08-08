@@ -581,6 +581,7 @@ export function createApp(options?: CreateAppOptions) {
         hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
         gatewayUrl: agentCfg?.gatewayUrl,
         gatewayToken: agentCfg?.gatewayToken,
+        dryRun: process.env.CONNECTOR_ENV?.toLowerCase() === "staging",
       };
       const actionText = `You were delegated ${ticketIdentifier}`;
       const message = (await buildWorkflowAwareDeliveryMessage(ticketIdentifier, authToken, actionText)) ?? actionText;
@@ -2621,6 +2622,7 @@ export function createApp(options?: CreateAppOptions) {
       // AI-2420: per-agent gateway-API target (never a global URL).
       gatewayUrl: agentCfg?.gatewayUrl,
       gatewayToken: agentCfg?.gatewayToken,
+      dryRun: process.env.CONNECTOR_ENV?.toLowerCase() === "staging",
     };
     const actionText = `${ticketIdentifier} was migrated to a new workflow state (its previous state was removed by a def change)`;
     const message =
@@ -2859,6 +2861,7 @@ if (isEntryPoint) {
       // AI-2420: per-agent gateway-API target (never a global URL).
       gatewayUrl: agentCfg?.gatewayUrl,
       gatewayToken: agentCfg?.gatewayToken,
+      dryRun: process.env.CONNECTOR_ENV?.toLowerCase() === "staging",
     };
     const actionText = `You were delegated ${ticketIdentifier}`;
     const message =
@@ -3188,6 +3191,7 @@ if (isEntryPoint) {
         // AI-2420: per-agent gateway-API target (never a global URL).
         gatewayUrl: agentCfg?.gatewayUrl,
         gatewayToken: agentCfg?.gatewayToken,
+        dryRun: process.env.CONNECTOR_ENV?.toLowerCase() === "staging",
       };
       const actionText = `SLA breach detected for ${identifier}`;
       const message =
@@ -3248,6 +3252,7 @@ if (isEntryPoint) {
         hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
         gatewayUrl: agentCfg?.gatewayUrl,
         gatewayToken: agentCfg?.gatewayToken,
+        dryRun: process.env.CONNECTOR_ENV?.toLowerCase() === "staging",
       };
       const actionText = `Validation SLA nudge for ${identifier}`;
       const message =

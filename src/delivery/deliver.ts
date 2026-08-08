@@ -67,6 +67,13 @@ export interface DeliveryConfig {
    * flag is not what you think it is.
    */
   requireGatewayApi?: boolean;
+  /**
+   * INF-1330 staging dry-run: when true, deliverToAgent short-circuits and
+   * records a dry-run dispatch without touching any gateway/hooks endpoint.
+   * Set by CONNECTOR_ENV=staging so two-instance tests can prove staging
+   * cannot wake production agents. Production leaves this false/undefined.
+   */
+  dryRun?: boolean;
   timeoutMs?: number;
   /**
    * Deprecated/unused at this layer. Retry backoff is owned by deliverWithAck,
@@ -173,6 +180,11 @@ export async function deliverToAgent(
   inFlightStore?: DispatchInFlightStore,
   sessionSpawnStore?: SessionSpawnIdempotencyStore,
 ): Promise<DeliveryResult> {
+  // INF-1330: staging dryRun — do not acquire any production-facing lease/inflight state.
+  if (config.dryRun === true || process.env.CONNECTOR_ENV?.toLowerCase() === "staging") {
+    log.info(`INF-1330 dryRun: skipping deliverToAgent for ${route.agentId} [${route.sessionKey}] (staging isolation)`);
+    return { dispatched: false, hookError: false, hookErrorSummary: "dryRun: staging delivery suppressed" };
+  }
   const updatedAt =
     (route.event.data as Record<string, string> | undefined)?.updatedAt;
 
@@ -357,6 +369,11 @@ export async function deliverMessageToAgent(
   message: string,
   config: DeliveryConfig,
 ): Promise<DeliveryResult> {
+  // INF-1330: staging dryRun — do not wake any real agent.
+  if (config.dryRun === true || process.env.CONNECTOR_ENV?.toLowerCase() === "staging") {
+    log.info(`INF-1330 dryRun: skipping delivery for ${agentName} [${sessionId}] (staging isolation)`);
+    return { dispatched: false, hookError: false, hookErrorSummary: "dryRun: staging delivery suppressed" };
+  }
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   // Prefer the Gateway OpenAI-compatible API path when configured — it uses

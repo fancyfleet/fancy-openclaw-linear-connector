@@ -573,6 +573,7 @@ async function deliverDelegateClearRecoveryWake(
           hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
           gatewayUrl: agentCfg?.gatewayUrl,
           gatewayToken: agentCfg?.gatewayToken,
+          dryRun: process.env.CONNECTOR_ENV?.toLowerCase() === "staging",
         };
         if (throttle) {
           await throttle.wait(route.agentId);
@@ -674,8 +675,26 @@ export function createWebhookRouter(
       const rawBody: Buffer | undefined = (req as Request & { rawBody?: Buffer }).rawBody;
       log.info(`Raw body length: ${rawBody?.length || 0} bytes`);
 
-      // ── 3. Signature validation (skip if no secret configured) ────────────
-      if (secrets.length > 0) {
+      // ── 3. Signature validation ──────────────────────────────────────────
+      // INF-1330 AC1 fail-closed: staging MUST have a staging-specific secret
+      // (LINEAR_WEBHOOK_SECRET_STAGING / LINEAR_WEBHOOK_SECRETS_STAGING).
+      // An empty secret list when CONNECTOR_ENV=staging means the instance
+      // is mis-provisioned — reject instead of skipping validation (otherwise
+      // it would accept unsigned webhooks).
+      const isStagingEnv = process.env.CONNECTOR_ENV?.toLowerCase() === "staging";
+      if (secrets.length === 0) {
+        if (isStagingEnv) {
+          log.error("INF-1330: CONNECTOR_ENV=staging but no staging webhook secret configured — rejecting webhook (fail-closed)");
+          appendOperationalEvent(operationalEventStore, {
+            outcome: "signature-rejected",
+            errorSummary: "Staging webhook secret not configured",
+            detail: signatureRejectedDetail(rawBody, 0),
+          });
+          res.status(401).json({ error: "Staging webhook secret not configured" });
+          return;
+        }
+        log.warn("No LINEAR_WEBHOOK_SECRETS or LINEAR_WEBHOOK_SECRET set — skipping signature validation");
+      } else {
         const signature = req.headers["x-linear-signature"] ?? req.headers["linear-signature"];
         if (!signature || typeof signature !== "string") {
           appendOperationalEvent(operationalEventStore, {
@@ -695,7 +714,7 @@ export function createWebhookRouter(
         }
 
         const signatureValid = verifyLinearSignatureMulti(rawBody, signature as string, secrets);
-      log.info(`Signature validation result: ${signatureValid ? "valid" : "invalid"}`);
+        log.info(`Signature validation result: ${signatureValid ? "valid" : "invalid"}`);
         if (!signatureValid) {
           const diagnostic = extractRejectedWebhookDiagnostic(rawBody);
           appendOperationalEvent(operationalEventStore, {
@@ -709,8 +728,6 @@ export function createWebhookRouter(
           res.status(401).json({ error: "Invalid signature" });
           return;
         }
-      } else {
-        log.warn("No LINEAR_WEBHOOK_SECRETS or LINEAR_WEBHOOK_SECRET set — skipping signature validation");
       }
 
       // ── 4. Parse JSON payload ─────────────────────────────────────────────
@@ -1013,6 +1030,7 @@ export function createWebhookRouter(
                 // falls back to per-agent hooksUrl/hooksToken from agents.json.
                 gatewayUrl: agentCfg?.gatewayUrl,
                 gatewayToken: agentCfg?.gatewayToken,
+                dryRun: process.env.CONNECTOR_ENV?.toLowerCase() === "staging",
               };
               try {
                 if (throttle) {
@@ -1851,6 +1869,7 @@ export function createWebhookRouter(
         // reachable.
         gatewayUrl: agentCfg?.gatewayUrl,
         gatewayToken: agentCfg?.gatewayToken,
+        dryRun: process.env.CONNECTOR_ENV?.toLowerCase() === "staging",
       };
       try {
         if (throttle) {
