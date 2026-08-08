@@ -76,6 +76,41 @@ export function writeCheckpointManifest(dest: string, manifest: CheckpointManife
   fs.renameSync(tmp, dest);
 }
 
+// ── manifest persistence (INF-1329 Slice A) ─────────────────────────────────
+
+export function getCheckpointManifestPath(): string {
+  // Production bootstrap reads the artifact-bound manifest written at build time.
+  // Prefer explicit env override for tests, otherwise cwd/dist/checkpoint-manifest.json.
+  if (process.env.CHECKPOINT_MANIFEST_PATH) return process.env.CHECKPOINT_MANIFEST_PATH;
+  return path.join(process.cwd(), "dist", "checkpoint-manifest.json");
+}
+
+function isValidManifest(obj: unknown): obj is CheckpointManifest {
+  if (!obj || typeof obj !== "object") return false;
+  const m = obj as Record<string, unknown>;
+  return (
+    typeof m["checkpointId"] === "string" &&
+    typeof m["commit"] === "string" &&
+    typeof m["artifactDigest"] === "string" &&
+    typeof m["workflowDefinitionsDigest"] === "string" &&
+    typeof m["configFingerprint"] === "string" &&
+    typeof m["version"] === "number" &&
+    m["version"] >= 1
+  );
+}
+
+export function loadCheckpointManifest(): CheckpointManifest | null {
+  const p = getCheckpointManifestPath();
+  try {
+    const raw = fs.readFileSync(p, "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (isValidManifest(parsed)) return parsed;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 // ── live comparison ────────────────────────────────────────────────────────
 
 export interface StoredCheckpointDigests {
@@ -130,6 +165,12 @@ export function resetCheckpointState(): void {
 
 export function ensureStoredManifest(): CheckpointManifest {
   if (storedManifest) return storedManifest;
+  // INF-1329: prefer the persisted build artifact manifest (survives restart).
+  const persisted = loadCheckpointManifest();
+  if (persisted) {
+    storedManifest = persisted;
+    return storedManifest;
+  }
   const live = computeLiveDigests();
   storedManifest = createCheckpointManifest({
     commit: live.commit,
@@ -149,12 +190,6 @@ function instanceConfigRootSync(): string {
 function resolveLiveCommitSync(): string {
   // 1. Env overrides for test injection win first — so tests can force drift without touching disk.
   //    In production these env vars are not set; the stamp/git path is authoritative.
-  //    Check env first only when explicitly set to a known test value.
-  //    But for real drift detection we must prefer disk truth — so we check stamp/git BEFORE falling back to env.
-  //    Test injection uses env AFTER disk read fails would be useless. Instead, env is checked first ONLY if set,
-  //    and disk is checked second — but getCheckpointHealth must not snap to manifest.
-  //    To keep both prod truth and test injection, prefer: env override if present, else stamp, else git.
-  //    Prod does not set GIT_COMMIT/ARTIFACT_DIGEST, so stamp/git path is used there.
   if (process.env.GIT_COMMIT) return process.env.GIT_COMMIT;
   if (process.env.DEPLOY_COMMIT) return process.env.DEPLOY_COMMIT;
   // 2. Prefer dist/DEPLOY_COMMIT stamp (production truth, AI-1841)
@@ -173,28 +208,68 @@ function resolveLiveCommitSync(): string {
   return "unknown";
 }
 
+// ── artifact digest: hash of built artifact (dist/), not lockfile proxy ────
+
+function collectDistFilesRecursive(dir: string, base: string, out: string[]): void {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(dir).sort();
+  } catch {
+    return;
+  }
+  for (const name of entries) {
+    if (name.startsWith(".")) continue;
+    // Exclude checkpoint binding files to keep artifact/commit dimensions independent.
+    if (name === "checkpoint-manifest.json" && path.resolve(dir) === path.resolve(base)) continue;
+    if (name === "DEPLOY_COMMIT" && path.resolve(dir) === path.resolve(base)) continue;
+    const full = path.join(dir, name);
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(full);
+    } catch {
+      continue;
+    }
+    if (stat.isDirectory()) {
+      collectDistFilesRecursive(full, base, out);
+    } else if (stat.isFile()) {
+      out.push(full);
+    }
+  }
+}
+
+export function computeArtifactDigestFromDist(distPath?: string): string | null {
+  const target = distPath ?? path.join(process.cwd(), "dist");
+  const files: string[] = [];
+  collectDistFilesRecursive(target, target, files);
+  if (files.length === 0) return null;
+  // Sort to ensure deterministic hashing (collect is already sorted per-dir, but full paths need sort).
+  files.sort();
+  const hash = crypto.createHash("sha256");
+  for (const f of files) {
+    try {
+      const content = fs.readFileSync(f);
+      // Include relative path in hash so renames are detected.
+      const rel = path.relative(target, f);
+      hash.update(rel, "utf8");
+      hash.update("\0", "utf8");
+      hash.update(content);
+      hash.update("\0", "utf8");
+    } catch {}
+  }
+  return `sha256:${hash.digest("hex")}`;
+}
+
 function resolveLiveArtifactDigestSync(): string {
+  // Test injection still wins if explicitly set.
   if (process.env.ARTIFACT_DIGEST) return process.env.ARTIFACT_DIGEST;
-  // Hash package-lock.json as artifact proxy; fallback to dist hash
+  // Primary: hash actual built artifact (dist/), deterministic sorted file list.
+  const distDigest = computeArtifactDigestFromDist();
+  if (distDigest) return distDigest;
+  // Fallback: hash package-lock.json only if dist is absent (dev without build).
   try {
     const lockPath = path.join(process.cwd(), "package-lock.json");
     const content = fs.readFileSync(lockPath, "utf8");
     return `sha256:${sha256Hex(content)}`;
-  } catch {}
-  try {
-    const distPath = path.join(process.cwd(), "dist");
-    const entries = fs.readdirSync(distPath).filter((n) => !n.startsWith(".")).sort();
-    if (entries.length > 0) {
-      const hash = crypto.createHash("sha256");
-      for (const name of entries) {
-        const p = path.join(distPath, name);
-        try {
-          const stat = fs.statSync(p);
-          if (stat.isFile()) hash.update(fs.readFileSync(p));
-        } catch {}
-      }
-      return `sha256:${hash.digest("hex")}`;
-    }
   } catch {}
   return `sha256:${sha256Hex("artifact")}`;
 }
