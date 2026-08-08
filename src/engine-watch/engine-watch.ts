@@ -19,7 +19,7 @@ function isTerminalStateType(stateType: string): boolean {
   return stateType === "completed" || stateType === "canceled";
 }
 
-function isActiveStateType(stateType: string): boolean {
+export function isActiveStateType(stateType: string): boolean {
   return stateType === "unstarted" || stateType === "started" || stateType === "triage";
 }
 
@@ -27,6 +27,15 @@ const dedupRegistry = new Map<string, TicketRef>();
 
 export function getDedupKey(signal: Signal): string {
   return `${signal.class}::${signal.evidence}`;
+}
+
+export function getDedupTicket(signal: Signal): TicketRef | undefined {
+  return dedupRegistry.get(getDedupKey(signal));
+}
+
+export function peekDedupActiveTicket(signal: Signal): TicketRef | null {
+  const t = dedupRegistry.get(getDedupKey(signal));
+  return t && isActiveStateType(t.stateType) ? t : null;
 }
 
 export function classifySignal(
@@ -105,11 +114,22 @@ export function classifySignal(
   }
 
   // No owner — new connector fix ticket (AC1 branch 3).
-  // Note: dedup for the no-owner branch is intentionally not checked against
-  // prior terminal follow-ups for the same key to avoid cross-context test
-  // pollution; duplicate prevention for truly repeated novel signals is
-  // covered by the active-owner dedup after the first ticket is created.
+  // Tick-level cross-tick dedup (AC4) is enforced in runEngineWatchTick by
+  // consulting the registry before creation and passing the active follow-up
+  // via ctx.activeFollowup; the classifier honors it here and records it so
+  // subsequent ticks reuse the same ticket. The registry is not consulted
+  // directly in this branch to avoid cross-context pollution between
+  // terminal-followup and no-owner unit tests that share the same signal
+  // shape (see AC5b pair).
   if (!owner) {
+    if (ctx.activeFollowup && isActiveStateType(ctx.activeFollowup.stateType)) {
+      dedupRegistry.set(dedupKey, ctx.activeFollowup);
+      return {
+        kind: "new-fix-ticket",
+        signalId: signal.id,
+        createdTicket: ctx.activeFollowup,
+      };
+    }
     if (ctx.createTicket) {
       const created = ctx.createTicket(signal);
       dedupRegistry.set(dedupKey, created);

@@ -24,6 +24,8 @@ import {
 import {
   classifySignal,
   buildEngineWatchSummary,
+  getDedupKey,
+  peekDedupActiveTicket,
   type Signal,
   type TicketRef,
   type Disposition,
@@ -85,7 +87,7 @@ function detailText(detail: unknown, errorSummary: string | null): string {
   return (errorSummary ?? "").slice(0, 800);
 }
 
-function defaultCollectSignalsFromStore(
+export function defaultCollectSignalsFromStore(
   operationalEventStore?: EngineWatchCronOptions["operationalEventStore"],
 ): Signal[] {
   if (!operationalEventStore || typeof (operationalEventStore as { query?: unknown }).query !== "function") return [];
@@ -158,8 +160,12 @@ function defaultCollectSignalsFromStore(
       }
     }
     return signals;
-  } catch {
-    return [];
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.error(`[engine-watch] defaultCollect failed: ${msg}`);
+    recordEngineWatchFail(msg);
+    markCronRunFailure("engine-watch", err instanceof Error ? err : new Error(msg));
+    throw err;
   }
 }
 
@@ -181,11 +187,9 @@ async function fetchTicketByIdentifier(identifier: string, authToken: string): P
   } catch { return null; }
 }
 
-async function searchActiveTicketForClass(signalClass: string, authToken: string): Promise<TicketRef | null> {
+export async function searchActiveTicketForClass(signalClass: string, authToken: string): Promise<TicketRef | null> {
   try {
-    // Search recent issues for an active (non-terminal) owner with matching class hint.
-    // We page a small window; the exact filter is best-effort — if nothing matches we return null.
-    const query = `query SearchIssues($filter: IssueFilter) { issues(filter: $filter, first: 50) { nodes { id identifier state { type name } labels { nodes { name } } } } }`;
+    const query = `query SearchIssues($filter: IssueFilter) { issues(filter: $filter, first: 50) { nodes { id identifier title labels { nodes { name } } state { type name } } } }`;
     const filter = { state: { type: { nin: ["completed", "canceled"] } } };
     const res = await fetch(LINEAR_API_URL, {
       method: "POST",
@@ -193,12 +197,19 @@ async function searchActiveTicketForClass(signalClass: string, authToken: string
       body: JSON.stringify({ query, variables: { filter } }),
     });
     if (!res.ok) return null;
-    const body = (await res.json()) as { data?: { issues?: { nodes: Array<{ id: string; identifier: string; state: { type: string; name: string }; labels: { nodes: Array<{ name: string }> } }> } } };
+    const body = (await res.json()) as { data?: { issues?: { nodes: Array<{ id: string; identifier: string; title: string; state: { type: string; name: string }; labels: { nodes: Array<{ name: string }> } }> } } };
     const nodes = body.data?.issues?.nodes ?? [];
     const hint = signalClass.toLowerCase();
+    const classPrefix = `[engine-watch] ${signalClass.toLowerCase()}`;
     for (const n of nodes) {
       const labelText = n.labels.nodes.map((l) => l.name.toLowerCase()).join(" ");
-      if (labelText.includes(hint.split("-")[0]) || n.identifier.toLowerCase().includes(hint.slice(0, 3))) {
+      const titleLower = (n.title ?? "").toLowerCase();
+      if (
+        titleLower.includes(classPrefix) ||
+        labelText.includes(`engine-watch:${hint}`) ||
+        labelText.includes(hint.split("-")[0]) ||
+        n.identifier.toLowerCase().includes(hint.slice(0, 3))
+      ) {
         return { id: n.id, identifier: n.identifier, state: n.state?.name ?? "unknown", stateType: n.state?.type ?? "unknown" };
       }
     }
@@ -228,7 +239,6 @@ async function defaultResolveOwner(signal: Signal, authToken: string): Promise<{
 }
 
 async function defaultCreateTicket(signal: Signal, authToken: string): Promise<TicketRef> {
-  // Resolve a team to create in — use the first accessible team.
   let teamId = "";
   try {
     const teamQuery = `query Teams { teams(first: 5) { nodes { id } } }`;
@@ -242,12 +252,26 @@ async function defaultCreateTicket(signal: Signal, authToken: string): Promise<T
   } catch { /* ignore */ }
   const title = `[engine-watch] ${signal.class} recurrence — ${signal.evidence.slice(0, 80)}`;
   const description = `Automated engine-watch follow-up for signal \`${signal.id}\` (class \`${signal.class}\`).\n\nEvidence:\n${signal.evidence}\n\nSource: ${signal.source ?? "unknown"} observedAt: ${signal.observedAt ?? "unknown"}`;
+  // Resolve a stable class-hint label so follow-ups are discoverable via
+  // searchActiveTicketForClass on the next tick (AC4 cross-tick dedup).
+  let labelIds: string[] | undefined;
+  if (teamId) {
+    try {
+      const { findOrCreateLabel } = await import("../linear-helpers.js");
+      const labelId = await findOrCreateLabel(teamId, `engine-watch:${signal.class}`, authToken.startsWith("Bearer ") ? authToken : `Bearer ${authToken}`);
+      if (labelId) labelIds = [labelId];
+    } catch { /* best-effort — creation still proceeds without label */ }
+  }
   try {
-    const mutation = `mutation CreateIssue($teamId: String!, $title: String!, $description: String!) { issueCreate(input: { teamId: $teamId, title: $title, description: $description }) { success issue { id identifier state { type name } } } }`;
+    const mutation = labelIds
+      ? `mutation CreateIssue($teamId: String!, $title: String!, $description: String!, $labelIds: [String!]!) { issueCreate(input: { teamId: $teamId, title: $title, description: $description, labelIds: $labelIds }) { success issue { id identifier state { type name } } } }`
+      : `mutation CreateIssue($teamId: String!, $title: String!, $description: String!) { issueCreate(input: { teamId: $teamId, title: $title, description: $description }) { success issue { id identifier state { type name } } } }`;
+    const variables: Record<string, unknown> = { teamId, title, description };
+    if (labelIds) variables.labelIds = labelIds;
     const res = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: authToken.startsWith("Bearer ") ? authToken : `Bearer ${authToken}` },
-      body: JSON.stringify({ query: mutation, variables: { teamId, title, description } }),
+      body: JSON.stringify({ query: mutation, variables }),
     });
     const body = (await res.json()) as { data?: { issueCreate?: { success: boolean; issue?: { id: string; identifier: string; state: { type: string; name: string } } } } };
     const issue = body.data?.issueCreate?.issue;
@@ -296,20 +320,41 @@ export async function runEngineWatchTick(opts: EngineWatchCronOptions = {}): Pro
 
   const dispositions: Disposition[] = [];
   for (const signal of signals) {
-    const ownerCtx = effective.resolveOwner
+    let ownerCtx = effective.resolveOwner
       ? await effective.resolveOwner(signal)
       : await defaultResolveOwner(signal, authToken);
+
+    // Cross-tick dedup (AC4): consult the in-process dedup registry BEFORE
+    // creating a ticket. If an active follow-up for this class::evidence was
+    // already created on a prior tick, reuse it so we do not file a duplicate.
+    // This applies to both the terminal-owner branch and the no-owner branch.
+    if (!ownerCtx.activeFollowup) {
+      const dedupActive = peekDedupActiveTicket(signal);
+      if (dedupActive) {
+        const isTerminal = !!ownerCtx.closestOwner && (ownerCtx.closestOwner.stateType === "completed" || ownerCtx.closestOwner.stateType === "canceled");
+        if (isTerminal || !ownerCtx.closestOwner) {
+          ownerCtx = { ...ownerCtx, activeFollowup: dedupActive };
+        }
+      }
+    }
 
     const isTerminal = !!ownerCtx.closestOwner && (ownerCtx.closestOwner.stateType === "completed" || ownerCtx.closestOwner.stateType === "canceled");
     const needsCreation = !ownerCtx.closestOwner || (isTerminal && !ownerCtx.activeFollowup);
 
     let createdTicket: TicketRef | null = null;
     if (needsCreation) {
-      try {
-        if (effective.createTicket) createdTicket = await effective.createTicket(signal);
-        else createdTicket = await defaultCreateTicket(signal, authToken);
-      } catch (err) {
-        log.warn(`[engine-watch] createTicket failed for ${signal.id}: ${err instanceof Error ? err.message : String(err)}`);
+      // Re-check dedup immediately before creation to close the race where
+      // a concurrent caller populated the registry after the pre-check above.
+      const lateDedup = peekDedupActiveTicket(signal);
+      if (lateDedup) {
+        ownerCtx = { ...ownerCtx, activeFollowup: lateDedup };
+      } else {
+        try {
+          if (effective.createTicket) createdTicket = await effective.createTicket(signal);
+          else createdTicket = await defaultCreateTicket(signal, authToken);
+        } catch (err) {
+          log.warn(`[engine-watch] createTicket failed for ${signal.id}: ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
     }
 
@@ -318,6 +363,8 @@ export async function runEngineWatchTick(opts: EngineWatchCronOptions = {}): Pro
       activeFollowup: ownerCtx.activeFollowup ?? createdTicket,
       createTicket: (s) => {
         if (createdTicket) return createdTicket;
+        const dedup = peekDedupActiveTicket(s);
+        if (dedup) return dedup;
         return { id: `engine-watch-${s.id}`, identifier: `INF-EW-${Date.now()}`, state: "To Do", stateType: "unstarted" };
       },
     });
