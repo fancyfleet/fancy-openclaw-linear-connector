@@ -2622,8 +2622,11 @@ export function createApp(options?: CreateAppOptions) {
   registerRegistryIntegrityCron();
 
   // INF-1302: engine-watch signal-to-ticket pipeline — periodic scan that
-  // promotes uncovered recurrence into active follow-up tickets.
-  registerEngineWatchCron();
+  // promotes uncovered recurrence into active follow-up tickets. Production
+  // collector is wired to the live operational-event store so real recurrence
+  // (migrate-state client-error, xfn/intake stale routing, etc.) reaches
+  // classification; test collector overrides are injected via cron options.
+  registerEngineWatchCron({ operationalEventStore });
 
   // AI-2582: transcript redaction sweep — periodic .trajectory.jsonl
   // credential redaction. Registered here so the cron registry and /health
