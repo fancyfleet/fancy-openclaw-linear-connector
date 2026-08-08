@@ -11,6 +11,7 @@ export interface EngineWatchState {
   lastRunAt: string | null;
   lastOutcomeType: EngineWatchOutcome | null;
   lastOutcome: { signals: number; dispositions: number };
+  lastSummary: string | null;
   lastError: string | null;
   /** True once the cron has been registered (proves bootstrap wiring, AC6/AC7). */
   scheduled: boolean;
@@ -22,6 +23,7 @@ let state: EngineWatchState = {
   lastRunAt: null,
   lastOutcomeType: null,
   lastOutcome: { signals: 0, dispositions: 0 },
+  lastSummary: null,
   lastError: null,
   scheduled: false,
   registeredAt: null,
@@ -32,12 +34,13 @@ export function markEngineWatchScheduled(): void {
   state.registeredAt = new Date().toISOString();
 }
 
-export function recordEngineWatchRun(result: { signals: number; dispositions: number }): void {
+export function recordEngineWatchRun(result: { signals: number; dispositions: number; summary?: string }): void {
   state = {
     ...state,
     lastRunAt: new Date().toISOString(),
     lastOutcomeType: "success",
     lastOutcome: { signals: result.signals, dispositions: result.dispositions },
+    lastSummary: result.summary ?? null,
     lastError: null,
   };
 }
@@ -69,6 +72,7 @@ export function resetEngineWatchStateForTest(): void {
     lastRunAt: null,
     lastOutcomeType: null,
     lastOutcome: { signals: 0, dispositions: 0 },
+    lastSummary: null,
     lastError: null,
     scheduled: false,
     registeredAt: null,
