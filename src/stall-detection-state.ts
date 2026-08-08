@@ -31,6 +31,12 @@ export interface StallDetectionState {
   lanes: string[];
   /** INF-1333: lane-distinct acknowledged-silence block. */
   acknowledgedSilence: { active: boolean };
+  /** INF-1333: live stalled count from the most recent sweep (0 until first sweep). */
+  stalledCount: number;
+  /** INF-1333: live stalled ticket identifiers from the most recent sweep. */
+  stalledTickets: string[];
+  /** INF-1333: ISO timestamp of the most recent sweep, or null before first sweep. */
+  lastSweepAt: string | null;
 }
 
 let state: StallDetectionState = {
@@ -39,6 +45,9 @@ let state: StallDetectionState = {
   progressTimeoutMs: DEFAULT_PROGRESS_TIMEOUT_MS,
   lanes: ["idle-lease", "acknowledged-silence"],
   acknowledgedSilence: { active: true },
+  stalledCount: 0,
+  stalledTickets: [],
+  lastSweepAt: null,
 };
 
 /**
@@ -55,7 +64,21 @@ export function recordStallDetectionActive(config: {
     progressTimeoutMs: config.progressTimeoutMs,
     lanes: ["idle-lease", "acknowledged-silence"],
     acknowledgedSilence: { active: true },
+    // Preserve live sweep results if already populated (re-registration is rare but safe)
+    stalledCount: state.stalledCount,
+    stalledTickets: state.stalledTickets,
+    lastSweepAt: state.lastSweepAt,
   };
+}
+
+/**
+ * INF-1333: record the live stalled result from the most recent sweep.
+ * Called by stall-sweep-cron runSweepIteration after each classification.
+ */
+export function recordStallSweepResult(result: { stalledCount: number; stalledTickets: string[] }): void {
+  state.stalledCount = result.stalledCount;
+  state.stalledTickets = [...result.stalledTickets];
+  state.lastSweepAt = new Date().toISOString();
 }
 
 /** Read the current stall detection liveness state (for /health). */
@@ -71,6 +94,9 @@ export function resetStallDetectionStateForTest(): void {
     progressTimeoutMs: DEFAULT_PROGRESS_TIMEOUT_MS,
     lanes: ["idle-lease", "acknowledged-silence"],
     acknowledgedSilence: { active: true },
+    stalledCount: 0,
+    stalledTickets: [],
+    lastSweepAt: null,
   };
 }
 

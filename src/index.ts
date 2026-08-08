@@ -788,16 +788,17 @@ export function createApp(options?: CreateAppOptions) {
       // observable at /health without waiting for a stall to occur.
       stallDetection: getStallDetectionState(),
       // INF-1333: promotion gate joins stall detection; blocks promotion when stalls exist.
+      // Reads live stalledCount/stalledTickets from stall-detection-state (populated by stall-sweep-cron).
       promotionGate: (() => {
         const sd = getStallDetectionState();
-        const gate = getPromotionGateHealth({ stalledCount: 0, stalledTickets: [] });
+        const gate = getPromotionGateHealth({ stalledCount: sd.stalledCount, stalledTickets: sd.stalledTickets });
         void isPromotionBlockedByStall;
         return { ...gate, stallDetectionActive: sd.active, lanes: sd.lanes };
       })(),
       // INF-1333 alias shapes accepted by the bootstrap test
       checkpoint: (() => {
         const sd = getStallDetectionState();
-        const gate = getPromotionGateHealth({ stalledCount: 0, stalledTickets: [] });
+        const gate = getPromotionGateHealth({ stalledCount: sd.stalledCount, stalledTickets: sd.stalledTickets });
         return { ...gate, stallBlocked: gate.blockedByStall, stallDetectionActive: sd.active };
       })(),
       // INF-979 AC4 (AI-1808 guard) / INF-1198: stale-session recovery + governed re-seat

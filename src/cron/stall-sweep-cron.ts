@@ -18,7 +18,7 @@ import type { LivenessRecord, StallClassifierConfig } from "../stall-detection.j
 import { getStalledTickets } from "../stall-detection.js";
 import { createModuleLogger } from "../logging.js";
 import { registerCron, markCronRunSuccess, markCronRunFailure, formatIntervalMs } from "./registry.js";
-import { recordStallDetectionActive } from "../stall-detection-state.js";
+import { recordStallDetectionActive, recordStallSweepResult } from "../stall-detection-state.js";
 
 const log = createModuleLogger("stall-sweep-cron");
 
@@ -56,6 +56,11 @@ function runSweepIteration(options: StallSweepCronOptions): void {
   try {
     const records = options.livenessRecords();
     const stalled = getStalledTickets(records, options.config);
+    // INF-1333: publish live stalled count so /health.promotionGate reflects real stalls.
+    recordStallSweepResult({
+      stalledCount: stalled.length,
+      stalledTickets: stalled.map((s) => s.ticketId),
+    });
     if (stalled.length > 0) {
       const summary = stalled
         .map((s) => `${s.ticketId} (${s.reason})`)
@@ -72,6 +77,11 @@ function runSweepIteration(options: StallSweepCronOptions): void {
     return;
   }
   markCronRunSuccess("stall-liveness-sweep");
+}
+
+/** INF-1333: synchronously run one sweep iteration (exported for promotion-gate wiring tests). */
+export function triggerStallSweepForTest(options: StallSweepCronOptions): void {
+  runSweepIteration(options);
 }
 
 /**
