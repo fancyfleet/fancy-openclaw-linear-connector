@@ -1198,6 +1198,16 @@ describe("defaultFetchStuckCandidates — retired-entity guard (INF-572)", () =>
     expect(completed).toHaveLength(0);
   });
 
+  // INF-580: `duplicate` is a first-class native terminal type (INF-203), not a
+  // flavor of `canceled`. main's guard previously used a module-local
+  // {completed, canceled} set and would surface a natively-`duplicate` issue as
+  // a stuck candidate — the coverage gap this forward-port closes by adopting the
+  // shared isNativelyTerminal() classifier (completed/canceled/duplicate).
+  it("excludes a natively-duplicate issue whose workflow state:* label is still non-terminal", async () => {
+    const candidates = await defaultFetchStuckCandidates(agent, deps(issueNode("duplicate", "Duplicate")));
+    expect(candidates).toHaveLength(0);
+  });
+
   it("still surfaces a live (non-terminal native state) issue in the same stuck shape as a candidate", async () => {
     const candidates = await defaultFetchStuckCandidates(agent, deps(issueNode("started", "In Progress")));
     expect(candidates).toHaveLength(1);
