@@ -161,6 +161,8 @@ interface FakeDeps {
   writeRollbackTarget: (priorId: string) => Promise<void>;
   getRollbackTarget: (id: string) => string | null;
   listRetainedCheckpoints: () => string[];
+  getAuditFields: () => unknown;
+  auditFields: unknown;
 }
 
 function makeFakeDeps(ctx: GateContext, spies: Record<string, jest.Mock> = {}): FakeDeps {
@@ -183,6 +185,8 @@ function makeFakeDeps(ctx: GateContext, spies: Record<string, jest.Mock> = {}): 
   const writeRollbackSpy = (spies.writeRollbackTarget ??= jest.fn(async (priorId: string) => { retained.push(priorId); }));
   const getRollbackSpy = (spies.getRollbackTarget ??= jest.fn((id: string) => retained.includes(id) ? id : null));
   const listRetainedSpy = (spies.listRetainedCheckpoints ??= jest.fn(() => [...retained]));
+  // Gate 6: audit context required and fail-closed — wire valid audit by default so happy paths pass
+  const getAuditFieldsSpy = (spies.getAuditFields ??= jest.fn(() => ctx.auditFields));
 
   // Wire getPin to reflect setPin mutations
   getPinSpy.mockImplementation(() => prodPin);
@@ -202,6 +206,8 @@ function makeFakeDeps(ctx: GateContext, spies: Record<string, jest.Mock> = {}): 
     writeRollbackTarget: writeRollbackSpy,
     getRollbackTarget: getRollbackSpy,
     listRetainedCheckpoints: listRetainedSpy,
+    getAuditFields: getAuditFieldsSpy,
+    auditFields: ctx.auditFields,
   };
 }
 

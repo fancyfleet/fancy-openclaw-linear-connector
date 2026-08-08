@@ -56,9 +56,9 @@ interface PromotionDeps {
   writeRollbackTarget: (priorId: string) => Promise<void>;
   getRollbackTarget: (id: string) => string | null;
   listRetainedCheckpoints: () => string[];
-  // Optional audit source for Gate 6
-  getAuditFields?: () => unknown;
-  auditFields?: unknown;
+  // Required audit source for Gate 6 — fail-closed (AC2)
+  getAuditFields: () => unknown;
+  auditFields: unknown;
   // Allow any extra keys without error
   [k: string]: unknown;
 }
@@ -149,8 +149,7 @@ export class PromotionGate {
       throw new GateRefusedError(`gate-5 pin retained check failed: current pin ${currentPin} not in retained [${retained.join(",")}]`, "gate-5-pin-retained");
     }
 
-    // Gate 6: audit fields
-    // Resolve audit fields from deps if provided
+    // Gate 6: audit fields — unconditional fail-closed (AC2). Missing/incomplete → refuse.
     let auditFields: Record<string, unknown> | null = null;
     const maybeGetAudit = this.deps.getAuditFields;
     if (typeof maybeGetAudit === "function") {
@@ -164,14 +163,10 @@ export class PromotionGate {
     } else if ((this.deps as Record<string, unknown>)["auditFields"] && typeof (this.deps as Record<string, unknown>)["auditFields"] === "object") {
       auditFields = (this.deps as Record<string, unknown>)["auditFields"] as Record<string, unknown>;
     }
-
-    // Only enforce gate 6 if audit fields are present/expected
-    // If deps exposes getAuditFields or auditFields, validate them strictly.
-    const hasAuditSource = typeof maybeGetAudit === "function" || !!this.deps.auditFields || !!(this.deps as Record<string, unknown>)["auditFields"];
-    if (hasAuditSource) {
-      if (!auditFields) {
-        throw new GateRefusedError("gate-6 audit missing", "gate-6-audit-missing");
-      }
+    if (!auditFields) {
+      throw new GateRefusedError("gate-6 audit missing", "gate-6-audit-missing");
+    }
+    {
       const sourceId = auditFields["sourceId"] as unknown;
       const targetId = auditFields["targetId"] as unknown;
       const operator = auditFields["operator"] as unknown;
