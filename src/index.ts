@@ -2626,7 +2626,7 @@ export function createApp(options?: CreateAppOptions) {
   // collector is wired to the live operational-event store so real recurrence
   // (migrate-state client-error, xfn/intake stale routing, etc.) reaches
   // classification; test collector overrides are injected via cron options.
-  registerEngineWatchCron({ operationalEventStore, enrolledTicketsStore });
+  registerEngineWatchCron({ operationalEventStore });
 
   // AI-2582: transcript redaction sweep — periodic .trajectory.jsonl
   // credential redaction. Registered here so the cron registry and /health

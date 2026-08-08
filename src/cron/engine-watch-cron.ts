@@ -74,7 +74,6 @@ export interface EngineWatchCronOptions {
   createTicket?: (signal: Signal) => Promise<TicketRef>;
   /** Injected for production default collector; also used by defaultResolveOwner/createTicket. */
   operationalEventStore?: unknown;
-  enrolledTicketsStore?: unknown;
 }
 
 // ── Default collector: derive signals from live operational events ─────────
