@@ -275,8 +275,11 @@ async function defaultCreateTicket(signal: Signal, authToken: string): Promise<T
     const body = (await res.json()) as { data?: { issueCreate?: { success: boolean; issue?: { id: string; identifier: string; state: { type: string; name: string } } } } };
     const issue = body.data?.issueCreate?.issue;
     if (issue) return { id: issue.id, identifier: issue.identifier, state: issue.state?.name ?? "To Do", stateType: issue.state?.type ?? "unstarted" };
-  } catch { /* fall through */ }
-  return { id: `engine-watch-${signal.id}`, identifier: `INF-EW-${Date.now()}`, state: "To Do", stateType: "unstarted" };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`engine-watch issueCreate failed for ${signal.id}: ${msg}`);
+  }
+  throw new Error(`engine-watch issueCreate failed for ${signal.id} \u2014 no Linear ticket returned`);
 }
 
 // ── Tick ────────────────────────────────────────────────────────────────────
@@ -352,7 +355,12 @@ export async function runEngineWatchTick(opts: EngineWatchCronOptions = {}): Pro
           if (effective.createTicket) createdTicket = await effective.createTicket(signal);
           else createdTicket = await defaultCreateTicket(signal, authToken);
         } catch (err) {
-          log.warn(`[engine-watch] createTicket failed for ${signal.id}: ${err instanceof Error ? err.message : String(err)}`);
+          const msg = err instanceof Error ? err.message : String(err);
+          const failMsg = `engine-watch createTicket failed for ${signal.id}: ${msg}`;
+          log.error(`[engine-watch] ${failMsg}`);
+          recordEngineWatchFail(failMsg);
+          markCronRunFailure("engine-watch", err instanceof Error ? err : new Error(failMsg));
+          throw err instanceof Error ? err : new Error(failMsg);
         }
       }
     }
@@ -364,7 +372,11 @@ export async function runEngineWatchTick(opts: EngineWatchCronOptions = {}): Pro
         if (createdTicket) return createdTicket;
         const dedup = peekDedupActiveTicket(s);
         if (dedup) return dedup;
-        return { id: `engine-watch-${s.id}`, identifier: `INF-EW-${Date.now()}`, state: "To Do", stateType: "unstarted" };
+        // Never synthesize a fallback ticket — creation failure must fail loud
+        // and leave the signal retryable (INF-1302 AC validation). Throwing here
+        // prevents a phantom INF-EW-* from being registered as active and
+        // suppressing retries via the dedup registry.
+        throw new Error(`engine-watch: no ticket available for ${s.id} \u2014 creation failed or was skipped`);
       },
     });
 
