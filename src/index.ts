@@ -114,6 +114,7 @@ import { loadRoster, getRoutingFunctionaryLiveness } from "./department-roster.j
 import { resolveServiceCredential, getDedicatedCredentialLiveness } from "./service-credential.js";
 import { createGuidanceRouter, getDocsLiveness } from "./docs/guidance-router.js";
 import { createHealthSnapshotRouter, getSnapshotLiveness, registerSnapshot } from "./health/snapshot.js";
+import { getCheckpointHealth } from "./checkpoint-manifest.js";
 import { TtlCache, buildFullCacheLiveness, markCacheFlushRouteMounted, registerTtlInvalidationCron } from "./cache/ttl-cache.js";
 import { DispatchRecordStore } from "./liveness-channel/dispatch-record-store.js";
 import { LivenessChannelEndpoint } from "./liveness-channel/index.js";
@@ -623,6 +624,14 @@ export function createApp(options?: CreateAppOptions) {
   // the exact failure mode of the v1.5.0 deploy (AI-1767): the image booted,
   // /health returned 200, but 0 of 28 agents were loaded → fleet-wide 401s
   // and dropped webhooks.
+  // INF-1329: checkpoint manifest — atomic and versioned, binding commit +
+  // artifact digest + workflow-def digests + redacted config fingerprints.
+  // Served via GET /health.checkpoint with live recomputation.
+  app.get("/health.checkpoint", (_req: Request, res: Response) => {
+    const health = getCheckpointHealth();
+    res.json(health);
+  });
+
   app.get("/health", async (_req: Request, res: Response) => {
     const agents = getAgents();
     const crons = getRegisteredCrons();
