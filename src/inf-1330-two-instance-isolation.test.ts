@@ -34,6 +34,7 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import http from "node:http";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DIST_ENTRY = path.resolve(__dirname, "../dist/index.js");
@@ -92,11 +93,61 @@ describe("INF-1330 AC2: two-instance isolation — staging cannot touch producti
   let stagingChild: ChildProcess | undefined;
   let prodStderr = "";
   let stagingStderr = "";
+  // Observable fake production gateway wake endpoint — the SAME server is the
+  // delivery target for BOTH children before startup, so the assertion can
+  // prove staging's webhook stimulus traverses bootstrap/routing/delivery and
+  // still produces zero dispatches, while a production control on the same
+  // target proves the fake is reachable (non-vacuous).
+  let fakeServer: http.Server | undefined;
+  let fakePort: number = 0;
+  let fakeHooksUrl: string = "";
+  // Raw request log + filtered dispatch hits (dispatch = has sessionKey/ticketId/message, not ping:true liveness)
+  const fakeRequests: Array<{ url: string; method: string; body: string }> = [];
+  const fakeDispatchHits: string[] = [];
 
-  beforeAll(() => {
+  beforeAll(async () => {
     if (!fs.existsSync(DIST_ENTRY)) {
       throw new Error(`dist/index.js not found at ${DIST_ENTRY} — run \`npm run build\` before jest`);
     }
+
+    // ── Fake wake endpoint BEFORE spawning either child (AC2 wiring proof) ──
+    // This server stands in for the fleet gateway. Both children are configured
+    // with OPENCLAW_HOOKS_URL pointing here before startup, so any real
+    // dispatch from either child would POST to this observable endpoint.
+    // Staging's dryRun must suppress the fetch — the zero-hits assertion after
+    // a real signed webhook POST to the running staging instance then proves
+    // the live bootstrap/routing/delivery wiring is isolated, not just a unit
+    // primitive called in the test process.
+    fakeServer = http.createServer((req, rawRes: any) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => {
+        const body = Buffer.concat(chunks).toString("utf8");
+        fakeRequests.push({ url: req.url ?? "/", method: req.method ?? "UNKNOWN", body });
+        let isDispatch = false;
+        try {
+          const parsed = JSON.parse(body) as Record<string, unknown>;
+          const hasPing = (parsed as any).ping === true;
+          const hasTicket =
+            typeof (parsed as any).sessionKey === "string" ||
+            typeof (parsed as any).ticketId === "string" ||
+            typeof (parsed as any).message === "string";
+          if (!hasPing && hasTicket) {
+            isDispatch = true;
+            fakeDispatchHits.push(body);
+          }
+        } catch {
+          // Non-JSON probe — not a dispatch
+        }
+        void isDispatch;
+        rawRes.writeHead(200, { "content-type": "application/json" });
+        rawRes.end(JSON.stringify({ ok: true }));
+      });
+    });
+    await new Promise<void>((resolve) => (fakeServer as any).listen(0, "127.0.0.1", resolve));
+    fakePort = (fakeServer.address() as { port: number }).port;
+    fakeHooksUrl = `http://127.0.0.1:${fakePort}/hooks`;
+
     prodDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-1330-two-prod-"));
     stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), "inf-1330-two-staging-"));
 
@@ -112,7 +163,10 @@ describe("INF-1330 AC2: two-instance isolation — staging cannot touch producti
       PORT: String(port),
       LOG_LEVEL: "error",
       LINEAR_OAUTH_TOKEN: "test-linear-oauth-token",
-      OPENCLAW_HOOKS_URL: `http://127.0.0.1:${port}/nonexistent-hooks`,
+      // Both children target the SAME observable fake (AC2 end-to-end wiring).
+      // Before the fix staging would POST dispatches here; after the fix
+      // staging's dryRun suppresses them while production still hits the fake.
+      OPENCLAW_HOOKS_URL: fakeHooksUrl,
       OPENCLAW_HOOKS_TOKEN: "test-token",
     });
 
@@ -125,6 +179,8 @@ describe("INF-1330 AC2: two-instance isolation — staging cannot touch producti
         LINEAR_WEBHOOK_SECRET: "prod-secret-1330",
         // Ensure staging secret not leaked into prod
         LINEAR_WEBHOOK_SECRET_STAGING: undefined as unknown as string,
+        // Production's delivery must still hit the fake (negative control)
+        OPENCLAW_HOOKS_TOKEN: "test-token",
       },
       stdio: ["ignore", "ignore", "pipe"],
     });
@@ -140,7 +196,6 @@ describe("INF-1330 AC2: two-instance isolation — staging cannot touch producti
         LINEAR_WEBHOOK_SECRET_STAGING: "staging-secret-1330",
         // Prod secret also present on host — staging must NOT use it
         LINEAR_WEBHOOK_SECRET: "prod-secret-1330",
-        OPENCLAW_HOOKS_URL: `http://127.0.0.1:${STAGING_PORT}/nonexistent-hooks`,
         OPENCLAW_HOOKS_TOKEN: "test-token-staging",
       },
       stdio: ["ignore", "ignore", "pipe"],
@@ -168,6 +223,9 @@ describe("INF-1330 AC2: two-instance isolation — staging cannot touch producti
     }
     for (const d of [prodDir, stagingDir]) {
       if (d) fs.rmSync(d, { recursive: true, force: true });
+    }
+    if (fakeServer) {
+      await new Promise<void>((resolve) => (fakeServer as any).close(resolve));
     }
   });
 
@@ -363,12 +421,14 @@ describe("INF-1330 AC2: two-instance isolation — staging cannot touch producti
     "INF-1330 AC2: staging delivery adapter is dry-run — dispatch via staging does NOT wake production agents",
     async () => {
       // Behavioural isolation proof: POST a real routable webhook into
-      // STAGING's ingress while both instances run concurrently, with a fake
-      // "production wake endpoint" standing in for the fleet gateway staging
-      // would contact if its dryRun adapter were absent. Assert that endpoint
-      // receives ZERO staging-triggered dispatch wakes, not just a health
-      // metadata flag. This exercises the actual bootstrap/routing/wiring that
-      // a direct delivery unit test would never touch.
+      // STAGING's ingress while BOTH instances run concurrently, with the SAME
+      // observable fake production wake endpoint that was configured as the
+      // delivery target for BOTH children BEFORE startup. Assert that endpoint
+      // receives ZERO staging-triggered dispatch wakes (end-to-end wiring), not
+      // just a health metadata flag. A production control against the SAME fake
+      // then proves the fake is reachable (non-vacuous). This exercises the
+      // actual bootstrap/routing/delivery wiring that a direct in-process
+      // deliverMessageToAgent call would never touch.
 
       // Keep the metadata invariants as pre-checks — they are necessary but
       // not sufficient, while the fake-endpoint observation is the load-bearing
@@ -393,73 +453,29 @@ describe("INF-1330 AC2: two-instance isolation — staging cannot touch producti
         (stagingDry === true ? "dryRun" : null);
       expect(stagingMode).toBe("dryRun");
 
-      // ── Fake production gateway wake endpoint ────────────────────────
-      // Staging is the ONLY instance under test. Its delivery layer reads
-      // OPENCLAW_HOOKS_URL at call time; pointing that hook at a controllable
-      // local HTTP server lets us count real staging-triggered wakes. Without
-      // dryRun the dispatch path would POST to that server (via the liveness
-      // ping and then the wake/delivery POST). With dryRun it short-circuits
-      // before any fetch.
-      //
-      // We spin the fake on a random loopback port and temporarily point
-      // staging at it. We snapshot the fake AFTER staging has finished the
-      // ingress round-trip so the harness timing bounds the assertion.
-      const http = await import("node:http");
-      const fakeRequests: Array<{ url: string; method: string; body: string }> = [];
-      const dispatchHits: string[] = [];
-      const fakeServer: import("node:http").Server = http.createServer((req, rawRes: any) => {
-        const chunks: Buffer[] = [];
-        req.on("data", (c: Buffer) => chunks.push(c));
-        req.on("end", () => {
-          const body = Buffer.concat(chunks).toString("utf8");
-          fakeRequests.push({ url: req.url ?? "/", method: req.method ?? "UNKNOWN", body });
-          let isDispatch = false;
-          try {
-            const parsed = JSON.parse(body) as Record<string, unknown>;
-            // Liveness ping has shape { agentId, ping:true }; a real dispatch
-            // wake has agentId+sessionKey/ticketId/message. Count only dispatch.
-            const hasPing = (parsed as any).ping === true;
-            const hasTicket =
-              typeof (parsed as any).sessionKey === "string" ||
-              typeof (parsed as any).ticketId === "string" ||
-              typeof (parsed as any).message === "string";
-            if (!hasPing && hasTicket) {
-              isDispatch = true;
-              dispatchHits.push(body);
-            }
-          } catch {
-            // Non-JSON probe — not a dispatch
-          }
-          void isDispatch;
-          rawRes.writeHead(200, { "content-type": "application/json" });
-          rawRes.end(JSON.stringify({ ok: true }));
-        });
-      });
-      await new Promise<void>((resolve) => (fakeServer as any).listen(0, "127.0.0.1", resolve));
-      const fakePort = (fakeServer.address() as { port: number }).port;
-      const fakeHooksUrl = `http://127.0.0.1:${fakePort}/hooks`;
+      // Reset fake counters so health polling / prior tests do not pollute the
+      // dispatch observation. Health has no reason to hit the fake (it is only
+      // the webhook-triggered delivery path that would), but resetting makes
+      // the assertion deterministic.
+      fakeRequests.length = 0;
+      fakeDispatchHits.length = 0;
 
-      // Point staging's delivery target at the fake. We can't mutate the
-      // already-spawned child env directly, so we do the minimal observable
-      // thing: assert that a real ingress event on staging — with the fake
-      // standing by — produces ZERO dispatch POSTs and that the ingress is
-      // still accepted (200). The fake is exercised via a direct
-      // deliverMessageToAgent call against it: staging-env must suppress the
-      // fetch, so with CONNECTOR_ENV=staging the dispatch hit count stays 0.
-      // This covers the bootstrap path where staging's per-agent hooksUrl would
-      // resolve to this fake in production; the two-instance proof then asserts
-      // that the running staging instance's /health dryRun invariant combined
-      // with the unit delivery gate implies the live wake path is also dryRun.
       const crypto = await import("node:crypto");
-      const validBody = JSON.stringify({
+
+      // ── Staging ingress: real signed routable webhook ──────────────────
+      // The fake was configured as staging's OPENCLAW_HOOKS_URL BEFORE startup
+      // (see beforeAll). If staging's dryRun wiring were absent, this webhook
+      // would cause staging's delivery layer to POST a dispatch payload to the
+      // fake. With dryRun the fake must stay at 0 dispatch hits.
+      const stagingBody = JSON.stringify({
         type: "Issue",
         action: "update",
         createdAt: new Date().toISOString(),
         actor: { id: "human-actor-ignored", name: "Human" },
         data: {
-          id: "iss-inf-1330-dispatch-probe",
+          id: "iss-inf-1330-dispatch-probe-staging",
           identifier: "ENG-1330",
-          title: "[TEST] INF-1330 AC2 dispatch probe",
+          title: "[TEST] INF-1330 AC2 staging dispatch probe",
           state: { id: "s1", name: "Todo", type: "unstarted" },
           priority: 0,
           priorityLabel: "No priority",
@@ -476,124 +492,85 @@ describe("INF-1330 AC2: two-instance isolation — staging cannot touch producti
       });
       const stagingSig = crypto
         .createHmac("sha256", "staging-secret-1330")
-        .update(Buffer.from(validBody))
+        .update(Buffer.from(stagingBody))
         .digest("hex");
 
-      // Staging ingress: signed with the staging secret — must be accepted,
-      // not signature-rejected (AC1 isolation proved this). The connector
-      // responds 200 before attempting delivery (webhook is accepted + queued),
-      // so we assert the HTTP-layer acceptance here.
       const stagingWebhookRes = await fetch(`http://127.0.0.1:${STAGING_PORT}/`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "x-linear-signature": stagingSig,
         },
-        body: validBody,
+        body: stagingBody,
       });
       expect(stagingWebhookRes.status).toBe(200);
       const stagingWebhookJson = (await stagingWebhookRes.json()) as Record<string, unknown>;
       expect(stagingWebhookJson.ok === true || (stagingWebhookJson as any).status === "ok").toBe(true);
 
-      // Give the staging event loop a bounded window to have reached the
-      // delivery layer (including liveness + bag/wake path). The delivery
-      // layer itself is synchronous to dryRun return; a sub-second sleep is
-      // generous.
-      await new Promise((r) => setTimeout(r, 1200));
+      // Bounded window for the staging event loop to have reached the delivery
+      // layer (liveness + bag/wake path). The delivery layer's dryRun gate is
+      // synchronous, so this is generous.
+      await new Promise((r) => setTimeout(r, 1500));
 
-      // The fake hooks URL was NOT configured on the spawned staging child
-      // (its OPENCLAW_HOOKS_URL was the staging port /nonexistent-hooks at
-      // spawn time), so the staging POST above cannot have hit the fake.
-      // What proves dryRun, then, is the DIRECT delivery primitive against
-      // the fake when called under CONNECTOR_ENV=staging: it must suppress the
-      // fetch and leave the fake at 0 dispatch hits. We verify that explicitly
-      // here, keeping the two-instance harness load-bearing (both instances up)
-      // while collapsing the fake-dispatch check into this same test.
+      // The load-bearing assertion: the running staging instance — with the
+      // fake as its live delivery target since before startup — produced ZERO
+      // dispatch POSTs to that target despite a real routable ingress. This
+      // covers the child's bootstrap/routing/delivery wiring end to end.
+      expect(fakeDispatchHits.length).toBe(0);
 
-      // Staging-env delivery against the fake — must leave the fake untouched.
-      // This mirrors src/delivery/deliver.test.ts's four unit cases but DOES
-      // observe the real production entry point's delivery contract: with a
-      // concrete HTTP target reachable on loopback, staging suppresses the
-      // fetch entirely.
-      const prevStaging = process.env.CONNECTOR_ENV;
-      const prevDry = process.env.OPENCLAW_HOOKS_URL as string | undefined;
-      const savedFetch = globalThis.fetch;
-      let stagingFetchCount = 0;
-      const passthroughFetch: typeof globalThis.fetch = (async (input: any, init?: any) => {
-        const urlStr = typeof input === "string" ? input : String((input as Request).url ?? input);
-        if (urlStr.includes(`127.0.0.1:${fakePort}`) || urlStr === fakeHooksUrl) stagingFetchCount++;
-        // For non-fake URLs, delegate to the real fetch so health polling etc still work
-        return (savedFetch as any)(input, init);
-      }) as unknown as typeof globalThis.fetch;
-      globalThis.fetch = passthroughFetch;
+      // ── Negative control: production against the SAME fake ─────────────
+      // Proves the fake is reachable and the 0-hits result is not vacuous.
+      // A routable webhook POSTed to the running PRODUCTION instance (which is
+      // also configured to the same fake before startup but without dryRun)
+      // MUST produce exactly one dispatch payload at the fake. Reset-discriminated
+      // by clearing the hits after the staging check so the increment is clean.
+      fakeDispatchHits.length = 0;
+      fakeRequests.length = 0;
 
-      // Load the built delivery primitive from dist (the same code the
-      // spawned connectors run) and invoke it with the fake as target.
-      // Using dist keeps this test anchored to the production bundle the
-      // two-instance harness boots.
-      const distDeliver: any = await import(path.resolve(__dirname, "../dist/delivery/deliver.js"));
-      process.env.CONNECTOR_ENV = "staging";
-      try {
-        const r = await distDeliver.deliverMessageToAgent("igor", `linear-ENG-1330:${Date.now()}`, "staging isolation dispatch probe", {
-          nodeBin: process.execPath,
-          hooksUrl: fakeHooksUrl,
-          hooksToken: "test-token-staging",
-          gatewayUrl: fakeHooksUrl,
-          gatewayToken: "test-token-staging",
-        });
-        expect(r.dispatched).toBe(false);
-        expect(String(r.hookErrorSummary ?? "")).toMatch(/dryRun/);
-      } finally {
-        process.env.CONNECTOR_ENV = prevStaging as string;
-        if (prevDry === undefined) delete (process.env as any).OPENCLAW_HOOKS_URL;
-        else process.env.OPENCLAW_HOOKS_URL = prevDry;
-        globalThis.fetch = savedFetch;
-        // Confirm the fake saw no dispatch payloads — only at most the
-        // staging webhook POST (to the connector, not to the fake). The fake
-        // itself was the dispatch target, so its dispatchHits must be 0.
-        // stagingFetchCount counts fetches that would have hit the fake's URL;
-        // with dryRun it must stay 0.
-        expect(stagingFetchCount).toBe(0);
-        expect(dispatchHits.length).toBe(0);
-      }
-
-      await new Promise<void>((resolve) => (fakeServer as any).close(resolve));
-
-      // Negative control: same delivery call WITHOUT staging dryRun DOES hit the fake.
-      // This prevents a vacuously-passing "0 hits" — proves the fake is reachable and the
-      // delivery primitive would have posted without the staging gate.
-      const http2 = await import("node:http");
-      const fake2Hits: string[] = [];
-      const fake2: import("node:http").Server = http2.createServer((req, rawRes: any) => {
-        const chunks: Buffer[] = [];
-        req.on("data", (c: Buffer) => chunks.push(c));
-        req.on("end", () => {
-          fake2Hits.push(Buffer.concat(chunks).toString("utf8"));
-          rawRes.writeHead(200, { "content-type": "application/json" });
-          rawRes.end(JSON.stringify({ ok: true }));
-        });
+      const prodBody = JSON.stringify({
+        type: "Issue",
+        action: "update",
+        createdAt: new Date().toISOString(),
+        actor: { id: "human-actor-ignored", name: "Human" },
+        data: {
+          id: "iss-inf-1330-dispatch-probe-prod",
+          identifier: "ENG-1331",
+          title: "[TEST] INF-1330 AC2 prod control probe",
+          state: { id: "s1", name: "Todo", type: "unstarted" },
+          priority: 0,
+          priorityLabel: "No priority",
+          team: { id: "t1", key: "ENG" },
+          labelIds: [],
+          url: "https://app.linear.app/test/issue/ENG-1331",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          delegate: { id: "user-igor-12345678" },
+          assignee: null,
+          mentionedUsers: [],
+        },
+        updatedFrom: { delegateId: null },
       });
-      await new Promise<void>((resolve) => (fake2 as any).listen(0, "127.0.0.1", resolve));
-      const fake2Port = (fake2.address() as { port: number }).port;
-      const fake2Url = `http://127.0.0.1:${fake2Port}/hooks`;
-      const prevStaging2 = process.env.CONNECTOR_ENV;
-      process.env.CONNECTOR_ENV = "production";
-      try {
-        // Need to stub linearUserId lookup so deliverMessageToAgent doesn't require agents.json
-        // It doesn't — it just needs hooksUrl/gatewayUrl present. Liveness is not called here (only via webhook path).
-        await distDeliver.deliverMessageToAgent("igor", `linear-ENG-1330:${Date.now()}`, "production control — must hit fake", {
-          nodeBin: process.execPath,
-          hooksUrl: fake2Url,
-          hooksToken: "test-token",
-          gatewayUrl: fake2Url,
-          gatewayToken: "test-token",
-        });
-        // The non-staging call must have produced exactly one dispatch payload at the fake
-        expect(fake2Hits.length).toBe(1);
-      } finally {
-        process.env.CONNECTOR_ENV = prevStaging2 as string;
-        await new Promise<void>((resolve) => (fake2 as any).close(resolve));
-      }
+      const prodSig = crypto
+        .createHmac("sha256", "prod-secret-1330")
+        .update(Buffer.from(prodBody))
+        .digest("hex");
+
+      const prodWebhookRes = await fetch(`http://127.0.0.1:${PROD_PORT}/`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-linear-signature": prodSig,
+        },
+        body: prodBody,
+      });
+      expect(prodWebhookRes.status).toBe(200);
+      const prodWebhookJson = (await prodWebhookRes.json()) as Record<string, unknown>;
+      expect(prodWebhookJson.ok === true || (prodWebhookJson as any).status === "ok").toBe(true);
+
+      await new Promise((r) => setTimeout(r, 4500));
+
+      // Production must have produced exactly one dispatch payload at the SAME fake.
+      expect(fakeDispatchHits.length).toBe(1);
     },
     60_000,
   );
