@@ -129,6 +129,7 @@ type IssuesPageResp = {
       };
     };
   };
+  errors?: Array<{ message: string }>;
 };
 
 // ── Terminal state detection ─────────────────────────────────────────────────
