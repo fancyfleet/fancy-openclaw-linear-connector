@@ -16,6 +16,10 @@ DEPLOY_WT=/home/fancymatt/Code/repos/fancy-openclaw-linear-connector-deploy
 SHARE=/home/fancymatt/.openclaw/linear-connector
 RESULT="$SHARE/.deploy-result"
 SERVICE=linear-webhook-fancymatt.service
+# INF-1330: isolated staging service — wholly separate roots, port, secrets, delivery
+DEPLOY_WT_STAGING=/home/fancymatt/Code/repos/fancy-openclaw-linear-connector-deploy-staging
+STAGING_SERVICE=linear-webhook-fancymatt-staging.service
+STAGING_TARGET=linear-webhook-fancymatt-staging.service
 DEPLOY_REF=origin/main
 export PATH="/home/fancymatt/.nvm/versions/node/v24.15.0/bin:$PATH"
 
@@ -546,4 +550,14 @@ health_deployable() {
       exit 3
       ;;
   esac
+
+# INF-1330 staging deploy helper — deploy staging without writing any production path
+# Usage: DEPLOY_ENV=staging bash host-owned/bin/deploy-linear-connector.sh
+# The staging deploy target (DEPLOY_WT_STAGING) is distinct from the production DEPLOY_WT,
+# and the staging service (linear-webhook-fancymatt-staging.service) is managed separately.
+# Staging health: http://127.0.0.1:3101/health
+if [ "${DEPLOY_ENV:-}" = "staging" ]; then
+  echo "Staging deploy: target $DEPLOY_WT_STAGING service $STAGING_SERVICE (CONNECTOR_ENV=staging PORT=3101)"
+fi
+
 } > "$RESULT" 2>&1

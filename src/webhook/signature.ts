@@ -64,8 +64,13 @@ export function verifyLinearSignatureMulti(
  * `LINEAR_WEBHOOK_SECRET` is included as the first entry.
  */
 export function parseWebhookSecrets(): string[] {
+  // INF-1330: partition webhook ingress secret by CONNECTOR_ENV
+  const isStaging = process.env.CONNECTOR_ENV?.toLowerCase() === "staging";
+  const stagingSingle = process.env.LINEAR_WEBHOOK_SECRET_STAGING;
   const multi = process.env.LINEAR_WEBHOOK_SECRETS;
-  const single = process.env.LINEAR_WEBHOOK_SECRET;
+  const single = isStaging
+    ? (stagingSingle ?? process.env.LINEAR_WEBHOOK_SECRET)
+    : process.env.LINEAR_WEBHOOK_SECRET;
 
   if (multi) {
     const secrets = multi.split(",").map(s => s.trim()).filter(Boolean);
