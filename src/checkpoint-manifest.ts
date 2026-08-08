@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
+import { execSync } from "node:child_process";
 
 export interface CheckpointManifest {
   checkpointId: string;
@@ -122,6 +124,10 @@ export function setStoredManifest(m: CheckpointManifest): void {
   storedManifest = m;
 }
 
+export function resetCheckpointState(): void {
+  storedManifest = null;
+}
+
 export function ensureStoredManifest(): CheckpointManifest {
   if (storedManifest) return storedManifest;
   const live = computeLiveDigests();
@@ -134,50 +140,127 @@ export function ensureStoredManifest(): CheckpointManifest {
   return storedManifest;
 }
 
-export function computeLiveDigests(): LiveCheckpointDigests {
-  // Commit: prefer env, fallback to stored manifest commit or unknown
-  const commit = process.env.GIT_COMMIT ?? process.env.DEPLOY_COMMIT ?? storedManifest?.commit ?? "unknown";
-  // Artifact: digest of built artifact or env override
-  const artifactDigest = process.env.ARTIFACT_DIGEST ?? storedManifest?.artifactDigest ?? `sha256:${sha256Hex("artifact")}`;
-  // Workflow definitions digest: hash file content if available
-  let workflowDefinitionsDigest = storedManifest?.workflowDefinitionsDigest ?? `sha256:${sha256Hex("workflow-defs")}`;
-  const wfPath = process.env.WORKFLOW_DEF_PATH;
-  if (wfPath) {
+// ── live digest resolution — independent recomputation, no snapping ───────
+
+function instanceConfigRootSync(): string {
+  return process.env.LINEAR_CONNECTOR_CONFIG_DIR ?? path.join(os.homedir(), ".openclaw", "linear-connector");
+}
+
+function resolveLiveCommitSync(): string {
+  // 1. Env overrides for test injection win first — so tests can force drift without touching disk.
+  //    In production these env vars are not set; the stamp/git path is authoritative.
+  //    Check env first only when explicitly set to a known test value.
+  //    But for real drift detection we must prefer disk truth — so we check stamp/git BEFORE falling back to env.
+  //    Test injection uses env AFTER disk read fails would be useless. Instead, env is checked first ONLY if set,
+  //    and disk is checked second — but getCheckpointHealth must not snap to manifest.
+  //    To keep both prod truth and test injection, prefer: env override if present, else stamp, else git.
+  //    Prod does not set GIT_COMMIT/ARTIFACT_DIGEST, so stamp/git path is used there.
+  if (process.env.GIT_COMMIT) return process.env.GIT_COMMIT;
+  if (process.env.DEPLOY_COMMIT) return process.env.DEPLOY_COMMIT;
+  // 2. Prefer dist/DEPLOY_COMMIT stamp (production truth, AI-1841)
+  try {
+    const stampPath = path.join(process.cwd(), "dist", "DEPLOY_COMMIT");
+    const stamped = fs.readFileSync(stampPath, "utf8").trim();
+    if (stamped) return stamped;
+  } catch {}
+  // 3. Fallback to git HEAD (dev/test)
+  try {
+    const out = execSync("git rev-parse --short HEAD", { stdio: ["ignore", "pipe", "ignore"] })
+      .toString()
+      .trim();
+    if (out) return out;
+  } catch {}
+  return "unknown";
+}
+
+function resolveLiveArtifactDigestSync(): string {
+  if (process.env.ARTIFACT_DIGEST) return process.env.ARTIFACT_DIGEST;
+  // Hash package-lock.json as artifact proxy; fallback to dist hash
+  try {
+    const lockPath = path.join(process.cwd(), "package-lock.json");
+    const content = fs.readFileSync(lockPath, "utf8");
+    return `sha256:${sha256Hex(content)}`;
+  } catch {}
+  try {
+    const distPath = path.join(process.cwd(), "dist");
+    const entries = fs.readdirSync(distPath).filter((n) => !n.startsWith(".")).sort();
+    if (entries.length > 0) {
+      const hash = crypto.createHash("sha256");
+      for (const name of entries) {
+        const p = path.join(distPath, name);
+        try {
+          const stat = fs.statSync(p);
+          if (stat.isFile()) hash.update(fs.readFileSync(p));
+        } catch {}
+      }
+      return `sha256:${hash.digest("hex")}`;
+    }
+  } catch {}
+  return `sha256:${sha256Hex("artifact")}`;
+}
+
+function resolveLiveWorkflowDigestSync(): string {
+  const dirEnv = process.env.WORKFLOW_DEFS_DIR || process.env.WORKFLOW_DEF_DIR;
+  if (dirEnv) {
     try {
-      const content = fs.readFileSync(wfPath, "utf8");
-      workflowDefinitionsDigest = `sha256:${sha256Hex(content)}`;
-      // If stored manifest was already created with default placeholder, update live to match file hash.
-      // But storedManifest still has old placeholder — that would cause mismatch. To keep initial
-      // overall true, if storedManifest exists and was created before file existed, we update
-      // stored's digest to match? No — we want live recomputation to show drift if file changed
-      // AFTER manifest creation. For tests that create temp files AFTER manifest init, the
-      // initial mismatch would be false negative. So if storedManifest was created before the
-      // temp file existed, we should treat live as stored value when file was not present at
-      // creation but now is. Simplest: if stored placeholder differs from file hash, keep live
-      // as stored value for backwards compat until manifest is re-blessed.
-      // Instead, we just return file hash — mismatch is okay but tests only check boolean types.
-      // Keep file hash as live value.
+      const entries = fs.readdirSync(dirEnv).filter((f) => f.endsWith(".yaml") || f.endsWith(".yml")).sort();
+      if (entries.length > 0) {
+        const hash = crypto.createHash("sha256");
+        for (const name of entries) {
+          const content = fs.readFileSync(path.join(dirEnv, name), "utf8");
+          hash.update(content);
+        }
+        return `sha256:${hash.digest("hex")}`;
+      }
+    } catch {}
+    // Dir set but unreadable/empty → still a live value, don't fall through to placeholder silently
+    return `sha256:${sha256Hex("workflow-defs")}`;
+  }
+  // Single-file mode
+  const candidates: string[] = [];
+  if (process.env.WORKFLOW_DEF_PATH) candidates.push(process.env.WORKFLOW_DEF_PATH);
+  candidates.push(path.join(instanceConfigRootSync(), "workflows", "dev-impl.yaml"));
+  for (const p of candidates) {
+    try {
+      const content = fs.readFileSync(p, "utf8");
+      return `sha256:${sha256Hex(content)}`;
     } catch {}
   }
-  // Config fingerprint: hash capability policy file if available
-  let configFingerprint = storedManifest?.configFingerprint ?? `sha256:${sha256Hex("config")}`;
-  const capPath = process.env.CAPABILITY_POLICY_PATH;
-  if (capPath) {
+  return `sha256:${sha256Hex("workflow-defs")}`;
+}
+
+function resolveLiveConfigFingerprintSync(): string {
+  // Try capability policy file
+  let fingerprint: string | null = null;
+  const capCandidates: string[] = [];
+  if (process.env.CAPABILITY_POLICY_PATH) capCandidates.push(process.env.CAPABILITY_POLICY_PATH);
+  capCandidates.push(path.join(instanceConfigRootSync(), "config", "capability-policy.yaml"));
+  for (const p of capCandidates) {
     try {
-      const content = fs.readFileSync(capPath, "utf8");
-      configFingerprint = `sha256:${sha256Hex(content)}`;
+      const content = fs.readFileSync(p, "utf8");
+      fingerprint = `sha256:${sha256Hex(content)}`;
+      break;
     } catch {}
   }
-  // Also consider AGENTS_FILE as part of config
+  if (fingerprint === null) fingerprint = `sha256:${sha256Hex("config")}`;
+
   const agentsPath = process.env.AGENTS_FILE;
   if (agentsPath) {
     try {
       const content = fs.readFileSync(agentsPath, "utf8");
-      // Mix agents file hash into config fingerprint
-      configFingerprint = `sha256:${sha256Hex(configFingerprint + ":" + sha256Hex(content))}`;
+      fingerprint = `sha256:${sha256Hex(fingerprint + ":" + sha256Hex(content))}`;
     } catch {}
   }
-  return { commit, artifactDigest, workflowDefinitionsDigest, configFingerprint };
+  return fingerprint;
+}
+
+export function computeLiveDigests(): LiveCheckpointDigests {
+  return {
+    commit: resolveLiveCommitSync(),
+    artifactDigest: resolveLiveArtifactDigestSync(),
+    workflowDefinitionsDigest: resolveLiveWorkflowDigestSync(),
+    configFingerprint: resolveLiveConfigFingerprintSync(),
+  };
 }
 
 export function getCheckpointHealth(): {
@@ -187,31 +270,6 @@ export function getCheckpointHealth(): {
 } {
   const manifest = ensureStoredManifest();
   const live = computeLiveDigests();
-  // Normalize live commit to manifest commit if no explicit GIT_COMMIT/DEPLOY_COMMIT env,
-  // so initial overall is true (no drift) — live recomputation still exercises the path.
-  if (!process.env.GIT_COMMIT && !process.env.DEPLOY_COMMIT) {
-    live.commit = manifest.commit;
-  }
-  if (!process.env.ARTIFACT_DIGEST) {
-    live.artifactDigest = manifest.artifactDigest;
-  }
-  // For workflow/config, if manifest was created before temp files existed, live file hash
-  // will differ. Detect placeholder vs file hash mismatch and align live to manifest so
-  // initial health is overall:true. Subsequent file changes after manifest creation
-  // where manifest already reflects file content will correctly show drift.
-  // We achieve this by checking if manifest digest looks like placeholder (hash of literal)
-  // — simpler: if stored digest equals hash of literal placeholder string, align live.
-  const placeholderWf = `sha256:${sha256Hex("workflow-defs")}`;
-  const placeholderCfg = `sha256:${sha256Hex("config")}`;
-  if (manifest.workflowDefinitionsDigest === placeholderWf && live.workflowDefinitionsDigest !== placeholderWf) {
-    live.workflowDefinitionsDigest = manifest.workflowDefinitionsDigest;
-  }
-  if (manifest.configFingerprint === placeholderCfg && live.configFingerprint !== placeholderCfg) {
-    live.configFingerprint = manifest.configFingerprint;
-  }
-  // Also handle case where workflow/config file hash was incorporated but manifest was created
-  // with temp file already present — then they already match, no adjustment needed.
-  // For config that includes AGENTS_FILE mixing, same logic: if manifest is placeholder, align.
   const matchesLive = computeLiveMatches(
     {
       commit: manifest.commit,
