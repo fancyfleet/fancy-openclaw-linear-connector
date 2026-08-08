@@ -1,6 +1,6 @@
 # Operator Recovery Runbook — Stop/Go + Freeze Checklist
 
-> **Scope:** Slice F (INF-1334). Authored against **existing** health/admin/deploy surfaces — **no UI dependency**, **no custom UI required**. Live today are `GET /health` (incl. `GET /health/snapshot` and `healthSnapshot.active`), the `admin` API, and the `deploy` CLI; checkpoint/promotion/rollback surfaces below are **frozen-contract** terms (Slice A/C/D — see Surface status) that activate when those slices land. There is no new dashboard or Helm control-center UI to deploy before this runbook is usable. This document runs entirely on existing health/admin/deploy surfaces and frozen Slice contracts — no dashboard, no panel, no console beyond those surfaces.
+> **Scope:** Slice F (INF-1334). Authored against **existing** health/admin/deploy surfaces — **no UI dependency**, **no custom UI required**. Live today are `GET /health` (incl. `GET /health/snapshot` and `healthSnapshot.active`), the `admin` API, and the host-owned deploy flow (`host-owned/bin/deploy-linear-connector.sh` via the host systemd/request-file trigger plus `systemd`/`PM2` per `docs/deployment.md`; deploy); checkpoint/promotion/rollback surfaces below are **frozen-contract** terms (Slice A/C/D — see Surface status) that activate when those slices land. There is no new dashboard or Helm control-center UI to deploy before this runbook is usable. This document runs entirely on existing health/admin/deploy surfaces and frozen Slice contracts — no dashboard, no panel, no console beyond those surfaces.
 >
 > **Classification:** **declared-standalone**. End-to-end release-evidence proof is **not owned here** and is **not by this slice** — it is carried by the per-capability **integration-verify** children **INF-1335** through **INF-1338** (one per capability slice). This runbook is the operator's stop/go checklist; the integration-verify suites are the e2e proof. Do not treat this doc as the end-to-end release-evidence artifact.
 >
@@ -24,7 +24,7 @@ Use this runbook when:
 | `GET /health/snapshot` | `curl -sf http://<connector>/health/snapshot` | **Live** — shipped (`src/health/snapshot.ts`) | Per-task health entries, dispatch/wake liveness |
 | `GET /health.checkpoint` | `curl -sf http://<connector>/health.checkpoint` | **Pending — Slice A (INF-1329)** — frozen contract, not yet on `main` | Live `checkpoint-manifest.json` + `matchesLive` — see § 5 Slice A |
 | `admin` | `admin` API / management console (see `docs/management-console.md`, `src/admin.ts`) | **Live** — shipped | Ticket state, workflow position, governance |
-| `deploy` — `deploy` | `deploy` CLI | **Live** — shipped | Deploy operations (existing) |
+| `deploy` — host-owned deploy (`host-owned/bin/deploy-linear-connector.sh` + `systemd`/`PM2`) | `host-owned/bin/deploy-linear-connector.sh` host request-file flow + `systemctl restart linear-webhook-fancymatt` / `npm run build` + `systemd`/`PM2`/`Docker` per `docs/deployment.md` (deploy) | **Live** — shipped | Deploy/redeploy operations (existing) |
 | `deploy` — `promote --from staging --checkpoint <id>` | `promote --from staging --checkpoint <id>` | **Pending — Slice C (INF-1331)** — frozen contract, fail-closed gate not yet on `main` | Promotion gate (see § 5 Slice C) |
 | `deploy` — `rollback --checkpoint <id>` | `rollback --checkpoint <id>` | **Pending — Slice D (INF-1332)** — frozen contract, named rollback not yet on `main` | Named rollback (see § 5 Slice D) |
 
@@ -63,7 +63,7 @@ Copy this checklist into the freeze incident ticket and check each item with evi
 
 > Checklist item: **whether rollback is available** — rollback available
 
-- Live today: check the last known good deploy commit retained by the deploy store and whether a redeploy of that commit is possible.
+- Live today: identify the last known good commit on `origin/main` that passed `INF-1335`–`INF-1338` (e.g. `git ls-remote origin main` / `git log --oneline` vs `GET /health` `commit` on prod) and confirm it is still redeployable via the host-owned flow — the deploy worktree at `host-owned/bin/deploy-linear-connector.sh` fetches `origin/main`, rebuilds (`npm run build`), copies `dist/` to the deploy worktree, and restarts `linear-webhook-fancymatt.service` with a `GET /health` health gate (see `docs/deployment.md` and `host-owned/bin/deploy-linear-connector.sh; deploy`). If the commit is on `origin` and the deploy worktree can fetch/build it, rollback-available's live fallback is satisfied. Deploy.
 - Pending — Slice D (INF-1332, frozen contract): `rollback --checkpoint <id>` operates on a retained checkpoint — the deploy store retains the last N `checkpoint-manifest.json` artifacts plus their `workflow definitions` bundles and restore artifacts. Until Slice D merges this command does not exist — record "rollback pending Slice D" and treat rollback-available as not yet verifiable via named rollback.
 - When Slice D is live, verify `rollback --checkpoint <id>` can resolve the target (dry-run if available). Rollback is **available** only if the retained checkpoint exists, its restore artifact is intact, and the workflow definitions for that checkpoint are still stored. The rollback path must verify exact live identity before restoring (see § 5 Slice D).
 - If no retained checkpoint is reachable or `verify identity` fails once Slice D is live, rollback is **not available** — treat promote as higher risk.
@@ -135,7 +135,7 @@ This section names each contract by its frozen terms. The runbook does not re-de
 ### Slice D — Named rollback (retained checkpoint) — pending INF-1332, frozen contract
 
 - Command (when merged): `rollback --checkpoint <id>` — restores a retained checkpoint (`src/rollback.ts` on `feature/INF-1332-named-rollback`).
-- Detail: rollback operates on a **retained checkpoint** plus its **restore artifact** and **workflow definitions** bundle. Before restoring, it performs **verify identity** / **exact live identity** checks against the live deployment. If identity verification fails, rollback is not available and the operator must not force it. Until Slice D merges this command does not exist; live fallback is redeploying the last known good commit.
+- Detail: rollback operates on a **retained checkpoint** plus its **restore artifact** and **workflow definitions** bundle. Before restoring, it performs **verify identity** / **exact live identity** checks against the live deployment. If identity verification fails, rollback is not available and the operator must not force it. Until Slice D merges this command does not exist; live fallback is redeploying the last known good commit via the host-owned deploy flow (`host-owned/bin/deploy-linear-connector.sh` host request-file + `systemd` restart per `docs/deployment.md`).
 - Operator use: Q4 — when live, rollback available means the retained checkpoint, restore artifact, and workflow definitions are all present and identity-verified.
 
 ### Slice E — Acknowledged-silence detection
@@ -173,7 +173,7 @@ cat config/checkpoint-manifest.json | jq .checkpointId
 # Q4 — whether rollback is available
 # Pending — Slice D (INF-1332, frozen contract; command not yet on main):
 rollback --checkpoint <previous-blessed-id> --dry-run  # verify retained checkpoint + restore artifact + workflow definitions + verify identity
-# Live fallback until Slice D merges: verify last known good deploy commit is still redeployable.
+# Live fallback until Slice D merges: verify last known good deploy commit is still redeployable via host-owned flow (`host-owned/bin/deploy-linear-connector.sh` fetch `origin/main` + build + `systemd` health gate per `docs/deployment.md`).
 
 # Q5 — whether dispatch/wake health has recovered (live)
 curl -sf http://connector.prod/health/snapshot | jq .tasks
@@ -183,7 +183,7 @@ curl -sf http://connector.prod/health/snapshot | jq .tasks
 promote --from staging --checkpoint <blessed-id>   # fail-closed promotion gate — gate refuses on mismatch
 ```
 
-Live commands above use existing surfaces (`GET /health`, `GET /health/snapshot`, `admin`, `deploy`); pending commands are the frozen Slice A/C/D contracts (`GET /health.checkpoint` / `checkpoint-manifest.json`, `promote --from staging --checkpoint <id>`, `rollback --checkpoint <id>`) — see Surface status and § 5. No custom UI, no new dashboard — **no UI dependency**.
+Live commands above use existing surfaces (`GET /health`, `GET /health/snapshot`, `admin`, host-owned deploy `host-owned/bin/deploy-linear-connector.sh` + `systemd`/`PM2` per `docs/deployment.md` — deploy); pending commands are the frozen Slice A/C/D contracts (`GET /health.checkpoint` / `checkpoint-manifest.json`, `promote --from staging --checkpoint <id>`, `rollback --checkpoint <id>`) — see Surface status and § 5. No custom UI, no new dashboard — **no UI dependency**.
 
 ---
 
