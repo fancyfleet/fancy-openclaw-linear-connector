@@ -128,4 +128,36 @@ describe("parseWebhookSecrets", () => {
     delete process.env.LINEAR_WEBHOOK_SECRETS;
     expect(parseWebhookSecrets()).toEqual([]);
   });
+
+  // INF-1330 AC1: staging must NOT fall back to the production secret.
+  // When CONNECTOR_ENV=staging and LINEAR_WEBHOOK_SECRET_STAGING is absent,
+  // the production LINEAR_WEBHOOK_SECRET must not be returned — wholly
+  // separate ingress secret, no shared path with production. The caller
+  // then fails closed (no usable secret → webhook verification cannot pass).
+  it("INF-1330 AC1: CONNECTOR_ENV=staging does not fall back to LINEAR_WEBHOOK_SECRET", () => {
+    process.env.CONNECTOR_ENV = "staging";
+    process.env.LINEAR_WEBHOOK_SECRET = "prod-secret";
+    delete process.env.LINEAR_WEBHOOK_SECRET_STAGING;
+    delete process.env.LINEAR_WEBHOOK_SECRETS;
+    expect(parseWebhookSecrets()).toEqual([]);
+    // Even a prod-signed payload must not validate against staging config
+    const body = JSON.stringify({ type: "Issue" });
+    const rawBody = Buffer.from(body);
+    const prodSig = makeSignature(body, "prod-secret");
+    expect(verifyLinearSignatureMulti(rawBody, prodSig, parseWebhookSecrets())).toBe(false);
+  });
+
+  it("INF-1330 AC1: CONNECTOR_ENV=staging reads LINEAR_WEBHOOK_SECRET_STAGING when set", () => {
+    process.env.CONNECTOR_ENV = "staging";
+    process.env.LINEAR_WEBHOOK_SECRET = "prod-secret";
+    process.env.LINEAR_WEBHOOK_SECRET_STAGING = "staging-secret";
+    delete process.env.LINEAR_WEBHOOK_SECRETS;
+    expect(parseWebhookSecrets()).toEqual(["staging-secret"]);
+    const body = JSON.stringify({ type: "Issue" });
+    const rawBody = Buffer.from(body);
+    const stagingSig = makeSignature(body, "staging-secret");
+    const prodSig = makeSignature(body, "prod-secret");
+    expect(verifyLinearSignatureMulti(rawBody, stagingSig, parseWebhookSecrets())).toBe(true);
+    expect(verifyLinearSignatureMulti(rawBody, prodSig, parseWebhookSecrets())).toBe(false);
+  });
 });
