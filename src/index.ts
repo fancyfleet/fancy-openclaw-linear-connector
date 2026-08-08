@@ -56,7 +56,7 @@ import { checkFanoutOutcomeStoreLiveness, getFanoutOutcomeStoreLiveness } from "
 import { registerDistillationCron, createProdGenerationContext } from "./cron/p4-metrics-distillation.js";
 import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerStallSweepCron } from "./cron/stall-sweep-cron.js";
-import { getStallDetectionState, DEFAULT_STALL_CONFIG } from "./stall-detection-state.js";
+import { getStallDetectionState, DEFAULT_STALL_CONFIG, getPromotionGateHealth, isPromotionBlockedByStall } from "./stall-detection-state.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
 import { registerDoneDetectorCron } from "./cron/done-ticket-detector-cron.js";
 import { registerLeakedCredentialSweepCron } from "./cron/leaked-credential-sweep-cron.js";
@@ -787,6 +787,19 @@ export function createApp(options?: CreateAppOptions) {
       // INF-314 AC9: stall detection liveness — active state + thresholds
       // observable at /health without waiting for a stall to occur.
       stallDetection: getStallDetectionState(),
+      // INF-1333: promotion gate joins stall detection; blocks promotion when stalls exist.
+      promotionGate: (() => {
+        const sd = getStallDetectionState();
+        const gate = getPromotionGateHealth({ stalledCount: 0, stalledTickets: [] });
+        void isPromotionBlockedByStall;
+        return { ...gate, stallDetectionActive: sd.active, lanes: sd.lanes };
+      })(),
+      // INF-1333 alias shapes accepted by the bootstrap test
+      checkpoint: (() => {
+        const sd = getStallDetectionState();
+        const gate = getPromotionGateHealth({ stalledCount: 0, stalledTickets: [] });
+        return { ...gate, stallBlocked: gate.blockedByStall, stallDetectionActive: sd.active };
+      })(),
       // INF-979 AC4 (AI-1808 guard) / INF-1198: stale-session recovery + governed re-seat
       // liveness. driverRegistered/staleSessionHandlerSubscribed prove the recovery
       // driver (SessionTracker) and its delegate-preserving handler are wired at

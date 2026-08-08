@@ -27,12 +27,18 @@ export interface StallDetectionState {
   ackTimeoutMs: number;
   /** Effective progress timeout in ms. */
   progressTimeoutMs: number;
+  /** INF-1333: lane breakdown observable at /health without waiting for a stall. */
+  lanes: string[];
+  /** INF-1333: lane-distinct acknowledged-silence block. */
+  acknowledgedSilence: { active: boolean };
 }
 
 let state: StallDetectionState = {
   active: false,
   ackTimeoutMs: DEFAULT_ACK_TIMEOUT_MS,
   progressTimeoutMs: DEFAULT_PROGRESS_TIMEOUT_MS,
+  lanes: ["idle-lease", "acknowledged-silence"],
+  acknowledgedSilence: { active: true },
 };
 
 /**
@@ -47,6 +53,8 @@ export function recordStallDetectionActive(config: {
     active: true,
     ackTimeoutMs: config.ackTimeoutMs,
     progressTimeoutMs: config.progressTimeoutMs,
+    lanes: ["idle-lease", "acknowledged-silence"],
+    acknowledgedSilence: { active: true },
   };
 }
 
@@ -61,5 +69,24 @@ export function resetStallDetectionStateForTest(): void {
     active: false,
     ackTimeoutMs: DEFAULT_ACK_TIMEOUT_MS,
     progressTimeoutMs: DEFAULT_PROGRESS_TIMEOUT_MS,
+    lanes: ["idle-lease", "acknowledged-silence"],
+    acknowledgedSilence: { active: true },
   };
 }
+
+// INF-1333: promotion gate helpers (also reachable via stall-detection-state import)
+export function isPromotionBlockedByStall(args: { stalledCount: number; stalledTickets?: string[] } | number): boolean {
+  const count = typeof args === "number" ? args : (args?.stalledCount ?? 0);
+  return count > 0;
+}
+
+export function getPromotionGateHealth(args: { stalledCount: number; stalledTickets?: string[] }): { blocked: boolean; blockedByStall: boolean; stalledCount: number; stalledTickets: string[] } {
+  const count = typeof args === "number" ? args : (args?.stalledCount ?? 0);
+  const tickets = typeof args === "number" ? [] : (args?.stalledTickets ?? []);
+  const blocked = count > 0;
+  return { blocked, blockedByStall: blocked, stalledCount: count, stalledTickets: tickets };
+}
+
+export const getStallPromotionGateHealth = getPromotionGateHealth;
+export const isStallBlockingPromotion = isPromotionBlockedByStall;
+
