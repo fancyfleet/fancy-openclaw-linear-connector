@@ -3899,6 +3899,28 @@ export async function verifyCommentSatisfiedBy(
   }
 }
 
+// INF-710: recovery/escape edges that an enforcement gate must NEVER block.
+// These edges do not advance the workflow forward — they route a wedged ticket
+// to a human or steward. Blocking a *forward* move (continue/deploy/force-deploy)
+// when config artifacts are degraded is correct; blocking the *escalation* move
+// is not — escalation is the sanctioned response to a red gate, not another thing
+// to gate. A gate that fails closed on its own escape hatch converts a recoverable
+// red signal into an unrecoverable no-terminal-path deadlock (INF-453 class; live
+// wedge INF-694). `escape` is the canonical break_glass command; a def with a
+// custom break_glass command still has the `--break-glass` steward override.
+const CONFIG_HEALTH_EXEMPT_INTENTS = new Set(["escape", "escalate", "needs-human"]);
+
+/**
+ * INF-710: true for the escape/escalate/needs-human recovery edges that must
+ * remain reachable even when config-health is degraded, so a blocked owner
+ * always has a legal path to a human/steward. These intents still pass through
+ * their own normal legality checks (delegate/steward gating) downstream — this
+ * only exempts them from the fail-closed degraded-artifacts short-circuit.
+ */
+export function isConfigHealthExemptIntent(intent: string): boolean {
+  return CONFIG_HEALTH_EXEMPT_INTENTS.has(intent);
+}
+
 export async function checkWorkflowRules(
   intent: string,
   issueId: string | null,
@@ -4030,11 +4052,18 @@ export async function checkWorkflowRules(
   }
 
   // ── Phase 6.5 / H-1: Fail-closed on config-load failure (§16.0) ──────
-  if (!breakGlassOverride && !isConfigHealthy()) {
+  // INF-710: exempt the escape/escalate/needs-human recovery edges. This gate
+  // runs before transition resolution, so without the carve-out it swallows the
+  // very edges an owner uses to escalate a degraded gate — a no-terminal-path
+  // deadlock (INF-453 class; live wedge INF-694). The forward moves
+  // (continue/deploy/force-deploy) are still (correctly) refused below; the
+  // recovery edges fall through to their own delegate/steward legality checks.
+  if (!breakGlassOverride && !isConfigHealthy() && !isConfigHealthExemptIntent(intent)) {
     log.error(`workflow-gate: config-health FAIL-CLOSED — rejecting '${intent}' on wf:${workflowId} ticket ${issueId} because config is degraded`);
     return (
       `[Proxy] '${intent}' blocked: config artifacts are degraded and enforcement cannot be trusted. ` +
-      `A steward can use break-glass (--break-glass flag or X-Openclaw-Break-Glass header) to bypass this check.`
+      `A steward can use break-glass (--break-glass flag or X-Openclaw-Break-Glass header) to bypass this check. ` +
+      `To route this ticket to a human or steward instead, use 'escalate', 'escape', or 'needs-human'.`
     );
   }
 
