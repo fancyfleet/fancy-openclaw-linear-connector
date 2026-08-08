@@ -94,7 +94,8 @@ describe("no-route alert scoping", () => {
     // Restore the jest.setup sentinel rather than deleting: with AGENTS_FILE
     // unset, reloadAgents falls back to the repo-root agents.json, which on a
     // live instance is encrypted and throws — failing every test in afterEach.
-    process.env.AGENTS_FILE = path.join(os.tmpdir(), "connector-jest-no-agents.json");
+    process.env.AGENTS_FILE =
+      process.env.JEST_NO_AGENTS_FILE ?? path.join(os.tmpdir(), "connector-jest-no-agents.json");
     delete process.env.LINEAR_WEBHOOK_SECRET;
     reloadAgents();
     _resetAlertBusForTests();
@@ -184,7 +185,8 @@ describe("known-human no-route resolution", () => {
 
   afterEach(() => {
     // See note in the suite above: restore the jest.setup sentinel, don't delete.
-    process.env.AGENTS_FILE = path.join(os.tmpdir(), "connector-jest-no-agents.json");
+    process.env.AGENTS_FILE =
+      process.env.JEST_NO_AGENTS_FILE ?? path.join(os.tmpdir(), "connector-jest-no-agents.json");
     delete process.env.LINEAR_WEBHOOK_SECRET;
     delete process.env.KNOWN_HUMANS_PATH;
     reloadAgents();

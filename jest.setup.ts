@@ -22,6 +22,17 @@ process.env.DATA_DIR = JEST_STATE_DIR;
 // cleanup; with no state dir, agents.ts falls back to process.cwd()/agents.json
 // (the live encrypted production file).
 process.env.OPENCLAW_LINEAR_CONNECTOR_STATE = JEST_STATE_DIR;
+// INF-844: implementer-store.ts defaults to a FIXED, shared /tmp/implementer-store.json
+// whenever IMPLEMENTER_STORE_PATH is unset. That path is written by tests running in
+// OTHER jest workers (workflow-gate.test.ts seeds ghost-body poison there, per AI-1531,
+// and never removes it), so any file that reads the default picks up another worker's
+// records — a real cross-worker race on disk, which jest's per-file environment isolation
+// does NOT cover (unlike process.env / globalThis / the module registry, which it resets
+// per file). This is the actual mechanism behind the INF-844 "different test fails per run"
+// flake. AI-1531 patched it per-suite in the files that knew to; pinning it here — like
+// DATA_DIR/AGENTS_FILE above — closes it for EVERY file, so no test defaults to the shared
+// path unless it explicitly opts in.
+process.env.IMPLEMENTER_STORE_PATH = path.join(JEST_STATE_DIR, "implementer-store.json");
 // jest only sets NODE_ENV=test when it is unset; the deployment container
 // exports NODE_ENV=production, which silently disabled createApp's test-mode
 // delivery config (50ms timeout, 0 retries) and let tests run with the
@@ -84,5 +95,19 @@ process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = "";
 // DEFAULT_AGENTS_PATH, which is process.cwd() + '/agents.json' — the LIVE
 // production encrypted agents file — causing every reloadAgents() that runs
 // without AGENTS_FILE set to hit the encryption key path and fail.
-const JEST_AGENTS_FILE = path.join(os.tmpdir(), "connector-jest-no-agents.json");
+//
+// INF-844: this was a FIXED, shared os.tmpdir()/connector-jest-no-agents.json —
+// the same shared-fixed-path class as IMPLEMENTER_STORE_PATH above. It is safe
+// today only because nothing writes to the sentinel, but that invariant is
+// unenforced: any test that writes agents while AGENTS_FILE still points here
+// would create the file for EVERY worker, so every other file relying on the
+// "non-existent sentinel → empty agents" contract would instead read those
+// agents — a cross-worker race jest's per-file isolation does not cover.
+// Rooting it in the per-worker JEST_STATE_DIR (a real, isolated temp dir; the
+// sentinel FILE inside it still does not exist → reloadAgents() returns [])
+// closes that. Exported as JEST_NO_AGENTS_FILE so the few tests that restore or
+// point AGENTS_FILE at the sentinel reference this per-worker path instead of
+// recomputing the shared literal.
+const JEST_AGENTS_FILE = path.join(JEST_STATE_DIR, "connector-jest-no-agents.json");
 process.env.AGENTS_FILE = JEST_AGENTS_FILE;
+process.env.JEST_NO_AGENTS_FILE = JEST_AGENTS_FILE;

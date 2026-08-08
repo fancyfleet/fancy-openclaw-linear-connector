@@ -22,6 +22,15 @@ function tempDb(): string {
   return path.join(dir, "test.db");
 }
 
+async function waitFor(condition: () => boolean, label: string, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (condition()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${label}`);
+}
+
 function createTestApp(
   bag: PendingWorkBag,
   sessionTracker: SessionTracker,
@@ -318,6 +327,8 @@ describe("terminal issue dispatch pruning", () => {
         .send(body)
         .expect(200);
     }
+
+    await waitFor(() => dispatched.length > 0, "unblock dispatch callback");
 
     expect(dispatched).toEqual([{ agentId: "igor", ticketId: "linear-INF-777" }]);
     expect(deliveries).toHaveLength(1);

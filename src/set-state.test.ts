@@ -611,7 +611,10 @@ describe("setStateAtomic — INF-58 multi-body role re-dispatch", () => {
   let inf58OriginalEncryptionKey: string | undefined;
   let inf58OriginalEncryptionKeyFile: string | undefined;
   let inf58OriginalSnapshot: string | undefined;
-  const INF58_NO_AGENTS_PATH: string = path.join(os.tmpdir(), "connector-jest-no-agents.json");
+  // INF-844: reference the per-worker sentinel exported by jest.setup.ts rather
+  // than recomputing the shared os.tmpdir() literal, so this stays isolated.
+  const INF58_NO_AGENTS_PATH: string =
+    process.env.JEST_NO_AGENTS_FILE ?? path.join(os.tmpdir(), "connector-jest-no-agents.json");
 
   const INF58_MULTI_BODY_WORKFLOW = `
 id: dev-impl
