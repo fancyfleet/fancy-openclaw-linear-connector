@@ -504,6 +504,54 @@ describe("dispositionToDone — mocked API", () => {
     expect(commentBody).toContain("[Disposition] Parent AC satisfied");
     expect(commentBody).toContain("review → done");
   });
+
+  // ── INF-749: native stateId synced atomically with the disposition label ──
+
+  it("INF-749: writes native stateId atomically with the state:done label when resolved", async () => {
+    const { dispositionToDone } = await import("./review.js");
+
+    globalThis.fetch = createMockFetch({
+      description: "- [x] AC satisfied",
+      labels: [{ id: "label-review", name: "state:review" }],
+      teamId: "team-1",
+      internalId: "uuid-parent-1",
+      children: [],
+    });
+
+    const result = await dispositionToDone("AI-1000", "Bearer test-token", "state-done-uuid");
+    expect(result.applied).toBe(true);
+
+    const updateCall = fetchCalls.find((c) => c.body.query?.includes("issueUpdate"));
+    expect(updateCall).toBeDefined();
+    // issueUpdateWorkflowFields nests label + state under `input` — the native
+    // lane moves in the SAME mutation as the label swap.
+    expect(updateCall.body.variables.input.stateId).toBe("state-done-uuid");
+    expect(updateCall.body.variables.input.labelIds).toContain("label-done");
+    expect(updateCall.body.variables.input.labelIds).not.toContain("label-review");
+  });
+
+  it("INF-749: fail-open — label-only write, no native stateId, when unresolved", async () => {
+    const { dispositionToDone } = await import("./review.js");
+
+    globalThis.fetch = createMockFetch({
+      description: "- [x] AC satisfied",
+      labels: [{ id: "label-review", name: "state:review" }],
+      teamId: "team-1",
+      internalId: "uuid-parent-1",
+      children: [],
+    });
+
+    // No nativeStateId argument → resolution miss → label-only fallback.
+    const result = await dispositionToDone("AI-1000", "Bearer test-token");
+    expect(result.applied).toBe(true);
+
+    const updateCall = fetchCalls.find((c) => c.body.query?.includes("issueUpdate"));
+    expect(updateCall).toBeDefined();
+    // Label-only mutation carries top-level labelIds and NO input/stateId — the
+    // native lane is left untouched (never blocks the disposition).
+    expect(updateCall.body.variables.labelIds).toContain("label-done");
+    expect(updateCall.body.variables.input).toBeUndefined();
+  });
 });
 
 describe("dispositionToSpawning — mocked API", () => {
@@ -591,6 +639,62 @@ describe("dispositionToSpawning — mocked API", () => {
     const commentBody: string = commentCall.body.variables.body;
     expect(commentBody).toContain("review → spawning");
     expect(commentBody).toContain("follow-up");
+  });
+
+  it("INF-749: writes native stateId atomically with the state:spawning label when resolved", async () => {
+    const { dispositionToSpawning } = await import("./review.js");
+
+    let fetchCalls: any[] = [];
+    globalThis.fetch = ((input: any, init?: any) => {
+      const body = init?.body ? JSON.parse(init.body) : {};
+      const query = body.query ?? "";
+      fetchCalls.push({ url: typeof input === "string" ? input : input.url, body });
+
+      if (query.includes("labels { nodes { id name } }") && query.includes("team { id }")) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            data: {
+              issue: {
+                id: "uuid-parent-1",
+                team: { id: "team-1" },
+                labels: { nodes: [{ id: "label-review", name: "state:review" }] },
+              },
+            },
+          }),
+        } as any);
+      }
+      if (query.includes("team(id:")) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            data: { team: { labels: { nodes: [{ id: "label-spawning", name: "state:spawning" }] } } },
+          }),
+        } as any);
+      }
+      if (query.includes("issueUpdate")) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ data: { issueUpdate: { success: true } } }),
+        } as any);
+      }
+      if (query.includes("commentCreate")) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ data: { commentCreate: { success: true } } }),
+        } as any);
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ data: {} }) } as any);
+    }) as any;
+
+    const result = await dispositionToSpawning("AI-1000", "Bearer test-token", "state-doing-uuid");
+    expect(result.applied).toBe(true);
+
+    const updateCall = fetchCalls.find((c) => c.body.query?.includes("issueUpdate"));
+    expect(updateCall).toBeDefined();
+    expect(updateCall.body.variables.input.stateId).toBe("state-doing-uuid");
+    expect(updateCall.body.variables.input.labelIds).toContain("label-spawning");
+    expect(updateCall.body.variables.input.labelIds).not.toContain("label-review");
   });
 });
 
@@ -830,6 +934,59 @@ describe("Integration: applyStateTransition + B-4 review", () => {
     // The issueUpdate SHOULD have been called (spawning transition)
     const updateCall = fetchCalls.find((c) => c.body.query?.includes("issueUpdate"));
     expect(updateCall).toBeDefined();
+  });
+
+  it("INF-749: approve from review syncs the native stateId to done atomically (AC1/AC2)", async () => {
+    const { applyStateTransition, resetWorkflowCache } = await import("./workflow-gate.js");
+    resetWorkflowCache();
+
+    setupMockFetch({
+      description: "- [x] First AC met\n- [x] Second AC met",
+    });
+
+    const fetchCalls: any[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = ((input: any, init?: any) => {
+      const body = init?.body ? JSON.parse(init.body) : {};
+      fetchCalls.push({ body });
+      return realFetch(input, init);
+    }) as any;
+
+    await applyStateTransition("approve", "AI-1000", "Bearer test-token");
+
+    // The caller resolves ux-audit `done`.native_state ("done") → Done stateId
+    // and threads it into the disposition, so the native lane moves in the same
+    // mutation as the label swap.
+    const updateCall = fetchCalls.find((c) => c.body.query?.includes("issueUpdate"));
+    expect(updateCall).toBeDefined();
+    expect(updateCall.body.variables.input.stateId).toBe("state-done");
+    expect(updateCall.body.variables.input.labelIds).toContain("l-done");
+    expect(updateCall.body.variables.input.labelIds).not.toContain("l-review");
+  });
+
+  it("INF-749: request-rework from review syncs the native stateId to doing (spawning)", async () => {
+    const { applyStateTransition, resetWorkflowCache } = await import("./workflow-gate.js");
+    resetWorkflowCache();
+
+    setupMockFetch({
+      description: "- [x] Some AC\n\n## Findings\n- **Follow-up gap**: Rework required",
+    });
+
+    const fetchCalls: any[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = ((input: any, init?: any) => {
+      const body = init?.body ? JSON.parse(init.body) : {};
+      fetchCalls.push({ body });
+      return realFetch(input, init);
+    }) as any;
+
+    await applyStateTransition("request-rework", "AI-1000", "Bearer test-token");
+
+    // ux-audit `spawning`.native_state ("doing") → Doing stateId.
+    const updateCall = fetchCalls.find((c) => c.body.query?.includes("issueUpdate"));
+    expect(updateCall).toBeDefined();
+    expect(updateCall.body.variables.input.stateId).toBe("state-doing");
+    expect(updateCall.body.variables.input.labelIds).toContain("l-spawning");
   });
 });
 

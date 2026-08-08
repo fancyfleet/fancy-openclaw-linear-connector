@@ -32,6 +32,7 @@ import {
   postComment,
   resolveInternalId,
   issueUpdateLabels,
+  issueUpdateWorkflowFields,
   fetchIssueWithLabels,
 } from "./linear-helpers.js";
 
@@ -179,6 +180,40 @@ async function fetchIssueDescription(
   }
 }
 
+// ── Native-state-aware label write (INF-749) ──────────────────────────────
+
+/**
+ * Apply a disposition label swap, syncing the native Linear `stateId` atomically
+ * with the `state:*` label when the caller resolved one.
+ *
+ * INF-749: the disposition path (review → done / review → spawning) is a genuine
+ * governed forward transition, but historically it wrote the `state:*` label only
+ * (`issueUpdateLabels`) and never moved the native Linear state. For ux-audit —
+ * the only workflow that routes through here — `review`'s native_state is
+ * `thinking` while `done`→`done` and `spawning`→`doing`, so a label-only swap
+ * left the ticket at `state:done` with a native `In Progress`/`Thinking` lane:
+ * the transition-time sibling of the INF-748 mint-time desync.
+ *
+ * Fail-open (per INF-749): if the caller could not resolve a native stateId
+ * (`nativeStateId` undefined), fall back to the label-only write and leave the
+ * native lane unchanged — never block the disposition on a resolution miss.
+ */
+async function applyDispositionLabels(
+  internalId: string,
+  newLabelIds: string[],
+  nativeStateId: string | undefined,
+  authToken: string,
+): Promise<boolean> {
+  if (nativeStateId) {
+    return issueUpdateWorkflowFields(
+      internalId,
+      { labelIds: newLabelIds, stateId: nativeStateId },
+      authToken,
+    );
+  }
+  return issueUpdateLabels(internalId, newLabelIds, authToken);
+}
+
 // ── Public API ────────────────────────────────────────────────────────────
 
 /**
@@ -218,14 +253,21 @@ export async function evaluateParentAcGate(
  * is posted on the issue explaining which ACs are unmet.
  *
  * If the AC gate passes:
- *   1. Atomically swap state:review → state:done.
+ *   1. Atomically swap state:review → state:done (and sync the native Linear
+ *      stateId when `nativeStateId` is resolved — INF-749).
  *   2. Post a disposition summary comment.
+ *
+ * @param nativeStateId - INF-749: the Linear stateId for the `done` state's
+ *   native_state, resolved by the caller (workflow-gate B2 apply) from the def.
+ *   When provided it is written atomically with the label; when undefined the
+ *   write is label-only (fail-open — a resolution miss never blocks the close).
  *
  * Returns the result of the disposition attempt.
  */
 export async function dispositionToDone(
   parentIdentifier: string,
   authToken: string,
+  nativeStateId?: string,
 ): Promise<DispositionResult> {
   const result: DispositionResult = {
     applied: false,
@@ -285,7 +327,7 @@ export async function dispositionToDone(
     doneLabelId,
   ];
 
-  const updated = await issueUpdateLabels(issue.internalId, newLabelIds, authToken);
+  const updated = await applyDispositionLabels(issue.internalId, newLabelIds, nativeStateId, authToken);
   if (!updated) {
     result.error = "Label swap mutation returned non-success";
     return result;
@@ -321,14 +363,20 @@ export async function dispositionToDone(
  * state so the fan-out engine can mint supplementary dev-impl tickets.
  *
  * Steps:
- *   1. Atomically swap state:review → state:spawning.
+ *   1. Atomically swap state:review → state:spawning (and sync the native Linear
+ *      stateId when `nativeStateId` is resolved — INF-749).
  *   2. Post a disposition comment noting the follow-up.
  *
  * The fan-out engine will trigger on the spawning transition as before.
+ *
+ * @param nativeStateId - INF-749: the Linear stateId for the `spawning` state's
+ *   native_state, resolved by the caller. Written atomically with the label when
+ *   provided; label-only fail-open when undefined.
  */
 export async function dispositionToSpawning(
   parentIdentifier: string,
   authToken: string,
+  nativeStateId?: string,
 ): Promise<DispositionResult> {
   const result: DispositionResult = {
     applied: false,
@@ -359,7 +407,7 @@ export async function dispositionToSpawning(
     spawningLabelId,
   ];
 
-  const updated = await issueUpdateLabels(issue.internalId, newLabelIds, authToken);
+  const updated = await applyDispositionLabels(issue.internalId, newLabelIds, nativeStateId, authToken);
   if (!updated) {
     result.error = "Label swap mutation returned non-success";
     return result;

@@ -7003,10 +7003,30 @@ export async function applyStateTransition(
   // Fail-closed: if the AC gate cannot be evaluated (description fetch error),
   // block the transition to prevent premature done.
   const disposition = resolveDisposition(workflowId, currentStateName ?? "", intent);
+  // INF-749: the disposition path is a governed forward transition; resolve the
+  // target state's native_state → Linear stateId here (where def + resolver are
+  // in scope) and hand it to review.ts so the label swap and the native lane move
+  // atomically — closing the transition-time sibling of the INF-748 mint desync.
+  // Fail-open: a resolution miss yields `undefined` and review.ts falls back to a
+  // label-only write, never blocking the disposition.
+  const resolveDispositionNativeStateId = async (targetStateId: string): Promise<string | undefined> => {
+    const targetNativeSemantic = def.states.find((s) => s.id === targetStateId)?.native_state;
+    if (!targetNativeSemantic) return undefined;
+    const resolved = await resolveNativeStateId(issue.teamId, targetNativeSemantic, authToken);
+    if (!resolved) {
+      log.warn(
+        `workflow-gate: B-4 review: fail-open — could not resolve native_state '${targetNativeSemantic}' ` +
+        `for disposition target '${targetStateId}' on ${issueId}; leaving native lane unchanged`,
+      );
+      return undefined;
+    }
+    return resolved;
+  };
   if (disposition === "done") {
     try {
       log.info(`workflow-gate: B-4 review: evaluating parent-AC gate for ${issueId} (review → done)`);
-      const acResult = await dispositionToDone(issueId, authToken);
+      const doneNativeStateId = await resolveDispositionNativeStateId("done");
+      const acResult = await dispositionToDone(issueId, authToken, doneNativeStateId);
       if (!acResult.applied) {
         log.warn(`workflow-gate: B-4 review: → done blocked for ${issueId}: ${acResult.error ?? "unknown"}`);
         return { status: "blocked", code: "parent-ac-gate", detail: acResult.error ?? "unknown", from: currentStateName, to: toStateName }; // Block the transition — AC gate failed
@@ -7027,7 +7047,8 @@ export async function applyStateTransition(
   if (disposition === "spawning") {
     try {
       log.info(`workflow-gate: B-4 review: disposition → spawning for ${issueId} (follow-up gaps)`);
-      const spawnResult = await dispositionToSpawning(issueId, authToken);
+      const spawningNativeStateId = await resolveDispositionNativeStateId("spawning");
+      const spawnResult = await dispositionToSpawning(issueId, authToken, spawningNativeStateId);
       if (!spawnResult.applied) {
         log.warn(`workflow-gate: B-4 review: → spawning failed for ${issueId}: ${spawnResult.error ?? "unknown"}`);
         // Fall through to normal transition — it'll go to spawning via the standard path
