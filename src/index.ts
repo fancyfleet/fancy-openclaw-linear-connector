@@ -124,9 +124,11 @@ import type { StaleSessionDetail } from "./bag/session-tracker.js";
 import crypto from "crypto";
 import path from "path";
 import { resolveStatePath } from "./state-dir.js";
+import { resolveConnectorConfig } from "./connector-env.js";
 
 const log = createModuleLogger("server", "info");
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3100;
+const _connectorConfig = resolveConnectorConfig(process.env as Record<string, string | undefined>);
+const PORT = _connectorConfig.port;
 const DEPLOYMENT_NAME = process.env.DEPLOYMENT_NAME ?? "fancymatt";
 const DEFAULT_CRITICAL_STALE_CRON_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_CRON_FAILURE_THRESHOLD = 3;
@@ -579,6 +581,7 @@ export function createApp(options?: CreateAppOptions) {
         hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
         gatewayUrl: agentCfg?.gatewayUrl,
         gatewayToken: agentCfg?.gatewayToken,
+        dryRun: process.env.CONNECTOR_ENV?.toLowerCase() === "staging",
       };
       const actionText = `You were delegated ${ticketIdentifier}`;
       const message = (await buildWorkflowAwareDeliveryMessage(ticketIdentifier, authToken, actionText)) ?? actionText;
@@ -718,8 +721,25 @@ export function createApp(options?: CreateAppOptions) {
       }
     }
 
+    // INF-1330: staging isolation — expose environment/port/roots/delivery at /health
+    const _connCfg = resolveConnectorConfig(process.env as Record<string, string | undefined>);
+    const _healthDataDir = _connCfg.dataDir;
+    const _healthDeliveryDryRun = _connCfg.deliveryDryRun;
+    const _healthDeliveryMode = _connCfg.deliveryMode;
+    const _healthGatewayUrl = _healthDeliveryDryRun ? null : (process.env.OPENCLAW_HOOKS_URL ?? null);
+
     res.status(healthy ? 200 : 503).json({
       status: healthy ? "ok" : "degraded",
+      environment: _connCfg.environment,
+      port: PORT,
+      listenPort: PORT,
+      dataDir: _healthDataDir,
+      stateDir: _healthDataDir,
+      roots: { dataDir: _healthDataDir },
+      delivery: { dryRun: _healthDeliveryDryRun, mode: _healthDeliveryMode, gatewayUrl: _healthGatewayUrl },
+      deliveryDryRun: _healthDeliveryDryRun,
+      deliveryMode: _healthDeliveryMode,
+      gatewayUrl: _healthGatewayUrl,
       // AI-2008: operational warnings surfaced at /health (dispatch-undeliverable
       // and any future first-class warning class). Always an array.
       warnings,
@@ -732,6 +752,9 @@ export function createApp(options?: CreateAppOptions) {
       // subprocess test (ai-2008-bootstrap-wiring).
       dispatchDelivery: {
         ...dispatchDeliveryScheduler.liveness(),
+        dryRun: _healthDeliveryDryRun,
+        mode: _healthDeliveryMode,
+        gatewayUrl: _healthGatewayUrl,
         undeliverable: undeliverable.length,
       },
       // INF-1214: liveness for the governed-transition (webhook-triggered
@@ -2613,6 +2636,7 @@ export function createApp(options?: CreateAppOptions) {
       // AI-2420: per-agent gateway-API target (never a global URL).
       gatewayUrl: agentCfg?.gatewayUrl,
       gatewayToken: agentCfg?.gatewayToken,
+      dryRun: process.env.CONNECTOR_ENV?.toLowerCase() === "staging",
     };
     const actionText = `${ticketIdentifier} was migrated to a new workflow state (its previous state was removed by a def change)`;
     const message =
@@ -2851,6 +2875,7 @@ if (isEntryPoint) {
       // AI-2420: per-agent gateway-API target (never a global URL).
       gatewayUrl: agentCfg?.gatewayUrl,
       gatewayToken: agentCfg?.gatewayToken,
+      dryRun: process.env.CONNECTOR_ENV?.toLowerCase() === "staging",
     };
     const actionText = `You were delegated ${ticketIdentifier}`;
     const message =
@@ -3180,6 +3205,7 @@ if (isEntryPoint) {
         // AI-2420: per-agent gateway-API target (never a global URL).
         gatewayUrl: agentCfg?.gatewayUrl,
         gatewayToken: agentCfg?.gatewayToken,
+        dryRun: process.env.CONNECTOR_ENV?.toLowerCase() === "staging",
       };
       const actionText = `SLA breach detected for ${identifier}`;
       const message =
@@ -3240,6 +3266,7 @@ if (isEntryPoint) {
         hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
         gatewayUrl: agentCfg?.gatewayUrl,
         gatewayToken: agentCfg?.gatewayToken,
+        dryRun: process.env.CONNECTOR_ENV?.toLowerCase() === "staging",
       };
       const actionText = `Validation SLA nudge for ${identifier}`;
       const message =

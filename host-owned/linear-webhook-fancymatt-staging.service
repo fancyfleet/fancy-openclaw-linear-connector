@@ -1,0 +1,20 @@
+[Unit]
+Description=Linear Webhook Service (fancymatt) — Staging
+After=network.target
+
+[Service]
+Type=simple
+User=fancymatt
+WorkingDirectory=/home/fancymatt/Code/repos/fancy-openclaw-linear-connector-deploy-staging
+EnvironmentFile=/home/fancymatt/Code/repos/fancy-openclaw-linear-connector-deploy-staging/.env
+Environment=CONNECTOR_ENV=staging
+Environment=PORT=3101
+Environment=PATH=/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+# Staging webhook secret is LINEAR_WEBHOOK_SECRET_STAGING (partitioned from production LINEAR_WEBHOOK_SECRET)
+ExecStart=/home/linuxbrew/.linuxbrew/bin/node dist/index.js
+Restart=always
+RestartSec=10
+# Health: http://127.0.0.1:3101/health (staging health contract, distinct from production :3100)
+
+[Install]
+WantedBy=multi-user.target

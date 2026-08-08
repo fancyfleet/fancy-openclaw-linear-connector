@@ -64,6 +64,26 @@ export function verifyLinearSignatureMulti(
  * `LINEAR_WEBHOOK_SECRET` is included as the first entry.
  */
 export function parseWebhookSecrets(): string[] {
+  // INF-1330: partition webhook ingress secret by CONNECTOR_ENV.
+  // Staging MUST NOT read any production/shared secret variables — when
+  // CONNECTOR_ENV=staging the ONLY sources are LINEAR_WEBHOOK_SECRET_STAGING
+  // and LINEAR_WEBHOOK_SECRETS_STAGING (AC1: wholly separate ingress secret,
+  // no shared ingress path with prod). Production reads only
+  // LINEAR_WEBHOOK_SECRET / LINEAR_WEBHOOK_SECRETS.
+  const isStaging = process.env.CONNECTOR_ENV?.toLowerCase() === "staging";
+  if (isStaging) {
+    const stagingSingle = process.env.LINEAR_WEBHOOK_SECRET_STAGING;
+    const stagingMulti = process.env.LINEAR_WEBHOOK_SECRETS_STAGING;
+    if (stagingMulti) {
+      const secrets = stagingMulti.split(",").map(s => s.trim()).filter(Boolean);
+      if (stagingSingle && !secrets.includes(stagingSingle)) {
+        secrets.unshift(stagingSingle);
+      }
+      return secrets;
+    }
+    return stagingSingle ? [stagingSingle] : [];
+  }
+
   const multi = process.env.LINEAR_WEBHOOK_SECRETS;
   const single = process.env.LINEAR_WEBHOOK_SECRET;
 

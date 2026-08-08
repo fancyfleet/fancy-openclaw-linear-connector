@@ -189,3 +189,85 @@ describe("AI-2420 per-agent gateway-API delivery", () => {
     expect(calls).toHaveLength(0);
   });
 });
+
+describe("INF-1330 AC2: staging dryRun delivery isolation — dispatch does NOT hit production agents", () => {
+  const savedEnv = process.env.CONNECTOR_ENV;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    jest.restoreAllMocks();
+    if (savedEnv === undefined) delete process.env.CONNECTOR_ENV;
+    else process.env.CONNECTOR_ENV = savedEnv;
+  });
+
+  it("deliverMessageToAgent with CONNECTOR_ENV=staging short-circuits without fetch (dryRun)", async () => {
+    process.env.CONNECTOR_ENV = "staging";
+    const { calls } = installFetchMock();
+    const cfg: DeliveryConfig = {
+      ...BASE,
+      nodeBin: "node",
+      hooksUrl: "http://prod-gateway/hooks",
+      hooksToken: "prod-token",
+      gatewayUrl: "http://prod-gateway/v1/chat/completions",
+      gatewayToken: "prod-gw-token",
+    };
+    const res = await deliverMessageToAgent(AGENT, SESSION, "wake", cfg);
+    expect(res.dispatched).toBe(false);
+    expect(res.hookErrorSummary).toMatch(/dryRun/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("deliverMessageToAgent with explicit dryRun:true short-circuits without fetch", async () => {
+    delete process.env.CONNECTOR_ENV;
+    const { calls } = installFetchMock();
+    const cfg: DeliveryConfig = {
+      ...BASE,
+      nodeBin: "node",
+      dryRun: true,
+      hooksUrl: "http://prod-gateway/hooks",
+      hooksToken: "prod-token",
+    };
+    const res = await deliverMessageToAgent(AGENT, SESSION, "wake", cfg);
+    expect(res.dispatched).toBe(false);
+    expect(res.hookErrorSummary).toMatch(/dryRun/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("deliverMessageToAgent with dryRun:false and no CONNECTOR_ENV=staging reaches the gateway (not suppressed)", async () => {
+    delete process.env.CONNECTOR_ENV;
+    const { calls } = installFetchMock(200, { ok: true, runId: "hook-run" });
+    const cfg: DeliveryConfig = {
+      ...BASE,
+      nodeBin: "node",
+      dryRun: false,
+      hooksUrl: "http://prod-gateway/hooks",
+      hooksToken: "prod-token",
+    };
+    const res = await deliverMessageToAgent(AGENT, SESSION, "wake", cfg);
+    expect(res.dispatched).toBe(true);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("deliverToAgent with CONNECTOR_ENV=staging does not acquire lease/inflight and does not fetch", async () => {
+    process.env.CONNECTOR_ENV = "staging";
+    const { calls } = installFetchMock();
+    // Import deliverToAgent dynamically to avoid circular mock ordering issues — use the already-imported binding
+    const { deliverToAgent } = await import("./deliver.js");
+    const route = {
+      agentId: AGENT,
+      sessionKey: SESSION,
+      priority: 0 as const,
+      routingReason: "delegate" as const,
+      event: { type: "Issue" as const, action: "update" as const, data: {}, raw: {}, actor: null } as unknown as import("../types.js").RouteResult["event"],
+    };
+    const cfg: DeliveryConfig = {
+      ...BASE,
+      nodeBin: "node",
+      hooksUrl: "http://prod-gateway/hooks",
+      hooksToken: "prod-token",
+    };
+    const res = await deliverToAgent(route as unknown as import("../types.js").RouteResult, cfg);
+    expect(res.dispatched).toBe(false);
+    expect(calls).toHaveLength(0);
+  });
+});
+
