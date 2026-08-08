@@ -55,6 +55,14 @@ export interface LivenessRecord {
   engagementSemantic?: "thinking" | "doing";
   /** INF-979 (AC3): epoch ms when the engagement ownership was last observed. */
   engagementObservedAt?: number;
+  /** INF-1333: prior gate artifact timestamp (valid prior artifact before acknowledged dispatch). */
+  priorGateArtifactAt?: number;
+  /** INF-1333 alias for priorGateArtifactAt. */
+  priorArtifactAt?: number;
+  /** INF-1333 negative guard: last connector failure outcome (must not count as progress). */
+  lastFailureOutcome?: string;
+  /** INF-1333 negative guard: epoch ms of last failure event. */
+  lastFailureAt?: number;
 }
 
 export interface StallClassifierConfig {
@@ -68,7 +76,11 @@ export interface StallClassifierConfig {
 
 export interface StallResult {
   stalled: boolean;
-  reason?: "null-delegate" | "no-ack" | "no-progress";
+  reason?: "null-delegate" | "no-ack" | "no-progress" | "acknowledged-silence";
+  /** Lane-distinct marker so promotion/health can gate per-lane (INF-1333). */
+  lane?: "acknowledged-silence" | "non-tdd-silent";
+  /** Alias code for lane-distinct detection (INF-1333). */
+  code?: "acknowledged-silence";
   /** True when this is the first stall → auto-redispatch. */
   redispatched: boolean;
   /** True when this is the second stall (already redispatched) → escalate. */
@@ -144,6 +156,20 @@ export function classifyStall(
     const progressReference = record.lastProgressAt ?? record.ackedAt;
     const elapsedSinceProgress = currentTime - progressReference;
     if (elapsedSinceProgress >= config.progressTimeoutMs) {
+      const hasPriorArtifact =
+        (record as unknown as Record<string, unknown>).priorGateArtifactAt !== undefined ||
+        (record as unknown as Record<string, unknown>).priorArtifactAt !== undefined;
+      const noProgressSinceAck = progressReference === record.ackedAt;
+      if (hasPriorArtifact && noProgressSinceAck) {
+        return {
+          stalled: true,
+          reason: "acknowledged-silence",
+          lane: "acknowledged-silence",
+          code: "acknowledged-silence",
+          redispatched: !record.redispatched,
+          escalated: record.redispatched,
+        };
+      }
       return {
         stalled: true,
         reason: "no-progress",
@@ -174,3 +200,90 @@ export function getStalledTickets(
   }
   return stalled;
 }
+
+// ── INF-1333: negative guard + warning surface ──────────────────────────────
+
+export const CONNECTOR_NON_ARTIFACT_OUTCOMES: ReadonlySet<string> = new Set([
+  "wake-turn-failed",
+  "delivery-failed",
+  "delivery-unconfirmed",
+  "dispatch-undeliverable",
+  "bootstrap-wake-failed",
+  "delegation-reconciliation-failed",
+  "no-activity-warn",
+  "no-activity-failed",
+  "no-activity-redispatch",
+  "delivered",
+  "dispatch-accepted",
+  "delivery-pending-ack",
+  "dedup-suppressed",
+  "queued",
+  "bag-added",
+  "bootstrap-wake-delivered",
+  "bootstrap-wake-dispatched",
+]);
+
+export function isProductiveOwnerActivity(outcome: string): boolean {
+  return !CONNECTOR_NON_ARTIFACT_OUTCOMES.has(String(outcome ?? ""));
+}
+
+export const isProductiveOwnerActivityOutcome = isProductiveOwnerActivity;
+
+export function isConnectorNonArtifactOutcome(outcome: string): boolean {
+  return CONNECTOR_NON_ARTIFACT_OUTCOMES.has(String(outcome ?? ""));
+}
+
+export function isNonArtifactOutcome(outcome: string): boolean {
+  return CONNECTOR_NON_ARTIFACT_OUTCOMES.has(String(outcome ?? ""));
+}
+
+export function getEffectiveLastProgressAt(record: LivenessRecord): number {
+  // Connector failure outcomes must never advance progress.
+  const r = record as unknown as Record<string, unknown>;
+  // Even if lastFailureAt is more recent, ignore it.
+  void r.lastFailureAt;
+  void r.lastFailureOutcome;
+  return record.lastProgressAt ?? record.ackedAt ?? record.dispatchedAt;
+}
+
+export const resolveProductiveProgressAt = getEffectiveLastProgressAt;
+
+export interface StallWarning {
+  ticketId: string;
+  reason: string;
+  lane?: string;
+}
+
+export function getStallWarnings(
+  records: LivenessRecord[],
+  config: StallClassifierConfig & { now?: number },
+): StallWarning[] {
+  const stalled = getStalledTickets(records, config);
+  return stalled.map((s) => {
+    const rec = records.find((r) => r.ticketId === s.ticketId);
+    const lane =
+      rec && ((rec as unknown as Record<string, unknown>).priorGateArtifactAt !== undefined ||
+        (rec as unknown as Record<string, unknown>).priorArtifactAt !== undefined)
+        ? "acknowledged-silence"
+        : undefined;
+    return lane ? { ticketId: s.ticketId, reason: s.reason, lane } : { ticketId: s.ticketId, reason: s.reason };
+  });
+}
+
+export const getIdleLeaseWarnings = getStallWarnings;
+export const getAcknowledgedSilenceWarnings = getStallWarnings;
+
+// INF-1333 promotion gate helpers (also reachable via stall-detection import)
+export function isPromotionBlockedByStall(args: { stalledCount: number; stalledTickets?: string[] } | number): boolean {
+  const count = typeof args === "number" ? args : (args?.stalledCount ?? 0);
+  return count > 0;
+}
+
+export function getPromotionGateHealth(args: { stalledCount: number; stalledTickets?: string[] }): { blocked: boolean; blockedByStall: boolean; stalledCount: number } {
+  const blocked = args.stalledCount > 0;
+  return { blocked, blockedByStall: blocked, stalledCount: args.stalledCount };
+}
+
+export const getStallPromotionGateHealth = getPromotionGateHealth;
+export const isStallBlockingPromotion = isPromotionBlockedByStall;
+
