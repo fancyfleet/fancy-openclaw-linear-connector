@@ -72,7 +72,8 @@ describe("INF-1330 AC1: CONNECTOR_ENV=staging isolated roots, port, secrets, del
     expect(found.length).toBeGreaterThan(0);
 
     // If a candidate exists, prove it actually partitions config.
-    const mod: any = await import(candidates[0].replace(/\.ts$/, ".js"));
+    // Import the .ts source directly via Jest/ts-jest (no hand-built .js twin needed).
+    const mod: any = await import(candidates[0]);
     const resolver =
       mod.resolveConnectorConfig ??
       mod.resolveStagingConfig ??
@@ -108,7 +109,7 @@ describe("INF-1330 AC1: CONNECTOR_ENV=staging isolated roots, port, secrets, del
     ];
     const file = candidates.find((p) => fs.existsSync(p));
     expect(file).toBeDefined();
-    const mod: any = await import((file as string).replace(/\.ts$/, ".js"));
+    const mod: any = await import(file as string);
     const fn = mod.resolveConnectorConfig ?? mod.getStagingConfig ?? mod.getConnectorEnvConfig;
     expect(fn).toBeDefined();
     const staging = fn({ CONNECTOR_ENV: "staging" } as any);
@@ -125,7 +126,7 @@ describe("INF-1330 AC1: CONNECTOR_ENV=staging isolated roots, port, secrets, del
     ];
     const file = candidates.find((p) => fs.existsSync(p));
     expect(file).toBeDefined();
-    const mod: any = await import((file as string).replace(/\.ts$/, ".js"));
+    const mod: any = await import(file as string);
     const fn = mod.resolveConnectorConfig ?? mod.getStagingConfig ?? mod.getConnectorEnvConfig;
     expect(fn).toBeDefined();
     const staging = fn({ CONNECTOR_ENV: "staging", OPENCLAW_LINEAR_CONNECTOR_STATE: "/tmp/staging-state" } as any);
@@ -146,7 +147,7 @@ describe("INF-1330 AC1: CONNECTOR_ENV=staging isolated roots, port, secrets, del
     ];
     const file = candidates.find((p) => fs.existsSync(p));
     expect(file).toBeDefined();
-    const mod: any = await import((file as string).replace(/\.ts$/, ".js"));
+    const mod: any = await import(file as string);
     const fn = mod.resolveConnectorConfig ?? mod.getStagingConfig ?? mod.getConnectorEnvConfig;
     expect(fn).toBeDefined();
     const staging = fn({ CONNECTOR_ENV: "staging" } as any);
@@ -166,7 +167,7 @@ describe("INF-1330 AC1: CONNECTOR_ENV=staging isolated roots, port, secrets, del
     ];
     const file = candidates.find((p) => fs.existsSync(p));
     expect(file).toBeDefined();
-    const mod: any = await import((file as string).replace(/\.ts$/, ".js"));
+    const mod: any = await import(file as string);
     const fn = mod.resolveConnectorConfig ?? mod.getStagingConfig ?? mod.getConnectorEnvConfig;
     expect(fn).toBeDefined();
     const staging = fn({ CONNECTOR_ENV: "staging" } as any);
@@ -183,7 +184,7 @@ describe("INF-1330 AC1: CONNECTOR_ENV=staging isolated roots, port, secrets, del
     ];
     const file = candidates.find((p) => fs.existsSync(p));
     expect(file).toBeDefined();
-    const mod: any = await import((file as string).replace(/\.ts$/, ".js"));
+    const mod: any = await import(file as string);
     const fn = mod.resolveConnectorConfig ?? mod.getStagingConfig ?? mod.getConnectorEnvConfig;
     expect(fn).toBeDefined();
     const staging = fn({ CONNECTOR_ENV: "staging", DATA_DIR: "/tmp/data-staging" } as any);
